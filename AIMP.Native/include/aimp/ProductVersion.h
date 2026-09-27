@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.136-player-sync-cathode-runtime-composite";
+    "0.11.4.137-player-sync-equipment-reselect";
 
 } // namespace aimp

@@ -111,6 +111,7 @@ private:
     void* characterCreateTrampoline_{};
 
     std::atomic<std::uintptr_t> cathodeEquipmentBase_{0U};
+    std::atomic<void*> npcEquipmentCommandAddress_{nullptr};
 
     std::atomic_flag publishLock_ = ATOMIC_FLAG_INIT;
     std::atomic<std::uint64_t> version_{0};

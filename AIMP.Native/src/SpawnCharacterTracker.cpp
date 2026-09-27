@@ -6,6 +6,7 @@
 #include "aimp/HookManager.h"
 #include "aimp/LevelGenerationTracker.h"
 #include "aimp/LifecycleCatalog.h"
+#include "aimp/RetailEquipmentPrimitives.h"
 #include "aimp/SignatureResolver.h"
 
 #include <Windows.h>
@@ -76,6 +77,121 @@ bool ValidCharacterAddress(const std::uintptr_t value) noexcept {
     return ValidAddress(value) && (value & 0x0FU) == 0U;
 }
 
+struct EquipmentSelectionResult final {
+    bool selected{};
+    bool retryable{};
+    const char* statusCode{"REMOTE_EQUIPMENT_SELECT_FAILED"};
+    const char* message{"Retail equipment selection failed."};
+};
+
+// FUN_00654E60 is a retail NPC equipment action constructor/executor. Keep the
+// SEH boundary trivial: this command runs only when PlayerSync changes visible
+// equipment, never from a frame hook.
+bool InvokeNpcEquipmentCommand(
+    void* function,
+    void* actionContext,
+    const std::uint32_t currentSlot,
+    const std::uint32_t targetSlot,
+    std::uint32_t& exceptionCode) noexcept {
+    exceptionCode = 0U;
+    if (function == nullptr || actionContext == nullptr) return false;
+    __try {
+        reinterpret_cast<NpcEquipmentCommandFn>(function)(
+            actionContext,
+            static_cast<std::uint8_t>(currentSlot != targetSlot),
+            currentSlot,
+            1U,
+            1U,
+            targetSlot,
+            1U,
+            0U,
+            1U);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        exceptionCode = static_cast<std::uint32_t>(GetExceptionCode());
+        return false;
+    }
+}
+
+EquipmentSelectionResult EnsureEquipmentSelected(
+    const std::uintptr_t character,
+    const std::uint32_t targetSlot,
+    void* npcEquipmentCommand,
+    std::uint32_t& exceptionCode) noexcept {
+    constexpr std::uint32_t kMaximumRetailEquipmentSlot = 10U;
+    if (!ValidCharacterAddress(character) || targetSlot > kMaximumRetailEquipmentSlot) {
+        return {false, false, "REMOTE_EQUIPMENT_SELECT_INVALID",
+            "Invalid Character or target equipment slot."};
+    }
+    const auto equipment = crash_guard::SafeRead<std::uintptr_t>(
+        reinterpret_cast<const void*>(character + 0x1100U));
+    if (!equipment.has_value() || *equipment == 0U) {
+        return {false, true, "REMOTE_EQUIPMENT_SELECT_NOT_READY",
+            "The Character EquipmentController is not ready."};
+    }
+
+    const auto targetWrapper = crash_guard::SafeRead<std::uintptr_t>(
+        reinterpret_cast<const void*>(*equipment + targetSlot * sizeof(std::uint32_t)));
+    const auto currentSlot = crash_guard::SafeRead<std::uint32_t>(
+        reinterpret_cast<const void*>(*equipment + 0x150CU));
+    const auto active = crash_guard::SafeRead<std::uint8_t>(
+        reinterpret_cast<const void*>(*equipment + 0x1510U));
+    if (!targetWrapper.has_value() || *targetWrapper == 0U ||
+        !currentSlot.has_value() || !active.has_value()) {
+        return {false, true, "REMOTE_EQUIPMENT_SELECT_NOT_READY",
+            "The target equipment attachment or controller selection state is not readable yet."};
+    }
+
+    if (*currentSlot == targetSlot && *active != 0U) {
+        return {true, false, "REMOTE_EQUIPMENT_SELECTED",
+            "The requested equipment slot is already selected and active."};
+    }
+    if (npcEquipmentCommand == nullptr) {
+        return {false, false, "REMOTE_EQUIPMENT_SELECT_UNAVAILABLE",
+            "The certified retail NPC equipment command did not resolve."};
+    }
+
+    // FUN_0043A360(Character, 3, 0) is exactly:
+    //   if (*(Character + 0x388) != 0) return *(Character + 0x388);
+    // Use the equivalent direct read so this rare command does not add another
+    // resolved native dependency. Retail callers also require bit 1 at +0x08
+    // and avoid issuing another equipment action while type 7 is active.
+    const auto actionContext = crash_guard::SafeRead<std::uintptr_t>(
+        reinterpret_cast<const void*>(character + 0x388U));
+    if (!actionContext.has_value() || *actionContext == 0U) {
+        return {false, true, "REMOTE_EQUIPMENT_SELECT_NOT_READY",
+            "The Character equipment action context is not ready."};
+    }
+    const auto actionFlags = crash_guard::SafeRead<std::uint8_t>(
+        reinterpret_cast<const void*>(*actionContext + 0x08U));
+    const auto actionType = crash_guard::SafeRead<std::uint16_t>(
+        reinterpret_cast<const void*>(*actionContext + 0x1EU));
+    if (!actionFlags.has_value() || !actionType.has_value()) {
+        return {false, true, "REMOTE_EQUIPMENT_SELECT_NOT_READY",
+            "The Character equipment action context is temporarily unreadable."};
+    }
+    if (*actionType == 7U || ((*actionFlags & 0x02U) == 0U)) {
+        return {false, true, "REMOTE_EQUIPMENT_SELECT_NOT_READY",
+            "A retail equipment transition is already active or not yet admissible."};
+    }
+
+    if (!InvokeNpcEquipmentCommand(
+            npcEquipmentCommand,
+            reinterpret_cast<void*>(*actionContext),
+            *currentSlot,
+            targetSlot,
+            exceptionCode)) {
+        return {false, false, "REMOTE_EQUIPMENT_SELECT_NATIVE_FAULT",
+            "The retail NPC equipment selection command faulted."};
+    }
+
+    // FUN_00654E60 enters the normal retail transition; selection becomes
+    // observable on a later engine update. The launcher already polls this
+    // command at 4 Hz, so return retryable instead of adding any frame hook.
+    return {false, true, "REMOTE_EQUIPMENT_SELECT_PENDING",
+        "Retail equipment selection was dispatched; waiting for the controller to converge."};
+}
+
 
 } // namespace
 
@@ -128,6 +244,9 @@ bool SpawnCharacterTracker::Install(
     }
 
     cathodeEquipmentBase_.store(cathode_equipment::Validate(resolver), std::memory_order_release);
+    npcEquipmentCommandAddress_.store(
+        resolver.ResolveMutable(SymbolId::CathodeNpcEquipmentCommand),
+        std::memory_order_release);
 
     HookRequest request{};
     request.name = "track_spawn_character_result";
@@ -425,7 +544,8 @@ SpawnCharacterTracker::ProvisionRemoteEquipmentOnGameThread(
 
     if (diagnostics_ != nullptr &&
         (inserted || record.stage != previous ||
-         record.operation != previousOperation || result != Result::Pending)) {
+         record.operation != previousOperation ||
+         (result != Result::Pending && previous != Stage::Equipped))) {
         diagnostics_->Log(
             result == Result::Pending || result == Result::Equipped
                 ? "info" : "warning",
@@ -459,13 +579,54 @@ SpawnCharacterTracker::ProvisionRemoteEquipmentOnGameThread(
              {"polls", Diagnostics::Unsigned(record.polls), true}});
     }
 
+    if (result == Result::Equipped) {
+        std::uint32_t selectionException = 0U;
+        const auto selection = EnsureEquipmentSelected(
+            characterAddress,
+            record.equipmentSlot,
+            npcEquipmentCommandAddress_.load(std::memory_order_acquire),
+            selectionException);
+        if (selection.selected) {
+            return {
+                true,
+                false,
+                selection.statusCode,
+                std::string(selection.message) + " slot=" +
+                    std::to_string(record.equipmentSlot) + "."};
+        }
+        if (selection.retryable) {
+            return {
+                false,
+                true,
+                selection.statusCode,
+                std::string(selection.message) + " slot=" +
+                    std::to_string(record.equipmentSlot) + "."};
+        }
+        if (diagnostics_ != nullptr) {
+            diagnostics_->Log(
+                "warning",
+                "PlayerSync.RemoteEquipmentSelect",
+                selection.message,
+                {{"statusCode", selection.statusCode},
+                 {"characterBase", Diagnostics::Pointer(
+                     reinterpret_cast<void*>(characterAddress))},
+                 {"equipmentSlot", Diagnostics::Unsigned(record.equipmentSlot), true},
+                 {"exceptionCode", Diagnostics::Unsigned(selectionException), true}});
+        }
+        return {
+            false,
+            false,
+            selection.statusCode,
+            std::string(selection.message) + " slot=" +
+                std::to_string(record.equipmentSlot) + "."};
+    }
+
     const auto slotText = result == Result::Equipped
         ? " slot=" + std::to_string(record.equipmentSlot) + "."
         : std::string{};
     return {
-        result == Result::Equipped,
+        false,
         result == Result::Pending,
-        result == Result::Equipped ? "REMOTE_EQUIPMENT_GIVEN" :
         result == Result::Pending ? "REMOTE_EQUIPMENT_NOT_READY" :
                                     "REMOTE_EQUIPMENT_CATHODE_FAILED",
         std::string(record.operation) + ": " +
