@@ -73,6 +73,24 @@ internal static class RemoteEquipmentDefinitions
         definition = resolved;
         return true;
     }
+
+    internal static bool TryGetPlayerSyncEquipmentId(
+        int equipmentIndex,
+        out string equipmentId)
+    {
+        equipmentId = equipmentIndex switch
+        {
+            0 => "npc-shotgun",
+            1 => "npc-pistol",
+            2 => "npc-melee",
+            3 => "cattleprod",
+            4 => "npc-flamethrower",
+            5 => "boltgun",
+            6 => "npc-motion-tracker",
+            _ => string.Empty
+        };
+        return equipmentId.Length != 0;
+    }
 }
 
 // Static CATHODE graph discovery for Character equipment archetypes.

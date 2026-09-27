@@ -142,6 +142,8 @@ public sealed class LobbyHost : IAsyncDisposable
 
     public event EventHandler<PlayerEquipmentSnapshotPayload>? PlayerEquipmentReceived;
 
+    public event EventHandler<PlayerActionEventPayload>? PlayerActionReceived;
+
     public event EventHandler<WorldNetworkContext>? WorldContextReceived;
 
     public event EventHandler<WorldHostAcceptedMutation>? WorldMutationAccepted;
@@ -295,6 +297,16 @@ public sealed class LobbyHost : IAsyncDisposable
         await BroadcastAsync(MessageType.PlayerEquipmentSnapshot, JsonPayload.Serialize(payload),
             cancellationToken).ConfigureAwait(false);
         PlayerEquipmentReceived?.Invoke(this, payload);
+    }
+
+    public async Task PublishHostPlayerActionAsync(
+        PlayerActionEventPayload payload,
+        CancellationToken cancellationToken = default)
+    {
+        ValidatePlayerAction(payload, HostPeerId);
+        await BroadcastAsync(MessageType.PlayerActionEvent, JsonPayload.Serialize(payload),
+            cancellationToken).ConfigureAwait(false);
+        PlayerActionReceived?.Invoke(this, payload);
     }
 
     public async Task SetHostWorldContextAsync(
@@ -978,6 +990,10 @@ public sealed class LobbyHost : IAsyncDisposable
                         .ConfigureAwait(false);
                     break;
 
+                case MessageType.PlayerActionEvent:
+                    await HandlePlayerActionAsync(state, frame.Payload, cancellationToken)
+                        .ConfigureAwait(false);
+                    break;
 
                 case MessageType.WorldContext:
                     await HandleWorldContextAsync(state, frame.Payload, cancellationToken)
@@ -1322,6 +1338,44 @@ public sealed class LobbyHost : IAsyncDisposable
         catch (Exception exception) when (exception is ProtocolException
             or InvalidOperationException) { return false; }
         return state.TryAcceptEquipmentSequence(payload.Sequence);
+    }
+
+    private async Task HandlePlayerActionAsync(
+        ClientState state,
+        ReadOnlyMemory<byte> bytes,
+        CancellationToken cancellationToken)
+    {
+        var payload = JsonPayload.Deserialize<PlayerActionEventPayload>(bytes.Span);
+        if (!TryAcceptPlayerAction(state, payload))
+        {
+            await SendErrorAsync(state.Connection, "INVALID_PLAYER_ACTION",
+                "The player-action event is invalid or stale.", cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
+        PlayerActionReceived?.Invoke(this, payload);
+        await BroadcastExceptAsync(MessageType.PlayerActionEvent,
+            JsonPayload.Serialize(payload), state.PeerId, cancellationToken).ConfigureAwait(false);
+    }
+
+    private bool TryAcceptPlayerAction(
+        ClientState state,
+        PlayerActionEventPayload payload)
+    {
+        try { ValidatePlayerAction(payload, state.PeerId); }
+        catch (Exception exception) when (exception is ProtocolException
+            or InvalidOperationException) { return false; }
+        return state.TryAcceptActionSequence(payload.Sequence);
+    }
+
+    private void ValidatePlayerAction(
+        PlayerActionEventPayload payload,
+        ulong expectedPeerId)
+    {
+        ModelValidation.Validate(payload);
+        if (payload.SessionId != SessionId || payload.PeerId != expectedPeerId)
+            throw new InvalidOperationException("Player-action identity is invalid.");
+        ValidateActiveGeneration(payload.LevelGeneration);
     }
 
     private void ValidatePlayerEquipment(
@@ -1669,6 +1723,7 @@ public sealed class LobbyHost : IAsyncDisposable
         private int _ready;
         private ulong _lastPositionSequence;
         private ulong _lastEquipmentSequence;
+        private ulong _lastActionSequence;
         private long _lastSeenTicks = Environment.TickCount64;
 
         public ClientState(
@@ -1714,6 +1769,13 @@ public sealed class LobbyHost : IAsyncDisposable
         {
             if (sequence <= _lastEquipmentSequence) return false;
             _lastEquipmentSequence = sequence;
+            return true;
+        }
+
+        public bool TryAcceptActionSequence(ulong sequence)
+        {
+            if (sequence <= _lastActionSequence) return false;
+            _lastActionSequence = sequence;
             return true;
         }
 

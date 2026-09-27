@@ -42,6 +42,8 @@ internal sealed class NativeRuntimeController : IDisposable
 
     internal event EventHandler<NativePlayerEquipmentStatePayload>? PlayerSyncStateProduced;
 
+    internal event EventHandler<NativePlayerActionEventPayload>? PlayerSyncActionProduced;
+
     internal void RefreshProcessStatus()
     {
         if (Volatile.Read(ref _disposed) != 0 || HasTrackedProcess()) return;
@@ -483,6 +485,7 @@ internal sealed class NativeRuntimeController : IDisposable
         session.WorldIntentReceived += OnWorldIntentReceived;
         session.WorldMutationResultReceived += OnWorldMutationResultReceived;
         session.PlayerSyncStateChanged += OnPlayerSyncStateChanged;
+        session.PlayerSyncActionProduced += OnPlayerSyncActionProduced;
         session.ConnectionClosed += OnConnectionClosed;
     }
 
@@ -497,6 +500,7 @@ internal sealed class NativeRuntimeController : IDisposable
         session.WorldIntentReceived -= OnWorldIntentReceived;
         session.WorldMutationResultReceived -= OnWorldMutationResultReceived;
         session.PlayerSyncStateChanged -= OnPlayerSyncStateChanged;
+        session.PlayerSyncActionProduced -= OnPlayerSyncActionProduced;
         session.ConnectionClosed -= OnConnectionClosed;
     }
 
@@ -512,6 +516,11 @@ internal sealed class NativeRuntimeController : IDisposable
         object? sender,
         NativePlayerEquipmentStatePayload value) =>
         PlayerSyncStateProduced?.Invoke(this, value);
+
+    private void OnPlayerSyncActionProduced(
+        object? sender,
+        NativePlayerActionEventPayload value) =>
+        PlayerSyncActionProduced?.Invoke(this, value);
 
 
     private void OnCapabilityChanged(object? sender, CapabilityStatePayload value) =>

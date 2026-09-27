@@ -4,6 +4,8 @@
 #include "aimp/CrashGuard.h"
 #include "aimp/SignatureResolver.h"
 
+#include <Windows.h>
+
 namespace aimp {
 namespace {
 
@@ -14,6 +16,7 @@ constexpr std::uintptr_t kEquipmentManagerOffset = 0x1100U;
 constexpr std::uintptr_t kCurrentEquipmentOffset = 0x150CU;
 constexpr std::uintptr_t kPreviousEquipmentOffset = 0x1514U;
 constexpr std::uintptr_t kEquipmentActiveOffset = 0x1510U;
+constexpr std::uintptr_t kAimPrimaryOffset = 0x00A1U;
 constexpr std::uintptr_t kPresentationStateObjectOffset = 0x152CU;
 constexpr std::uintptr_t kPresentationStateOffset = 0x04U;
 
@@ -23,6 +26,65 @@ bool ValidEquipmentIndex(const std::int32_t value) noexcept {
 
 bool ValidPresentationState(const std::int32_t value) noexcept {
     return value >= 0 && value <= 64;
+}
+
+struct RawEquipmentState {
+    std::int32_t currentEquipmentIndex{-1};
+    std::int32_t previousEquipmentIndex{-1};
+    std::int32_t presentationState{-1};
+    std::uintptr_t presentationStateObject{};
+    std::uint16_t aimPrimary{};
+    std::uint8_t equipmentActive{};
+};
+
+bool TryReadEquipmentState(
+    const std::uintptr_t equipmentManager,
+    RawEquipmentState& state) noexcept {
+#if defined(_MSC_VER)
+    __try {
+        state.currentEquipmentIndex = *reinterpret_cast<const volatile std::int32_t*>(
+            equipmentManager + kCurrentEquipmentOffset);
+        state.previousEquipmentIndex = *reinterpret_cast<const volatile std::int32_t*>(
+            equipmentManager + kPreviousEquipmentOffset);
+        state.equipmentActive = *reinterpret_cast<const volatile std::uint8_t*>(
+            equipmentManager + kEquipmentActiveOffset);
+        state.aimPrimary = *reinterpret_cast<const volatile std::uint16_t*>(
+            equipmentManager + kAimPrimaryOffset);
+        state.presentationStateObject = *reinterpret_cast<const volatile std::uintptr_t*>(
+            equipmentManager + kPresentationStateObjectOffset);
+        if (state.presentationStateObject == 0U) return false;
+        state.presentationState = *reinterpret_cast<const volatile std::int32_t*>(
+            state.presentationStateObject + kPresentationStateOffset);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    const auto current = crash_guard::SafeRead<std::int32_t>(
+        reinterpret_cast<const void*>(equipmentManager + kCurrentEquipmentOffset));
+    const auto previous = crash_guard::SafeRead<std::int32_t>(
+        reinterpret_cast<const void*>(equipmentManager + kPreviousEquipmentOffset));
+    const auto active = crash_guard::SafeRead<std::uint8_t>(
+        reinterpret_cast<const void*>(equipmentManager + kEquipmentActiveOffset));
+    const auto aimPrimary = crash_guard::SafeRead<std::uint16_t>(
+        reinterpret_cast<const void*>(equipmentManager + kAimPrimaryOffset));
+    const auto stateObject = crash_guard::SafeRead<std::uintptr_t>(
+        reinterpret_cast<const void*>(equipmentManager + kPresentationStateObjectOffset));
+    if (!current.has_value() || !previous.has_value() || !active.has_value() ||
+        !aimPrimary.has_value() || !stateObject.has_value() || *stateObject == 0U) {
+        return false;
+    }
+    const auto presentation = crash_guard::SafeRead<std::int32_t>(
+        reinterpret_cast<const void*>(*stateObject + kPresentationStateOffset));
+    if (!presentation.has_value()) return false;
+    state.currentEquipmentIndex = *current;
+    state.previousEquipmentIndex = *previous;
+    state.equipmentActive = *active;
+    state.aimPrimary = *aimPrimary;
+    state.presentationStateObject = *stateObject;
+    state.presentationState = *presentation;
+    return true;
+#endif
 }
 
 } // namespace
@@ -78,27 +140,14 @@ void PlayerSyncObserver::ObserveOnGameThread() noexcept {
         return;
     }
 
-    const auto currentEquipment = crash_guard::SafeRead<std::int32_t>(
-        reinterpret_cast<const void*>(*equipmentManager + kCurrentEquipmentOffset));
-    const auto previousEquipment = crash_guard::SafeRead<std::int32_t>(
-        reinterpret_cast<const void*>(*equipmentManager + kPreviousEquipmentOffset));
-    const auto active = crash_guard::SafeRead<std::uint8_t>(
-        reinterpret_cast<const void*>(*equipmentManager + kEquipmentActiveOffset));
-    const auto stateObject = crash_guard::SafeRead<std::uintptr_t>(
-        reinterpret_cast<const void*>(*equipmentManager + kPresentationStateObjectOffset));
-
-    if (!currentEquipment.has_value() || !previousEquipment.has_value() ||
-        !active.has_value() || !stateObject.has_value() || *stateObject == 0U ||
-        !ValidEquipmentIndex(*currentEquipment) ||
-        !ValidEquipmentIndex(*previousEquipment)) {
-        PublishUnavailable();
-        return;
-    }
-
-    const auto presentationState = crash_guard::SafeRead<std::int32_t>(
-        reinterpret_cast<const void*>(*stateObject + kPresentationStateOffset));
-    if (!presentationState.has_value() ||
-        !ValidPresentationState(*presentationState)) {
+    // Once the controller pointer is validated, collect all hot fields in one
+    // SEH-protected block. This avoids multiple VirtualQuery-backed SafeRead
+    // calls every CharacterManager frame.
+    RawEquipmentState raw{};
+    if (!TryReadEquipmentState(*equipmentManager, raw) ||
+        !ValidEquipmentIndex(raw.currentEquipmentIndex) ||
+        !ValidEquipmentIndex(raw.previousEquipmentIndex) ||
+        !ValidPresentationState(raw.presentationState)) {
         PublishUnavailable();
         return;
     }
@@ -106,21 +155,60 @@ void PlayerSyncObserver::ObserveOnGameThread() noexcept {
     PlayerEquipmentSnapshot observed{};
     observed.localPlayer = *localPlayer;
     observed.equipmentManager = *equipmentManager;
-    observed.currentEquipmentIndex = *currentEquipment;
-    observed.previousEquipmentIndex = *previousEquipment;
-    observed.presentationState = *presentationState;
-    observed.equipmentActive = *active != 0U;
+    observed.currentEquipmentIndex = raw.currentEquipmentIndex;
+    observed.previousEquipmentIndex = raw.previousEquipmentIndex;
+    observed.presentationState = raw.presentationState;
+    observed.equipmentActive = raw.equipmentActive != 0U;
+    observed.aimHeld = (raw.aimPrimary & 0x00FFU) != 0U;
+    observed.primaryHeld = (raw.aimPrimary & 0xFF00U) != 0U;
     observed.valid = true;
 
+    const bool sameController = hasLastObserved_ && lastObserved_.valid &&
+        observed.localPlayer == lastObserved_.localPlayer &&
+        observed.equipmentManager == lastObserved_.equipmentManager;
+    if (sameController) {
+        if (observed.aimHeld != lastObserved_.aimHeld) {
+            QueueAction(
+                PlayerSyncActionKind::Aim,
+                observed.aimHeld,
+                observed.currentEquipmentIndex,
+                observed.presentationState);
+        }
+        if (observed.primaryHeld != lastObserved_.primaryHeld) {
+            QueueAction(
+                PlayerSyncActionKind::Primary,
+                observed.primaryHeld,
+                observed.currentEquipmentIndex,
+                observed.presentationState);
+        }
+        if (lastObserved_.presentationState != 9 &&
+            observed.presentationState == 9) {
+            QueueAction(
+                PlayerSyncActionKind::Reload,
+                true,
+                observed.currentEquipmentIndex,
+                observed.presentationState);
+        }
+    }
+
+    // Presentation 6/7/8/9 can oscillate while an action is held. Do not turn
+    // those engine-internal transitions into durable PlayerSync publications.
+    // The ordered edge ring above preserves the events that matter.
     const bool changed = !hasLastObserved_ ||
         !lastObserved_.valid ||
         observed.localPlayer != lastObserved_.localPlayer ||
         observed.equipmentManager != lastObserved_.equipmentManager ||
         observed.currentEquipmentIndex != lastObserved_.currentEquipmentIndex ||
         observed.previousEquipmentIndex != lastObserved_.previousEquipmentIndex ||
-        observed.presentationState != lastObserved_.presentationState ||
-        observed.equipmentActive != lastObserved_.equipmentActive;
+        observed.equipmentActive != lastObserved_.equipmentActive ||
+        observed.aimHeld != lastObserved_.aimHeld ||
+        observed.primaryHeld != lastObserved_.primaryHeld;
+
     if (!changed) {
+        // Keep the engine-thread baseline current for Reload edge detection,
+        // without publishing or allocating anything.
+        observed.revision = lastObserved_.revision;
+        lastObserved_ = observed;
         return;
     }
 
@@ -133,6 +221,23 @@ void PlayerSyncObserver::ObserveOnGameThread() noexcept {
 void PlayerSyncObserver::PublishUnavailable() noexcept {
     if (hasLastObserved_ && !lastObserved_.valid) {
         return;
+    }
+
+    // Never leave a remote Character with a held input if the local Player
+    // disappears during a level transition or teardown.
+    if (hasLastObserved_ && lastObserved_.valid) {
+        if (lastObserved_.primaryHeld) {
+            QueueAction(
+                PlayerSyncActionKind::Primary, false,
+                lastObserved_.currentEquipmentIndex,
+                lastObserved_.presentationState);
+        }
+        if (lastObserved_.aimHeld) {
+            QueueAction(
+                PlayerSyncActionKind::Aim, false,
+                lastObserved_.currentEquipmentIndex,
+                lastObserved_.presentationState);
+        }
     }
 
     PlayerEquipmentSnapshot unavailable{};
@@ -157,6 +262,8 @@ void PlayerSyncObserver::Publish(
         std::memory_order_relaxed);
     presentationState_.store(snapshot.presentationState, std::memory_order_relaxed);
     equipmentActive_.store(snapshot.equipmentActive ? 1U : 0U, std::memory_order_relaxed);
+    aimHeld_.store(snapshot.aimHeld ? 1U : 0U, std::memory_order_relaxed);
+    primaryHeld_.store(snapshot.primaryHeld ? 1U : 0U, std::memory_order_relaxed);
     valid_.store(snapshot.valid ? 1U : 0U, std::memory_order_relaxed);
     sequence_.fetch_add(1U, std::memory_order_release);
 }
@@ -181,6 +288,8 @@ bool PlayerSyncObserver::TrySnapshot(
             presentationState_.load(std::memory_order_relaxed);
         snapshot.equipmentActive =
             equipmentActive_.load(std::memory_order_relaxed) != 0U;
+        snapshot.aimHeld = aimHeld_.load(std::memory_order_relaxed) != 0U;
+        snapshot.primaryHeld = primaryHeld_.load(std::memory_order_relaxed) != 0U;
         snapshot.valid = valid_.load(std::memory_order_relaxed) != 0U;
 
         const auto after = sequence_.load(std::memory_order_acquire);
@@ -191,5 +300,42 @@ bool PlayerSyncObserver::TrySnapshot(
     }
     return false;
 }
+
+void PlayerSyncObserver::QueueAction(
+    const PlayerSyncActionKind action,
+    const bool active,
+    const std::int32_t currentEquipmentIndex,
+    const std::int32_t presentationState) noexcept {
+    const auto write = actionWrite_.load(std::memory_order_relaxed);
+    const auto read = actionRead_.load(std::memory_order_acquire);
+    if (write - read >= kActionRingCapacity) {
+        // Extremely unlikely at human input rates. Durable Aim/Primary state in
+        // PlayerEquipmentSnapshot still provides convergence if this ever fills.
+        return;
+    }
+
+    PlayerSyncActionEvent event{};
+    event.sequence = nextActionSequence_++;
+    event.action = action;
+    event.active = active;
+    event.currentEquipmentIndex = currentEquipmentIndex;
+    event.presentationState = presentationState;
+    actionRing_[write % kActionRingCapacity] = event;
+    actionWrite_.store(write + 1U, std::memory_order_release);
+}
+
+bool PlayerSyncObserver::TryPopAction(
+    PlayerSyncActionEvent& output) noexcept {
+    const auto read = actionRead_.load(std::memory_order_relaxed);
+    const auto write = actionWrite_.load(std::memory_order_acquire);
+    if (read == write) {
+        return false;
+    }
+
+    output = actionRing_[read % kActionRingCapacity];
+    actionRead_.store(read + 1U, std::memory_order_release);
+    return true;
+}
+
 
 } // namespace aimp

@@ -65,10 +65,20 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
     private NativePlayerEquipmentStatePayload? _lastQueuedEquipmentState;
     private DateTimeOffset _nextEquipmentRefreshAtUtc = DateTimeOffset.MinValue;
     private PlayerEquipmentSnapshotPayload? _pendingLocalEquipment;
-    private bool _equipmentSendRunning;
-    private ulong _localEquipmentSequence;
+    private bool _playerSyncSendRunning;
+    // Equipment snapshots and action edges share one sequence domain so a
+    // delayed durable snapshot can never overwrite a newer Aim/Primary edge.
+    private ulong _localPlayerSyncSequence;
+    private readonly Queue<PlayerActionEventPayload> _pendingLocalPlayerActions = new();
     private readonly Dictionary<ulong, PlayerEquipmentSnapshotPayload> _remoteEquipment = new();
+    private readonly Queue<PlayerActionEventPayload> _pendingRemotePlayerActions = new();
+    private readonly Dictionary<ulong, ulong> _remoteLastPlayerSyncSequence = new();
+    private bool _remotePlayerActionApplyRunning;
+    private readonly Dictionary<ulong, int> _remoteProvisionedEquipment = new();
+    private readonly Dictionary<ulong, bool> _remoteAppliedAim = new();
+    private readonly Dictionary<ulong, bool> _remoteAppliedPrimary = new();
     private readonly SemaphoreSlim _remoteEquipmentProvisionGate = new(1, 1);
+    private readonly SemaphoreSlim _remotePlayerSyncGate = new(1, 1);
     private bool _movementCommandRunning;
     private string _lastMovementFailure = string.Empty;
     private DateTimeOffset _lastMovementFailureLoggedAt;
@@ -375,6 +385,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         _controller.WorldIntentProduced += OnNativeWorldIntentProduced;
         _controller.WorldMutationCompleted += OnNativeWorldMutationCompleted;
         _controller.PlayerSyncStateProduced += OnNativePlayerSyncStateProduced;
+        _controller.PlayerSyncActionProduced += OnNativePlayerSyncActionProduced;
     }
 
     internal event EventHandler<MultiplayerSessionView>? StateChanged;
@@ -415,7 +426,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
             now, positionAvailable, position, yawAvailable, yaw,
             movementProfileAvailable, movementProfile);
         if (TryQueueLocalPosition(now)) _ = PumpLocalPositionsAsync();
-        if (TryQueueLocalEquipment(now)) _ = PumpLocalEquipmentAsync();
+        if (TryQueueLocalEquipment(now)) _ = PumpLocalPlayerSyncAsync();
         _ = TryAdvanceGameplayAsync(runtime);
         _ = TryConvergeRemoteCharactersAsync(runtime, now);
         _ = TryAdvanceRemoteMovementAsync(runtime, now);
@@ -509,10 +520,12 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         _controller.WorldIntentProduced -= OnNativeWorldIntentProduced;
         _controller.WorldMutationCompleted -= OnNativeWorldMutationCompleted;
         _controller.PlayerSyncStateProduced -= OnNativePlayerSyncStateProduced;
+        _controller.PlayerSyncActionProduced -= OnNativePlayerSyncActionProduced;
         StopNetworkAsync("Launcher closed").GetAwaiter().GetResult();
         _commandGate.Dispose();
         _spawnGate.Dispose();
         _remoteEquipmentProvisionGate.Dispose();
+        _remotePlayerSyncGate.Dispose();
         _lifetime.Dispose();
     }
 
@@ -2185,6 +2198,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         host.SpawnRemotePlayersRequested += OnSpawnRemotePlayersRequested;
         host.PlayerPositionReceived += OnPlayerPositionReceived;
         host.PlayerEquipmentReceived += OnPlayerEquipmentReceived;
+        host.PlayerActionReceived += OnPlayerActionReceived;
         host.WorldContextReceived += OnWorldContextReceived;
         host.WorldMutationAccepted += OnWorldMutationAccepted;
         host.WorldIntentRejected += OnWorldIntentRejected;
@@ -2200,6 +2214,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         host.SpawnRemotePlayersRequested -= OnSpawnRemotePlayersRequested;
         host.PlayerPositionReceived -= OnPlayerPositionReceived;
         host.PlayerEquipmentReceived -= OnPlayerEquipmentReceived;
+        host.PlayerActionReceived -= OnPlayerActionReceived;
         host.WorldContextReceived -= OnWorldContextReceived;
         host.WorldMutationAccepted -= OnWorldMutationAccepted;
         host.WorldIntentRejected -= OnWorldIntentRejected;
@@ -2216,6 +2231,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         client.SpawnRemotePlayersRequested += OnSpawnRemotePlayersRequested;
         client.PlayerPositionReceived += OnPlayerPositionReceived;
         client.PlayerEquipmentReceived += OnPlayerEquipmentReceived;
+        client.PlayerActionReceived += OnPlayerActionReceived;
         client.WorldContextReceived += OnWorldContextReceived;
         client.WorldMutationReceived += OnWorldMutationReceived;
         client.WorldIntentRejected += OnWorldIntentRejected;
@@ -2234,6 +2250,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         client.SpawnRemotePlayersRequested -= OnSpawnRemotePlayersRequested;
         client.PlayerPositionReceived -= OnPlayerPositionReceived;
         client.PlayerEquipmentReceived -= OnPlayerEquipmentReceived;
+        client.PlayerActionReceived -= OnPlayerActionReceived;
         client.WorldContextReceived -= OnWorldContextReceived;
         client.WorldMutationReceived -= OnWorldMutationReceived;
         client.WorldIntentRejected -= OnWorldIntentRejected;
@@ -2283,6 +2300,10 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         _remoteCharacters.Remove(peerId);
         _remotePositions.Remove(peerId);
         _remoteEquipment.Remove(peerId);
+        _remoteLastPlayerSyncSequence.Remove(peerId);
+        _remoteProvisionedEquipment.Remove(peerId);
+        _remoteAppliedAim.Remove(peerId);
+        _remoteAppliedPrimary.Remove(peerId);
         _remoteSpawnRetryAttempts.Remove(peerId);
         _remoteSpawnRetryNotBeforeUtc.Remove(peerId);
     }
@@ -2371,9 +2392,16 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         _lastQueuedEquipmentState = null;
         _nextEquipmentRefreshAtUtc = DateTimeOffset.MinValue;
         _pendingLocalEquipment = null;
-        _equipmentSendRunning = false;
-        _localEquipmentSequence = 0;
+        _playerSyncSendRunning = false;
+        _localPlayerSyncSequence = 0;
+        _pendingLocalPlayerActions.Clear();
         _remoteEquipment.Clear();
+        _pendingRemotePlayerActions.Clear();
+        _remoteLastPlayerSyncSequence.Clear();
+        _remotePlayerActionApplyRunning = false;
+        _remoteProvisionedEquipment.Clear();
+        _remoteAppliedAim.Clear();
+        _remoteAppliedPrimary.Clear();
         _movementCommandRunning = false;
     }
 
@@ -2455,7 +2483,40 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         }
 
         if (value.Valid && TryQueueLocalEquipment(DateTimeOffset.UtcNow))
-            _ = PumpLocalEquipmentAsync();
+            _ = PumpLocalPlayerSyncAsync();
+    }
+
+    private void OnNativePlayerSyncActionProduced(
+        object? sender,
+        NativePlayerActionEventPayload value)
+    {
+        if (Volatile.Read(ref _disposed) != 0) return;
+
+        var startPump = false;
+        lock (_stateGate)
+        {
+            if (_start is null || !_localGameplayReady) return;
+            var peerId = LocalPeerId();
+            if (peerId == 0 || (_host is null && _client is null)) return;
+
+            _pendingLocalPlayerActions.Enqueue(new PlayerActionEventPayload(
+                _start.SessionId,
+                peerId,
+                _start.LevelGeneration,
+                ++_localPlayerSyncSequence,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                value.Action,
+                value.Active,
+                value.CurrentEquipmentIndex,
+                value.PresentationState));
+            if (!_playerSyncSendRunning)
+            {
+                _playerSyncSendRunning = true;
+                startPump = true;
+            }
+        }
+
+        if (startPump) _ = PumpLocalPlayerSyncAsync();
     }
 
     private void OnPlayerEquipmentReceived(
@@ -2470,25 +2531,64 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
             if (value.SessionId != _start.SessionId
                 || value.LevelGeneration != _start.LevelGeneration) return;
             if (_lobby.Players.All(player => player.PeerId != value.PeerId)) return;
-            if (_remoteEquipment.TryGetValue(value.PeerId, out previous)
-                && value.Sequence <= previous.Sequence) return;
+            if (_remoteLastPlayerSyncSequence.TryGetValue(value.PeerId, out var lastSequence)
+                && value.Sequence <= lastSequence) return;
+            _remoteLastPlayerSyncSequence[value.PeerId] = value.Sequence;
+            _remoteEquipment.TryGetValue(value.PeerId, out previous);
             _remoteEquipment[value.PeerId] = value;
             _remoteCharacters.TryGetValue(value.PeerId, out characterBase);
         }
 
-        var changed = previous is null
+        var equipmentChanged = previous is null
             || previous.CurrentEquipmentIndex != value.CurrentEquipmentIndex
             || previous.PreviousEquipmentIndex != value.PreviousEquipmentIndex
-            || previous.EquipmentActive != value.EquipmentActive
-            || previous.PresentationState != value.PresentationState;
-        if (!changed) return;
+            || previous.EquipmentActive != value.EquipmentActive;
+        var actionStateChanged = previous is null
+            || previous.AimHeld != value.AimHeld
+            || previous.PrimaryHeld != value.PrimaryHeld;
+        if (!equipmentChanged && !actionStateChanged) return;
 
-        var characterText = characterBase == 0
-            ? "CharacterBase=pending"
-            : $"CharacterBase=0x{characterBase:X8}";
-        _diagnostics.Log("PlayerSync",
-            $"Remote PeerId {value.PeerId}: equipment={value.CurrentEquipmentIndex}, previous={value.PreviousEquipmentIndex}, " +
-            $"active={(value.EquipmentActive ? 1 : 0)}, state={value.PresentationState}, {characterText}.");
+        if (equipmentChanged)
+        {
+            var characterText = characterBase == 0
+                ? "CharacterBase=pending"
+                : $"CharacterBase=0x{characterBase:X8}";
+            _diagnostics.Log("PlayerSync",
+                $"Remote PeerId {value.PeerId}: equipment={value.CurrentEquipmentIndex}, previous={value.PreviousEquipmentIndex}, " +
+                $"active={(value.EquipmentActive ? 1 : 0)}, aim={(value.AimHeld ? 1 : 0)}, primary={(value.PrimaryHeld ? 1 : 0)}, {characterText}.");
+        }
+
+        // Durable Aim/Primary state is also a loss-recovery path for the bounded
+        // edge queue. This only runs on an actual state transition, never per frame.
+        if (characterBase != 0U)
+            _ = ConvergeRemotePlayerEquipmentAsync(value.PeerId);
+    }
+
+    private void OnPlayerActionReceived(
+        object? sender,
+        PlayerActionEventPayload value)
+    {
+        if (Volatile.Read(ref _disposed) != 0) return;
+        var startPump = false;
+        lock (_stateGate)
+        {
+            if (_start is null || _lobby is null || value.PeerId == LocalPeerId()) return;
+            if (value.SessionId != _start.SessionId
+                || value.LevelGeneration != _start.LevelGeneration) return;
+            if (_lobby.Players.All(player => player.PeerId != value.PeerId)) return;
+            if (_remoteLastPlayerSyncSequence.TryGetValue(value.PeerId, out var lastSequence)
+                && value.Sequence <= lastSequence) return;
+            _remoteLastPlayerSyncSequence[value.PeerId] = value.Sequence;
+
+            _pendingRemotePlayerActions.Enqueue(value);
+            if (!_remotePlayerActionApplyRunning)
+            {
+                _remotePlayerActionApplyRunning = true;
+                startPump = true;
+            }
+        }
+
+        if (startPump) _ = PumpRemotePlayerActionsAsync();
     }
 
     private void OnSpawnPositionRequested(
@@ -2606,57 +2706,81 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
                 || _lastQueuedEquipmentState.CurrentEquipmentIndex != state.CurrentEquipmentIndex
                 || _lastQueuedEquipmentState.PreviousEquipmentIndex != state.PreviousEquipmentIndex
                 || _lastQueuedEquipmentState.EquipmentActive != state.EquipmentActive
-                || _lastQueuedEquipmentState.PresentationState != state.PresentationState;
+                || _lastQueuedEquipmentState.AimHeld != state.AimHeld
+                || _lastQueuedEquipmentState.PrimaryHeld != state.PrimaryHeld;
             if (!changed && now < _nextEquipmentRefreshAtUtc) return false;
 
             _lastQueuedEquipmentState = state;
             _nextEquipmentRefreshAtUtc = now.AddSeconds(1);
             _pendingLocalEquipment = new PlayerEquipmentSnapshotPayload(
-                _start.SessionId, peerId, _start.LevelGeneration, ++_localEquipmentSequence,
+                _start.SessionId, peerId, _start.LevelGeneration, ++_localPlayerSyncSequence,
                 now.ToUnixTimeMilliseconds(), state.CurrentEquipmentIndex,
-                state.PreviousEquipmentIndex, state.EquipmentActive, state.PresentationState);
+                state.PreviousEquipmentIndex, state.EquipmentActive, state.PresentationState,
+                state.AimHeld, state.PrimaryHeld);
 
             if (changed)
             {
                 _diagnostics.Log("PlayerSync",
                     $"Native local equipment changed: revision={state.Revision}, " +
                     $"current={state.CurrentEquipmentIndex}, previous={state.PreviousEquipmentIndex}, " +
-                    $"active={(state.EquipmentActive ? 1 : 0)}, state={state.PresentationState}.");
+                    $"active={(state.EquipmentActive ? 1 : 0)}, aim={(state.AimHeld ? 1 : 0)}, " +
+                    $"primary={(state.PrimaryHeld ? 1 : 0)}.");
             }
 
-            if (_equipmentSendRunning) return false;
-            _equipmentSendRunning = true;
+            if (_playerSyncSendRunning) return false;
+            _playerSyncSendRunning = true;
             return true;
         }
     }
 
-    private async Task PumpLocalEquipmentAsync()
+    private async Task PumpLocalPlayerSyncAsync()
     {
         try
         {
-            while (TakePendingLocalEquipment() is { } value)
-                await SendLocalEquipmentAsync(value).ConfigureAwait(false);
+            while (true)
+            {
+                PlayerEquipmentSnapshotPayload? equipment = null;
+                PlayerActionEventPayload? action = null;
+                lock (_stateGate)
+                {
+                    var hasEquipment = _pendingLocalEquipment is not null;
+                    var hasAction = _pendingLocalPlayerActions.Count != 0;
+                    if (!hasEquipment && !hasAction)
+                    {
+                        _playerSyncSendRunning = false;
+                        return;
+                    }
+
+                    if (hasEquipment && (!hasAction
+                        || _pendingLocalEquipment!.Sequence
+                            < _pendingLocalPlayerActions.Peek().Sequence))
+                    {
+                        equipment = _pendingLocalEquipment;
+                        _pendingLocalEquipment = null;
+                    }
+                    else
+                    {
+                        action = _pendingLocalPlayerActions.Dequeue();
+                    }
+                }
+
+                if (equipment is not null)
+                    await SendLocalEquipmentAsync(equipment).ConfigureAwait(false);
+                else if (action is not null)
+                    await SendLocalPlayerActionAsync(action).ConfigureAwait(false);
+            }
         }
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
         catch (Exception exception)
         {
-            _diagnostics.Log("PlayerSync", $"Equipment publishing stopped: {exception.Message}");
+            _diagnostics.Log("PlayerSync",
+                $"PlayerSync publishing stopped: {exception.Message}");
             lock (_stateGate)
             {
                 _pendingLocalEquipment = null;
-                _equipmentSendRunning = false;
+                _pendingLocalPlayerActions.Clear();
+                _playerSyncSendRunning = false;
             }
-        }
-    }
-
-    private PlayerEquipmentSnapshotPayload? TakePendingLocalEquipment()
-    {
-        lock (_stateGate)
-        {
-            var value = _pendingLocalEquipment;
-            _pendingLocalEquipment = null;
-            if (value is null) _equipmentSendRunning = false;
-            return value;
         }
     }
 
@@ -2674,6 +2798,366 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         if (client is not null)
             return client.SendPlayerEquipmentAsync(value, _lifetime.Token);
         throw new InvalidOperationException("The lobby network is disconnected.");
+    }
+
+    private Task SendLocalPlayerActionAsync(PlayerActionEventPayload value)
+    {
+        LobbyHost? host;
+        LobbyClient? client;
+        lock (_stateGate)
+        {
+            host = _host;
+            client = _client;
+        }
+        if (host is not null)
+            return host.PublishHostPlayerActionAsync(value, _lifetime.Token);
+        if (client is not null)
+            return client.SendPlayerActionAsync(value, _lifetime.Token);
+        throw new InvalidOperationException("The lobby network is disconnected.");
+    }
+
+    private async Task PumpRemotePlayerActionsAsync()
+    {
+        try
+        {
+            while (TakePendingRemotePlayerAction() is { } value)
+                await ApplyRemotePlayerActionAsync(value).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
+        catch (Exception exception)
+        {
+            _diagnostics.Log("PlayerSync",
+                $"Remote player-action application stopped: {exception.Message}");
+            lock (_stateGate)
+            {
+                _pendingRemotePlayerActions.Clear();
+                _remotePlayerActionApplyRunning = false;
+            }
+        }
+    }
+
+    private PlayerActionEventPayload? TakePendingRemotePlayerAction()
+    {
+        lock (_stateGate)
+        {
+            if (_pendingRemotePlayerActions.Count == 0)
+            {
+                _remotePlayerActionApplyRunning = false;
+                return null;
+            }
+            return _pendingRemotePlayerActions.Dequeue();
+        }
+    }
+
+    private async Task ApplyRemotePlayerActionAsync(PlayerActionEventPayload value)
+    {
+        await _remotePlayerSyncGate.WaitAsync(_lifetime.Token).ConfigureAwait(false);
+        try
+        {
+            uint characterBase;
+            PlayerEquipmentSnapshotPayload? equipment;
+            lock (_stateGate)
+            {
+                if (_start is null || value.SessionId != _start.SessionId
+                    || value.LevelGeneration != _start.LevelGeneration
+                    || !_remoteCharacters.TryGetValue(value.PeerId, out characterBase)
+                    || characterBase == 0U)
+                    return;
+                _remoteEquipment.TryGetValue(value.PeerId, out equipment);
+                if (equipment is not null && equipment.Sequence > value.Sequence)
+                    return;
+            }
+
+            if (value.Action == PlayerActionKind.Reload)
+            {
+                _diagnostics.Log("PlayerSync",
+                    $"Remote PeerId {value.PeerId} entered Reloading (state 9); " +
+                    "reload execution is intentionally not replicated yet.");
+                return;
+            }
+
+            if (value.Active && !await EnsureRemotePlayerEquipmentAsync(
+                    value.PeerId, characterBase, value.CurrentEquipmentIndex)
+                    .ConfigureAwait(false))
+                return;
+
+            // Provisioning can await the catalog/Give path. A newer durable
+            // snapshot supersedes this edge; a newer action edge does not, because
+            // ordered action transitions must all be applied.
+            lock (_stateGate)
+            {
+                if (_remoteEquipment.TryGetValue(value.PeerId, out var newestEquipment))
+                {
+                    if (newestEquipment.Sequence > value.Sequence) return;
+                    equipment = newestEquipment;
+                }
+            }
+
+            if (value.Action == PlayerActionKind.Aim)
+            {
+                var aimApplied = false;
+                lock (_stateGate) _remoteAppliedAim.TryGetValue(value.PeerId, out aimApplied);
+                if (aimApplied == value.Active) return;
+
+                if (await ExecuteRemoteCharacterActionAsync(
+                        characterBase, value.Active ? "aim-start" : "aim-stop")
+                        .ConfigureAwait(false))
+                {
+                    lock (_stateGate) _remoteAppliedAim[value.PeerId] = value.Active;
+                }
+                return;
+            }
+
+            if (value.Action == PlayerActionKind.Primary)
+            {
+                var primaryApplied = false;
+                lock (_stateGate) _remoteAppliedPrimary.TryGetValue(value.PeerId, out primaryApplied);
+                if (primaryApplied == value.Active) return;
+
+                if (value.Active)
+                {
+                    var aimApplied = false;
+                    lock (_stateGate) _remoteAppliedAim.TryGetValue(value.PeerId, out aimApplied);
+                    if (!aimApplied && equipment?.AimHeld == true)
+                    {
+                        if (await ExecuteRemoteCharacterActionAsync(characterBase, "aim-start")
+                                .ConfigureAwait(false))
+                        {
+                            lock (_stateGate) _remoteAppliedAim[value.PeerId] = true;
+                        }
+                    }
+                }
+
+                if (await ExecuteRemoteCharacterActionAsync(
+                        characterBase, value.Active ? "primary-start" : "primary-stop")
+                        .ConfigureAwait(false))
+                {
+                    lock (_stateGate) _remoteAppliedPrimary[value.PeerId] = value.Active;
+                }
+            }
+        }
+        finally
+        {
+            _remotePlayerSyncGate.Release();
+        }
+    }
+
+    private async Task ConvergeRemotePlayerEquipmentAsync(ulong peerId)
+    {
+        var gateHeld = false;
+        try
+        {
+            await _remotePlayerSyncGate.WaitAsync(_lifetime.Token).ConfigureAwait(false);
+            gateHeld = true;
+
+            uint characterBase;
+            PlayerEquipmentSnapshotPayload? equipment;
+            lock (_stateGate)
+            {
+                if (!_remoteCharacters.TryGetValue(peerId, out characterBase)
+                    || characterBase == 0U
+                    || !_remoteEquipment.TryGetValue(peerId, out equipment)
+                    || equipment is null)
+                    return;
+            }
+
+            // When first-person is holstered the retail controller may expose
+            // current=10 while previous still identifies the weapon the player
+            // carries. Keep that weapon visible on the remote Character with Aim
+            // off instead of despawning it.
+            var visibleEquipmentIndex = ResolveVisibleRemoteEquipmentIndex(equipment);
+            if (!await EnsureRemotePlayerEquipmentAsync(
+                    peerId, characterBase, visibleEquipmentIndex)
+                    .ConfigureAwait(false))
+            {
+                // No supported carried equipment: keep any already-provisioned
+                // weapon visible, but never leave remote input held.
+                await StopRemotePlayerActionsAsync(peerId, characterBase)
+                    .ConfigureAwait(false);
+                return;
+            }
+
+            // Provisioning from an older durable snapshot is still useful, but
+            // never let its Aim/Primary state overwrite a newer ordered edge
+            // that arrived while the Give command was running.
+            lock (_stateGate)
+            {
+                if (_remoteLastPlayerSyncSequence.TryGetValue(peerId, out var newestSequence)
+                    && equipment.Sequence < newestSequence)
+                    return;
+            }
+
+            var desiredAim = equipment.AimHeld;
+            var desiredPrimary = equipment.PrimaryHeld && desiredAim;
+            bool appliedAim;
+            bool appliedPrimary;
+            lock (_stateGate)
+            {
+                _remoteAppliedAim.TryGetValue(peerId, out appliedAim);
+                _remoteAppliedPrimary.TryGetValue(peerId, out appliedPrimary);
+            }
+
+            if (appliedAim != desiredAim)
+            {
+                if (await ExecuteRemoteCharacterActionAsync(
+                        characterBase, desiredAim ? "aim-start" : "aim-stop")
+                        .ConfigureAwait(false))
+                {
+                    lock (_stateGate) _remoteAppliedAim[peerId] = desiredAim;
+                }
+            }
+
+            if (appliedPrimary != desiredPrimary)
+            {
+                if (await ExecuteRemoteCharacterActionAsync(
+                        characterBase, desiredPrimary ? "primary-start" : "primary-stop")
+                        .ConfigureAwait(false))
+                {
+                    lock (_stateGate) _remoteAppliedPrimary[peerId] = desiredPrimary;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
+        catch (Exception exception)
+        {
+            _diagnostics.Log("PlayerSync",
+                $"Remote PlayerSync convergence failed for PeerId {peerId}: {exception.Message}");
+        }
+        finally
+        {
+            if (gateHeld) _remotePlayerSyncGate.Release();
+        }
+    }
+
+    private static int ResolveVisibleRemoteEquipmentIndex(
+        PlayerEquipmentSnapshotPayload equipment)
+    {
+        if (RemoteEquipmentDefinitions.TryGetPlayerSyncEquipmentId(
+                equipment.CurrentEquipmentIndex, out _))
+            return equipment.CurrentEquipmentIndex;
+        if (RemoteEquipmentDefinitions.TryGetPlayerSyncEquipmentId(
+                equipment.PreviousEquipmentIndex, out _))
+            return equipment.PreviousEquipmentIndex;
+        return equipment.CurrentEquipmentIndex;
+    }
+
+    private async Task<bool> EnsureRemotePlayerEquipmentAsync(
+        ulong peerId,
+        uint characterBase,
+        int equipmentIndex)
+    {
+        int provisionedIndex;
+        lock (_stateGate)
+        {
+            if (_remoteProvisionedEquipment.TryGetValue(peerId, out provisionedIndex)
+                && provisionedIndex == equipmentIndex)
+                return true;
+        }
+
+        if (!RemoteEquipmentDefinitions.TryGetPlayerSyncEquipmentId(
+                equipmentIndex, out var equipmentId))
+            return false;
+        if (!RemoteEquipmentDefinitions.TryGet(equipmentId, out var definition)
+            || !definition.SelectorEnabled)
+        {
+            _diagnostics.Log("PlayerSync",
+                $"Remote equipment index {equipmentIndex} ('{equipmentId}') is not provisionable by the certified bridge yet.");
+            return false;
+        }
+
+        LobbyPlayer? player;
+        Task<RemoteEquipmentCatalogSet?>? preparation;
+        lock (_stateGate)
+        {
+            player = _lobby?.Players.FirstOrDefault(value => value.PeerId == peerId);
+            preparation = _remoteEquipmentCatalogPreparation;
+        }
+        if (player is null || preparation is null) return false;
+
+        var catalogs = await preparation.ConfigureAwait(false);
+        if (catalogs is null || !catalogs.TryGet(equipmentId, out var catalog))
+            return false;
+
+        // A new equipment identity must never inherit a held cycle from the
+        // previously-provisioned item.
+        await StopRemotePlayerActionsAsync(peerId, characterBase).ConfigureAwait(false);
+
+        await _remoteEquipmentProvisionGate.WaitAsync(_lifetime.Token).ConfigureAwait(false);
+        bool provisioned;
+        try
+        {
+            provisioned = await ProvisionRemoteEquipmentAsync(
+                player, characterBase, catalog).ConfigureAwait(false);
+        }
+        finally
+        {
+            _remoteEquipmentProvisionGate.Release();
+        }
+        if (!provisioned) return false;
+
+        lock (_stateGate)
+        {
+            if (_remoteCharacters.TryGetValue(peerId, out var currentCharacter)
+                && currentCharacter == characterBase)
+            {
+                _remoteProvisionedEquipment[peerId] = equipmentIndex;
+                _remoteAppliedAim[peerId] = false;
+                _remoteAppliedPrimary[peerId] = false;
+            }
+        }
+        return true;
+    }
+
+    private async Task StopRemotePlayerActionsAsync(ulong peerId, uint characterBase)
+    {
+        bool primary;
+        bool aim;
+        lock (_stateGate)
+        {
+            _remoteAppliedPrimary.TryGetValue(peerId, out primary);
+            _remoteAppliedAim.TryGetValue(peerId, out aim);
+        }
+
+        if (primary && await ExecuteRemoteCharacterActionAsync(
+                characterBase, "primary-stop").ConfigureAwait(false))
+        {
+            lock (_stateGate) _remoteAppliedPrimary[peerId] = false;
+        }
+        if (aim && await ExecuteRemoteCharacterActionAsync(
+                characterBase, "aim-stop").ConfigureAwait(false))
+        {
+            lock (_stateGate) _remoteAppliedAim[peerId] = false;
+        }
+    }
+
+    private async Task<bool> ExecuteRemoteCharacterActionAsync(
+        uint characterBase,
+        string action)
+    {
+        try
+        {
+            var arguments = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["characterAddress"] = $"0x{characterBase:X8}",
+                ["action"] = action
+            };
+            var result = await _controller.ExecuteReplicationCommandAsync(
+                GameCommandNames.CharacterActionTest, arguments, _lifetime.Token)
+                .ConfigureAwait(false);
+            if (result.Executed) return true;
+
+            _diagnostics.Log("PlayerSync",
+                $"Remote CharacterAction '{action}' rejected for 0x{characterBase:X8}: " +
+                $"{result.StatusCode} - {result.Message}");
+            return false;
+        }
+        catch (Exception exception) when (exception is ProtocolException
+            or IOException or InvalidOperationException or TimeoutException)
+        {
+            _diagnostics.Log("PlayerSync",
+                $"Remote CharacterAction '{action}' failed for 0x{characterBase:X8}: {exception.Message}");
+            return false;
+        }
     }
 
     private async Task TryAdvanceRemoteMovementAsync(
@@ -3349,9 +3833,6 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         var characterBase = await WaitForTrackedSpawnAsync(previousKey, expectedSpawnKey)
             .ConfigureAwait(false);
         StoreRemoteCharacter(target.Player, characterBase);
-        _diagnostics.Log("PlayerSync",
-            $"Remote equipment provisioning is manual for PeerId {target.Player.PeerId}. " +
-            "Use the Launcher command 'Give Equipment to Remote Characters (manual)' after the Character is visibly initialized.");
         await ShowPlayerJoinedMessageAsync(target.Player.DisplayName).ConfigureAwait(false);
     }
 
@@ -3619,6 +4100,13 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
     {
         lock (_stateGate)
         {
+            if (!_remoteCharacters.TryGetValue(player.PeerId, out var previousCharacter)
+                || previousCharacter != characterBase)
+            {
+                _remoteProvisionedEquipment.Remove(player.PeerId);
+                _remoteAppliedAim.Remove(player.PeerId);
+                _remoteAppliedPrimary.Remove(player.PeerId);
+            }
             _remoteCharacters[player.PeerId] = characterBase;
             _remoteSpawnRetryAttempts.Remove(player.PeerId);
             _remoteSpawnRetryNotBeforeUtc.Remove(player.PeerId);
@@ -3631,8 +4119,10 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         {
             _diagnostics.Log("PlayerSync",
                 $"Remote PeerId {player.PeerId} state is ready for CharacterBase=0x{characterBase:X8}: " +
-                $"equipment={equipment.CurrentEquipmentIndex}, previous={equipment.PreviousEquipmentIndex}, active={(equipment.EquipmentActive ? 1 : 0)}, " +
-                $"state={equipment.PresentationState}.");
+                $"equipment={equipment.CurrentEquipmentIndex}, previous={equipment.PreviousEquipmentIndex}, " +
+                $"active={(equipment.EquipmentActive ? 1 : 0)}, aim={(equipment.AimHeld ? 1 : 0)}, " +
+                $"primary={(equipment.PrimaryHeld ? 1 : 0)}.");
+            _ = ConvergeRemotePlayerEquipmentAsync(player.PeerId);
         }
     }
 

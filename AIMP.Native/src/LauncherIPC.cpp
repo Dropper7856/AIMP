@@ -643,9 +643,17 @@ void LauncherIPC::AttachPlayerSyncObserver(
 }
 
 void LauncherIPC::PublishPlayerSyncTraffic() {
+    if (playerSyncObserver_ == nullptr) {
+        return;
+    }
+
     if (!sessionConfigured_.load(std::memory_order_acquire) ||
-        !netzReadySent_.load(std::memory_order_acquire) ||
-        playerSyncObserver_ == nullptr) {
+        !netzReadySent_.load(std::memory_order_acquire)) {
+        // Edge events only have meaning inside the active multiplayer session.
+        // Drop stale offline edges while retaining the durable snapshot, which
+        // will converge the current Aim/Primary state when a session starts.
+        PlayerSyncActionEvent ignored{};
+        while (playerSyncObserver_->TryPopAction(ignored)) {}
         return;
     }
 
@@ -656,28 +664,48 @@ void LauncherIPC::PublishPlayerSyncTraffic() {
 
     const auto previous = lastPublishedPlayerSyncRevision_.load(
         std::memory_order_acquire);
-    if (previous == snapshot.revision) {
-        return;
+    if (previous != snapshot.revision) {
+        std::ostringstream json;
+        json << "{\"schemaVersion\":2"
+             << ",\"revision\":" << snapshot.revision
+             << ",\"valid\":" << (snapshot.valid ? "true" : "false")
+             << ",\"currentEquipmentIndex\":" << snapshot.currentEquipmentIndex
+             << ",\"previousEquipmentIndex\":" << snapshot.previousEquipmentIndex
+             << ",\"equipmentActive\":" << (snapshot.equipmentActive ? "true" : "false")
+             << ",\"presentationState\":" << snapshot.presentationState
+             << ",\"aimHeld\":" << (snapshot.aimHeld ? "true" : "false")
+             << ",\"primaryHeld\":" << (snapshot.primaryHeld ? "true" : "false")
+             << '}';
+        const auto payload = JsonBytes(json.str());
+        if (Queue(
+                protocol::MessageType::PlayerSyncState,
+                0,
+                localSequence_.fetch_add(1U, std::memory_order_relaxed),
+                payload)) {
+            lastPublishedPlayerSyncRevision_.store(
+                snapshot.revision,
+                std::memory_order_release);
+        }
     }
 
-    std::ostringstream json;
-    json << "{\"schemaVersion\":1"
-         << ",\"revision\":" << snapshot.revision
-         << ",\"valid\":" << (snapshot.valid ? "true" : "false")
-         << ",\"currentEquipmentIndex\":" << snapshot.currentEquipmentIndex
-         << ",\"previousEquipmentIndex\":" << snapshot.previousEquipmentIndex
-         << ",\"equipmentActive\":" << (snapshot.equipmentActive ? "true" : "false")
-         << ",\"presentationState\":" << snapshot.presentationState
-         << '}';
-    const auto payload = JsonBytes(json.str());
-    if (Queue(
-            protocol::MessageType::PlayerSyncState,
-            0,
-            localSequence_.fetch_add(1U, std::memory_order_relaxed),
-            payload)) {
-        lastPublishedPlayerSyncRevision_.store(
-            snapshot.revision,
-            std::memory_order_release);
+    PlayerSyncActionEvent action{};
+    for (std::size_t count = 0U; count < 32U &&
+         playerSyncObserver_->TryPopAction(action); ++count) {
+        std::ostringstream actionJson;
+        actionJson << "{\"schemaVersion\":1"
+                   << ",\"eventSequence\":" << action.sequence
+                   << ",\"action\":" << static_cast<unsigned>(action.action)
+                   << ",\"active\":" << (action.active ? "true" : "false")
+                   << ",\"currentEquipmentIndex\":" << action.currentEquipmentIndex
+                   << ",\"presentationState\":" << action.presentationState
+                   << '}';
+        if (!Queue(
+                protocol::MessageType::PlayerSyncAction,
+                0,
+                localSequence_.fetch_add(1U, std::memory_order_relaxed),
+                JsonBytes(actionJson.str()))) {
+            break;
+        }
     }
 }
 

@@ -149,6 +149,13 @@ public sealed record PlayerPositionSnapshotPayload(
     PlayerMoveType MoveType,
     float NativeMoveSpeed);
 
+public enum PlayerActionKind
+{
+    Aim = 0,
+    Primary = 1,
+    Reload = 2
+}
+
 public sealed record NativePlayerEquipmentStatePayload(
     int SchemaVersion,
     ulong Revision,
@@ -156,6 +163,16 @@ public sealed record NativePlayerEquipmentStatePayload(
     int CurrentEquipmentIndex,
     int PreviousEquipmentIndex,
     bool EquipmentActive,
+    int PresentationState,
+    bool AimHeld,
+    bool PrimaryHeld);
+
+public sealed record NativePlayerActionEventPayload(
+    int SchemaVersion,
+    ulong EventSequence,
+    PlayerActionKind Action,
+    bool Active,
+    int CurrentEquipmentIndex,
     int PresentationState);
 
 public sealed record PlayerEquipmentSnapshotPayload(
@@ -167,6 +184,19 @@ public sealed record PlayerEquipmentSnapshotPayload(
     int CurrentEquipmentIndex,
     int PreviousEquipmentIndex,
     bool EquipmentActive,
+    int PresentationState,
+    bool AimHeld,
+    bool PrimaryHeld);
+
+public sealed record PlayerActionEventPayload(
+    Guid SessionId,
+    ulong PeerId,
+    int LevelGeneration,
+    ulong Sequence,
+    long SentAtUnixMilliseconds,
+    PlayerActionKind Action,
+    bool Active,
+    int CurrentEquipmentIndex,
     int PresentationState);
 
 public sealed record LobbyStartPayload(

@@ -61,6 +61,8 @@ public sealed class LobbyClient : IAsyncDisposable
 
     public event EventHandler<PlayerEquipmentSnapshotPayload>? PlayerEquipmentReceived;
 
+    public event EventHandler<PlayerActionEventPayload>? PlayerActionReceived;
+
     public event EventHandler<WorldNetworkContext>? WorldContextReceived;
 
     public event EventHandler<WorldNetworkMutation>? WorldMutationReceived;
@@ -229,6 +231,17 @@ public sealed class LobbyClient : IAsyncDisposable
             JsonPayload.Serialize(payload), cancellationToken).AsTask();
     }
 
+    public Task SendPlayerActionAsync(
+        PlayerActionEventPayload payload,
+        CancellationToken cancellationToken = default)
+    {
+        ModelValidation.Validate(payload);
+        if (payload.SessionId != SessionId || payload.PeerId != PeerId)
+            throw new InvalidOperationException("The player-action identity is invalid.");
+        return _connection.SendAsync(MessageType.PlayerActionEvent,
+            JsonPayload.Serialize(payload), cancellationToken).AsTask();
+    }
+
     private void ValidateSpawnPositionResponseInput(
         SpawnPositionRequestPayload request,
         PlayerSpawnPositionPayload position)
@@ -375,6 +388,13 @@ public sealed class LobbyClient : IAsyncDisposable
                         PlayerEquipmentReceived?.Invoke(this, equipment);
                         break;
 
+                    case MessageType.PlayerActionEvent:
+                        var action = JsonPayload.Deserialize<PlayerActionEventPayload>(
+                            frame.Payload.Span);
+                        ValidatePlayerAction(action);
+                        PlayerActionReceived?.Invoke(this, action);
+                        break;
+
                     case MessageType.WorldContext:
                         var worldContext = WorldReplicationCodec.DecodeNetworkContext(frame.Payload.Span);
                         if (worldContext.SessionId != SessionId)
@@ -482,6 +502,14 @@ public sealed class LobbyClient : IAsyncDisposable
         var known = Snapshot?.Players.Any(player => player.PeerId == payload.PeerId) == true;
         if (payload.SessionId != SessionId || !known || payload.PeerId == PeerId)
             throw new ProtocolException("The player-equipment snapshot identity is invalid.");
+    }
+
+    private void ValidatePlayerAction(PlayerActionEventPayload payload)
+    {
+        ModelValidation.Validate(payload);
+        var known = Snapshot?.Players.Any(player => player.PeerId == payload.PeerId) == true;
+        if (payload.SessionId != SessionId || !known || payload.PeerId == PeerId)
+            throw new ProtocolException("The player-action event identity is invalid.");
     }
 
     private async Task HeartbeatLoopAsync(CancellationToken cancellationToken)

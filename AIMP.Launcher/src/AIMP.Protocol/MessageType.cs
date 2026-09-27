@@ -26,6 +26,7 @@ public enum MessageType : ushort
     WorldSyncLifecycle = 20,
     WorldIntentAbandoned = 21,
     PlayerSyncState = 22,
+    PlayerSyncAction = 23,
 
     LobbyJoin = 100,
     LobbyJoinAccepted = 101,
@@ -46,6 +47,7 @@ public enum MessageType : ushort
     WorldTransactionRecoveryRequest = 116,
     WorldTransactionRecoveryStatus = 117,
     PlayerEquipmentSnapshot = 118,
+    PlayerActionEvent = 119,
 
     TestModeConfigure = 200,
     CapabilityQuery = 201,

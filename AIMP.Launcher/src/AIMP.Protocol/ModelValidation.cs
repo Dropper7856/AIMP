@@ -126,7 +126,7 @@ public static class ModelValidation
 
     public static void Validate(NativePlayerEquipmentStatePayload? value)
     {
-        if (value is null || value.SchemaVersion != 1 || value.Revision == 0
+        if (value is null || value.SchemaVersion != 2 || value.Revision == 0
             || value.CurrentEquipmentIndex is < -1 or > 64
             || value.PreviousEquipmentIndex is < -1 or > 64
             || value.PresentationState is < -1 or > 64)
@@ -142,6 +142,28 @@ public static class ModelValidation
             || value.PreviousEquipmentIndex is < -1 or > 64
             || value.PresentationState is < 0 or > 64)
             throw new ProtocolException("The player-equipment snapshot is invalid.");
+    }
+
+    public static void Validate(NativePlayerActionEventPayload? value)
+    {
+        if (value is null || value.SchemaVersion != 1 || value.EventSequence == 0
+            || (int)value.Action is < 0 or > 2
+            || (value.Action == PlayerActionKind.Reload && !value.Active)
+            || value.CurrentEquipmentIndex is < -1 or > 64
+            || value.PresentationState is < -1 or > 64)
+            throw new ProtocolException("The native player-action event is invalid.");
+    }
+
+    public static void Validate(PlayerActionEventPayload? value)
+    {
+        if (value is null || value.SessionId == Guid.Empty || value.PeerId == 0
+            || value.LevelGeneration < 1 || value.Sequence == 0
+            || value.SentAtUnixMilliseconds <= 0
+            || (int)value.Action is < 0 or > 2
+            || (value.Action == PlayerActionKind.Reload && !value.Active)
+            || value.CurrentEquipmentIndex is < -1 or > 64
+            || value.PresentationState is < 0 or > 64)
+            throw new ProtocolException("The player-action event is invalid.");
     }
 
     public static void Validate(LobbyStartPayload? value)
