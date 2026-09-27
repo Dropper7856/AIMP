@@ -1,0 +1,2449 @@
+#include "aimp/CharacterDirectStepRuntime.h"
+
+#include "aimp/CrashGuard.h"
+#include "aimp/HookManager.h"
+
+#include <Windows.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <bit>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <cwchar>
+#include <cstdio>
+#include <mutex>
+
+namespace aimp::character_direct_step_runtime {
+namespace {
+
+constexpr auto kNativeRvas = NativeMovementRvas();
+constexpr auto kCharacterRegistry = NativeCharacterRegistry();
+constexpr std::uintptr_t kCharacterPositionOffset = 0x0070U;
+constexpr std::uintptr_t kNpcLocomotionCycleOffset = 0x036CU;
+constexpr std::uintptr_t kNpcLocomotionCycleOwnerOffset = 0x0004U;
+constexpr std::uintptr_t kNpcLocomotionCycleStateOffset = 0x001AU;
+constexpr std::uintptr_t kMovementActionObjectOffset = 0x42A8U;
+constexpr std::uintptr_t kMovementActionStateOffset = 0x0008U;
+constexpr std::uintptr_t kMovementActionModeResetOffset = 0x0190U;
+constexpr std::uintptr_t kMovementActionMoveTypeOffset = 0x0194U;
+constexpr std::uintptr_t kMovementActionCurrentMoveTypeOffset = 0x0198U;
+constexpr std::uintptr_t kNativeOrientationOffset = 0x0184U;
+constexpr std::uint32_t kMovementActionMoveState = 2U;
+constexpr std::uintptr_t kLocomotionSubsystemOffset = 0x03F0U;
+constexpr std::uintptr_t kLocomotionEnabledOffsetA = 0x02C8U;
+constexpr std::uintptr_t kLocomotionEnabledOffsetB = 0x02CAU;
+constexpr std::uint64_t kReplicationLeaseMilliseconds = 600U;
+constexpr std::uint32_t kPersistentReplicationFrames = 0xFFFFFFFFU;
+constexpr float kControlDirectionDotThreshold = 0.9999619F;
+constexpr float kControlMagnitudeEpsilon = 0.0005F;
+constexpr float kControlIntensityEpsilon = 0.0005F;
+constexpr float kMoveRequestEpsilon = 0.0001F;
+constexpr std::uint8_t kNpcLocomotionIdleState = 0x01U;
+constexpr std::uint8_t kNpcLocomotionMoveState = 0x38U;
+constexpr float kFollowerLateralCorrectionStart = 0.025F;
+constexpr float kFollowerLateralCorrectionFull = 0.60F;
+constexpr float kFollowerMaximumLateralBlend = 0.55F;
+constexpr float kFollowerSettleDistance = 0.080F;
+constexpr float kFollowerInitialPlacementTolerance = 0.05F;
+constexpr float kFollowerMaximumMagnitude = 8.0F;
+// v13 keeps retail locomotion for normal motion, but allows a lagging proxy to
+// recover network error materially faster than v12.8. The hard-resync below is
+// still reserved for genuine divergence, not ordinary latency.
+constexpr float kFollowerCatchupGain = 0.35F;
+constexpr float kFollowerAheadBrakeGain = 0.55F;
+constexpr float kFollowerMinimumSpeedMultiplier = 0.45F;
+constexpr float kFollowerMaximumSpeedMultiplier = 1.35F;
+constexpr float kFollowerHardResyncDistance = 1.50F;
+constexpr std::uint64_t kFollowerHardResyncCooldownMilliseconds = 250U;
+constexpr std::uint64_t kFollowerHardResyncProbeIntervalMilliseconds = 100U;
+constexpr std::uint64_t kMoveTypeValidationIntervalMilliseconds = 250U;
+constexpr std::uint32_t kInvalidMoveType = 0xFFFFFFFFU;
+constexpr float kFollowerMinimumSettlingMagnitude = 0.12F;
+constexpr float kFollowerMaximumSettlingMagnitude = 0.65F;
+constexpr std::uintptr_t kReservedSlot = 1U;
+
+using ActivateLocomotionCycleFn = void(__thiscall*)(void* cycle);
+using EnterIdleCycleFn = void(__thiscall*)(void* cycle);
+using SubmitLocomotionFn = void(__thiscall*)(
+    void* subsystem,
+    const float* direction,
+    float intensity);
+using TeleportCharacterFn = void(__thiscall*)(
+    void* registryEntry,
+    const float* position);
+
+struct MovementSlot final {
+    std::atomic<std::uintptr_t> characterAddress{0U};
+    std::atomic<std::uintptr_t> stateAddress{0U};
+    std::atomic<std::uintptr_t> movementActionAddress{0U};
+    std::atomic<std::uint32_t> directionXBits{0U};
+    std::atomic<std::uint32_t> directionYBits{0U};
+    std::atomic<std::uint32_t> directionZBits{0U};
+    std::atomic<std::uint32_t> deltaYawBits{0U};
+    std::atomic<std::uint32_t> intensityBits{
+        std::bit_cast<std::uint32_t>(1.0F)};
+    std::atomic<std::uint32_t> networkXBits{0U};
+    std::atomic<std::uint32_t> networkYBits{0U};
+    std::atomic<std::uint32_t> networkZBits{0U};
+    std::atomic<std::uint32_t> replicatedYawBits{0U};
+    std::atomic<std::uint32_t> moveType{1U};
+    std::atomic<std::uint32_t> appliedMoveType{kInvalidMoveType};
+    std::atomic<std::uint64_t> lastMoveTypeValidationTickMs{0U};
+    std::atomic<std::uint32_t> remainingFrames{0U};
+    std::atomic<std::uint64_t> controlRevision{0U};
+    std::atomic<std::uint64_t> appliedControlRevision{0U};
+    std::atomic<std::uint64_t> leaseExpiresAtTickMs{0U};
+    std::atomic<bool> worldSpace{false};
+    std::atomic<bool> hasNetworkTransform{false};
+    std::atomic<bool> hasReplicatedYaw{false};
+    std::atomic<bool> applyPhysicalStep{false};
+    std::atomic<bool> nativeStateActive{false};
+    std::atomic<bool> moveActive{false};
+    std::atomic<bool> driveRequested{false};
+    std::atomic<std::uint8_t> lastObservedNativeState{0U};
+    std::atomic<bool> stopPending{false};
+    std::atomic<bool> initialPlacementPending{false};
+    std::atomic<std::uint64_t> lastHookTickMs{0U};
+    std::atomic<std::uint64_t> lastHardResyncAttemptTickMs{0U};
+    std::atomic<std::uint64_t> lastHardResyncProbeTickMs{0U};
+
+    std::atomic<std::uint64_t> activationAttempts{0U};
+    std::atomic<std::uint64_t> activationApplications{0U};
+    std::atomic<std::uint64_t> activationReuses{0U};
+    std::atomic<std::uint64_t> activationFailures{0U};
+    std::atomic<std::uint64_t> nativeStateLosses{0U};
+    std::atomic<std::uint64_t> nativeStateReacquireAttempts{0U};
+    std::atomic<std::uint64_t> nativeStateReacquireSuccesses{0U};
+    std::atomic<std::uint64_t> enterMoveTransitions{0U};
+    std::atomic<std::uint64_t> updateMoveTransitions{0U};
+    std::atomic<std::uint64_t> exitMoveTransitions{0U};
+    std::atomic<std::uint64_t> idleHoldApplications{0U};
+    std::atomic<std::uint64_t> enginePumpApplications{0U};
+    std::atomic<std::uint64_t> aiActivationSuppressions{0U};
+    std::atomic<std::uint64_t> aiIdleSuppressions{0U};
+    std::atomic<std::uint64_t> nativeIdleApplications{0U};
+    std::atomic<std::uint64_t> followerApplications{0U};
+    std::atomic<std::uint64_t> effectiveMoveTypeApplications{0U};
+    std::atomic<std::uint64_t> hookHits{0U};
+    std::atomic<std::uint64_t> finalSubmissions{0U};
+    std::atomic<std::uint64_t> requestApplications{0U};
+    std::atomic<std::uint64_t> transformApplications{0U};
+    std::atomic<std::uint64_t> teleportApplications{0U};
+    std::atomic<std::uint64_t> hardResyncAttempts{0U};
+    std::atomic<std::uint64_t> hardResyncApplications{0U};
+    std::atomic<std::uint64_t> physicalApplications{0U};
+    std::atomic<std::uint64_t> stopApplications{0U};
+    std::atomic<std::uint64_t> protectedFailures{0U};
+    std::atomic<std::uintptr_t> lastCharacter{0U};
+};
+
+std::atomic<bool> gInstalled{false};
+std::array<MovementSlot, MaximumConcurrentTargets()> gSlots{};
+std::atomic<std::uintptr_t> gLastArmedCharacter{0U};
+std::uintptr_t gModuleBase{};
+ActivateLocomotionCycleFn gActivateLocomotionCycle{};
+EnterIdleCycleFn gEnterIdleCycle{};
+SubmitLocomotionFn gSubmitLocomotion{};
+TeleportCharacterFn gTeleportCharacter{};
+void* gActivateLocomotionTrampoline{};
+void* gEnterIdleCycleTrampoline{};
+void* gMovementActionPostGaitTrampoline{};
+void* gNpcLocomotionPreTransformTrampoline{};
+
+void* gNpcLocomotionPostSubmitTrampoline{};
+
+std::mutex gLocomotionFlightMutex;
+HANDLE gLocomotionFlightFile{INVALID_HANDLE_VALUE};
+std::atomic<std::uint64_t> gLocomotionFlightHeartbeatTickMs{0U};
+
+[[nodiscard]] bool EnsureLocomotionFlightOpenLocked() noexcept {
+    if (gLocomotionFlightFile != INVALID_HANDLE_VALUE) return true;
+    wchar_t root[32768]{};
+    const auto length = GetEnvironmentVariableW(L"LOCALAPPDATA", root, _countof(root));
+    if (length == 0U || length >= _countof(root)) {
+        if (GetTempPathW(_countof(root), root) == 0U) return false;
+    }
+    std::size_t used = wcslen(root);
+    if (used != 0U && root[used - 1U] != L'\\') {
+        if (used + 1U >= _countof(root)) return false;
+        root[used++] = L'\\'; root[used] = L'\0';
+    }
+    if (wcscat_s(root, _countof(root), L"AIMP") != 0) return false;
+    CreateDirectoryW(root, nullptr);
+    if (wcscat_s(root, _countof(root), L"\\logs") != 0) return false;
+    CreateDirectoryW(root, nullptr);
+    wchar_t suffix[128]{};
+    if (_snwprintf_s(suffix, _countof(suffix), _TRUNCATE,
+            L"\\AIMP.RemoteLocomotionFlight-%lu.jsonl", GetCurrentProcessId()) < 0 ||
+        wcscat_s(root, _countof(root), suffix) != 0) return false;
+    gLocomotionFlightFile = CreateFileW(
+        root, FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    return gLocomotionFlightFile != INVALID_HANDLE_VALUE;
+}
+
+void AppendLocomotionFlight(
+    const char* eventName,
+    const MovementSlot& slot,
+    const std::uintptr_t characterAddress,
+    const std::uintptr_t cycleAddress,
+    const std::uint8_t cycleState,
+    const std::uint32_t detail = 0U) noexcept {
+    std::lock_guard lock(gLocomotionFlightMutex);
+    if (!EnsureLocomotionFlightOpenLocked()) return;
+    char line[2048]{};
+    const auto length = _snprintf_s(
+        line, sizeof(line), _TRUNCATE,
+        "{\"version\":1,\"tickMs\":%llu,\"tid\":%lu,"
+        "\"event\":\"%s\",\"character\":%llu,\"cycle\":%llu,"
+        "\"cycleState\":%u,\"detail\":%u,\"armed\":%s,\"moveActive\":%s,"
+        "\"nativeStateActive\":%s,\"driveRequested\":%s,\"moveType\":%u,"
+        "\"activationAttempts\":%llu,\"activationApplications\":%llu,"
+        "\"activationFailures\":%llu,\"nativeStateLosses\":%llu,"
+        "\"reacquireAttempts\":%llu,\"reacquireSuccesses\":%llu,"
+        "\"protectedFailures\":%llu,\"hardResyncAttempts\":%llu,"
+        "\"hardResyncApplications\":%llu}\r\n",
+        static_cast<unsigned long long>(GetTickCount64()), GetCurrentThreadId(), eventName,
+        static_cast<unsigned long long>(characterAddress),
+        static_cast<unsigned long long>(cycleAddress),
+        static_cast<unsigned>(cycleState), detail,
+        slot.characterAddress.load(std::memory_order_relaxed) != 0U ? "true" : "false",
+        slot.moveActive.load(std::memory_order_relaxed) ? "true" : "false",
+        slot.nativeStateActive.load(std::memory_order_relaxed) ? "true" : "false",
+        slot.driveRequested.load(std::memory_order_relaxed) ? "true" : "false",
+        slot.moveType.load(std::memory_order_relaxed),
+        static_cast<unsigned long long>(slot.activationAttempts.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(slot.activationApplications.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(slot.activationFailures.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(slot.nativeStateLosses.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(slot.nativeStateReacquireAttempts.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(slot.nativeStateReacquireSuccesses.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(slot.protectedFailures.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(slot.hardResyncAttempts.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(slot.hardResyncApplications.load(std::memory_order_relaxed)));
+    if (length <= 0) return;
+    DWORD written = 0U;
+    static_cast<void>(WriteFile(
+        gLocomotionFlightFile, line, static_cast<DWORD>(length), &written, nullptr));
+}
+
+template<std::size_t Size>
+bool ValidateBytes(
+    const std::uintptr_t address,
+    const std::array<std::uint8_t, Size>& expected) noexcept {
+#if defined(_MSC_VER)
+    __try {
+        return std::memcmp(
+            reinterpret_cast<const void*>(address),
+            expected.data(),
+            expected.size()) == 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    return std::memcmp(
+        reinterpret_cast<const void*>(address),
+        expected.data(),
+        expected.size()) == 0;
+#endif
+}
+
+bool ValidateSubmitFunction(const std::uintptr_t address) noexcept {
+    constexpr std::array<std::uint8_t, 16> expected{
+        0x55U, 0x8BU, 0xECU, 0x83U,
+        0xE4U, 0xF0U, 0x8BU, 0x45U,
+        0x08U, 0x83U, 0xECU, 0x1CU,
+        0x56U, 0x8BU, 0xF1U, 0x50U,
+    };
+    return ValidateBytes(address, expected);
+}
+
+bool ValidateActivationFunction(const std::uintptr_t address) noexcept {
+    constexpr std::array<std::uint8_t, 13> expected{
+        0x56U, 0x8BU, 0xF1U, 0x8AU,
+        0x46U, 0x1AU, 0x8BU, 0x4EU,
+        0x04U, 0x88U, 0x46U, 0x1BU,
+        0xE8U,
+    };
+    return ValidateBytes(address, expected);
+}
+
+bool ValidateIdleTransitionFunction(const std::uintptr_t address) noexcept {
+    // The absolute EH handler pointer is relocated, so only validate stable
+    // instruction bytes at the function entry and the ECX->ESI prologue.
+    constexpr std::array<std::uint8_t, 2> entry{0x6AU, 0xFFU};
+    constexpr std::array<std::uint8_t, 3> thisPrologue{0x56U, 0x8BU, 0xF1U};
+    return ValidateBytes(address, entry) &&
+        ValidateBytes(address + 0x18U, thisPrologue);
+}
+
+bool ValidateLocomotionVtable(const std::uintptr_t moduleBase) noexcept {
+    const auto vtable = moduleBase + kNativeRvas.npcLocomotionVtable;
+    const auto update = crash_guard::SafeRead<std::uintptr_t>(
+        reinterpret_cast<const void*>(vtable + 0x20U));
+    return update.has_value() &&
+        *update == moduleBase + kNativeRvas.npcLocomotionCycleUpdate;
+}
+
+bool ValidateTeleportFunction(const std::uintptr_t address) noexcept {
+    constexpr std::array<std::uint8_t, 16> expected{
+        0x55U, 0x8BU, 0xECU, 0x83U,
+        0xE4U, 0xF0U, 0x83U, 0xECU,
+        0x44U, 0x53U, 0x56U, 0x8BU,
+        0xF1U, 0x8BU, 0x0EU, 0x57U,
+    };
+    return ValidateBytes(address, expected);
+}
+
+void ResetPayload(MovementSlot& slot) noexcept {
+    slot.stateAddress.store(0U, std::memory_order_relaxed);
+    slot.movementActionAddress.store(0U, std::memory_order_relaxed);
+    slot.directionXBits.store(0U, std::memory_order_relaxed);
+    slot.directionYBits.store(0U, std::memory_order_relaxed);
+    slot.directionZBits.store(0U, std::memory_order_relaxed);
+    slot.deltaYawBits.store(0U, std::memory_order_relaxed);
+    slot.intensityBits.store(
+        std::bit_cast<std::uint32_t>(1.0F),
+        std::memory_order_relaxed);
+    slot.networkXBits.store(0U, std::memory_order_relaxed);
+    slot.networkYBits.store(0U, std::memory_order_relaxed);
+    slot.networkZBits.store(0U, std::memory_order_relaxed);
+    slot.replicatedYawBits.store(0U, std::memory_order_relaxed);
+    slot.moveType.store(1U, std::memory_order_relaxed);
+    slot.appliedMoveType.store(kInvalidMoveType, std::memory_order_relaxed);
+    slot.lastMoveTypeValidationTickMs.store(0U, std::memory_order_relaxed);
+    slot.remainingFrames.store(0U, std::memory_order_release);
+    slot.controlRevision.store(0U, std::memory_order_release);
+    slot.appliedControlRevision.store(0U, std::memory_order_release);
+    slot.leaseExpiresAtTickMs.store(0U, std::memory_order_release);
+    slot.worldSpace.store(false, std::memory_order_release);
+    slot.hasNetworkTransform.store(false, std::memory_order_release);
+    slot.hasReplicatedYaw.store(false, std::memory_order_release);
+    slot.applyPhysicalStep.store(false, std::memory_order_release);
+    slot.nativeStateActive.store(false, std::memory_order_release);
+    slot.moveActive.store(false, std::memory_order_release);
+    slot.driveRequested.store(false, std::memory_order_release);
+    slot.lastObservedNativeState.store(0U, std::memory_order_release);
+    slot.stopPending.store(false, std::memory_order_release);
+    slot.initialPlacementPending.store(false, std::memory_order_release);
+    slot.lastHookTickMs.store(0U, std::memory_order_release);
+    slot.lastHardResyncAttemptTickMs.store(0U, std::memory_order_release);
+    slot.lastHardResyncProbeTickMs.store(0U, std::memory_order_release);
+}
+
+void ResetCounters(MovementSlot& slot) noexcept {
+    slot.activationAttempts.store(0U, std::memory_order_relaxed);
+    slot.activationApplications.store(0U, std::memory_order_relaxed);
+    slot.activationReuses.store(0U, std::memory_order_relaxed);
+    slot.activationFailures.store(0U, std::memory_order_relaxed);
+    slot.nativeStateLosses.store(0U, std::memory_order_relaxed);
+    slot.nativeStateReacquireAttempts.store(0U, std::memory_order_relaxed);
+    slot.nativeStateReacquireSuccesses.store(0U, std::memory_order_relaxed);
+    slot.enterMoveTransitions.store(0U, std::memory_order_relaxed);
+    slot.updateMoveTransitions.store(0U, std::memory_order_relaxed);
+    slot.exitMoveTransitions.store(0U, std::memory_order_relaxed);
+    slot.idleHoldApplications.store(0U, std::memory_order_relaxed);
+    slot.enginePumpApplications.store(0U, std::memory_order_relaxed);
+    slot.aiActivationSuppressions.store(0U, std::memory_order_relaxed);
+    slot.aiIdleSuppressions.store(0U, std::memory_order_relaxed);
+    slot.nativeIdleApplications.store(0U, std::memory_order_relaxed);
+    slot.followerApplications.store(0U, std::memory_order_relaxed);
+    slot.effectiveMoveTypeApplications.store(0U, std::memory_order_relaxed);
+    slot.hookHits.store(0U, std::memory_order_relaxed);
+    slot.finalSubmissions.store(0U, std::memory_order_relaxed);
+    slot.requestApplications.store(0U, std::memory_order_relaxed);
+    slot.transformApplications.store(0U, std::memory_order_relaxed);
+    slot.teleportApplications.store(0U, std::memory_order_relaxed);
+    slot.hardResyncAttempts.store(0U, std::memory_order_relaxed);
+    slot.hardResyncApplications.store(0U, std::memory_order_relaxed);
+    slot.physicalApplications.store(0U, std::memory_order_relaxed);
+    slot.stopApplications.store(0U, std::memory_order_relaxed);
+    slot.protectedFailures.store(0U, std::memory_order_relaxed);
+    slot.lastCharacter.store(0U, std::memory_order_relaxed);
+}
+
+MovementSlot* FindSlot(const std::uintptr_t characterAddress) noexcept {
+    if (characterAddress == 0U) return nullptr;
+    for (auto& slot : gSlots) {
+        if (slot.characterAddress.load(std::memory_order_acquire) ==
+            characterAddress)
+            return &slot;
+    }
+    return nullptr;
+}
+
+MovementSlot* FindSlotByMovementAction(
+    const std::uintptr_t movementActionAddress) noexcept {
+    if (movementActionAddress == 0U) return nullptr;
+    for (auto& slot : gSlots) {
+        if (slot.movementActionAddress.load(std::memory_order_acquire) ==
+            movementActionAddress)
+            return &slot;
+    }
+    return nullptr;
+}
+
+MovementSlot* FindOrAllocateSlot(
+    const std::uintptr_t characterAddress) noexcept {
+    if (auto* existing = FindSlot(characterAddress)) return existing;
+    for (auto& slot : gSlots) {
+        auto empty = std::uintptr_t{0U};
+        if (!slot.characterAddress.compare_exchange_strong(
+                empty,
+                kReservedSlot,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire))
+            continue;
+        ResetPayload(slot);
+        ResetCounters(slot);
+        slot.characterAddress.store(characterAddress, std::memory_order_release);
+        return &slot;
+    }
+    return nullptr;
+}
+
+void ReleaseSlot(MovementSlot& slot) noexcept {
+    slot.remainingFrames.store(0U, std::memory_order_release);
+    slot.leaseExpiresAtTickMs.store(0U, std::memory_order_release);
+    slot.nativeStateActive.store(false, std::memory_order_release);
+    slot.moveActive.store(false, std::memory_order_release);
+    slot.driveRequested.store(false, std::memory_order_release);
+    slot.lastObservedNativeState.store(0U, std::memory_order_release);
+    slot.stateAddress.store(0U, std::memory_order_release);
+    slot.movementActionAddress.store(0U, std::memory_order_release);
+    slot.appliedMoveType.store(kInvalidMoveType, std::memory_order_release);
+    slot.lastMoveTypeValidationTickMs.store(0U, std::memory_order_release);
+    slot.lastHookTickMs.store(0U, std::memory_order_release);
+    slot.lastHardResyncAttemptTickMs.store(0U, std::memory_order_release);
+    slot.lastHardResyncProbeTickMs.store(0U, std::memory_order_release);
+    slot.hasNetworkTransform.store(false, std::memory_order_release);
+    slot.hasReplicatedYaw.store(false, std::memory_order_release);
+    slot.applyPhysicalStep.store(false, std::memory_order_release);
+    slot.stopPending.store(false, std::memory_order_release);
+    slot.initialPlacementPending.store(false, std::memory_order_release);
+    slot.characterAddress.store(0U, std::memory_order_release);
+}
+
+bool ReadTransform(
+    const std::uintptr_t characterAddress,
+    float& x,
+    float& y,
+    float& z) noexcept {
+    std::array<float, 3> values{};
+    if (!crash_guard::TryCopy(
+            values.data(),
+            reinterpret_cast<const void*>(
+                characterAddress + kCharacterPositionOffset),
+            sizeof(values)))
+        return false;
+    x = values[0];
+    y = values[1];
+    z = values[2];
+    return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
+}
+
+std::uintptr_t FindCharacterRegistryEntry(
+    const std::uintptr_t characterAddress) noexcept {
+    if (gModuleBase == 0U || characterAddress == 0U) return 0U;
+    const auto table = gModuleBase + kCharacterRegistry.table;
+    for (std::size_t index = 0U;
+         index < kCharacterRegistry.capacity;
+         ++index) {
+        const auto entry = table + index * kCharacterRegistry.stride;
+        const auto character = crash_guard::SafeRead<std::uintptr_t>(
+            reinterpret_cast<const void*>(entry + kCharacterRegistry.character));
+        if (!character.has_value() || *character != characterAddress) continue;
+        const auto physicalBody = crash_guard::SafeRead<std::uintptr_t>(
+            reinterpret_cast<const void*>(entry + kCharacterRegistry.physicalBody));
+        const auto secondaryBody = crash_guard::SafeRead<std::uintptr_t>(
+            reinterpret_cast<const void*>(entry + kCharacterRegistry.secondaryBody));
+        const auto active = crash_guard::SafeRead<std::uint8_t>(
+            reinterpret_cast<const void*>(entry + kCharacterRegistry.active));
+        if (!physicalBody.has_value() || *physicalBody == 0U ||
+            !secondaryBody.has_value() || *secondaryBody == 0U ||
+            !active.has_value() || *active == 0U)
+            return 0U;
+        return entry;
+    }
+    return 0U;
+}
+
+bool TeleportCharacter(
+    const std::uintptr_t characterAddress,
+    const float x,
+    const float y,
+    const float z) noexcept {
+    if (gTeleportCharacter == nullptr || !std::isfinite(x) ||
+        !std::isfinite(y) || !std::isfinite(z))
+        return false;
+    const auto entry = FindCharacterRegistryEntry(characterAddress);
+    if (entry == 0U) return false;
+    alignas(16) const std::array<float, 4> position{x, y, z, 0.0F};
+#if defined(_MSC_VER)
+    __try {
+        gTeleportCharacter(
+            reinterpret_cast<void*>(entry),
+            position.data());
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    gTeleportCharacter(reinterpret_cast<void*>(entry), position.data());
+    return true;
+#endif
+}
+
+bool ApplyPhysicalDelta(
+    const std::uintptr_t characterAddress,
+    const float x,
+    const float y,
+    const float z,
+    const float yaw) noexcept {
+    const auto offsets = PhysicalOffsets();
+    return crash_guard::TryWrite(
+               reinterpret_cast<void*>(characterAddress + offsets.x),
+               &x,
+               sizeof(x)) &&
+        crash_guard::TryWrite(
+               reinterpret_cast<void*>(characterAddress + offsets.y),
+               &y,
+               sizeof(y)) &&
+        crash_guard::TryWrite(
+               reinterpret_cast<void*>(characterAddress + offsets.z),
+               &z,
+               sizeof(z)) &&
+        crash_guard::TryWrite(
+               reinterpret_cast<void*>(characterAddress + offsets.yaw),
+               &yaw,
+               sizeof(yaw));
+}
+
+bool ReadNativeCycle(
+    const std::uintptr_t characterAddress,
+    std::uintptr_t& cycleAddress,
+    std::uint8_t& cycleState) noexcept {
+    const auto cycle = crash_guard::SafeRead<std::uintptr_t>(
+        reinterpret_cast<const void*>(
+            characterAddress + kNpcLocomotionCycleOffset));
+    if (!cycle.has_value() || *cycle == 0U) return false;
+    const auto owner = crash_guard::SafeRead<std::uintptr_t>(
+        reinterpret_cast<const void*>(
+            *cycle + kNpcLocomotionCycleOwnerOffset));
+    const auto state = crash_guard::SafeRead<std::uint8_t>(
+        reinterpret_cast<const void*>(
+            *cycle + kNpcLocomotionCycleStateOffset));
+    if (!owner.has_value() || *owner != characterAddress ||
+        !state.has_value())
+        return false;
+    cycleAddress = *cycle;
+    cycleState = *state;
+    return true;
+}
+
+bool IsNativeLocomotionCycle(const std::uintptr_t cycleAddress) noexcept {
+    if (cycleAddress == 0U || gModuleBase == 0U) return false;
+    const auto vtable = crash_guard::SafeRead<std::uintptr_t>(
+        reinterpret_cast<const void*>(cycleAddress));
+    if (!vtable.has_value() ||
+        *vtable != gModuleBase + kNativeRvas.npcLocomotionVtable)
+        return false;
+    const auto update = crash_guard::SafeRead<std::uintptr_t>(
+        reinterpret_cast<const void*>(*vtable + 0x20U));
+    return update.has_value() &&
+        *update == gModuleBase + kNativeRvas.npcLocomotionCycleUpdate;
+}
+
+bool IsNativeMoveState(
+    const std::uintptr_t cycleAddress,
+    const std::uint8_t cycleState) noexcept {
+    // Runtime evidence from the retail executable is explicit here: the AI
+    // caller checks cycle+0x1A against 0x38 before invoking +257900, and the
+    // +257900 transition itself writes 0x38. The vtable proves the object type;
+    // it is not sufficient evidence that the Move state is actually active.
+    return cycleState == kNpcLocomotionMoveState &&
+        IsNativeLocomotionCycle(cycleAddress);
+}
+
+bool IsNativeIdleState(const std::uint8_t cycleState) noexcept {
+    return cycleState == kNpcLocomotionIdleState;
+}
+
+bool ApplyRetailMoveType(
+    MovementSlot& slot,
+    const std::uintptr_t characterAddress,
+    const std::uint32_t moveType,
+    const bool forceValidation = false) noexcept {
+    if (characterAddress == 0U || moveType > 3U) return false;
+
+    const auto now = GetTickCount64();
+    const auto applied = slot.appliedMoveType.load(std::memory_order_acquire);
+    const auto lastValidation =
+        slot.lastMoveTypeValidationTickMs.load(std::memory_order_acquire);
+    if (!forceValidation && applied == moveType &&
+        now - lastValidation < kMoveTypeValidationIntervalMilliseconds)
+        return true;
+
+    const auto movementAction = crash_guard::SafeRead<std::uintptr_t>(
+        reinterpret_cast<const void*>(
+            characterAddress + kMovementActionObjectOffset));
+    if (!movementAction.has_value() || *movementAction == 0U) return false;
+    slot.movementActionAddress.store(*movementAction, std::memory_order_release);
+
+    // v10.4 re-read and potentially rewrote +0x194/+0x190 every engine tick.
+    // +0x190 is a live retail state field, so forcing it continuously can
+    // perturb the animation graph and stalls the hot CharacterManager path.
+    // Apply the retail gait only on a real gait transition, then validate it
+    // at a low rate so AI-side writes cannot silently steal the mode.
+    const auto current = crash_guard::SafeRead<std::uint32_t>(
+        reinterpret_cast<const void*>(
+            *movementAction + kMovementActionMoveTypeOffset));
+    if (!current.has_value()) return false;
+
+    if (forceValidation || *current != moveType || applied != moveType) {
+        if (!crash_guard::TryWrite(
+                reinterpret_cast<void*>(
+                    *movementAction + kMovementActionMoveTypeOffset),
+                &moveType, sizeof(moveType)))
+            return false;
+        const std::uint32_t reset = 0U;
+        if (!crash_guard::TryWrite(
+                reinterpret_cast<void*>(
+                    *movementAction + kMovementActionModeResetOffset),
+                &reset, sizeof(reset)))
+            return false;
+    }
+
+    slot.appliedMoveType.store(moveType, std::memory_order_release);
+    slot.lastMoveTypeValidationTickMs.store(now, std::memory_order_release);
+    return true;
+}
+
+bool PrepareNativeMovementAction(
+    const std::uintptr_t characterAddress) noexcept {
+    if (characterAddress == 0U) return false;
+
+    // Retail FUN_00450710 does more than call +257900: on the normal movement
+    // path it first acquires CharacterBase+42A8 through FUN_00402080 and writes
+    // movementAction+08 = 2. Calling +257900 alone can put cycle+1A in 0x38
+    // without connecting the movement action to the animation graph, producing
+    // the frozen pre-run pose observed in v10/v10.2. The remote controller has
+    // no AI destination object, so it reproduces the retail movement-action
+    // state directly and keeps AI destination ownership out of the path.
+    const auto movementAction = crash_guard::SafeRead<std::uintptr_t>(
+        reinterpret_cast<const void*>(
+            characterAddress + kMovementActionObjectOffset));
+    if (!movementAction.has_value() || *movementAction == 0U) return false;
+
+    const auto moveState = kMovementActionMoveState;
+    return crash_guard::TryWrite(
+        reinterpret_cast<void*>(
+            *movementAction + kMovementActionStateOffset),
+        &moveState,
+        sizeof(moveState));
+}
+
+bool CallNativeMoveTransition(
+    MovementSlot& slot,
+    const std::uintptr_t characterAddress,
+    const bool reacquisition) noexcept {
+    slot.activationAttempts.fetch_add(1U, std::memory_order_relaxed);
+    AppendLocomotionFlight(reacquisition ? "move_reacquire_attempt" : "move_activate_attempt",
+        slot, characterAddress, slot.stateAddress.load(std::memory_order_relaxed),
+        slot.lastObservedNativeState.load(std::memory_order_relaxed));
+    if (reacquisition) {
+        slot.nativeStateReacquireAttempts.fetch_add(
+            1U, std::memory_order_relaxed);
+    }
+
+    std::uintptr_t cycleAddress = 0U;
+    std::uint8_t cycleState = 0U;
+    if (gActivateLocomotionCycle == nullptr ||
+        !ReadNativeCycle(characterAddress, cycleAddress, cycleState)) {
+        slot.activationFailures.fetch_add(1U, std::memory_order_relaxed);
+        AppendLocomotionFlight("move_cycle_unavailable", slot, characterAddress,
+            cycleAddress, cycleState);
+        return false;
+    }
+    slot.stateAddress.store(cycleAddress, std::memory_order_release);
+    slot.lastObservedNativeState.store(cycleState, std::memory_order_release);
+
+    // 0x38 is the real native Move state. Do not treat the locomotion-class
+    // vtable alone as an active Move: the same persistent cycle object can be
+    // observed while its state byte is Idle/transitioning. This was the v10
+    // regression that let network control write movement values without first
+    // starting the native animation state.
+    if (IsNativeMoveState(cycleAddress, cycleState)) {
+        slot.nativeStateActive.store(true, std::memory_order_release);
+        slot.activationReuses.fetch_add(1U, std::memory_order_relaxed);
+        if (reacquisition) {
+            slot.nativeStateReacquireSuccesses.fetch_add(
+                1U, std::memory_order_relaxed);
+        }
+        AppendLocomotionFlight(reacquisition ? "move_reacquire_reuse" : "move_activate_reuse",
+            slot, characterAddress, cycleAddress, cycleState);
+        return true;
+    }
+
+    const auto moveType = slot.moveType.load(std::memory_order_acquire);
+    if (!ApplyRetailMoveType(slot, characterAddress, moveType, true) ||
+        !PrepareNativeMovementAction(characterAddress)) {
+        slot.nativeStateActive.store(false, std::memory_order_release);
+        slot.activationFailures.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+
+#if defined(_MSC_VER)
+    __try {
+        // This is the HookManager trampoline, not the detoured entry. Retail
+        // FUN_00450710 prepares movementAction+08 before making this call; the
+        // remote controller reproduced that prerequisite immediately above.
+        gActivateLocomotionCycle(reinterpret_cast<void*>(cycleAddress));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        slot.nativeStateActive.store(false, std::memory_order_release);
+        slot.activationFailures.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+#else
+    gActivateLocomotionCycle(reinterpret_cast<void*>(cycleAddress));
+#endif
+
+    std::uintptr_t activatedCycle = 0U;
+    std::uint8_t activatedState = 0U;
+    const auto activated = ReadNativeCycle(
+            characterAddress, activatedCycle, activatedState) &&
+        activatedCycle == cycleAddress &&
+        IsNativeMoveState(activatedCycle, activatedState);
+    slot.lastObservedNativeState.store(
+        activatedState, std::memory_order_release);
+    slot.nativeStateActive.store(activated, std::memory_order_release);
+    if (!activated) {
+        slot.activationFailures.fetch_add(1U, std::memory_order_relaxed);
+        AppendLocomotionFlight("move_activate_failed", slot, characterAddress,
+            activatedCycle, activatedState);
+        return false;
+    }
+    slot.activationApplications.fetch_add(1U, std::memory_order_relaxed);
+    if (reacquisition) {
+        slot.nativeStateReacquireSuccesses.fetch_add(
+            1U, std::memory_order_relaxed);
+    }
+    AppendLocomotionFlight(reacquisition ? "move_reacquire_applied" : "move_activate_applied",
+        slot, characterAddress, activatedCycle, activatedState);
+    return true;
+}
+
+bool CallNativeIdleTransition(
+    MovementSlot& slot,
+    const std::uintptr_t characterAddress) noexcept {
+    std::uintptr_t cycleAddress = 0U;
+    std::uint8_t cycleState = 0U;
+    if (!ReadNativeCycle(characterAddress, cycleAddress, cycleState)) {
+        slot.protectedFailures.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+    slot.stateAddress.store(cycleAddress, std::memory_order_release);
+    slot.lastObservedNativeState.store(cycleState, std::memory_order_release);
+    if (IsNativeIdleState(cycleState)) {
+        slot.nativeStateActive.store(false, std::memory_order_release);
+        return true;
+    }
+    AppendLocomotionFlight("idle_transition_attempt", slot, characterAddress, cycleAddress, cycleState);
+    if (gEnterIdleCycle == nullptr) return false;
+#if defined(_MSC_VER)
+    __try {
+        gEnterIdleCycle(reinterpret_cast<void*>(cycleAddress));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        slot.protectedFailures.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+#else
+    gEnterIdleCycle(reinterpret_cast<void*>(cycleAddress));
+#endif
+    std::uintptr_t nextCycle = 0U;
+    std::uint8_t nextState = 0U;
+    if (!ReadNativeCycle(characterAddress, nextCycle, nextState)) {
+        slot.nativeStateActive.store(false, std::memory_order_release);
+        slot.nativeIdleApplications.fetch_add(1U, std::memory_order_relaxed);
+        return true;
+    }
+    slot.stateAddress.store(nextCycle, std::memory_order_release);
+    slot.lastObservedNativeState.store(nextState, std::memory_order_release);
+    const auto stillMoving = IsNativeMoveState(nextCycle, nextState);
+    slot.nativeStateActive.store(stillMoving, std::memory_order_release);
+    if (!IsNativeIdleState(nextState)) {
+        slot.protectedFailures.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+    slot.nativeIdleApplications.fetch_add(1U, std::memory_order_relaxed);
+    AppendLocomotionFlight("idle_transition_applied", slot, characterAddress, nextCycle, nextState);
+    return true;
+}
+
+bool WriteReplicatedYaw(
+    const std::uintptr_t characterAddress,
+    const float yaw) noexcept {
+    return characterAddress != 0U && std::isfinite(yaw) &&
+        crash_guard::TryWrite(
+            reinterpret_cast<void*>(
+                characterAddress + ReplicatedYawOffset()),
+            &yaw,
+            sizeof(yaw));
+}
+
+bool ReadReplicatedYaw(
+    const std::uintptr_t characterAddress,
+    float& yaw) noexcept {
+    const auto value = crash_guard::SafeRead<float>(
+        reinterpret_cast<const void*>(
+            characterAddress + ReplicatedYawOffset()));
+    if (!value.has_value() || !std::isfinite(*value)) return false;
+    yaw = *value;
+    return true;
+}
+
+float LoadFloat(const std::atomic<std::uint32_t>& bits) noexcept {
+    return std::bit_cast<float>(bits.load(std::memory_order_relaxed));
+}
+
+bool WriteNativeCycleControl(
+    const std::uintptr_t cycleAddress,
+    const NativeCycleControlPlan& plan) noexcept {
+    if (cycleAddress == 0U || !std::isfinite(plan.magnitude) ||
+        !std::isfinite(plan.worldHeading) ||
+        !std::isfinite(plan.intensity))
+        return false;
+    const auto offsets = NativeCycleOffsets();
+    return crash_guard::TryWrite(
+               reinterpret_cast<void*>(cycleAddress + offsets.magnitude),
+               &plan.magnitude,
+               sizeof(plan.magnitude)) &&
+        crash_guard::TryWrite(
+               reinterpret_cast<void*>(cycleAddress + offsets.worldHeading),
+               &plan.worldHeading,
+               sizeof(plan.worldHeading)) &&
+        crash_guard::TryWrite(
+               reinterpret_cast<void*>(cycleAddress + offsets.intensity),
+               &plan.intensity,
+               sizeof(plan.intensity));
+}
+
+bool ControlPayloadChanged(
+    const MovementSlot& slot,
+    const float directionX,
+    const float directionY,
+    const float directionZ,
+    const float deltaYaw,
+    const float intensity,
+    const bool worldSpace,
+    const bool applyPhysicalStep) noexcept {
+    if (slot.controlRevision.load(std::memory_order_acquire) == 0U ||
+        slot.worldSpace.load(std::memory_order_acquire) != worldSpace ||
+        slot.applyPhysicalStep.load(std::memory_order_acquire) !=
+            applyPhysicalStep)
+        return true;
+
+    const auto previousX = LoadFloat(slot.directionXBits);
+    const auto previousY = LoadFloat(slot.directionYBits);
+    const auto previousZ = LoadFloat(slot.directionZBits);
+    const auto previousYaw = LoadFloat(slot.deltaYawBits);
+    const auto previousIntensity = LoadFloat(slot.intensityBits);
+    if (applyPhysicalStep) {
+        return directionX != previousX || directionY != previousY ||
+            directionZ != previousZ || deltaYaw != previousYaw ||
+            intensity != previousIntensity;
+    }
+
+    const auto previousMagnitude = std::hypot(previousX, previousZ);
+    const auto nextMagnitude = std::hypot(directionX, directionZ);
+    if (!std::isfinite(previousMagnitude) || !std::isfinite(nextMagnitude) ||
+        std::abs(previousMagnitude - nextMagnitude) >=
+            kControlMagnitudeEpsilon ||
+        std::abs(previousIntensity - intensity) >=
+            kControlIntensityEpsilon)
+        return true;
+    if (previousMagnitude <= 0.0001F || nextMagnitude <= 0.0001F)
+        return previousMagnitude != nextMagnitude;
+    const auto dot = std::clamp(
+        (previousX * directionX + previousZ * directionZ) /
+            (previousMagnitude * nextMagnitude),
+        -1.0F,
+        1.0F);
+    return dot < kControlDirectionDotThreshold;
+}
+
+void PublishControlPayload(
+    MovementSlot& slot,
+    const float directionX,
+    const float directionY,
+    const float directionZ,
+    const float deltaYaw,
+    const float intensity,
+    const bool worldSpace,
+    const bool applyPhysicalStep) noexcept {
+    if (!ControlPayloadChanged(
+            slot,
+            directionX,
+            directionY,
+            directionZ,
+            deltaYaw,
+            intensity,
+            worldSpace,
+            applyPhysicalStep))
+        return;
+    // Publishing a new control revision never reconstructs the cycle. The
+    // post-AI hook reapplies the latest values after native preprocessing,
+    // because the spawned CIVILIAN controller overwrites them every tick.
+    slot.directionXBits.store(
+        std::bit_cast<std::uint32_t>(directionX),
+        std::memory_order_relaxed);
+    slot.directionYBits.store(
+        std::bit_cast<std::uint32_t>(directionY),
+        std::memory_order_relaxed);
+    slot.directionZBits.store(
+        std::bit_cast<std::uint32_t>(directionZ),
+        std::memory_order_relaxed);
+    slot.deltaYawBits.store(
+        std::bit_cast<std::uint32_t>(deltaYaw),
+        std::memory_order_relaxed);
+    slot.intensityBits.store(
+        std::bit_cast<std::uint32_t>(intensity),
+        std::memory_order_relaxed);
+    slot.worldSpace.store(worldSpace, std::memory_order_relaxed);
+    slot.applyPhysicalStep.store(applyPhysicalStep, std::memory_order_relaxed);
+    slot.controlRevision.fetch_add(1U, std::memory_order_release);
+}
+
+struct FollowerDemand final {
+    bool drive{};
+    bool networkFollower{};
+    bool inputMoving{};
+    float directionX{};
+    float directionZ{};
+    float intensity{};
+};
+
+bool LoadNetworkTarget(
+    const MovementSlot& slot,
+    float& x,
+    float& y,
+    float& z) noexcept {
+    if (!slot.hasNetworkTransform.load(std::memory_order_acquire)) return false;
+    x = LoadFloat(slot.networkXBits);
+    y = LoadFloat(slot.networkYBits);
+    z = LoadFloat(slot.networkZBits);
+    return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
+}
+
+bool ApplyHardNetworkResync(
+    MovementSlot& slot,
+    const std::uintptr_t characterAddress) noexcept {
+    if (slot.initialPlacementPending.load(std::memory_order_acquire)) return false;
+
+    const auto now = GetTickCount64();
+    const auto lease = slot.leaseExpiresAtTickMs.load(std::memory_order_acquire);
+    if (lease == 0U || now >= lease) return false;
+
+    // 5.14 performance pass: the normal follower below already reads the
+    // character transform every engine frame. Hard resync is only an emergency
+    // guard for multi-metre divergence, so probing it every frame duplicated a
+    // native transform read for every remote character. Keep the emergency
+    // path responsive while bounding that duplicate work to 10 Hz.
+    const auto lastProbe = slot.lastHardResyncProbeTickMs.load(
+        std::memory_order_acquire);
+    if (lastProbe != 0U &&
+        now - lastProbe < kFollowerHardResyncProbeIntervalMilliseconds)
+        return false;
+    slot.lastHardResyncProbeTickMs.store(now, std::memory_order_release);
+
+    float targetX = 0.0F;
+    float targetY = 0.0F;
+    float targetZ = 0.0F;
+    if (!LoadNetworkTarget(slot, targetX, targetY, targetZ)) return false;
+
+    float currentX = 0.0F;
+    float currentY = 0.0F;
+    float currentZ = 0.0F;
+    if (!ReadTransform(characterAddress, currentX, currentY, currentZ)) return false;
+
+    const auto dx = targetX - currentX;
+    const auto dy = targetY - currentY;
+    const auto dz = targetZ - currentZ;
+    const auto distanceSquared = dx * dx + dy * dy + dz * dz;
+    constexpr auto hardDistanceSquared =
+        kFollowerHardResyncDistance * kFollowerHardResyncDistance;
+    if (!std::isfinite(distanceSquared) || distanceSquared < hardDistanceSquared)
+        return false;
+
+    const auto last = slot.lastHardResyncAttemptTickMs.load(std::memory_order_acquire);
+    if (last != 0U && now - last < kFollowerHardResyncCooldownMilliseconds)
+        return false;
+    slot.lastHardResyncAttemptTickMs.store(now, std::memory_order_release);
+    slot.hardResyncAttempts.fetch_add(1U, std::memory_order_relaxed);
+    AppendLocomotionFlight("hard_resync_attempt", slot, characterAddress,
+        slot.stateAddress.load(std::memory_order_relaxed),
+        slot.lastObservedNativeState.load(std::memory_order_relaxed));
+
+    if (!TeleportCharacter(characterAddress, targetX, targetY, targetZ)) {
+        AppendLocomotionFlight("hard_resync_failed", slot, characterAddress,
+            slot.stateAddress.load(std::memory_order_relaxed),
+            slot.lastObservedNativeState.load(std::memory_order_relaxed));
+        return false;
+    }
+    slot.transformApplications.fetch_add(1U, std::memory_order_relaxed);
+    slot.teleportApplications.fetch_add(1U, std::memory_order_relaxed);
+    slot.hardResyncApplications.fetch_add(1U, std::memory_order_relaxed);
+    AppendLocomotionFlight("hard_resync_applied", slot, characterAddress,
+        slot.stateAddress.load(std::memory_order_relaxed),
+        slot.lastObservedNativeState.load(std::memory_order_relaxed));
+    return true;
+}
+
+bool BuildFollowerDemand(
+    const MovementSlot& slot,
+    const std::uintptr_t characterAddress,
+    FollowerDemand& demand) noexcept {
+    demand = {};
+    auto inputX = LoadFloat(slot.directionXBits);
+    auto inputZ = LoadFloat(slot.directionZBits);
+    auto intensity = LoadFloat(slot.intensityBits);
+    if (!std::isfinite(inputX) || !std::isfinite(inputZ) ||
+        !std::isfinite(intensity))
+        return false;
+
+    const auto lease = slot.leaseExpiresAtTickMs.load(std::memory_order_acquire);
+    const auto stale = lease != 0U && GetTickCount64() >= lease;
+    if (stale) {
+        inputX = 0.0F;
+        inputZ = 0.0F;
+    }
+
+    const auto inputMagnitude = std::hypot(inputX, inputZ);
+    demand.inputMoving = !stale &&
+        std::isfinite(inputMagnitude) &&
+        inputMagnitude > kMoveRequestEpsilon &&
+        intensity > kMoveRequestEpsilon;
+
+    float targetX = 0.0F;
+    float targetY = 0.0F;
+    float targetZ = 0.0F;
+    // Never chase a stale network transform after its replication lease has
+    // expired. v12.8 could keep settling toward the last old sample even after
+    // network updates stopped, which amplified visible desynchronization.
+    const auto hasTarget = !stale && LoadNetworkTarget(slot, targetX, targetY, targetZ);
+    float errorX = 0.0F;
+    float errorZ = 0.0F;
+    auto planarError = 0.0F;
+    if (hasTarget) {
+        float currentX = 0.0F;
+        float currentY = 0.0F;
+        float currentZ = 0.0F;
+        if (ReadTransform(characterAddress, currentX, currentY, currentZ)) {
+            errorX = targetX - currentX;
+            errorZ = targetZ - currentZ;
+            planarError = std::hypot(errorX, errorZ);
+            if (!std::isfinite(planarError)) return false;
+        }
+    }
+    demand.networkFollower = hasTarget;
+
+    if (demand.inputMoving) {
+        auto headingX = inputX / inputMagnitude;
+        auto headingZ = inputZ / inputMagnitude;
+        auto alongTrackError = 0.0F;
+
+        if (hasTarget && planarError > kMoveRequestEpsilon) {
+            // Keep the remote player's actual travel direction authoritative.
+            // Correct only the lateral component of network error while the
+            // player is moving; otherwise chasing the latest snapshot directly
+            // can make the NPC cut diagonally or briefly travel backwards.
+            alongTrackError = errorX * headingX + errorZ * headingZ;
+            const auto lateralX = errorX - headingX * alongTrackError;
+            const auto lateralZ = errorZ - headingZ * alongTrackError;
+            const auto lateralError = std::hypot(lateralX, lateralZ);
+            if (lateralError > kFollowerLateralCorrectionStart) {
+                const auto correction = std::clamp(
+                    (lateralError - kFollowerLateralCorrectionStart) /
+                        (kFollowerLateralCorrectionFull -
+                         kFollowerLateralCorrectionStart),
+                    0.0F,
+                    kFollowerMaximumLateralBlend);
+                const auto lateralDirectionX = lateralX / lateralError;
+                const auto lateralDirectionZ = lateralZ / lateralError;
+                headingX = headingX * (1.0F - correction) +
+                    lateralDirectionX * correction;
+                headingZ = headingZ * (1.0F - correction) +
+                    lateralDirectionZ * correction;
+                const auto correctedLength = std::hypot(headingX, headingZ);
+                if (correctedLength > kMoveRequestEpsilon) {
+                    headingX /= correctedLength;
+                    headingZ /= correctedLength;
+                }
+            }
+        }
+
+        // Along-track error changes speed, not travel direction. This lets a
+        // slightly lagging replica catch up without steering away from the path
+        // taken by the remote player. Never reverse while the source is moving.
+        const auto catchupMultiplier = hasTarget
+            ? (alongTrackError >= 0.0F
+                ? std::clamp(
+                    1.0F + alongTrackError * kFollowerCatchupGain,
+                    1.0F,
+                    kFollowerMaximumSpeedMultiplier)
+                : std::clamp(
+                    1.0F + alongTrackError * kFollowerAheadBrakeGain,
+                    kFollowerMinimumSpeedMultiplier,
+                    1.0F))
+            : 1.0F;
+        const auto magnitude = std::clamp(
+            inputMagnitude * catchupMultiplier,
+            0.35F,
+            kFollowerMaximumMagnitude);
+        demand.drive = true;
+        demand.directionX = headingX * magnitude;
+        demand.directionZ = headingZ * magnitude;
+        demand.intensity = intensity;
+        return true;
+    }
+
+    // Once the remote player has stopped, finish the remaining network error
+    // through the native locomotion cycle instead of applying a final snap.
+    if (hasTarget && planarError > kFollowerSettleDistance) {
+        const auto magnitude = std::clamp(
+            planarError * 2.5F,
+            kFollowerMinimumSettlingMagnitude,
+            kFollowerMaximumSettlingMagnitude);
+        demand.drive = true;
+        demand.directionX = errorX / planarError * magnitude;
+        demand.directionZ = errorZ / planarError * magnitude;
+        demand.intensity = std::max(intensity, 1.0F);
+        return true;
+    }
+
+    demand.drive = false;
+    demand.intensity = 0.0F;
+    return true;
+}
+
+bool SubmitNativeRequest(
+    const std::uintptr_t characterAddress,
+    const float x,
+    const float y,
+    const float z,
+    const float intensity) noexcept {
+    if (gSubmitLocomotion == nullptr ||
+        !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
+        !std::isfinite(intensity))
+        return false;
+    alignas(16) const std::array<float, 4> direction{x, y, z, 0.0F};
+    const std::uint8_t enabled = 1U;
+    static_assert(sizeof(enabled) == NativeLocomotionFlagWidth());
+    if (!crash_guard::TryWrite(
+            reinterpret_cast<void*>(
+                characterAddress + kLocomotionEnabledOffsetA),
+            &enabled,
+            sizeof(enabled)) ||
+        !crash_guard::TryWrite(
+            reinterpret_cast<void*>(
+                characterAddress + kLocomotionEnabledOffsetB),
+            &enabled,
+            sizeof(enabled)))
+        return false;
+#if defined(_MSC_VER)
+    __try {
+        gSubmitLocomotion(
+            reinterpret_cast<void*>(
+                characterAddress + kLocomotionSubsystemOffset),
+            direction.data(),
+            intensity);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    gSubmitLocomotion(
+        reinterpret_cast<void*>(
+            characterAddress + kLocomotionSubsystemOffset),
+        direction.data(),
+        intensity);
+    return true;
+#endif
+}
+
+bool SubmitStopRequest(
+    MovementSlot& slot,
+    const std::uintptr_t characterAddress) noexcept {
+    // This is a hard release used for teardown or a failed request. Normal
+    // network idle uses HoldWorldReplicationIdle and keeps overriding the AI.
+    const auto cycleAddress =
+        slot.stateAddress.load(std::memory_order_acquire);
+    const NativeCycleControlPlan stoppedPlan{};
+    const auto controlStopped = cycleAddress == 0U ||
+        WriteNativeCycleControl(cycleAddress, stoppedPlan);
+    const auto cycleStopped = !IsNativeLocomotionCycle(cycleAddress) ||
+        CallNativeIdleTransition(slot, characterAddress);
+    const auto nativeStopped = SubmitNativeRequest(
+        characterAddress,
+        0.0F,
+        0.0F,
+        0.0F,
+        0.0F);
+    auto physicalStopped = true;
+    if (slot.applyPhysicalStep.load(std::memory_order_acquire)) {
+        physicalStopped = ApplyPhysicalDelta(
+            characterAddress,
+            0.0F,
+            0.0F,
+            0.0F,
+            0.0F);
+    }
+    if (controlStopped && cycleStopped && nativeStopped && physicalStopped) {
+        slot.stopApplications.fetch_add(1U, std::memory_order_relaxed);
+    } else {
+        slot.protectedFailures.fetch_add(1U, std::memory_order_relaxed);
+    }
+    ReleaseSlot(slot);
+    return controlStopped && cycleStopped && nativeStopped && physicalStopped;
+}
+
+void __fastcall ActivateLocomotionCycleDetour(
+    void* cycle,
+    void*) noexcept {
+    const auto original = reinterpret_cast<ActivateLocomotionCycleFn>(
+        gActivateLocomotionTrampoline);
+    if (original == nullptr || cycle == nullptr) return;
+    const auto cycleAddress = reinterpret_cast<std::uintptr_t>(cycle);
+    const auto owner = crash_guard::SafeRead<std::uintptr_t>(
+        reinterpret_cast<const void*>(
+            cycleAddress + kNpcLocomotionCycleOwnerOffset));
+    if (!owner.has_value() || *owner == 0U) {
+        original(cycle);
+        return;
+    }
+    auto* slot = FindSlot(*owner);
+    if (slot == nullptr) {
+        original(cycle);
+        return;
+    }
+
+    // If the network is currently asking this Character to move, an AI-side
+    // activation can safely be co-opted as a native 0x38 state transition. The
+    // post-AI hook still replaces the AI heading/speed before locomotion is
+    // submitted, so no AI destination survives. While network-idle, activation
+    // remains blocked to prevent the delayed return-to-spawn behavior.
+    const auto state = crash_guard::SafeRead<std::uint8_t>(
+        reinterpret_cast<const void*>(
+            cycleAddress + kNpcLocomotionCycleStateOffset));
+    if (slot->driveRequested.load(std::memory_order_acquire) &&
+        (!state.has_value() || *state != kNpcLocomotionMoveState)) {
+        original(cycle);
+        return;
+    }
+    slot->aiActivationSuppressions.fetch_add(1U, std::memory_order_relaxed);
+    return;
+}
+
+void __fastcall EnterIdleCycleDetour(
+    void* cycle,
+    void*) noexcept {
+    const auto original = reinterpret_cast<EnterIdleCycleFn>(
+        gEnterIdleCycleTrampoline);
+    if (original == nullptr || cycle == nullptr) return;
+    const auto cycleAddress = reinterpret_cast<std::uintptr_t>(cycle);
+    const auto owner = crash_guard::SafeRead<std::uintptr_t>(
+        reinterpret_cast<const void*>(
+            cycleAddress + kNpcLocomotionCycleOwnerOffset));
+    if (!owner.has_value() || *owner == 0U) {
+        original(cycle);
+        return;
+    }
+    auto* slot = FindSlot(*owner);
+    if (slot == nullptr) {
+        original(cycle);
+        return;
+    }
+
+    // During a network Move, CIVILIAN AI cannot tear down 0x38 underneath the
+    // remote controller. Once the network wants Idle, allowing the engine's
+    // own Idle transition is harmless and keeps the animation graph natural;
+    // the engine-thread pump independently reconciles the state as a fallback.
+    if (!slot->driveRequested.load(std::memory_order_acquire)) {
+        original(cycle);
+        return;
+    }
+    slot->aiIdleSuppressions.fetch_add(1U, std::memory_order_relaxed);
+    return;
+}
+
+void __cdecl ApplyReplicatedEffectiveMoveType(
+    const std::uintptr_t movementActionAddress) noexcept {
+    auto* slot = FindSlotByMovementAction(movementActionAddress);
+    if (slot == nullptr ||
+        !slot->driveRequested.load(std::memory_order_acquire))
+        return;
+
+    const auto moveType = slot->moveType.load(std::memory_order_acquire);
+    if (moveType > 3U) return;
+
+    // Retail state 2 can recompute +0x198 from MovementAction's own internal
+    // velocity immediately before this hook. The remote Character is driven by
+    // ActNPCLocomotionCycle, so that private velocity is not authoritative for
+    // our proxy. Keep both requested (+0x194) and effective (+0x198) gait
+    // coherent for downstream animation consumers, but NEVER write the private
+    // +0x1AC/+0x1B4 velocity fields. v10.7 did that and corrupted leg motion
+    // even at rest because those fields are engine-owned and use a different
+    // frame/lifecycle than our replicated world vector.
+    const auto applied =
+        crash_guard::TryWrite(
+            reinterpret_cast<void*>(
+                movementActionAddress + kMovementActionMoveTypeOffset),
+            &moveType,
+            sizeof(moveType)) &&
+        crash_guard::TryWrite(
+            reinterpret_cast<void*>(
+                movementActionAddress + kMovementActionCurrentMoveTypeOffset),
+            &moveType,
+            sizeof(moveType));
+    if (applied) {
+        slot->effectiveMoveTypeApplications.fetch_add(
+            1U, std::memory_order_relaxed);
+    } else {
+        slot->protectedFailures.fetch_add(1U, std::memory_order_relaxed);
+    }
+}
+
+void __cdecl RecordNpcLocomotionFinalSubmission(
+    const std::uintptr_t cycleAddress,
+    const std::uintptr_t characterAddress) noexcept {
+    auto* slot = FindSlot(characterAddress);
+    if (slot == nullptr || cycleAddress == 0U) return;
+    if (slot->stateAddress.load(std::memory_order_acquire) != cycleAddress)
+        return;
+    slot->finalSubmissions.fetch_add(1U, std::memory_order_relaxed);
+}
+
+void __cdecl ApplyAtNpcLocomotionPreTransform(
+    const std::uintptr_t cycleAddress,
+    const std::uintptr_t characterAddress,
+    const std::uintptr_t orientationObject) noexcept {
+    auto* slot = FindSlot(characterAddress);
+    if (slot == nullptr || cycleAddress == 0U) return;
+
+    const auto owner = crash_guard::SafeRead<std::uintptr_t>(
+        reinterpret_cast<const void*>(
+            cycleAddress + kNpcLocomotionCycleOwnerOffset));
+    if (!owner.has_value() || *owner != characterAddress) {
+        slot->protectedFailures.fetch_add(1U, std::memory_order_relaxed);
+        return;
+    }
+
+    slot->stateAddress.store(cycleAddress, std::memory_order_release);
+    const auto state = crash_guard::SafeRead<std::uint8_t>(
+        reinterpret_cast<const void*>(
+            cycleAddress + kNpcLocomotionCycleStateOffset));
+    const auto observedState = state.value_or(0U);
+    slot->lastObservedNativeState.store(
+        observedState, std::memory_order_release);
+    const auto moveStateActive = state.has_value() &&
+        IsNativeMoveState(cycleAddress, observedState);
+    slot->nativeStateActive.store(
+        moveStateActive, std::memory_order_release);
+    slot->hookHits.fetch_add(1U, std::memory_order_relaxed);
+    slot->lastCharacter.store(characterAddress, std::memory_order_relaxed);
+    slot->lastHookTickMs.store(GetTickCount64(), std::memory_order_release);
+
+    // Never feed movement controls into an Idle/transition state. v10 could
+    // write +4C/+50/+5C while cycle+0x1A was still 0x01, which produced the
+    // frozen pre-run pose / sliding behavior reported in game. PumpOnEngineThread
+    // owns the 0x01 -> 0x38 transition; controls start on the next valid 0x38 tick.
+    if (!moveStateActive) return;
+
+    FollowerDemand demand{};
+    if (!BuildFollowerDemand(*slot, characterAddress, demand)) {
+        slot->protectedFailures.fetch_add(1U, std::memory_order_relaxed);
+        return;
+    }
+
+    NativeCycleControlPlan control{};
+    if (demand.drive) {
+        auto built = false;
+
+        // Network snapshots describe motion in world space, but retail
+        // ActNPCLocomotionCycle does not consume an absolute world heading. At
+        // +26D4F6 it fetches orientationObject+184, then FUN_0043CD30 computes
+        // (cycleHeading - nativeOrientation) before producing cycle+68/+64.
+        // v10/v10.2 wrote an absolute atan2 heading before that subtraction,
+        // which is why source-forward could become receiver-left. At this hook
+        // EAX has already been resolved by AI.exe to that exact orientation
+        // object, so compensate in the engine's own frame instead of guessing
+        // a +/-90 or 180 degree offset.
+        if (demand.networkFollower) {
+            if (!slot->hasReplicatedYaw.load(std::memory_order_acquire) ||
+                orientationObject == 0U) {
+                slot->protectedFailures.fetch_add(
+                    1U, std::memory_order_relaxed);
+                return;
+            }
+            const auto nativeOrientation = crash_guard::SafeRead<float>(
+                reinterpret_cast<const void*>(
+                    orientationObject + kNativeOrientationOffset));
+            const auto replicatedYaw = LoadFloat(slot->replicatedYawBits);
+            if (!nativeOrientation.has_value() ||
+                !TryBuildOrientationAwareNativeCycleControlPlan(
+                    demand.directionX,
+                    demand.directionZ,
+                    demand.intensity,
+                    replicatedYaw,
+                    *nativeOrientation,
+                    control)) {
+                slot->protectedFailures.fetch_add(
+                    1U, std::memory_order_relaxed);
+                return;
+            }
+            built = true;
+        } else {
+            auto characterYaw = 0.0F;
+            const auto worldSpace =
+                slot->worldSpace.load(std::memory_order_acquire);
+            if (!worldSpace &&
+                !ReadReplicatedYaw(characterAddress, characterYaw)) {
+                slot->protectedFailures.fetch_add(
+                    1U, std::memory_order_relaxed);
+                return;
+            }
+            built = TryBuildNativeCycleControlPlan(
+                demand.directionX,
+                demand.directionZ,
+                demand.intensity,
+                worldSpace,
+                characterYaw,
+                control);
+        }
+
+        if (!built) {
+            slot->protectedFailures.fetch_add(1U, std::memory_order_relaxed);
+            return;
+        }
+        if (demand.networkFollower) {
+            slot->followerApplications.fetch_add(1U, std::memory_order_relaxed);
+        }
+    }
+
+    // This hook runs at mod.main()+26D4FE, after AI.exe has fetched its native
+    // orientation reference and immediately before FUN_0043CD30 transforms the
+    // cycle heading into local X/Z. For a bound remote Character +4C/+50/+5C
+    // are authoritative from the network follower, while the retail animation
+    // timeline and final +28D6D0 submission remain native.
+    if (!WriteNativeCycleControl(cycleAddress, control)) {
+        slot->protectedFailures.fetch_add(1U, std::memory_order_relaxed);
+        return;
+    }
+    slot->appliedControlRevision.store(
+        slot->controlRevision.load(std::memory_order_acquire),
+        std::memory_order_release);
+    slot->requestApplications.fetch_add(1U, std::memory_order_relaxed);
+
+    if (slot->applyPhysicalStep.load(std::memory_order_acquire)) {
+        const auto directionX = LoadFloat(slot->directionXBits);
+        const auto directionY = LoadFloat(slot->directionYBits);
+        const auto directionZ = LoadFloat(slot->directionZBits);
+        const auto deltaYaw = LoadFloat(slot->deltaYawBits);
+        if (ApplyPhysicalDelta(
+                characterAddress,
+                directionX,
+                directionY,
+                directionZ,
+                deltaYaw)) {
+            slot->physicalApplications.fetch_add(1U, std::memory_order_relaxed);
+        } else {
+            slot->protectedFailures.fetch_add(1U, std::memory_order_relaxed);
+        }
+    }
+
+    // World replication is persistent ownership. Snapshot loss makes the
+    // follower settle/idle; it must never release the slot back to the AI.
+    if (slot->hasNetworkTransform.load(std::memory_order_acquire)) return;
+
+    auto remaining = slot->remainingFrames.load(std::memory_order_acquire);
+    if (remaining == 0U || remaining == kPersistentReplicationFrames) return;
+    while (remaining > 0U &&
+        !slot->remainingFrames.compare_exchange_weak(
+            remaining,
+            remaining - 1U,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+    }
+    if (remaining == 1U) {
+        slot->stopPending.store(true, std::memory_order_release);
+    }
+}
+
+bool ArmCore(
+    const std::uintptr_t characterAddress,
+    const float directionX,
+    const float directionY,
+    const float directionZ,
+    const float deltaYaw,
+    const float intensity,
+    const bool worldSpace,
+    const bool hasNetworkTransform,
+    const float networkX,
+    const float networkY,
+    const float networkZ,
+    const bool hasReplicatedYaw,
+    const float replicatedYaw,
+    const bool hasMoveType,
+    const std::uint32_t moveType,
+    const bool applyPhysicalStep,
+    const std::uint32_t frameCount,
+    std::string& error) noexcept {
+    if (!Installed()) {
+        error = "Character remote-player controller is not installed";
+        return false;
+    }
+    if (characterAddress == 0U ||
+        !std::isfinite(directionX) || !std::isfinite(directionY) ||
+        !std::isfinite(directionZ) || !std::isfinite(deltaYaw) ||
+        !std::isfinite(intensity)) {
+        error = "Character remote-player arguments are invalid";
+        return false;
+    }
+    if (hasNetworkTransform &&
+        (!worldSpace || !std::isfinite(networkX) ||
+         !std::isfinite(networkY) || !std::isfinite(networkZ))) {
+        error = "Authoritative network transform is invalid";
+        return false;
+    }
+    if (hasReplicatedYaw &&
+        (!worldSpace || !std::isfinite(replicatedYaw) ||
+         replicatedYaw < -3.3F || replicatedYaw > 3.3F)) {
+        error = "Replicated yaw is invalid";
+        return false;
+    }
+    if (hasMoveType && (!worldSpace || moveType > 3U)) {
+        error = "Retail move_type is outside SLOW_WALK..RUN";
+        return false;
+    }
+    if (frameCount == 0U && !hasNetworkTransform) return Stop(characterAddress);
+
+    const auto wasKnown = FindSlot(characterAddress) != nullptr;
+    auto* slot = FindOrAllocateSlot(characterAddress);
+    if (slot == nullptr) {
+        error = "No free remote-player locomotion slot is available";
+        return false;
+    }
+
+    PublishControlPayload(
+        *slot,
+        directionX,
+        directionY,
+        directionZ,
+        deltaYaw,
+        intensity,
+        worldSpace,
+        applyPhysicalStep);
+    slot->networkXBits.store(
+        std::bit_cast<std::uint32_t>(networkX),
+        std::memory_order_relaxed);
+    slot->networkYBits.store(
+        std::bit_cast<std::uint32_t>(networkY),
+        std::memory_order_relaxed);
+    slot->networkZBits.store(
+        std::bit_cast<std::uint32_t>(networkZ),
+        std::memory_order_relaxed);
+    slot->replicatedYawBits.store(
+        std::bit_cast<std::uint32_t>(replicatedYaw),
+        std::memory_order_relaxed);
+    slot->hasNetworkTransform.store(
+        hasNetworkTransform,
+        std::memory_order_release);
+    slot->hasReplicatedYaw.store(hasReplicatedYaw, std::memory_order_release);
+    if (hasMoveType) {
+        const auto previousMoveType =
+            slot->moveType.exchange(moveType, std::memory_order_acq_rel);
+        if (previousMoveType != moveType) {
+            slot->appliedMoveType.store(
+                kInvalidMoveType, std::memory_order_release);
+            slot->lastMoveTypeValidationTickMs.store(
+                0U, std::memory_order_release);
+        }
+    }
+    slot->leaseExpiresAtTickMs.store(
+        hasNetworkTransform
+            ? GetTickCount64() + kReplicationLeaseMilliseconds
+            : 0U,
+        std::memory_order_release);
+    slot->stopPending.store(false, std::memory_order_release);
+    const auto requestedMagnitude = std::hypot(directionX, directionZ);
+    slot->driveRequested.store(
+        std::isfinite(requestedMagnitude) &&
+            requestedMagnitude > kMoveRequestEpsilon &&
+            intensity > kMoveRequestEpsilon,
+        std::memory_order_release);
+    slot->remainingFrames.store(frameCount, std::memory_order_release);
+    if (!wasKnown && hasNetworkTransform) {
+        slot->initialPlacementPending.store(true, std::memory_order_release);
+    }
+
+    // Native state changes are intentionally NOT performed from the command
+    // dispatch path. CharacterManagerUpdate calls PumpOnEngineThread(), which
+    // owns activation, Idle, yaw, initial placement and AI suppression timing.
+    std::uintptr_t cycleAddress = 0U;
+    std::uint8_t cycleState = 0U;
+    if (ReadNativeCycle(characterAddress, cycleAddress, cycleState)) {
+        slot->stateAddress.store(cycleAddress, std::memory_order_release);
+        slot->lastObservedNativeState.store(cycleState, std::memory_order_release);
+        slot->nativeStateActive.store(
+            IsNativeMoveState(cycleAddress, cycleState),
+            std::memory_order_release);
+    }
+    gLastArmedCharacter.store(characterAddress, std::memory_order_release);
+    return true;
+}
+
+#if defined(_MSC_VER) && defined(_M_IX86)
+__declspec(naked) void MovementActionPostGaitDetour() {
+    __asm {
+        // mod.main()+5B874 / AI.exe.text+5A874 is the first instruction
+        // after retail state-2 gait selection has finished updating +0x198.
+        // ESI is the MovementAction. Preserve the machine state, restore the
+        // replicated effective gait for owned remote Characters, then let the
+        // trampoline execute the displaced movss xmm0,[esi+144].
+        sub esp, 080h
+        movdqu [esp + 000h], xmm0
+        movdqu [esp + 010h], xmm1
+        movdqu [esp + 020h], xmm2
+        movdqu [esp + 030h], xmm3
+        movdqu [esp + 040h], xmm4
+        movdqu [esp + 050h], xmm5
+        movdqu [esp + 060h], xmm6
+        movdqu [esp + 070h], xmm7
+        pushfd
+        pushad
+
+        push esi
+        call ApplyReplicatedEffectiveMoveType
+        add esp, 4
+
+        popad
+        popfd
+        movdqu xmm0, [esp + 000h]
+        movdqu xmm1, [esp + 010h]
+        movdqu xmm2, [esp + 020h]
+        movdqu xmm3, [esp + 030h]
+        movdqu xmm4, [esp + 040h]
+        movdqu xmm5, [esp + 050h]
+        movdqu xmm6, [esp + 060h]
+        movdqu xmm7, [esp + 070h]
+        add esp, 080h
+        jmp dword ptr [gMovementActionPostGaitTrampoline]
+    }
+}
+
+__declspec(naked) void NpcLocomotionPreTransformDetour() {
+    __asm {
+        // At mod.main()+26D4FE the retail code has just executed
+        //   mov eax,[helperResult]
+        //   movss xmm0,[eax+184]
+        // so ESI is the locomotion cycle and EAX is the exact native
+        // orientation object used by FUN_0043CD30. Preserve the full machine
+        // state, inject network controls in that same orientation frame, then
+        // execute the displaced LEA/PUSH sequence through the trampoline.
+        sub esp, 080h
+        movdqu [esp + 000h], xmm0
+        movdqu [esp + 010h], xmm1
+        movdqu [esp + 020h], xmm2
+        movdqu [esp + 030h], xmm3
+        movdqu [esp + 040h], xmm4
+        movdqu [esp + 050h], xmm5
+        movdqu [esp + 060h], xmm6
+        movdqu [esp + 070h], xmm7
+        pushfd
+        pushad
+
+        push eax
+        mov eax, dword ptr [esi + 4]
+        push eax
+        push esi
+        call ApplyAtNpcLocomotionPreTransform
+        add esp, 12
+
+        popad
+        popfd
+        movdqu xmm0, [esp + 000h]
+        movdqu xmm1, [esp + 010h]
+        movdqu xmm2, [esp + 020h]
+        movdqu xmm3, [esp + 030h]
+        movdqu xmm4, [esp + 040h]
+        movdqu xmm5, [esp + 050h]
+        movdqu xmm6, [esp + 060h]
+        movdqu xmm7, [esp + 070h]
+        add esp, 080h
+        jmp dword ptr [gNpcLocomotionPreTransformTrampoline]
+    }
+}
+
+__declspec(naked) void NpcLocomotionPostSubmitDetour() {
+    __asm {
+        sub esp, 080h
+        movdqu [esp + 000h], xmm0
+        movdqu [esp + 010h], xmm1
+        movdqu [esp + 020h], xmm2
+        movdqu [esp + 030h], xmm3
+        movdqu [esp + 040h], xmm4
+        movdqu [esp + 050h], xmm5
+        movdqu [esp + 060h], xmm6
+        movdqu [esp + 070h], xmm7
+        pushfd
+        pushad
+
+        mov eax, dword ptr [esi + 4]
+        push eax
+        push esi
+        call RecordNpcLocomotionFinalSubmission
+        add esp, 8
+
+        popad
+        popfd
+        movdqu xmm0, [esp + 000h]
+        movdqu xmm1, [esp + 010h]
+        movdqu xmm2, [esp + 020h]
+        movdqu xmm3, [esp + 030h]
+        movdqu xmm4, [esp + 040h]
+        movdqu xmm5, [esp + 050h]
+        movdqu xmm6, [esp + 060h]
+        movdqu xmm7, [esp + 070h]
+        add esp, 080h
+        jmp dword ptr [gNpcLocomotionPostSubmitTrampoline]
+    }
+}
+#endif
+
+void PumpSlotOnEngineThread(MovementSlot& slot) noexcept {
+    const auto characterAddress =
+        slot.characterAddress.load(std::memory_order_acquire);
+    if (characterAddress == 0U || characterAddress == kReservedSlot) return;
+    slot.enginePumpApplications.fetch_add(1U, std::memory_order_relaxed);
+    slot.lastCharacter.store(characterAddress, std::memory_order_relaxed);
+
+    if (slot.stopPending.load(std::memory_order_acquire)) {
+        SubmitStopRequest(slot, characterAddress);
+        return;
+    }
+
+    if (slot.hasReplicatedYaw.load(std::memory_order_acquire)) {
+        const auto yaw = LoadFloat(slot.replicatedYawBits);
+        if (!WriteReplicatedYaw(characterAddress, yaw)) {
+            slot.protectedFailures.fetch_add(1U, std::memory_order_relaxed);
+        }
+    }
+
+    if (slot.initialPlacementPending.load(std::memory_order_acquire)) {
+        float targetX = 0.0F;
+        float targetY = 0.0F;
+        float targetZ = 0.0F;
+        if (LoadNetworkTarget(slot, targetX, targetY, targetZ)) {
+            float currentX = 0.0F;
+            float currentY = 0.0F;
+            float currentZ = 0.0F;
+            if (ReadTransform(characterAddress, currentX, currentY, currentZ)) {
+                const auto dx = targetX - currentX;
+                const auto dy = targetY - currentY;
+                const auto dz = targetZ - currentZ;
+                const auto distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+                if (std::isfinite(distance) &&
+                    distance <= kFollowerInitialPlacementTolerance) {
+                    slot.initialPlacementPending.store(false, std::memory_order_release);
+                } else if (std::isfinite(distance) &&
+                    TeleportCharacter(characterAddress, targetX, targetY, targetZ)) {
+                    slot.initialPlacementPending.store(false, std::memory_order_release);
+                    slot.transformApplications.fetch_add(1U, std::memory_order_relaxed);
+                    slot.teleportApplications.fetch_add(1U, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
+
+    // v13: locomotion remains the normal correction path, but a Character that
+    // diverges substantially from the latest authoritative player transform is
+    // snapped back through the game's validated native teleport primitive.
+    // This prevents a transient locomotion/pathing failure from becoming a
+    // permanent multi-metre desynchronization.
+    static_cast<void>(ApplyHardNetworkResync(slot, characterAddress));
+
+    std::uintptr_t cycleAddress = 0U;
+    std::uint8_t cycleState = 0U;
+    if (!ReadNativeCycle(characterAddress, cycleAddress, cycleState)) {
+        AppendLocomotionFlight("pump_cycle_unavailable", slot, characterAddress, cycleAddress, cycleState);
+        slot.nativeStateActive.store(false, std::memory_order_release);
+        slot.stateAddress.store(0U, std::memory_order_release);
+        return;
+    }
+    const auto previousCycle = slot.stateAddress.exchange(
+        cycleAddress, std::memory_order_acq_rel);
+    slot.lastObservedNativeState.store(cycleState, std::memory_order_release);
+    auto nativeMoving = IsNativeMoveState(cycleAddress, cycleState);
+    const auto cachedNative = slot.nativeStateActive.exchange(
+        nativeMoving, std::memory_order_acq_rel);
+    const auto wasMoving = slot.moveActive.load(std::memory_order_acquire);
+    if (wasMoving && cachedNative &&
+        (!nativeMoving ||
+         (previousCycle != 0U && previousCycle != cycleAddress))) {
+        slot.nativeStateLosses.fetch_add(1U, std::memory_order_relaxed);
+        AppendLocomotionFlight("native_state_loss", slot, characterAddress, cycleAddress, cycleState);
+    }
+
+    const auto flightNow = GetTickCount64();
+    auto previousHeartbeat = gLocomotionFlightHeartbeatTickMs.load(std::memory_order_relaxed);
+    if ((previousHeartbeat == 0U || flightNow - previousHeartbeat >= 1000U) &&
+        gLocomotionFlightHeartbeatTickMs.compare_exchange_strong(
+            previousHeartbeat, flightNow, std::memory_order_relaxed, std::memory_order_relaxed))
+        AppendLocomotionFlight("heartbeat", slot, characterAddress, cycleAddress, cycleState);
+
+    FollowerDemand demand{};
+    if (!BuildFollowerDemand(slot, characterAddress, demand)) {
+        slot.protectedFailures.fetch_add(1U, std::memory_order_relaxed);
+        return;
+    }
+    slot.driveRequested.store(demand.drive, std::memory_order_release);
+
+    if (demand.drive) {
+        if (!ApplyRetailMoveType(
+                slot,
+                characterAddress,
+                slot.moveType.load(std::memory_order_acquire))) {
+            slot.protectedFailures.fetch_add(1U, std::memory_order_relaxed);
+            return;
+        }
+        if (!wasMoving) {
+            slot.enterMoveTransitions.fetch_add(1U, std::memory_order_relaxed);
+        } else {
+            slot.updateMoveTransitions.fetch_add(1U, std::memory_order_relaxed);
+        }
+        if (!nativeMoving) {
+            if (!CallNativeMoveTransition(slot, characterAddress, wasMoving)) {
+                slot.nativeStateActive.store(false, std::memory_order_release);
+                slot.moveActive.store(false, std::memory_order_release);
+                return;
+            }
+            std::uintptr_t verifiedCycle = 0U;
+            std::uint8_t verifiedState = 0U;
+            nativeMoving = ReadNativeCycle(
+                    characterAddress, verifiedCycle, verifiedState) &&
+                IsNativeMoveState(verifiedCycle, verifiedState);
+            slot.stateAddress.store(verifiedCycle, std::memory_order_release);
+            slot.lastObservedNativeState.store(
+                verifiedState, std::memory_order_release);
+        }
+        slot.nativeStateActive.store(nativeMoving, std::memory_order_release);
+        slot.moveActive.store(nativeMoving, std::memory_order_release);
+        return;
+    }
+
+    if (wasMoving) {
+        slot.exitMoveTransitions.fetch_add(1U, std::memory_order_relaxed);
+    } else {
+        slot.idleHoldApplications.fetch_add(1U, std::memory_order_relaxed);
+    }
+    if (!IsNativeIdleState(cycleState) &&
+        !CallNativeIdleTransition(slot, characterAddress)) {
+        return;
+    }
+    slot.moveActive.store(false, std::memory_order_release);
+    slot.nativeStateActive.store(false, std::memory_order_release);
+}
+
+RuntimeSnapshot SnapshotSlot(const MovementSlot& slot) noexcept {
+    RuntimeSnapshot result{};
+    result.characterAddress =
+        slot.characterAddress.load(std::memory_order_acquire);
+    result.remainingFrames =
+        slot.remainingFrames.load(std::memory_order_acquire);
+    result.activationAttempts =
+        slot.activationAttempts.load(std::memory_order_relaxed);
+    result.activationApplications =
+        slot.activationApplications.load(std::memory_order_relaxed);
+    result.activationReuses =
+        slot.activationReuses.load(std::memory_order_relaxed);
+    result.activationFailures =
+        slot.activationFailures.load(std::memory_order_relaxed);
+    result.nativeStateLosses =
+        slot.nativeStateLosses.load(std::memory_order_relaxed);
+    result.nativeStateReacquireAttempts =
+        slot.nativeStateReacquireAttempts.load(std::memory_order_relaxed);
+    result.nativeStateReacquireSuccesses =
+        slot.nativeStateReacquireSuccesses.load(std::memory_order_relaxed);
+    result.enterMoveTransitions =
+        slot.enterMoveTransitions.load(std::memory_order_relaxed);
+    result.updateMoveTransitions =
+        slot.updateMoveTransitions.load(std::memory_order_relaxed);
+    result.exitMoveTransitions =
+        slot.exitMoveTransitions.load(std::memory_order_relaxed);
+    result.idleHoldApplications =
+        slot.idleHoldApplications.load(std::memory_order_relaxed);
+    result.enginePumpApplications =
+        slot.enginePumpApplications.load(std::memory_order_relaxed);
+    result.aiActivationSuppressions =
+        slot.aiActivationSuppressions.load(std::memory_order_relaxed);
+    result.aiIdleSuppressions =
+        slot.aiIdleSuppressions.load(std::memory_order_relaxed);
+    result.nativeIdleApplications =
+        slot.nativeIdleApplications.load(std::memory_order_relaxed);
+    result.followerApplications =
+        slot.followerApplications.load(std::memory_order_relaxed);
+    result.effectiveMoveTypeApplications =
+        slot.effectiveMoveTypeApplications.load(std::memory_order_relaxed);
+    result.hookHits = slot.hookHits.load(std::memory_order_relaxed);
+    result.finalSubmissions =
+        slot.finalSubmissions.load(std::memory_order_relaxed);
+    result.requestApplications =
+        slot.requestApplications.load(std::memory_order_relaxed);
+    result.transformApplications =
+        slot.transformApplications.load(std::memory_order_relaxed);
+    result.teleportApplications =
+        slot.teleportApplications.load(std::memory_order_relaxed);
+    result.hardResyncAttempts =
+        slot.hardResyncAttempts.load(std::memory_order_relaxed);
+    result.hardResyncApplications =
+        slot.hardResyncApplications.load(std::memory_order_relaxed);
+    result.physicalApplications =
+        slot.physicalApplications.load(std::memory_order_relaxed);
+    result.stopApplications =
+        slot.stopApplications.load(std::memory_order_relaxed);
+    result.protectedFailures =
+        slot.protectedFailures.load(std::memory_order_relaxed);
+    result.lastCharacter =
+        slot.lastCharacter.load(std::memory_order_relaxed);
+    result.lastStateAddress =
+        slot.stateAddress.load(std::memory_order_acquire);
+    result.nativeCycleState =
+        slot.lastObservedNativeState.load(std::memory_order_acquire);
+    result.nativeStateActive =
+        slot.nativeStateActive.load(std::memory_order_acquire);
+    result.moveActive =
+        slot.moveActive.load(std::memory_order_acquire);
+    result.armed = result.characterAddress != 0U &&
+        result.characterAddress != kReservedSlot &&
+        result.remainingFrames != 0U;
+    return result;
+}
+
+} // namespace
+
+bool TryBuildNativeCycleControlPlan(
+    const float directionX,
+    const float directionZ,
+    const float intensity,
+    const bool worldSpace,
+    const float characterYaw,
+    NativeCycleControlPlan& plan) noexcept {
+    if (!std::isfinite(directionX) || !std::isfinite(directionZ) ||
+        !std::isfinite(intensity) ||
+        (!worldSpace && !std::isfinite(characterYaw)))
+        return false;
+    const auto magnitude = std::hypot(directionX, directionZ);
+    if (!std::isfinite(magnitude)) return false;
+    const auto sourceHeading = std::atan2(directionX, directionZ);
+    constexpr auto twoPi = 6.28318530717958647692F;
+    const auto worldHeading = worldSpace
+        ? sourceHeading
+        : std::remainder(characterYaw + sourceHeading, twoPi);
+    if (!std::isfinite(worldHeading)) return false;
+    plan.magnitude = magnitude;
+    plan.worldHeading = worldHeading;
+    plan.intensity = intensity;
+    return true;
+}
+
+bool TryBuildOrientationAwareNativeCycleControlPlan(
+    const float worldDirectionX,
+    const float worldDirectionZ,
+    const float intensity,
+    const float replicatedYaw,
+    const float nativeOrientation,
+    NativeCycleControlPlan& plan) noexcept {
+    if (!std::isfinite(worldDirectionX) ||
+        !std::isfinite(worldDirectionZ) ||
+        !std::isfinite(intensity) ||
+        !std::isfinite(replicatedYaw) ||
+        !std::isfinite(nativeOrientation))
+        return false;
+
+    const auto magnitude = std::hypot(worldDirectionX, worldDirectionZ);
+    if (!std::isfinite(magnitude)) return false;
+
+    // AI.exe FUN_0066DC20 demonstrates the retail yaw transform:
+    //   worldX = localX*cos(yaw) + localZ*sin(yaw)
+    //   worldZ = localZ*cos(yaw) - localX*sin(yaw)
+    // Invert that exact transform so the remote receiver asks its animation /
+    // locomotion graph for the same Character-local motion as the source.
+    const auto sinYaw = std::sin(replicatedYaw);
+    const auto cosYaw = std::cos(replicatedYaw);
+    const auto localX =
+        worldDirectionX * cosYaw - worldDirectionZ * sinYaw;
+    const auto localZ =
+        worldDirectionX * sinYaw + worldDirectionZ * cosYaw;
+    if (!std::isfinite(localX) || !std::isfinite(localZ)) return false;
+
+    const auto localHeading = std::atan2(localX, localZ);
+    constexpr auto twoPi = 6.28318530717958647692F;
+    const auto nativeHeading =
+        std::remainder(nativeOrientation + localHeading, twoPi);
+    if (!std::isfinite(nativeHeading)) return false;
+
+    plan.magnitude = magnitude;
+    plan.worldHeading = nativeHeading;
+    plan.intensity = intensity;
+    return true;
+}
+
+bool Install(
+    const std::uintptr_t moduleBase,
+    HookManager& hooks,
+    std::string& error) {
+#if !defined(_MSC_VER) || !defined(_M_IX86)
+    error = "Character remote-player hooks require MSVC x86";
+    return false;
+#else
+    if (gInstalled.load(std::memory_order_acquire)) return true;
+    if (moduleBase == 0U) {
+        error = "AI.exe module base is unavailable";
+        return false;
+    }
+
+    const auto activateAddress =
+        moduleBase + kNativeRvas.activateLocomotionCycle;
+    const auto idleAddress = moduleBase + kNativeRvas.enterIdleCycle;
+    const auto submitAddress = moduleBase + kNativeRvas.submitLocomotion;
+    const auto teleportAddress = moduleBase + kNativeRvas.teleportCharacter;
+    if (!ValidateActivationFunction(activateAddress)) {
+        error =
+            "mod.main()+257900 ActNPCLocomotionCycle transition bytes do not match";
+        return false;
+    }
+    if (!ValidateIdleTransitionFunction(idleAddress)) {
+        error = "mod.main()+25BDD0 native Idle transition bytes do not match";
+        return false;
+    }
+    if (!ValidateLocomotionVtable(moduleBase)) {
+        error =
+            "ActNPCLocomotionCycle vtable/update identity does not match mod.main()+26D4B0";
+        return false;
+    }
+    if (!ValidateSubmitFunction(submitAddress)) {
+        error = "mod.main()+28D6D0 native locomotion bytes do not match";
+        return false;
+    }
+    if (!ValidateTeleportFunction(teleportAddress)) {
+        error =
+            "mod.main()+3ECCA0 physical Character repositioning bytes do not match";
+        return false;
+    }
+
+    gModuleBase = moduleBase;
+    gSubmitLocomotion = reinterpret_cast<SubmitLocomotionFn>(submitAddress);
+    gTeleportCharacter =
+        reinterpret_cast<TeleportCharacterFn>(teleportAddress);
+
+    const auto hookCheckpoint = hooks.InstalledCount();
+
+    HookRequest activationRequest{};
+    activationRequest.name = "remote_player_block_ai_move_activation";
+    activationRequest.target = reinterpret_cast<void*>(activateAddress);
+    activationRequest.detour =
+        reinterpret_cast<void*>(&ActivateLocomotionCycleDetour);
+    activationRequest.patchLength = 6U;
+    activationRequest.expected = MaskedBytes{
+        {0x56U, 0x8BU, 0xF1U, 0x8AU, 0x46U, 0x1AU},
+        "xxxxxx"};
+    activationRequest.relocationSafePrefix = true;
+    activationRequest.trampolineOut = &gActivateLocomotionTrampoline;
+    if (!hooks.Install(activationRequest, error)) {
+        gModuleBase = 0U;
+        gEnterIdleCycle = nullptr;
+        gSubmitLocomotion = nullptr;
+        gTeleportCharacter = nullptr;
+        gActivateLocomotionTrampoline = nullptr;
+        gEnterIdleCycleTrampoline = nullptr;
+        error = "Remote Character AI move-activation hook: " + error;
+        return false;
+    }
+    gActivateLocomotionCycle = reinterpret_cast<ActivateLocomotionCycleFn>(
+        gActivateLocomotionTrampoline);
+
+    HookRequest idleRequest{};
+    idleRequest.name = "remote_player_block_ai_idle_transition";
+    idleRequest.target = reinterpret_cast<void*>(idleAddress);
+    idleRequest.detour = reinterpret_cast<void*>(&EnterIdleCycleDetour);
+    idleRequest.patchLength = 7U;
+    idleRequest.expected = MaskedBytes{
+        {0x6AU, 0xFFU, 0x68U, 0x00U, 0x00U, 0x00U, 0x00U},
+        "xxx????"};
+    idleRequest.relocationSafePrefix = true;
+    idleRequest.trampolineOut = &gEnterIdleCycleTrampoline;
+    if (!hooks.Install(idleRequest, error)) {
+        std::string rollbackError;
+        hooks.UninstallFrom(hookCheckpoint, rollbackError);
+        gActivateLocomotionTrampoline = nullptr;
+        gEnterIdleCycleTrampoline = nullptr;
+        gModuleBase = 0U;
+        gActivateLocomotionCycle = nullptr;
+        gEnterIdleCycle = nullptr;
+        gSubmitLocomotion = nullptr;
+        gTeleportCharacter = nullptr;
+        error = "Remote Character AI idle-transition hook: " + error +
+            (rollbackError.empty()
+                ? std::string{}
+                : "; rollback: " + rollbackError);
+        return false;
+    }
+    gEnterIdleCycle = reinterpret_cast<EnterIdleCycleFn>(
+        gEnterIdleCycleTrampoline);
+
+    HookRequest gaitRequest{};
+    gaitRequest.name = "remote_player_movement_action_effective_gait";
+    gaitRequest.target = reinterpret_cast<void*>(
+        moduleBase + kNativeRvas.movementActionPostGaitSelection);
+    gaitRequest.detour = reinterpret_cast<void*>(&MovementActionPostGaitDetour);
+    // Exact retail bytes at mod.main()+5B874 / AI.exe.text+5A874:
+    //   movss xmm0,[esi+144]
+    // This is after +0x198 has been selected for state 2 and before the
+    // downstream movement/animation calculations consume it.
+    gaitRequest.patchLength = 8U;
+    gaitRequest.expected = MaskedBytes{
+        {0xF3U, 0x0FU, 0x10U, 0x86U, 0x44U, 0x01U, 0x00U, 0x00U},
+        "xxxxxxxx"};
+    gaitRequest.relocationSafePrefix = true;
+    gaitRequest.trampolineOut = &gMovementActionPostGaitTrampoline;
+    if (!hooks.Install(gaitRequest, error)) {
+        std::string rollbackError;
+        hooks.UninstallFrom(hookCheckpoint, rollbackError);
+        gActivateLocomotionTrampoline = nullptr;
+        gEnterIdleCycleTrampoline = nullptr;
+        gMovementActionPostGaitTrampoline = nullptr;
+        gModuleBase = 0U;
+        gActivateLocomotionCycle = nullptr;
+        gEnterIdleCycle = nullptr;
+        gSubmitLocomotion = nullptr;
+        gTeleportCharacter = nullptr;
+        error = "Remote MovementAction effective-gait hook: " + error +
+            (rollbackError.empty()
+                ? std::string{}
+                : "; rollback: " + rollbackError);
+        return false;
+    }
+
+    HookRequest tickRequest{};
+    tickRequest.name = "remote_player_npc_locomotion_pre_transform_control";
+    tickRequest.target = reinterpret_cast<void*>(
+        moduleBase + kNativeRvas.npcLocomotionPreTransformControl);
+    tickRequest.detour =
+        reinterpret_cast<void*>(&NpcLocomotionPreTransformDetour);
+    // Exact retail bytes at mod.main()+26D4FE / AI.exe.text+26C4FE:
+    //   lea edi,[esi+64]; push edi; lea ebx,[esi+68]; push ebx
+    // The prefix has no relative operands and is safe to relocate verbatim.
+    tickRequest.patchLength = 8U;
+    tickRequest.expected = MaskedBytes{
+        {0x8DU, 0x7EU, 0x64U, 0x57U, 0x8DU, 0x5EU, 0x68U, 0x53U},
+        "xxxxxxxx"};
+    tickRequest.relocationSafePrefix = true;
+    tickRequest.trampolineOut = &gNpcLocomotionPreTransformTrampoline;
+    if (!hooks.Install(tickRequest, error)) {
+        std::string rollbackError;
+        hooks.UninstallFrom(hookCheckpoint, rollbackError);
+        gActivateLocomotionTrampoline = nullptr;
+        gEnterIdleCycleTrampoline = nullptr;
+        gMovementActionPostGaitTrampoline = nullptr;
+        gNpcLocomotionPreTransformTrampoline = nullptr;
+        gModuleBase = 0U;
+        gActivateLocomotionCycle = nullptr;
+        gEnterIdleCycle = nullptr;
+        gSubmitLocomotion = nullptr;
+        gTeleportCharacter = nullptr;
+        error = "ActNPCLocomotionCycle pre-transform control hook: " + error +
+            (rollbackError.empty()
+                ? std::string{}
+                : "; rollback: " + rollbackError);
+        return false;
+    }
+
+    HookRequest finalSubmitRequest{};
+    finalSubmitRequest.name =
+        "remote_player_npc_locomotion_post_final_submit";
+    finalSubmitRequest.target = reinterpret_cast<void*>(
+        moduleBase + kNativeRvas.npcLocomotionPostSubmit);
+    finalSubmitRequest.detour =
+        reinterpret_cast<void*>(&NpcLocomotionPostSubmitDetour);
+    finalSubmitRequest.patchLength = 5U;
+    finalSubmitRequest.expected = MaskedBytes{
+        {0x8BU, 0x4EU, 0x04U, 0x8BU, 0x11U},
+        "xxxxx"};
+    finalSubmitRequest.relocationSafePrefix = true;
+    finalSubmitRequest.trampolineOut = &gNpcLocomotionPostSubmitTrampoline;
+    if (!hooks.Install(finalSubmitRequest, error)) {
+        std::string rollbackError;
+        hooks.UninstallFrom(hookCheckpoint, rollbackError);
+        gActivateLocomotionTrampoline = nullptr;
+        gEnterIdleCycleTrampoline = nullptr;
+        gMovementActionPostGaitTrampoline = nullptr;
+        gNpcLocomotionPreTransformTrampoline = nullptr;
+        gNpcLocomotionPostSubmitTrampoline = nullptr;
+        gModuleBase = 0U;
+        gActivateLocomotionCycle = nullptr;
+        gEnterIdleCycle = nullptr;
+        gSubmitLocomotion = nullptr;
+        gTeleportCharacter = nullptr;
+        error = "ActNPCLocomotionCycle final-submit observation hook: " +
+            error +
+            (rollbackError.empty()
+                ? std::string{}
+                : "; rollback: " + rollbackError);
+        return false;
+    }
+
+    gInstalled.store(true, std::memory_order_release);
+    return true;
+#endif
+}
+
+bool Installed() noexcept {
+    return gInstalled.load(std::memory_order_acquire);
+}
+
+void PumpOnEngineThread() noexcept {
+    if (!Installed()) return;
+    for (auto& slot : gSlots) {
+        PumpSlotOnEngineThread(slot);
+    }
+}
+
+bool ArmDirection(
+    const std::uintptr_t characterAddress,
+    const float directionX,
+    const float directionZ,
+    const float intensity,
+    const std::uint32_t frameCount,
+    std::string& error) noexcept {
+    return ArmCore(
+        characterAddress,
+        directionX,
+        0.0F,
+        directionZ,
+        0.0F,
+        intensity,
+        false,
+        false,
+        0.0F,
+        0.0F,
+        0.0F,
+        false,
+        0.0F,
+        false,
+        1U,
+        false,
+        frameCount,
+        error);
+}
+
+bool ArmWorldDirection(
+    const std::uintptr_t characterAddress,
+    const float directionX,
+    const float directionZ,
+    const float intensity,
+    const std::uint32_t frameCount,
+    std::string& error) noexcept {
+    return ArmCore(
+        characterAddress,
+        directionX,
+        0.0F,
+        directionZ,
+        0.0F,
+        intensity,
+        true,
+        false,
+        0.0F,
+        0.0F,
+        0.0F,
+        false,
+        0.0F,
+        false,
+        1U,
+        false,
+        frameCount,
+        error);
+}
+
+bool ArmWorldReplication(
+    const std::uintptr_t characterAddress,
+    const float directionX,
+    const float directionZ,
+    const float intensity,
+    const float networkX,
+    const float networkY,
+    const float networkZ,
+    const float replicationYaw,
+    const std::uint32_t moveType,
+    const std::uint32_t frameCount,
+    std::string& error) noexcept {
+    return ArmCore(
+        characterAddress,
+        directionX,
+        0.0F,
+        directionZ,
+        0.0F,
+        intensity,
+        true,
+        true,
+        networkX,
+        networkY,
+        networkZ,
+        true,
+        replicationYaw,
+        true,
+        moveType,
+        false,
+        frameCount,
+        error);
+}
+
+bool HoldWorldReplicationIdle(
+    const std::uintptr_t characterAddress,
+    const float networkX,
+    const float networkY,
+    const float networkZ,
+    const float replicationYaw,
+    const std::uint32_t moveType,
+    std::string& error) noexcept {
+    // Network Idle keeps ownership of the Character without pretending that a
+    // native Move is active. If a small residual position error remains, the
+    // follower can finish it using the last replicated retail gait; no GoTo or
+    // pathfinding destination is ever created.
+    if (!ArmCore(
+        characterAddress,
+        0.0F,
+        0.0F,
+        0.0F,
+        0.0F,
+        0.0F,
+        true,
+        true,
+        networkX,
+        networkY,
+        networkZ,
+        true,
+        replicationYaw,
+        true,
+        moveType,
+        false,
+        kPersistentReplicationFrames,
+        error))
+        return false;
+    if (auto* slot = FindSlot(characterAddress)) {
+        // Idle ownership is released only by an explicit teardown command.
+        // A missing network heartbeat must freeze the proxy, not return it to
+        // the CIVILIAN spawn objective observed in Cheat Engine.
+        slot->leaseExpiresAtTickMs.store(0U, std::memory_order_release);
+    }
+    return true;
+}
+
+bool ApplyReplicatedYaw(
+    const std::uintptr_t characterAddress,
+    const float yaw,
+    std::string& error) noexcept {
+    if (characterAddress == 0U || !std::isfinite(yaw) ||
+        yaw < -3.3F || yaw > 3.3F) {
+        error = "Replicated yaw or CharacterBase is invalid";
+        return false;
+    }
+    if (WriteReplicatedYaw(characterAddress, yaw)) return true;
+    error = "The replicated Character yaw field could not be written safely";
+    return false;
+}
+
+bool Arm(
+    const std::uintptr_t characterAddress,
+    const float deltaX,
+    const float deltaY,
+    const float deltaZ,
+    const float deltaYaw,
+    const std::uint32_t frameCount,
+    std::string& error) noexcept {
+    return ArmCore(
+        characterAddress,
+        deltaX,
+        deltaY,
+        deltaZ,
+        deltaYaw,
+        1.0F,
+        false,
+        false,
+        0.0F,
+        0.0F,
+        0.0F,
+        false,
+        0.0F,
+        false,
+        1U,
+        true,
+        frameCount,
+        error);
+}
+
+void Stop() noexcept {
+    for (auto& slot : gSlots) {
+        const auto character =
+            slot.characterAddress.load(std::memory_order_acquire);
+        if (character == 0U || character == kReservedSlot) continue;
+        slot.remainingFrames.store(0U, std::memory_order_release);
+        slot.stopPending.store(true, std::memory_order_release);
+    }
+}
+
+bool Stop(const std::uintptr_t characterAddress) noexcept {
+    auto* slot = FindSlot(characterAddress);
+    if (slot == nullptr) return true;
+    slot->remainingFrames.store(0U, std::memory_order_release);
+    slot->stopPending.store(false, std::memory_order_release);
+    return SubmitStopRequest(*slot, characterAddress);
+}
+
+std::uint32_t RemainingFrames() noexcept {
+    return RemainingFrames(
+        gLastArmedCharacter.load(std::memory_order_acquire));
+}
+
+std::uint32_t RemainingFrames(
+    const std::uintptr_t characterAddress) noexcept {
+    const auto* slot = FindSlot(characterAddress);
+    return slot == nullptr
+        ? 0U
+        : slot->remainingFrames.load(std::memory_order_acquire);
+}
+
+RuntimeSnapshot Snapshot() noexcept {
+    const auto last = gLastArmedCharacter.load(std::memory_order_acquire);
+    if (const auto* slot = FindSlot(last)) return SnapshotSlot(*slot);
+    for (const auto& slot : gSlots) {
+        const auto character =
+            slot.characterAddress.load(std::memory_order_acquire);
+        if (character != 0U && character != kReservedSlot)
+            return SnapshotSlot(slot);
+    }
+    return RuntimeSnapshot{};
+}
+
+RuntimeSnapshot Snapshot(const std::uintptr_t characterAddress) noexcept {
+    const auto* slot = FindSlot(characterAddress);
+    return slot == nullptr ? RuntimeSnapshot{} : SnapshotSlot(*slot);
+}
+
+
+} // namespace aimp::character_direct_step_runtime

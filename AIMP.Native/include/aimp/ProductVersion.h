@@ -1,0 +1,8 @@
+#pragma once
+
+namespace aimp {
+
+inline constexpr char kNativeVersion[] =
+    "0.11.4.136-player-sync-cathode-runtime-composite";
+
+} // namespace aimp

@@ -1,0 +1,472 @@
+using AIMP.Protocol;
+using System.Globalization;
+
+namespace AIMP.Launcher;
+
+internal enum RemoteMovementAction
+{
+    None,
+    Move,
+    Stop
+}
+
+internal sealed record RemotePositionTrackSnapshot(
+    PlayerPositionSnapshotPayload? Previous,
+    PlayerPositionSnapshotPayload Latest,
+    DateTimeOffset ReceivedAtUtc,
+    bool ObservedMoving,
+    float EstimatedVelocityX,
+    float EstimatedVelocityZ,
+    float RemoteStepDistance,
+    bool CommandMoving,
+    float LastCommandDirectionX,
+    float LastCommandDirectionZ,
+    float LastCommandIntensity,
+    float LastCommandPositionX,
+    float LastCommandPositionY,
+    float LastCommandPositionZ,
+    float LastCommandYaw,
+    PlayerMoveType LastCommandMoveType,
+    float LastCommandMoveSpeed,
+    DateTimeOffset LastCommandAtUtc);
+
+internal sealed class RemotePositionTrack
+{
+    // v10.6 samples the source transform at ~60 Hz. Scale the displacement
+    // thresholds with the shorter sample interval so SlowWalk still starts
+    // reliably, while four stationary samples preserve roughly the same
+    // 60-70 ms stop hysteresis as v10.5.
+    private const float StartStepDistance = 0.005F;
+    private const float StopStepDistance = 0.0015F;
+    private const float DirectionSmoothing = 1.00F;
+    private const int StationarySamplesToStop = 4;
+    private const float DiscontinuityDistance = 2.0F;
+
+    private PlayerPositionSnapshotPayload? _previous;
+    private PlayerPositionSnapshotPayload? _latest;
+    private DateTimeOffset _receivedAtUtc;
+    private float _estimatedVelocityX;
+    private float _estimatedVelocityZ;
+    private float _remoteStepDistance;
+    private bool _observedMoving;
+    private int _stationarySamples;
+    private float _lastCommandDirectionX;
+    private float _lastCommandDirectionZ;
+    private float _lastCommandIntensity = RemoteMovementPlanner.BaseWalkIntensity;
+    private float _lastCommandPositionX;
+    private float _lastCommandPositionY;
+    private float _lastCommandPositionZ;
+    private float _lastCommandYaw = float.NaN;
+    private PlayerMoveType _lastCommandMoveType = PlayerMoveType.Walk;
+    private float _lastCommandMoveSpeed = RemoteMovementPlanner.LegacyWalkFallbackMagnitude;
+    private DateTimeOffset _lastCommandAtUtc;
+
+    internal bool CommandMoving { get; private set; }
+
+    internal bool TryAccept(PlayerPositionSnapshotPayload value, DateTimeOffset receivedAtUtc)
+    {
+        if (_latest is not null && value.Sequence <= _latest.Sequence) return false;
+        var previous = _latest;
+        var previousReceivedAtUtc = _receivedAtUtc;
+        _previous = previous;
+        _latest = value;
+        _receivedAtUtc = receivedAtUtc;
+        if (previous is null) { ResetObservedMotion(); return true; }
+        UpdateObservedMotion(previous, value, previousReceivedAtUtc, receivedAtUtc);
+        return true;
+    }
+
+    internal RemotePositionTrackSnapshot? Snapshot()
+    {
+        var latest = _latest;
+        return latest is null ? null : CreateSnapshot(latest);
+    }
+
+    private RemotePositionTrackSnapshot CreateSnapshot(PlayerPositionSnapshotPayload latest) =>
+        new(_previous, latest, _receivedAtUtc, _observedMoving,
+            _estimatedVelocityX, _estimatedVelocityZ, _remoteStepDistance, CommandMoving,
+            _lastCommandDirectionX, _lastCommandDirectionZ, _lastCommandIntensity,
+            _lastCommandPositionX, _lastCommandPositionY, _lastCommandPositionZ,
+            _lastCommandYaw, _lastCommandMoveType, _lastCommandMoveSpeed,
+            _lastCommandAtUtc);
+
+    internal void MarkCommand(RemoteMovementPlan plan, DateTimeOffset appliedAtUtc)
+    {
+        if (plan.Action == RemoteMovementAction.Move)
+        {
+            MarkMoveCommand(plan, appliedAtUtc);
+            return;
+        }
+        if (plan.Action == RemoteMovementAction.Stop) MarkStopCommand(plan, appliedAtUtc);
+    }
+
+    private void MarkMoveCommand(RemoteMovementPlan plan, DateTimeOffset appliedAtUtc)
+    {
+        CommandMoving = true;
+        _lastCommandDirectionX = plan.DirectionX;
+        _lastCommandDirectionZ = plan.DirectionZ;
+        _lastCommandIntensity = plan.Intensity;
+        _lastCommandPositionX = plan.PositionX;
+        _lastCommandPositionY = plan.PositionY;
+        _lastCommandPositionZ = plan.PositionZ;
+        _lastCommandMoveType = plan.MoveType;
+        _lastCommandMoveSpeed = plan.NativeMoveSpeed;
+        MarkYaw(plan.Yaw, appliedAtUtc);
+    }
+
+    private void MarkStopCommand(RemoteMovementPlan plan, DateTimeOffset appliedAtUtc)
+    {
+        CommandMoving = false;
+        _lastCommandDirectionX = 0F;
+        _lastCommandDirectionZ = 0F;
+        _lastCommandIntensity = RemoteMovementPlanner.BaseWalkIntensity;
+        _lastCommandPositionX = plan.PositionX;
+        _lastCommandPositionY = plan.PositionY;
+        _lastCommandPositionZ = plan.PositionZ;
+        _lastCommandMoveType = plan.MoveType;
+        _lastCommandMoveSpeed = plan.NativeMoveSpeed;
+        MarkYaw(plan.Yaw, appliedAtUtc);
+    }
+
+    private void MarkYaw(float yaw, DateTimeOffset appliedAtUtc)
+    {
+        _lastCommandYaw = yaw;
+        _lastCommandAtUtc = appliedAtUtc;
+    }
+
+    private void UpdateObservedMotion(
+        PlayerPositionSnapshotPayload previous,
+        PlayerPositionSnapshotPayload latest,
+        DateTimeOffset previousReceivedAtUtc,
+        DateTimeOffset receivedAtUtc)
+    {
+        var stepX = latest.X - previous.X;
+        var stepZ = latest.Z - previous.Z;
+        var step = Length(stepX, stepZ);
+        _remoteStepDistance = step;
+        if (!IsContinuousStep(step)) { ResetObservedMotion(); return; }
+        if (step >= MovementThreshold())
+        {
+            ObserveMovement(stepX, stepZ, previous, latest, previousReceivedAtUtc, receivedAtUtc);
+            return;
+        }
+        ObserveStationarySample();
+    }
+
+    private bool IsContinuousStep(float step) =>
+        float.IsFinite(step) && step < DiscontinuityDistance;
+
+    private float MovementThreshold() => _observedMoving ? StopStepDistance : StartStepDistance;
+
+    private void ObserveMovement(
+        float stepX,
+        float stepZ,
+        PlayerPositionSnapshotPayload previous,
+        PlayerPositionSnapshotPayload latest,
+        DateTimeOffset previousReceivedAtUtc,
+        DateTimeOffset receivedAtUtc)
+    {
+        _observedMoving = true;
+        _stationarySamples = 0;
+        UpdateVelocity(stepX, stepZ, previous, latest, previousReceivedAtUtc, receivedAtUtc);
+    }
+
+    private void ObserveStationarySample()
+    {
+        if (!_observedMoving)
+        {
+            _estimatedVelocityX = 0F;
+            _estimatedVelocityZ = 0F;
+            return;
+        }
+        if (++_stationarySamples >= StationarySamplesToStop) ResetObservedMotion();
+    }
+
+    private void UpdateVelocity(
+        float stepX,
+        float stepZ,
+        PlayerPositionSnapshotPayload previous,
+        PlayerPositionSnapshotPayload latest,
+        DateTimeOffset previousReceivedAtUtc,
+        DateTimeOffset receivedAtUtc)
+    {
+        var seconds = SampleSeconds(previous, latest, previousReceivedAtUtc, receivedAtUtc);
+        if (seconds <= 0F) return;
+        var velocityX = stepX / seconds;
+        var velocityZ = stepZ / seconds;
+        if (!float.IsFinite(velocityX) || !float.IsFinite(velocityZ)) return;
+        ApplyVelocity(velocityX, velocityZ);
+    }
+
+    private void ApplyVelocity(float velocityX, float velocityZ)
+    {
+        if (Length(_estimatedVelocityX, _estimatedVelocityZ) <= float.Epsilon)
+        {
+            _estimatedVelocityX = velocityX;
+            _estimatedVelocityZ = velocityZ;
+            return;
+        }
+        var dot = VelocityDot(velocityX, velocityZ);
+        var alpha = dot < -0.25F ? 1F : DirectionSmoothing;
+        _estimatedVelocityX += (velocityX - _estimatedVelocityX) * alpha;
+        _estimatedVelocityZ += (velocityZ - _estimatedVelocityZ) * alpha;
+    }
+
+    private float VelocityDot(float velocityX, float velocityZ)
+    {
+        var previousLength = Length(_estimatedVelocityX, _estimatedVelocityZ);
+        var currentLength = Length(velocityX, velocityZ);
+        return previousLength > float.Epsilon && currentLength > float.Epsilon
+            ? (_estimatedVelocityX * velocityX + _estimatedVelocityZ * velocityZ)
+                / (previousLength * currentLength)
+            : 1F;
+    }
+
+    private static float SampleSeconds(
+        PlayerPositionSnapshotPayload previous,
+        PlayerPositionSnapshotPayload latest,
+        DateTimeOffset previousReceivedAtUtc,
+        DateTimeOffset receivedAtUtc)
+    {
+        var sourceMilliseconds = latest.SentAtUnixMilliseconds - previous.SentAtUnixMilliseconds;
+        if (sourceMilliseconds is >= 5 and <= 500) return sourceMilliseconds / 1000F;
+        var receiveSeconds = (float)(receivedAtUtc - previousReceivedAtUtc).TotalSeconds;
+        return receiveSeconds is > 0F and <= 0.5F ? receiveSeconds : 0F;
+    }
+
+    private void ResetObservedMotion()
+    {
+        _observedMoving = false;
+        _stationarySamples = 0;
+        _estimatedVelocityX = 0F;
+        _estimatedVelocityZ = 0F;
+        _remoteStepDistance = 0F;
+    }
+
+    private static float Length(float x, float z) => MathF.Sqrt(x * x + z * z);
+}
+
+internal sealed record RemoteMovementPlan(
+    RemoteMovementAction Action,
+    float DirectionX,
+    float DirectionZ,
+    float Intensity,
+    float PositionX,
+    float PositionY,
+    float PositionZ,
+    float Yaw,
+    float RemoteStepDistance,
+    PlayerMoveType MoveType,
+    float NativeMoveSpeed);
+
+internal static class RemoteMovementPlanner
+{
+    internal static readonly TimeSpan SnapshotTimeout = TimeSpan.FromMilliseconds(200);
+    // The native follower runs every engine frame and keeps consuming the
+    // latest network target.  Normal target refreshes therefore do not need to
+    // cross Launcher -> DLL -> engine at 60 Hz.  Sharp direction changes and
+    // gait/speed changes still bypass this cap above, preserving responsiveness.
+    internal static readonly TimeSpan MinimumCommandInterval = TimeSpan.FromMilliseconds(25);
+    internal static readonly TimeSpan MovementHeartbeat = TimeSpan.FromMilliseconds(33);
+    internal static readonly TimeSpan OrientationHeartbeat = TimeSpan.FromMilliseconds(33);
+
+    internal const float BaseWalkIntensity = 1.100F;
+    // Fallback only. v10.4 reads the retail source Character's requested
+    // move_type and its own +0x4C speed table instead of assuming WALK.
+    internal const float LegacyWalkFallbackMagnitude = 1.15073F;
+    private const float DirectionResendDot = 0.997F;
+    private const float ImmediateDirectionResendDot = 0.75F;
+    private const float PositionResendDistance = 0.008F;
+    private const float YawResendRadians = 0.00872665F; // 0.5 degree.
+
+    internal static RemoteMovementPlan Create(
+        RemotePositionTrackSnapshot track,
+        DateTimeOffset now)
+    {
+        var age = now - track.ReceivedAtUtc;
+        if (age > SnapshotTimeout) return StalePlan(track);
+        if (track.Previous is null || !track.ObservedMoving) return IdlePlan(track, now);
+        var velocityLength = Length(track.EstimatedVelocityX, track.EstimatedVelocityZ);
+        if (velocityLength <= float.Epsilon) return IdlePlan(track, now);
+        return MovingPlan(track, now, velocityLength);
+    }
+
+    private static RemoteMovementPlan MovingPlan(
+        RemotePositionTrackSnapshot track,
+        DateTimeOffset now,
+        float velocityLength)
+    {
+        var motionX = track.EstimatedVelocityX / velocityLength;
+        var motionZ = track.EstimatedVelocityZ / velocityLength;
+        var nativeMoveSpeed = track.Latest.NativeMoveSpeed;
+        var directionX = motionX * nativeMoveSpeed;
+        var directionZ = motionZ * nativeMoveSpeed;
+        var action = ShouldDispatchMove(track, directionX, directionZ, now)
+            ? RemoteMovementAction.Move : RemoteMovementAction.None;
+        return new(action, directionX, directionZ, BaseWalkIntensity,
+            track.Latest.X, track.Latest.Y, track.Latest.Z,
+            track.Latest.Yaw, track.RemoteStepDistance,
+            track.Latest.MoveType, nativeMoveSpeed);
+    }
+
+    private static bool ShouldDispatchMove(
+        RemotePositionTrackSnapshot track,
+        float directionX,
+        float directionZ,
+        DateTimeOffset now)
+    {
+        if (!track.CommandMoving || track.LastCommandAtUtc == default) return true;
+        if (track.Latest.MoveType != track.LastCommandMoveType ||
+            MathF.Abs(track.Latest.NativeMoveSpeed - track.LastCommandMoveSpeed) >= 0.005F)
+            return true;
+        var sinceLastCommand = now - track.LastCommandAtUtc;
+        var dot = DirectionDot(track, directionX, directionZ);
+        if (dot < ImmediateDirectionResendDot) return true;
+        if (sinceLastCommand < MinimumCommandInterval) return false;
+        if (sinceLastCommand >= MovementHeartbeat) return true;
+        return PositionMoved(track)
+            || dot < DirectionResendDot || YawChanged(track, track.Latest.Yaw);
+    }
+
+    private static RemoteMovementPlan IdlePlan(
+        RemotePositionTrackSnapshot track,
+        DateTimeOffset now)
+    {
+        var shouldSend = track.CommandMoving || PositionMoved(track)
+            || ShouldDispatchOrientation(track, now);
+        return new(shouldSend ? RemoteMovementAction.Stop : RemoteMovementAction.None,
+            0F, 0F, BaseWalkIntensity,
+            track.Latest.X, track.Latest.Y, track.Latest.Z,
+            track.Latest.Yaw, track.RemoteStepDistance,
+            track.Latest.MoveType, track.Latest.NativeMoveSpeed);
+    }
+
+    private static RemoteMovementPlan StalePlan(RemotePositionTrackSnapshot track) =>
+        new(track.CommandMoving ? RemoteMovementAction.Stop : RemoteMovementAction.None,
+            0F, 0F, BaseWalkIntensity,
+            track.Latest.X, track.Latest.Y, track.Latest.Z,
+            track.Latest.Yaw, track.RemoteStepDistance,
+            track.Latest.MoveType, track.Latest.NativeMoveSpeed);
+
+    private static bool ShouldDispatchOrientation(
+        RemotePositionTrackSnapshot track,
+        DateTimeOffset now)
+    {
+        if (track.LastCommandAtUtc == default || !float.IsFinite(track.LastCommandYaw)) return true;
+        if (YawChanged(track, track.Latest.Yaw)) return true;
+        return now - track.LastCommandAtUtc >= OrientationHeartbeat;
+    }
+
+    private static bool YawChanged(RemotePositionTrackSnapshot track, float yaw) =>
+        AngularDistance(track.LastCommandYaw, yaw) >= YawResendRadians;
+
+    internal static float AngularDistance(float first, float second)
+    {
+        if (!float.IsFinite(first) || !float.IsFinite(second)) return float.PositiveInfinity;
+        var delta = MathF.IEEERemainder(second - first, MathF.Tau);
+        return MathF.Abs(delta);
+    }
+
+    private static float DirectionDot(
+        RemotePositionTrackSnapshot track,
+        float directionX,
+        float directionZ)
+    {
+        var lastLength = Length(track.LastCommandDirectionX, track.LastCommandDirectionZ);
+        var currentLength = Length(directionX, directionZ);
+        return lastLength > float.Epsilon && currentLength > float.Epsilon
+            ? (track.LastCommandDirectionX * directionX + track.LastCommandDirectionZ * directionZ)
+                / (lastLength * currentLength)
+            : -1F;
+    }
+
+    private static bool PositionMoved(RemotePositionTrackSnapshot track)
+    {
+        var x = track.Latest.X - track.LastCommandPositionX;
+        var y = track.Latest.Y - track.LastCommandPositionY;
+        var z = track.Latest.Z - track.LastCommandPositionZ;
+        return MathF.Sqrt(x * x + y * y + z * z) >= PositionResendDistance;
+    }
+
+    private static float Length(float x, float z) => MathF.Sqrt(x * x + z * z);
+}
+
+internal static class RemoteMovementCommandFactory
+{
+    private const string SafetyFrames = "3600";
+
+    internal static IReadOnlyDictionary<string, string> Create(
+        uint characterBase,
+        RemoteMovementPlan plan) =>
+        plan.Action == RemoteMovementAction.Stop
+            ? CreateStop(characterBase, plan)
+            : CreateMove(characterBase, plan);
+
+    internal static IReadOnlyDictionary<string, string> CreateStop(uint characterBase) =>
+        CreateBaseArguments(characterBase, 0F, 0F,
+            RemoteMovementPlanner.BaseWalkIntensity, "0");
+
+    internal static IReadOnlyDictionary<string, string> CreateStop(
+        uint characterBase,
+        float yaw)
+    {
+        var arguments = new Dictionary<string, string>(CreateStop(characterBase), StringComparer.Ordinal)
+        {
+            ["replicationYaw"] = FormatYaw(yaw)
+        };
+        return arguments;
+    }
+
+    private static IReadOnlyDictionary<string, string> CreateStop(
+        uint characterBase,
+        RemoteMovementPlan plan)
+    {
+        var arguments = new Dictionary<string, string>(
+            CreateStop(characterBase, plan.Yaw), StringComparer.Ordinal)
+        {
+            ["replicationPositionX"] = Format(plan.PositionX),
+            ["replicationPositionY"] = Format(plan.PositionY),
+            ["replicationPositionZ"] = Format(plan.PositionZ),
+            ["moveType"] = ((int)plan.MoveType).ToString(CultureInfo.InvariantCulture)
+        };
+        return arguments;
+    }
+
+    private static IReadOnlyDictionary<string, string> CreateMove(
+        uint characterBase,
+        RemoteMovementPlan plan)
+    {
+        var arguments = new Dictionary<string, string>(
+            CreateBaseArguments(characterBase, plan.DirectionX, plan.DirectionZ,
+                plan.Intensity, SafetyFrames), StringComparer.Ordinal)
+        {
+            ["replicationPositionX"] = Format(plan.PositionX),
+            ["replicationPositionY"] = Format(plan.PositionY),
+            ["replicationPositionZ"] = Format(plan.PositionZ),
+            ["replicationYaw"] = FormatYaw(plan.Yaw),
+            ["moveType"] = ((int)plan.MoveType).ToString(CultureInfo.InvariantCulture)
+        };
+        return arguments;
+    }
+
+    private static string Format(float value) =>
+        value.ToString("0.000000", CultureInfo.InvariantCulture);
+
+    private static string FormatYaw(float value) =>
+        value.ToString("0.000000", CultureInfo.InvariantCulture);
+
+    private static IReadOnlyDictionary<string, string> CreateBaseArguments(
+        uint characterBase,
+        float directionX,
+        float directionZ,
+        float intensity,
+        string frames) => new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["characterAddress"] = $"0x{characterBase:X8}",
+            ["directionX"] = Format(directionX),
+            ["directionZ"] = Format(directionZ),
+            ["intensity"] = intensity.ToString("0.000", CultureInfo.InvariantCulture),
+            ["frameCount"] = frames,
+            ["directionSpace"] = "world"
+        };
+}

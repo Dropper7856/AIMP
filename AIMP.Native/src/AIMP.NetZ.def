@@ -1,0 +1,5 @@
+EXPORTS
+    AimpDllVersion=_AimpDllVersion@0
+    AimpGetState=_AimpGetState@0
+    AimpProtocolVersion=_AimpProtocolVersion@0
+    AimpRequestShutdown=_AimpRequestShutdown@0

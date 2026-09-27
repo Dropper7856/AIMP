@@ -1,0 +1,35 @@
+# Native builds
+AIMP.Native/build/
+AIMP.Native/out/
+*.pdb
+*.ilk
+*.obj
+
+# .NET builds and user state
+**/bin/
+**/obj/
+*.user
+*.suo
+.vs/
+
+# Runtime diagnostics and local configuration
+logs/
+*.log
+*.jsonl
+launcher.settings.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+*.exe
+*.c
+*.lnk
+*.zip
+*.ps1
+*.md
+
+tools/
+analysis/
+AIMP.Native/build_profiles

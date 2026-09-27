@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <NoWarn>$(NoWarn);NU1701</NoWarn>
+    <AssemblyName>AIMP.Protocol.Tests</AssemblyName>
+    <DotNetSdkRoot>$([System.IO.Path]::GetFullPath('$(MSBuildSDKsPath)\..\..'))</DotNetSdkRoot>
+    <Sdk8Directories>$([System.IO.Directory]::GetDirectories('$(DotNetSdkRoot)', '8.*'))</Sdk8Directories>
+    <RoslynSdkDirectory Condition="'$(Sdk8Directories)' != ''">$([System.String]::Copy('$(Sdk8Directories)').Split(';').GetValue(0))</RoslynSdkDirectory>
+    <RoslynBinariesPath Condition="'$(RoslynSdkDirectory)' != ''">$(RoslynSdkDirectory)\Roslyn\bincore</RoslynBinariesPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\AIMP.Protocol\AIMP.Protocol.csproj" />
+    <ProjectReference Include="..\..\src\AIMP.Launcher\AIMP.Launcher.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="Microsoft.CodeAnalysis">
+      <HintPath>$(RoslynBinariesPath)\Microsoft.CodeAnalysis.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Microsoft.CodeAnalysis.CSharp">
+      <HintPath>$(RoslynBinariesPath)\Microsoft.CodeAnalysis.CSharp.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+  <Target Name="ValidateRoslynSdkReferences" BeforeTargets="ResolveAssemblyReferences">
+    <Error
+      Condition="!Exists('$(RoslynBinariesPath)\Microsoft.CodeAnalysis.CSharp.dll')"
+      Text="A local .NET 8 SDK with Roslyn compiler assemblies is required to build the architecture tests." />
+  </Target>
+</Project>
