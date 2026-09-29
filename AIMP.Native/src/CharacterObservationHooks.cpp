@@ -8,6 +8,7 @@
 #include "aimp/LifecycleCatalog.h"
 #include "aimp/SignatureResolver.h"
 #include "aimp/SpawnCharacterTracker.h"
+#include "aimp/RuntimeFeatureFlags.h"
 
 #include <atomic>
 
@@ -49,6 +50,13 @@ std::uint32_t CaptureAndForward(
     const std::size_t bytes,
     const std::uint32_t sourceRva,
     const std::atomic<void*>& trampoline) noexcept {
+    const auto original = reinterpret_cast<SpawnCallback>(
+        trampoline.load(std::memory_order_acquire));
+    if (!runtime_features::Enabled(
+            runtime_features::Feature::CharacterLifecycleCapture)) {
+        return original == nullptr ? 0U : original(sink, request);
+    }
+
     ActiveDetour active;
     auto* catalog = gCatalog.load(std::memory_order_acquire);
     const auto* generation = gGeneration.load(std::memory_order_acquire);
@@ -61,8 +69,6 @@ std::uint32_t CaptureAndForward(
             generation->CurrentGeneration(),
             sourceRva);
     }
-    const auto original = reinterpret_cast<SpawnCallback>(
-        trampoline.load(std::memory_order_acquire));
     return original == nullptr ? 0U : original(sink, request);
 }
 
@@ -101,6 +107,10 @@ void Lifecycle(
     const std::uintptr_t first = 0,
     const std::uintptr_t second = 0,
     const std::uintptr_t result = 0) noexcept {
+    if (!runtime_features::Enabled(
+            runtime_features::Feature::CharacterLifecycleCapture)) {
+        return;
+    }
     auto* catalog = gLifecycle.load(std::memory_order_acquire);
     if (catalog != nullptr) {
         catalog->CaptureFromHook(

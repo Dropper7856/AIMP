@@ -8,6 +8,7 @@
 #include "aimp/LevelGenerationTracker.h"
 #include "aimp/NativeLimits.h"
 #include "aimp/PlayerSyncObserver.h"
+#include "aimp/RuntimeFeatureFlags.h"
 #include "aimp/ReplicationCore.h"
 #include "aimp/SignatureResolver.h"
 
@@ -206,21 +207,25 @@ std::uint32_t __cdecl MainThreadCharacterProcessingDetour() noexcept {
             EngineThreadSource::MainThreadCharacterProcessing,
             performanceCounter);
     }
-    if (auto* evidence = gEvidence.load(std::memory_order_acquire);
-        evidence != nullptr) {
+    if (runtime_features::Enabled(runtime_features::Feature::EngineThreadEvidence)) {
+        if (auto* evidence = gEvidence.load(std::memory_order_acquire);
+            evidence != nullptr) {
         evidence->ObserveMainThreadCharacterProcessing(
             threadId,
             performanceCounter);
+        }
     }
 
     const auto original = reinterpret_cast<MainThreadCallback>(
         gMainThreadTrampoline.load(std::memory_order_acquire));
     const auto result = original == nullptr ? 0U : original();
 
-    static_cast<void>(replication_core::PumpDeferredRemoteApplyOnEngineThread());
-    if (auto* dispatcher = gDispatcher.load(std::memory_order_acquire);
-        dispatcher != nullptr) {
-        dispatcher->DrainOnEngineThread(4);
+    if (runtime_features::Enabled(runtime_features::Feature::GameThreadPumps)) {
+        static_cast<void>(replication_core::PumpDeferredRemoteApplyOnEngineThread());
+        if (auto* dispatcher = gDispatcher.load(std::memory_order_acquire);
+            dispatcher != nullptr) {
+            dispatcher->DrainOnEngineThread(4);
+        }
     }
     return result;
 }
@@ -238,23 +243,28 @@ void __fastcall CharacterManagerUpdateDetour(
             EngineThreadSource::CharacterManagerUpdate,
             performanceCounter);
     }
-    if (auto* evidence = gEvidence.load(std::memory_order_acquire);
-        evidence != nullptr) {
+    if (runtime_features::Enabled(runtime_features::Feature::EngineThreadEvidence)) {
+        if (auto* evidence = gEvidence.load(std::memory_order_acquire);
+            evidence != nullptr) {
         evidence->ObserveCharacterManagerUpdate(
             threadId,
             performanceCounter,
             reinterpret_cast<std::uintptr_t>(manager));
+        }
     }
     // Apply queued replication commands before CharacterManager advances the
     // native animation graph. This lets the 0x01 -> 0x38 transition happen in
     // time for the same frame's ActNPCLocomotionCycle update instead of one
     // frame after the AI has already ticked.
-    static_cast<void>(replication_core::PumpDeferredRemoteApplyOnEngineThread());
-    if (auto* dispatcher = gDispatcher.load(std::memory_order_acquire);
-        dispatcher != nullptr) {
-        dispatcher->DrainOnEngineThread(4);
+    if (runtime_features::Enabled(runtime_features::Feature::GameThreadPumps)) {
+        static_cast<void>(replication_core::PumpDeferredRemoteApplyOnEngineThread());
+        if (auto* dispatcher = gDispatcher.load(std::memory_order_acquire);
+            dispatcher != nullptr) {
+            dispatcher->DrainOnEngineThread(4);
+        }
+        character_direct_step_runtime::PumpOnEngineThread(
+            character_direct_step_runtime::EnginePumpPhase::PreCharacterManager);
     }
-    character_direct_step_runtime::PumpOnEngineThread();
 
     const auto original = reinterpret_cast<ManagerUpdate>(
         gManagerUpdateTrampoline.load(std::memory_order_acquire));
@@ -272,15 +282,18 @@ void __fastcall CharacterManagerUpdateDetour(
 
     // Commands can arrive while CharacterManager is executing, and CIVILIAN
     // code may attempt another state transition during the update. Drain once
-    // more and reconcile after the native tick. Pumping twice does not restart
-    // locomotion: the runtime only calls a transition when cycle+0x1A differs
-    // from the requested 0x38/0x01 state.
-    static_cast<void>(replication_core::PumpDeferredRemoteApplyOnEngineThread());
-    if (auto* dispatcher = gDispatcher.load(std::memory_order_acquire);
-        dispatcher != nullptr) {
-        dispatcher->DrainOnEngineThread(4);
+    // more after the native tick. The Remote Movement POST phase is deliberately
+    // cheap: it returns immediately unless a target changed during retail or a
+    // native state loss was observed and actually needs reconciliation.
+    if (runtime_features::Enabled(runtime_features::Feature::GameThreadPumps)) {
+        static_cast<void>(replication_core::PumpDeferredRemoteApplyOnEngineThread());
+        if (auto* dispatcher = gDispatcher.load(std::memory_order_acquire);
+            dispatcher != nullptr) {
+            dispatcher->DrainOnEngineThread(4);
+        }
+        character_direct_step_runtime::PumpOnEngineThread(
+            character_direct_step_runtime::EnginePumpPhase::PostCharacterManager);
     }
-    character_direct_step_runtime::PumpOnEngineThread();
 }
 
 void __fastcall ReadinessProducerDetour(
@@ -298,8 +311,9 @@ void __fastcall ReadinessProducerDetour(
             EngineThreadSource::CharacterReadinessProducer,
             performanceCounter);
     }
-    if (auto* evidence = gEvidence.load(std::memory_order_acquire);
-        evidence != nullptr) {
+    if (runtime_features::Enabled(runtime_features::Feature::EngineThreadEvidence)) {
+        if (auto* evidence = gEvidence.load(std::memory_order_acquire);
+            evidence != nullptr) {
         evidence->ObserveReadinessProducer(
             threadId,
             performanceCounter,
@@ -307,15 +321,18 @@ void __fastcall ReadinessProducerDetour(
             reinterpret_cast<std::uintptr_t>(manager),
             spawnKey,
             reinterpret_cast<std::uintptr_t>(record));
+        }
     }
     const auto original = reinterpret_cast<ReadinessProducer>(
         gReadinessProducerTrampoline.load(std::memory_order_acquire));
     if (original != nullptr) {
         original(manager, spawnKey, record);
     }
-    if (auto* dispatcher = gDispatcher.load(std::memory_order_acquire);
-        dispatcher != nullptr) {
-        dispatcher->DrainOnEngineThread(4);
+    if (runtime_features::Enabled(runtime_features::Feature::GameThreadPumps)) {
+        if (auto* dispatcher = gDispatcher.load(std::memory_order_acquire);
+            dispatcher != nullptr) {
+            dispatcher->DrainOnEngineThread(4);
+        }
     }
 }
 
@@ -325,6 +342,16 @@ void __fastcall ReadinessPublisherDetour(
     const void* message,
     const std::uint32_t observedZero) noexcept {
     ActiveDetour active;
+    const auto original = reinterpret_cast<ReadinessPublisher>(
+        gReadinessPublisherTrampoline.load(std::memory_order_acquire));
+    if (!runtime_features::Enabled(
+            runtime_features::Feature::EngineThreadEvidence)) {
+        if (original != nullptr) {
+            original(publisher, message, observedZero);
+        }
+        return;
+    }
+
     bool readable = false;
     const auto copy = CopyReadyMessage(message, readable);
     if (auto* evidence = gEvidence.load(std::memory_order_acquire);
@@ -337,8 +364,6 @@ void __fastcall ReadinessPublisherDetour(
             copy,
             readable);
     }
-    const auto original = reinterpret_cast<ReadinessPublisher>(
-        gReadinessPublisherTrampoline.load(std::memory_order_acquire));
     if (original != nullptr) {
         original(publisher, message, observedZero);
     }
@@ -349,6 +374,16 @@ void __fastcall ReadinessBarrierDetour(
     void*,
     const void* message) noexcept {
     ActiveDetour active;
+    const auto original = reinterpret_cast<ReadinessBarrier>(
+        gReadinessBarrierTrampoline.load(std::memory_order_acquire));
+    if (!runtime_features::Enabled(
+            runtime_features::Feature::EngineThreadEvidence)) {
+        if (original != nullptr) {
+            original(sink, message);
+        }
+        return;
+    }
+
     bool messageReadable = false;
     const auto copy = CopyReadyMessage(message, messageReadable);
     std::uint32_t countBefore = 0;
@@ -357,8 +392,6 @@ void __fastcall ReadinessBarrierDetour(
     const auto recordBefore =
         ReadRecordFromReadySink(sink, copy, messageReadable);
 
-    const auto original = reinterpret_cast<ReadinessBarrier>(
-        gReadinessBarrierTrampoline.load(std::memory_order_acquire));
     if (original != nullptr) {
         original(sink, message);
     }

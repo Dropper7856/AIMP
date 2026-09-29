@@ -33,6 +33,7 @@ using RefillFn = std::uint32_t(__thiscall*)(void*, std::int32_t);
 constexpr std::size_t kMaximumSessions = 8U;
 constexpr double kWaitTimeout = 5.0; // active engine time, never a firing cadence
 constexpr unsigned int kReleaseUpdates = 2U;
+constexpr ULONGLONG kSteadyValidationIntervalMs = 250ULL;
 constexpr std::uintptr_t kMaximumAddress = 0xFFFF0000U;
 
 struct Birth {
@@ -99,6 +100,7 @@ struct Session {
     unsigned int coherentReleaseUpdates{};
     double waitSeconds{};
     std::uint64_t revision{};
+    ULONGLONG nextSteadyValidationTick{};
     StartBlock lastStartBlock{StartBlock::None};
     std::uint32_t reportedStartBlocks{}; // each functional refusal once per press
 };
@@ -154,11 +156,23 @@ thread_local unsigned int gUpdateDepth{};
 std::array<std::atomic<std::uintptr_t>, kMaximumSessions> gControllerHints{};
 std::atomic<std::uint32_t> gControllerMask{0U};
 
+bool NeedsNaturalUpdate(const Session& session) noexcept {
+    if (!session.used) return false;
+    if (session.legacyBlocked || !session.legacyCleaned) return true;
+    if (session.phase != Phase::Idle || !session.releaseComplete) return true;
+    if (session.primaryRequested || session.primaryApplied ||
+        session.aimStopPending || session.aimStopFailed) return true;
+    // A stable Aim HOLD is controller-owned state. Once A1 is applied, lifecycle
+    // hooks and explicit commands are sufficient; keeping the controller in the
+    // EquipmentController::Update detour only revalidates the same state every frame.
+    return session.aimRequested != session.aimApplied;
+}
+
 void PublishControllerHintsLocked() noexcept {
     std::uint32_t mask = 0U;
     for (std::size_t i = 0U; i < kMaximumSessions; ++i) {
         const auto& session = gRuntime.sessions[i];
-        const auto controller = gRuntime.enabled && session.used
+        const auto controller = gRuntime.enabled && NeedsNaturalUpdate(session)
             ? session.controller : 0U;
         gControllerHints[i].store(controller, std::memory_order_release);
         if (controller != 0U) mask |= (1U << i);
@@ -264,6 +278,24 @@ bool CopyWithSeh(void* output, const void* input, const std::size_t bytes) noexc
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+}
+
+bool ReadInputBytesFast(
+    const std::uintptr_t controller,
+    std::array<std::uint8_t, 2>& inputs) noexcept {
+#if defined(_MSC_VER)
+    if (controller < 0x10000U || controller > kMaximumAddress - 0xA2U) return false;
+    __try {
+        inputs[0] = *reinterpret_cast<const volatile std::uint8_t*>(controller + 0xA1U);
+        inputs[1] = *reinterpret_cast<const volatile std::uint8_t*>(controller + 0xA2U);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    return crash_guard::TryCopy(
+        inputs.data(), reinterpret_cast<const void*>(controller + 0xA1U), inputs.size());
+#endif
 }
 
 bool CopyReadable(void* output, const void* input, const std::size_t bytes) noexcept {
@@ -696,6 +728,26 @@ Ticket BeforeUpdate(const std::uintptr_t controller) {
         if (gRuntime.releaseThreadId == 0U ||
             gRuntime.releaseThreadId != GetCurrentThreadId()) return ticket;
     }
+
+    // Primary HOLD can persist for many retail updates. Between periodic deep
+    // identity checks, the only state AIMP must observe is A1/A2. Equipment
+    // replacement initiated by AIMP always sends STOP first, while lifecycle
+    // hooks synchronously invalidate a destroyed Character. If either byte
+    // drifts or the cheap read faults, fall through to the fully certified path.
+    const bool hotSteadyPrimary = session->legacyCleaned && !session->legacyBlocked &&
+        session->itemBound && session->phase == Phase::Held &&
+        session->aimRequested && session->aimApplied &&
+        session->primaryRequested && session->primaryApplied &&
+        !session->aimStopPending && !session->aimStopFailed;
+    const auto steadyNow = GetTickCount64();
+    if (hotSteadyPrimary && steadyNow < session->nextSteadyValidationTick) {
+        std::array<std::uint8_t, 2> inputs{};
+        if (ReadInputBytesFast(controller, inputs) &&
+            inputs[0] != 0U && inputs[1] != 0U) {
+            return ticket;
+        }
+    }
+
     if (!ControllerIdentity(*session)) {
         Fault(*session, "character_or_controller_invalidated");
         *session = {}; // no cleanup through a detached/reused controller
@@ -757,6 +809,9 @@ Ticket BeforeUpdate(const std::uintptr_t controller) {
                     if (steadyAim || inputs[1] != 0U ||
                         SetNative(gRuntime.primaryStart, controller)) {
                         if (!sameSession()) return {};
+                        session->nextSteadyValidationTick =
+                            GetTickCount64() + kSteadyValidationIntervalMs;
+                        PublishControllerHintsLocked();
                         return ticket;
                     }
                 }
@@ -776,6 +831,20 @@ Ticket BeforeUpdate(const std::uintptr_t controller) {
     const bool readable = ReadFrame(*session, frame);
     if (!sameSession()) return ticket;
     if (!readable) {
+        // A freshly selected/provisioned retail item can be present in the
+        // Character equipment table one or two natural updates before its
+        // Presentation/current-item chain is fully readable. No AIMP input has
+        // been applied yet in this admission state, so this is a transient
+        // readiness condition, not a poisoned action cycle. Let retail advance
+        // once and retry on the next natural update without converting the
+        // session into a permanent Faulted subscriber.
+        const bool freshEquipmentSettling = session->phase == Phase::Releasing &&
+            !session->itemBound && !session->aimApplied && !session->primaryApplied &&
+            !session->aimStopPending && !session->aimStopFailed;
+        if (freshEquipmentSettling) {
+            PublishControllerHintsLocked();
+            return ticket;
+        }
         Fault(*session, "equipment_not_ready");
     } else if (!session->itemBound) {
         BindEquipment(*session, frame);
@@ -861,6 +930,14 @@ Ticket BeforeUpdate(const std::uintptr_t controller) {
     // invalidate sessions synchronously on destruction/generation changes.
     ticket.needsAfterUpdate = session->phase == Phase::Releasing ||
         session->phase == Phase::PendingStart || session->phase == Phase::Faulted;
+    if (session->phase == Phase::Held && session->primaryRequested &&
+        session->primaryApplied && session->aimRequested && session->aimApplied) {
+        session->nextSteadyValidationTick =
+            GetTickCount64() + kSteadyValidationIntervalMs;
+    }
+    // This is what removes a stable Aim HOLD from the detour mask. Transitions,
+    // Primary and release/fault barriers stay subscribed to natural updates.
+    PublishControllerHintsLocked();
     return ticket;
 }
 
@@ -908,6 +985,19 @@ void AfterUpdate(const Ticket& ticket) {
         if (session->coherentReleaseUpdates >= kReleaseUpdates) {
             if (session->phase == Phase::Faulted) {
                 session->faultReleaseComplete = true;
+                // A fault is a safety barrier, not a permanent subscription.
+                // Once retail has proven a coherent released state and no AIMP
+                // input remains applied/pending, there is nothing left for the
+                // EquipmentController detour to supervise. Retire the session
+                // exactly like a fully released Idle session. A later Aim START
+                // will admit a fresh session against the then-current equipment.
+                if (!session->aimRequested && !session->primaryRequested &&
+                    !session->aimApplied && !session->primaryApplied &&
+                    !session->aimStopPending && !session->aimStopFailed) {
+                    *session = {};
+                    PublishControllerHintsLocked();
+                    return;
+                }
             } else {
                 session->releaseComplete = true;
                 ChangePhase(*session, Phase::Idle, "release_barrier_complete");
@@ -936,6 +1026,7 @@ void AfterUpdate(const Ticket& ticket) {
         *session = {};
         PublishControllerHintsLocked();
     }
+    PublishControllerHintsLocked();
     if (gRuntime.detached && AllReleasedLocked()) {
         gRuntime.enabled = false;
         gRuntime.generations = nullptr;
@@ -1255,8 +1346,8 @@ bool Install(const SignatureResolver& resolver, HookManager& hooks,
     gInstalled.store(true, std::memory_order_release);
     try {
         diagnostics.Log("info", "character_action_runtime_performance",
-            "Steady Aim and Held Primary validate live equipment and input bytes only; native updates and release barriers are unchanged.",
-            {{"policy", "steady_action_selection_v4"}});
+            "Stable Aim leaves the EquipmentController detour; Held Primary uses cheap A1/A2 checks with periodic certified validation. Release barriers are unchanged.",
+            {{"policy", "event_aim_periodic_primary_v5"}});
         diagnostics.Log("info", "character_action_runtime_rearm_policy",
             "New presses wait for native readiness; two full released updates are required. No native state is reset.",
             {{"policy", "native_ready_edge_release_v2"}});
@@ -1296,6 +1387,7 @@ Result SetAim(const std::uintptr_t character, const bool enabled) {
         session->aimRequested = false;
         BeginRelease(*session, "aim_stop_requested");
     } else session->aimRequested = true;
+    PublishControllerHintsLocked();
     return Accepted(session);
 }
 
@@ -1325,6 +1417,7 @@ Result SetPrimaryAction(const std::uintptr_t character, const bool enabled) {
     }
     // Releasing stays Releasing. A true request here is exactly one deferred
     // intent; a later STOP cancels it without producing a synthetic click.
+    PublishControllerHintsLocked();
     return Accepted(session);
 }
 
@@ -1513,6 +1606,9 @@ void RequestStopAll() noexcept {
             ++session.revision;
             BeginRelease(session, "runtime_shutdown_requested");
         }
+        // Stable Aim sessions are normally absent from the detour mask; shutdown
+        // must subscribe them again so their transition-only STOP is consumed.
+        PublishControllerHintsLocked();
     } catch (...) { }
 }
 

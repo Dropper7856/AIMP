@@ -849,6 +849,27 @@ bool DecodeGameCommand(
             return true;
         }
 
+        if (command->stringValue == "PERFORMANCE_ISOLATION_SET") {
+            if (output.levelGeneration != 0U || arguments->objectValue.size() != 2U)
+                return false;
+            const auto* module = Field(*arguments, "module", JsonType::String);
+            const auto* enabled = Field(*arguments, "enabled", JsonType::String);
+            if (module == nullptr || enabled == nullptr ||
+                (enabled->stringValue != "0" && enabled->stringValue != "1"))
+                return false;
+            constexpr std::array<std::string_view, 8U> kModules{
+                "player-sync-observer", "remote-movement-runtime",
+                "worldsync-hooks", "character-lifecycle", "engine-evidence",
+                "native-diagnostics", "locomotion-flight", "game-thread-pumps"};
+            if (std::find(kModules.begin(), kModules.end(),
+                    std::string_view(module->stringValue)) == kModules.end())
+                return false;
+            output.command = command->stringValue;
+            output.performanceIsolationModule = module->stringValue;
+            output.performanceIsolationEnabled = enabled->stringValue == "1";
+            return true;
+        }
+
 
 
 

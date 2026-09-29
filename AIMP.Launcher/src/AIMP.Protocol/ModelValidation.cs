@@ -650,6 +650,18 @@ public static class ModelValidation
             return;
         }
 
+        if (string.Equals(value.Command, GameCommandNames.PerformanceIsolationSet,
+                StringComparison.Ordinal))
+        {
+            if (value.LevelGeneration != 0 || value.Arguments.Count != 2
+                || !value.Arguments.TryGetValue("module", out var module)
+                || !PerformanceIsolationNativeModules.All.Contains(module)
+                || !value.Arguments.TryGetValue("enabled", out var enabled)
+                || (enabled != "0" && enabled != "1"))
+                throw new ProtocolException("PERFORMANCE_ISOLATION_SET parameters are invalid.");
+            return;
+        }
+
 
 
         if (value.Arguments.Count == 0)

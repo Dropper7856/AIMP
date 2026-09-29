@@ -158,6 +158,7 @@ public static class GameCommandNames
     public const string WorldCompositeInputStats = "WORLD_COMPOSITE_INPUT_STATS";
     // Internal Launcher -> Native ProbeDirect configuration, intentionally absent from the UI catalogue.
     public const string WorldWs3EmptyCallbackSet = "WORLD_WS3_EMPTY_CALLBACK_SET";
+    public const string PerformanceIsolationSet = "PERFORMANCE_ISOLATION_SET";
     public const string WorldStateDiscoveryBaseline = "WORLD_STATE_DISCOVERY_BASELINE";
     public const string WorldStateDiscoveryAfter = "WORLD_STATE_DISCOVERY_AFTER";
     public const string WorldStateDiscoveryStatus = "WORLD_STATE_DISCOVERY_STATUS";
@@ -179,9 +180,32 @@ public static class GameCommandNames
             WorldInteractionStats,
             WorldCompositeInputStats,
             WorldWs3EmptyCallbackSet,
+            PerformanceIsolationSet,
             WorldStateDiscoveryBaseline,
             WorldStateDiscoveryAfter,
             WorldStateDiscoveryStatus
+        },
+        StringComparer.Ordinal);
+}
+
+
+public static class PerformanceIsolationNativeModules
+{
+    public const string PlayerSyncObserver = "player-sync-observer";
+    public const string RemoteMovementRuntime = "remote-movement-runtime";
+    public const string WorldSyncHooks = "worldsync-hooks";
+    public const string CharacterLifecycle = "character-lifecycle";
+    public const string EngineEvidence = "engine-evidence";
+    public const string NativeDiagnostics = "native-diagnostics";
+    public const string LocomotionFlight = "locomotion-flight";
+    public const string GameThreadPumps = "game-thread-pumps";
+
+    public static readonly IReadOnlySet<string> All = new HashSet<string>(
+        new[]
+        {
+            PlayerSyncObserver, RemoteMovementRuntime, WorldSyncHooks,
+            CharacterLifecycle, EngineEvidence, NativeDiagnostics,
+            LocomotionFlight, GameThreadPumps
         },
         StringComparer.Ordinal);
 }

@@ -23,6 +23,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
     private readonly LauncherSettingsStore _settingsStore;
     private readonly ScaleformBridgeListener _bridge;
     private readonly LauncherDiagnostics _diagnostics;
+    private readonly PerformanceIsolationState _performanceIsolation;
     private readonly SemaphoreSlim _commandGate = new(1, 1);
     private readonly SemaphoreSlim _spawnGate = new(1, 1);
     private readonly CancellationTokenSource _lifetime = new();
@@ -375,17 +376,148 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
     internal MultiplayerSessionCoordinator(
         NativeRuntimeController controller,
         LauncherSettingsStore settingsStore,
-        ScaleformBridgeListener bridge)
+        ScaleformBridgeListener bridge,
+        PerformanceIsolationState performanceIsolation)
     {
         _controller = controller ?? throw new ArgumentNullException(nameof(controller));
         _settingsStore = settingsStore ?? throw new ArgumentNullException(nameof(settingsStore));
         _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
+        _performanceIsolation = performanceIsolation ?? throw new ArgumentNullException(nameof(performanceIsolation));
         _diagnostics = controller.Diagnostics;
         _bridge.MessageReceived += OnBridgeMessage;
         _controller.WorldIntentProduced += OnNativeWorldIntentProduced;
         _controller.WorldMutationCompleted += OnNativeWorldMutationCompleted;
         _controller.PlayerSyncStateProduced += OnNativePlayerSyncStateProduced;
         _controller.PlayerSyncActionProduced += OnNativePlayerSyncActionProduced;
+    }
+
+    internal async Task ApplyPerformanceIsolationModuleAsync(
+        PerformanceIsolationModule module, bool enabled)
+    {
+        switch (module)
+        {
+            case PerformanceIsolationModule.PositionNetworkTransmit:
+                _performanceIsolation.SetEnabled(module, enabled);
+                if (!enabled)
+                {
+                    lock (_stateGate) _pendingLocalPosition = null;
+                }
+                return;
+
+            case PerformanceIsolationModule.RemoteMovement:
+                if (!enabled)
+                {
+                    _performanceIsolation.SetEnabled(module, false);
+                    uint[] characters;
+                    lock (_stateGate) characters = _remoteCharacters.Values.Distinct().ToArray();
+                    await StopRemoteCharactersBestEffortAsync(characters).ConfigureAwait(false);
+                    await _controller.SetPerformanceIsolationModuleAsync(
+                        PerformanceIsolationNativeModules.RemoteMovementRuntime, false, _lifetime.Token)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    await _controller.SetPerformanceIsolationModuleAsync(
+                        PerformanceIsolationNativeModules.RemoteMovementRuntime, true, _lifetime.Token)
+                        .ConfigureAwait(false);
+                    _performanceIsolation.SetEnabled(module, true);
+                }
+                return;
+
+            case PerformanceIsolationModule.EquipmentSync:
+            case PerformanceIsolationModule.ActionSync:
+                _performanceIsolation.SetEnabled(module, enabled);
+                if (module == PerformanceIsolationModule.ActionSync)
+                {
+                    lock (_stateGate) _lastQueuedEquipmentState = null;
+                }
+                if (!enabled && module == PerformanceIsolationModule.ActionSync)
+                {
+                    KeyValuePair<ulong, uint>[] characters;
+                    lock (_stateGate)
+                    {
+                        _pendingLocalPlayerActions.Clear();
+                        _pendingRemotePlayerActions.Clear();
+                        characters = _remoteCharacters.ToArray();
+                    }
+                    foreach (var pair in characters)
+                        await StopRemotePlayerActionsAsync(pair.Key, pair.Value).ConfigureAwait(false);
+                }
+                if (!enabled && module == PerformanceIsolationModule.EquipmentSync)
+                {
+                    lock (_stateGate)
+                    {
+                        _pendingLocalEquipment = null;
+                        _lastQueuedEquipmentState = null;
+                    }
+                }
+                var observerEnabled =
+                    _performanceIsolation.IsEnabled(PerformanceIsolationModule.EquipmentSync) ||
+                    _performanceIsolation.IsEnabled(PerformanceIsolationModule.ActionSync);
+                await _controller.SetPerformanceIsolationModuleAsync(
+                    PerformanceIsolationNativeModules.PlayerSyncObserver, observerEnabled, _lifetime.Token)
+                    .ConfigureAwait(false);
+                return;
+
+            case PerformanceIsolationModule.WorldSync:
+                if (!enabled)
+                {
+                    _performanceIsolation.SetEnabled(module, false);
+                    lock (_stateGate) _worldSyncEnabledForSession = false;
+                    await CloseNativeWorldBusAsync("performance-isolation").ConfigureAwait(false);
+                    await _controller.SetPerformanceIsolationModuleAsync(
+                        PerformanceIsolationNativeModules.WorldSyncHooks, false, _lifetime.Token)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    await _controller.SetPerformanceIsolationModuleAsync(
+                        PerformanceIsolationNativeModules.WorldSyncHooks, true, _lifetime.Token)
+                        .ConfigureAwait(false);
+                    _performanceIsolation.SetEnabled(module, true);
+                    lock (_stateGate)
+                    {
+                        _worldSyncEnabledForSession = _settingsStore.Load().WorldSyncEnabled;
+                        _worldActivationAttempted = false;
+                    }
+                    await TryActivateAutomaticWorldSyncAsync(_controller.Snapshot).ConfigureAwait(false);
+                }
+                return;
+
+            case PerformanceIsolationModule.EngineThreadEvidence:
+                await _controller.SetPerformanceIsolationModuleAsync(
+                    PerformanceIsolationNativeModules.EngineEvidence, enabled, _lifetime.Token)
+                    .ConfigureAwait(false);
+                _performanceIsolation.SetEnabled(module, enabled);
+                return;
+
+            case PerformanceIsolationModule.CharacterLifecycleCapture:
+                await _controller.SetPerformanceIsolationModuleAsync(
+                    PerformanceIsolationNativeModules.CharacterLifecycle, enabled, _lifetime.Token)
+                    .ConfigureAwait(false);
+                _performanceIsolation.SetEnabled(module, enabled);
+                return;
+
+            case PerformanceIsolationModule.GameThreadPumps:
+                if (!enabled)
+                {
+                    KeyValuePair<ulong, uint>[] characters;
+                    lock (_stateGate) characters = _remoteCharacters.ToArray();
+                    await StopRemoteCharactersBestEffortAsync(
+                        characters.Select(pair => pair.Value)).ConfigureAwait(false);
+                    foreach (var pair in characters)
+                        await StopRemotePlayerActionsAsync(pair.Key, pair.Value).ConfigureAwait(false);
+                }
+                await _controller.SetPerformanceIsolationModuleAsync(
+                    PerformanceIsolationNativeModules.GameThreadPumps, enabled, _lifetime.Token)
+                    .ConfigureAwait(false);
+                _performanceIsolation.SetEnabled(module, enabled);
+                return;
+
+            default:
+                _performanceIsolation.SetEnabled(module, enabled);
+                return;
+        }
     }
 
     internal event EventHandler<MultiplayerSessionView>? StateChanged;
@@ -2313,7 +2445,8 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
 
     private async Task HandleLobbyStartedAsync(LobbyStartPayload value)
     {
-        var worldSyncEnabled = _settingsStore.Load().WorldSyncEnabled;
+        var worldSyncEnabled = _settingsStore.Load().WorldSyncEnabled &&
+            _performanceIsolation.IsEnabled(PerformanceIsolationModule.WorldSync);
         uint[] previousCharacters;
         LobbyHost? host;
         LobbyClient? client;
@@ -2471,7 +2604,8 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         object? sender,
         NativePlayerEquipmentStatePayload value)
     {
-        if (Volatile.Read(ref _disposed) != 0) return;
+        if (Volatile.Read(ref _disposed) != 0 ||
+            !_performanceIsolation.IsEnabled(PerformanceIsolationModule.EquipmentSync)) return;
         lock (_stateGate)
         {
             _localEquipmentState = value.Valid ? value : null;
@@ -2490,7 +2624,8 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         object? sender,
         NativePlayerActionEventPayload value)
     {
-        if (Volatile.Read(ref _disposed) != 0) return;
+        if (Volatile.Read(ref _disposed) != 0 ||
+            !_performanceIsolation.IsEnabled(PerformanceIsolationModule.ActionSync)) return;
 
         var startPump = false;
         lock (_stateGate)
@@ -2523,6 +2658,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         object? sender,
         PlayerEquipmentSnapshotPayload value)
     {
+        if (!_performanceIsolation.IsEnabled(PerformanceIsolationModule.EquipmentSync)) return;
         PlayerEquipmentSnapshotPayload? previous;
         uint characterBase;
         lock (_stateGate)
@@ -2539,10 +2675,14 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
             _remoteCharacters.TryGetValue(value.PeerId, out characterBase);
         }
 
+        // Only a change in the equipment that can actually be represented on
+        // the remote Character requires convergence. Retail can oscillate raw
+        // current/previous/active fields while resolving to the same carried item;
+        // treating those internal transitions as equipment changes causes needless
+        // network/convergence work without changing the remote result.
         var equipmentChanged = previous is null
-            || previous.CurrentEquipmentIndex != value.CurrentEquipmentIndex
-            || previous.PreviousEquipmentIndex != value.PreviousEquipmentIndex
-            || previous.EquipmentActive != value.EquipmentActive;
+            || ResolveVisibleRemoteEquipmentIndex(previous)
+                != ResolveVisibleRemoteEquipmentIndex(value);
         var actionStateChanged = previous is null
             || previous.AimHeld != value.AimHeld
             || previous.PrimaryHeld != value.PrimaryHeld;
@@ -2568,7 +2708,8 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         object? sender,
         PlayerActionEventPayload value)
     {
-        if (Volatile.Read(ref _disposed) != 0) return;
+        if (Volatile.Read(ref _disposed) != 0 ||
+            !_performanceIsolation.IsEnabled(PerformanceIsolationModule.ActionSync)) return;
         var startPump = false;
         lock (_stateGate)
         {
@@ -2642,6 +2783,8 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
 
     private bool TryQueueLocalPosition(DateTimeOffset now)
     {
+        if (!_performanceIsolation.IsEnabled(PerformanceIsolationModule.PositionNetworkTransmit))
+            return false;
         lock (_stateGate)
         {
             if (_start is null || !_localGameplayReady || !_positionAvailable)
@@ -2695,6 +2838,8 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
 
     private bool TryQueueLocalEquipment(DateTimeOffset now)
     {
+        if (!_performanceIsolation.IsEnabled(PerformanceIsolationModule.EquipmentSync))
+            return false;
         lock (_stateGate)
         {
             if (_start is null || !_localGameplayReady
@@ -2702,12 +2847,13 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
             var peerId = LocalPeerId();
             if (peerId == 0 || (_host is null && _client is null)) return false;
 
+            var includeActions =
+                _performanceIsolation.IsEnabled(PerformanceIsolationModule.ActionSync);
             var changed = _lastQueuedEquipmentState is null
-                || _lastQueuedEquipmentState.CurrentEquipmentIndex != state.CurrentEquipmentIndex
-                || _lastQueuedEquipmentState.PreviousEquipmentIndex != state.PreviousEquipmentIndex
-                || _lastQueuedEquipmentState.EquipmentActive != state.EquipmentActive
-                || _lastQueuedEquipmentState.AimHeld != state.AimHeld
-                || _lastQueuedEquipmentState.PrimaryHeld != state.PrimaryHeld;
+                || ResolveVisibleLocalEquipmentIndex(_lastQueuedEquipmentState)
+                    != ResolveVisibleLocalEquipmentIndex(state)
+                || (includeActions && (_lastQueuedEquipmentState.AimHeld != state.AimHeld
+                    || _lastQueuedEquipmentState.PrimaryHeld != state.PrimaryHeld));
             if (!changed && now < _nextEquipmentRefreshAtUtc) return false;
 
             _lastQueuedEquipmentState = state;
@@ -2716,7 +2862,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
                 _start.SessionId, peerId, _start.LevelGeneration, ++_localPlayerSyncSequence,
                 now.ToUnixTimeMilliseconds(), state.CurrentEquipmentIndex,
                 state.PreviousEquipmentIndex, state.EquipmentActive, state.PresentationState,
-                state.AimHeld, state.PrimaryHeld);
+                includeActions && state.AimHeld, includeActions && state.PrimaryHeld);
 
             if (changed)
             {
@@ -2851,6 +2997,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
 
     private async Task ApplyRemotePlayerActionAsync(PlayerActionEventPayload value)
     {
+        if (!_performanceIsolation.IsEnabled(PerformanceIsolationModule.ActionSync)) return;
         await _remotePlayerSyncGate.WaitAsync(_lifetime.Token).ConfigureAwait(false);
         try
         {
@@ -2977,6 +3124,9 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
                 return;
             }
 
+            if (!_performanceIsolation.IsEnabled(PerformanceIsolationModule.ActionSync))
+                return;
+
             // Provisioning from an older durable snapshot is still useful, but
             // never let its Aim/Primary state overwrite a newer ordered edge
             // that arrived while the Give command was running.
@@ -3027,6 +3177,18 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         {
             if (gateHeld) _remotePlayerSyncGate.Release();
         }
+    }
+
+    private static int ResolveVisibleLocalEquipmentIndex(
+        NativePlayerEquipmentStatePayload equipment)
+    {
+        if (RemoteEquipmentDefinitions.TryGetPlayerSyncEquipmentId(
+                equipment.CurrentEquipmentIndex, out _))
+            return equipment.CurrentEquipmentIndex;
+        if (RemoteEquipmentDefinitions.TryGetPlayerSyncEquipmentId(
+                equipment.PreviousEquipmentIndex, out _))
+            return equipment.PreviousEquipmentIndex;
+        return equipment.CurrentEquipmentIndex;
     }
 
     private static int ResolveVisibleRemoteEquipmentIndex(
@@ -3164,6 +3326,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         NativeRuntimeSnapshot runtime,
         DateTimeOffset now)
     {
+        if (!_performanceIsolation.IsEnabled(PerformanceIsolationModule.RemoteMovement)) return;
         if (!TryBeginRemoteMovement(runtime, out var targets)) return;
         try
         {
@@ -3427,6 +3590,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
 
     private async Task TryActivateAutomaticWorldSyncAsync(NativeRuntimeSnapshot runtime)
     {
+        if (!_performanceIsolation.IsEnabled(PerformanceIsolationModule.WorldSync)) return;
         LobbyHost? host;
         Task<PreparedWorldManifest?>? preparation;
         lock (_stateGate)
@@ -3640,6 +3804,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         NativeRuntimeSnapshot runtime,
         DateTimeOffset now)
     {
+        if (!_performanceIsolation.IsEnabled(PerformanceIsolationModule.RemoteCharacterSpawn)) return;
         RemotePlayerSpawnTarget target;
         lock (_stateGate)
         {
@@ -3786,6 +3951,8 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
 
     private bool TryBeginPendingSpawnRequest(NativeRuntimeSnapshot runtime)
     {
+        if (!_performanceIsolation.IsEnabled(PerformanceIsolationModule.RemoteCharacterSpawn))
+            return false;
         lock (_stateGate)
         {
             if (_pendingSpawnRequest is null || _spawnRequestRunning) return false;

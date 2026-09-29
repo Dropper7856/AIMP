@@ -60,9 +60,15 @@ bool Install(
 
 [[nodiscard]] bool Installed() noexcept;
 
-// Called from CharacterManagerUpdate on the engine thread. This is the sole
-// owner of native Move/Idle transitions and the one-time initial placement.
-void PumpOnEngineThread() noexcept;
+// Called from CharacterManagerUpdate on the engine thread. PRE owns normal
+// follower preparation and native transitions. POST is a reconciliation pass
+// that only performs work when state changed during the retail manager tick.
+enum class EnginePumpPhase : std::uint8_t {
+    PreCharacterManager = 0U,
+    PostCharacterManager = 1U,
+};
+
+void PumpOnEngineThread(EnginePumpPhase phase) noexcept;
 
 bool ArmDirection(
     std::uintptr_t characterAddress,

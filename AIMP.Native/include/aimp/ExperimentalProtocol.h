@@ -50,6 +50,8 @@ struct DiagnosticSnapshotRequest : RequestEnvelope {
 struct GameCommandRequest : RequestEnvelope {
     std::string command;
     bool worldSync3EmptyCallbackEnabled{};
+    std::string performanceIsolationModule;
+    bool performanceIsolationEnabled{};
     PopupMessageCommand popupMessage;
     SpawnCharacterCommand spawnCharacter;
     CharacterDirectMoveCommand characterDirectMove;

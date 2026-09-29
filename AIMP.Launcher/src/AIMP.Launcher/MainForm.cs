@@ -9,6 +9,8 @@ internal sealed class MainForm : Form
     private readonly ScaleformBridgeListener _bridge;
     private readonly GameLaunchCoordinator _gameLauncher;
     private readonly MultiplayerSessionCoordinator _multiplayer;
+    private readonly PerformanceIsolationState _performanceIsolation = new();
+    private readonly Dictionary<PerformanceIsolationModule, ToolStripMenuItem> _performanceItems = new();
     private readonly Button _launchButton = new() { Text = "Launch Game", AutoSize = true };
     private readonly Button _settingsButton = new() { Text = "Settings", AutoSize = true };
     private readonly Button _injectButton = new() { Text = "Inject DLL", AutoSize = true };
@@ -40,7 +42,8 @@ internal sealed class MainForm : Form
         _bridge = new ScaleformBridgeListener(_controller.Diagnostics);
         _gameLauncher = new GameLaunchCoordinator(_settingsStore,
             new UiPakInstaller(_controller.Diagnostics), _bridge, _controller.Diagnostics);
-        _multiplayer = new MultiplayerSessionCoordinator(_controller, _settingsStore, _bridge);
+        _multiplayer = new MultiplayerSessionCoordinator(
+            _controller, _settingsStore, _bridge, _performanceIsolation);
         ConfigureWindow();
         Controls.Add(BuildInterface());
         SubscribeEvents();
@@ -63,15 +66,172 @@ internal sealed class MainForm : Form
     {
         var root = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill, Padding = new Padding(12), ColumnCount = 1, RowCount = 3
+            Dock = DockStyle.Fill, Padding = new Padding(12), ColumnCount = 1, RowCount = 4
         };
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.Controls.Add(BuildActionBar(), 0, 0);
-        root.Controls.Add(BuildStatusPanel(), 0, 1);
-        root.Controls.Add(BuildLogPanel(), 0, 2);
+        root.Controls.Add(BuildPerformanceMenu(), 0, 0);
+        root.Controls.Add(BuildActionBar(), 0, 1);
+        root.Controls.Add(BuildStatusPanel(), 0, 2);
+        root.Controls.Add(BuildLogPanel(), 0, 3);
         return root;
+    }
+
+    private Control BuildPerformanceMenu()
+    {
+        var strip = new MenuStrip
+        {
+            Dock = DockStyle.Fill,
+            GripStyle = ToolStripGripStyle.Hidden,
+            Margin = new Padding(0, 0, 0, 8)
+        };
+        var root = new ToolStripMenuItem("Performance Isolation");
+        AddPerformanceItem(root, PerformanceIsolationModule.LocalPlayerSampling,
+            "Local player memory sampling",
+            "Stops launcher ReadProcessMemory sampling for local position/yaw/movement profile.");
+        AddPerformanceItem(root, PerformanceIsolationModule.PositionNetworkTransmit,
+            "Position network transmit",
+            "Stops publishing local position snapshots while keeping the lobby connected.");
+        AddPerformanceItem(root, PerformanceIsolationModule.RemoteCharacterSpawn,
+            "Remote Character spawn / convergence",
+            "Stops new remote Character spawn/convergence. Existing Characters are not despawned; disable before join/rejoin for a clean test.");
+        AddPerformanceItem(root, PerformanceIsolationModule.RemoteMovement,
+            "Remote movement replication",
+            "Stops remote Character movement commands and disables the native movement follower.");
+        AddPerformanceItem(root, PerformanceIsolationModule.EquipmentSync,
+            "Equipment replication",
+            "Stops PlayerSync equipment snapshots and remote equipment convergence.");
+        AddPerformanceItem(root, PerformanceIsolationModule.ActionSync,
+            "Aim / Primary replication",
+            "Stops PlayerSync Aim/Primary events and releases currently-applied remote actions.");
+        root.DropDownItems.Add(new ToolStripSeparator());
+        AddPerformanceItem(root, PerformanceIsolationModule.WorldSync,
+            "WorldSync / CATHODE",
+            "Closes the WorldSync bus and bypasses native WorldSync/CATHODE replication hooks.");
+        AddPerformanceItem(root, PerformanceIsolationModule.UiBridge,
+            "Scaleform / UI bridge",
+            "Stops the launcher Scaleform TCP bridge while leaving lobby IPC/network connected.");
+        AddPerformanceItem(root, PerformanceIsolationModule.EngineThreadEvidence,
+            "Native engine-thread evidence",
+            "Disables native engine-thread evidence/capture work.");
+        AddPerformanceItem(root, PerformanceIsolationModule.CharacterLifecycleCapture,
+            "Native Character lifecycle capture",
+            "Disables native Character create/lifecycle observation while preserving safety cleanup.");
+        AddPerformanceItem(root, PerformanceIsolationModule.GameThreadPumps,
+            "Native game-thread pumps",
+            "Disables AIMP game-thread dispatcher/replay/movement pumps. The IPC control channel stays live so this can be re-enabled.");
+        AddPerformanceItem(root, PerformanceIsolationModule.Diagnostics,
+            "Diagnostics / log recording",
+            "Stops launcher/native diagnostic log recording and the locomotion flight recorder.");
+        root.DropDownItems.Add(new ToolStripSeparator());
+        var enableAll = new ToolStripMenuItem("Enable all");
+        enableAll.Click += async (_, _) => await ApplyAllPerformanceModulesAsync(true);
+        root.DropDownItems.Add(enableAll);
+        var disableAll = new ToolStripMenuItem("Disable all (keep lobby connected)");
+        disableAll.Click += async (_, _) => await ApplyAllPerformanceModulesAsync(false);
+        root.DropDownItems.Add(disableAll);
+        strip.Items.Add(root);
+        return strip;
+    }
+
+    private void AddPerformanceItem(
+        ToolStripMenuItem root,
+        PerformanceIsolationModule module,
+        string text,
+        string toolTip)
+    {
+        var item = new ToolStripMenuItem(text)
+        {
+            Checked = true,
+            CheckOnClick = false,
+            Tag = module,
+            ToolTipText = toolTip
+        };
+        item.Click += OnPerformanceModuleClick;
+        _performanceItems[module] = item;
+        root.DropDownItems.Add(item);
+    }
+
+    private async void OnPerformanceModuleClick(object? sender, EventArgs eventArgs)
+    {
+        if (sender is not ToolStripMenuItem item || item.Tag is not PerformanceIsolationModule module)
+            return;
+        await ApplyPerformanceModuleAsync(module, !item.Checked);
+    }
+
+    private async Task ApplyPerformanceModuleAsync(
+        PerformanceIsolationModule module, bool enabled)
+    {
+        if (!_performanceItems.TryGetValue(module, out var item) || !item.Enabled) return;
+        item.Enabled = false;
+        try
+        {
+            switch (module)
+            {
+                case PerformanceIsolationModule.UiBridge:
+                    if (enabled) StartBridge();
+                    else await _bridge.StopAsync().ConfigureAwait(true);
+                    _performanceIsolation.SetEnabled(module, enabled);
+                    break;
+
+                case PerformanceIsolationModule.Diagnostics:
+                    if (enabled) _controller.Diagnostics.SetEnabled(true);
+                    await _controller.SetPerformanceIsolationModuleAsync(
+                        PerformanceIsolationNativeModules.NativeDiagnostics, enabled).ConfigureAwait(true);
+                    await _controller.SetPerformanceIsolationModuleAsync(
+                        PerformanceIsolationNativeModules.LocomotionFlight, enabled).ConfigureAwait(true);
+                    _performanceIsolation.SetEnabled(module, enabled);
+                    if (!enabled) _controller.Diagnostics.SetEnabled(false);
+                    break;
+
+                default:
+                    await _multiplayer.ApplyPerformanceIsolationModuleAsync(module, enabled)
+                        .ConfigureAwait(true);
+                    break;
+            }
+            item.Checked = enabled;
+            if (_controller.Diagnostics.Enabled)
+                _controller.Diagnostics.Log("Performance",
+                    $"Isolation module {module}={(enabled ? "ON" : "OFF")}.");
+        }
+        catch (Exception exception)
+        {
+            if (module == PerformanceIsolationModule.Diagnostics)
+                _controller.Diagnostics.SetEnabled(true);
+            ShowError($"Performance isolation update failed for {item.Text}: {exception.Message}");
+        }
+        finally
+        {
+            item.Enabled = true;
+        }
+    }
+
+    private async Task ApplyAllPerformanceModulesAsync(bool enabled)
+    {
+        var disableOrder = new[]
+        {
+            PerformanceIsolationModule.LocalPlayerSampling,
+            PerformanceIsolationModule.PositionNetworkTransmit,
+            PerformanceIsolationModule.RemoteCharacterSpawn,
+            PerformanceIsolationModule.EquipmentSync,
+            PerformanceIsolationModule.ActionSync,
+            PerformanceIsolationModule.RemoteMovement,
+            PerformanceIsolationModule.WorldSync,
+            PerformanceIsolationModule.UiBridge,
+            PerformanceIsolationModule.EngineThreadEvidence,
+            PerformanceIsolationModule.CharacterLifecycleCapture,
+            PerformanceIsolationModule.Diagnostics,
+            PerformanceIsolationModule.GameThreadPumps
+        };
+        IEnumerable<PerformanceIsolationModule> order =
+            enabled ? disableOrder.Reverse() : disableOrder;
+        foreach (var module in order)
+        {
+            if (_performanceItems.TryGetValue(module, out var item) && item.Checked != enabled)
+                await ApplyPerformanceModuleAsync(module, enabled).ConfigureAwait(true);
+        }
     }
 
     private Control BuildActionBar()
@@ -326,6 +486,14 @@ internal sealed class MainForm : Form
     private void OnPositionTick(object? sender, EventArgs eventArgs)
     {
         var runtime = _controller.Snapshot;
+        if (!_performanceIsolation.IsEnabled(PerformanceIsolationModule.LocalPlayerSampling))
+        {
+            _playerPositionStatus.Text = "Disabled (Performance Isolation)";
+            _playerPositionStatus.ForeColor = Color.DarkOrange;
+            _multiplayer.UpdateLocalRuntime(
+                runtime, false, default, false, default, false, default);
+            return;
+        }
         if (_positionReader.TryRead(runtime, out var position))
         {
             var yawAvailable = _positionReader.TryReadYaw(runtime, out var yaw);

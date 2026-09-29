@@ -1,4 +1,5 @@
 #include "aimp/WorldPublicActions.h"
+#include "aimp/RuntimeFeatureFlags.h"
 
 #include "aimp/BuildProfile.h"
 #include "aimp/CathodePrimitiveExecutor.h"
@@ -2750,6 +2751,10 @@ void OutputCapture(void* self, void** instance, const std::uint32_t* input,
     const auto original = reinterpret_cast<PublicFn>(gOutputTrampoline.load(std::memory_order_acquire));
     if (original == nullptr) return;
     ObserveLocalEmittedOutput(instance, input);
+    if (!runtime_features::Enabled(runtime_features::Feature::WorldSyncHooks)) {
+        original(self, instance, input, callback, delay, tail);
+        return;
+    }
     if (!gInstalled.load(std::memory_order_acquire)) {
         original(self, instance, input, callback, delay, tail);
         return;
@@ -2957,6 +2962,14 @@ void OutputCapture(void* self, void** instance, const std::uint32_t* input,
 
 void __fastcall PublicDetour(void* self, void*, void** instance, const std::uint32_t* input,
     void** callback, double delay, std::uint32_t tail) {
+    if (!runtime_features::Enabled(runtime_features::Feature::WorldSyncHooks)) {
+        const auto original = reinterpret_cast<PublicFn>(
+            gPublicTrampoline.load(std::memory_order_acquire));
+        if (original != nullptr) {
+            original(self, instance, input, callback, delay, tail);
+        }
+        return;
+    }
     replication_core::BeginCausalTurn();
 #if defined(_MSC_VER) && defined(_M_IX86)
     __try { PublicCapture(self, instance, input, callback, delay, tail); }
@@ -2969,6 +2982,10 @@ void __fastcall PublicDetour(void* self, void*, void** instance, const std::uint
 
 void __fastcall OutputDetour(void* self, void*, void** instance, const std::uint32_t* input,
     void** callback, double delay, std::uint32_t tail) {
+    if (!runtime_features::Enabled(runtime_features::Feature::WorldSyncHooks)) {
+        OutputCapture(self, instance, input, callback, delay, tail);
+        return;
+    }
     // Patch 115.5 may install only this certified boundary before WorldSync is
     // armed. In that bootstrap state the detour is observation-only and must
     // not enter replication causal-turn machinery.
@@ -2993,6 +3010,10 @@ void __fastcall SchedulerDrainDetour(void* manager, void*, std::uint32_t mode) {
     using DrainFn = void (__thiscall*)(void*, std::uint32_t);
     const auto original = reinterpret_cast<DrainFn>(gDrainTrampoline.load(std::memory_order_acquire));
     if (original == nullptr) return;
+    if (!runtime_features::Enabled(runtime_features::Feature::WorldSyncHooks)) {
+        original(manager, mode);
+        return;
+    }
     replication_core::BeginCausalTurn();
 #if defined(_MSC_VER) && defined(_M_IX86)
     __try { original(manager, mode); }
@@ -3008,6 +3029,9 @@ void* __fastcall WorkBuildDetour(void* self, void*, void** source,
     void** parent, void** payload) {
     const auto original = reinterpret_cast<WorkBuildFn>(gBuildTrampoline.load(std::memory_order_acquire));
     if (original == nullptr) return self;
+    if (!runtime_features::Enabled(runtime_features::Feature::WorldSyncHooks)) {
+        return original(self, source, input, target, flags, time, parent, payload);
+    }
     Forget(self); // Every allocation/reuse boundary, including readiness gaps.
     auto* registry = gRegistry.load(std::memory_order_acquire);
     if (registry == nullptr || !registry->RuntimeCaptureReady())
@@ -3269,6 +3293,9 @@ std::uint8_t __fastcall WorkExecuteDetour(void* manager, void*, void** target,
                                          void** owner, void** itemHolder) {
     const auto original = reinterpret_cast<WorkExecuteFn>(gExecuteTrampoline.load(std::memory_order_acquire));
     if (original == nullptr) return 0U;
+    if (!runtime_features::Enabled(runtime_features::Feature::WorldSyncHooks)) {
+        return original(manager, target, owner, itemHolder);
+    }
     auto* registry = gRegistry.load(std::memory_order_acquire);
     if (registry == nullptr || !registry->RuntimeCaptureReady())
         return original(manager, target, owner, itemHolder);
@@ -3358,6 +3385,10 @@ std::uint8_t __fastcall WorkExecuteDetour(void* manager, void*, void** target,
 
 void __fastcall WorkDestroyDetour(void* self, void*) {
     const auto original = reinterpret_cast<WorkDestroyFn>(gDestroyTrampoline.load(std::memory_order_acquire));
+    if (!runtime_features::Enabled(runtime_features::Feature::WorldSyncHooks)) {
+        if (original != nullptr) original(self);
+        return;
+    }
     const auto cause = TaskCause(self, gEpoch.load(std::memory_order_relaxed));
     if (cause.cause != 0U) TraceContext(cause, 7U);
     Forget(self);

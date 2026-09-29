@@ -1,4 +1,5 @@
 #include "aimp/Diagnostics.h"
+#include "aimp/RuntimeFeatureFlags.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -98,6 +99,9 @@ void Diagnostics::Log(
     const std::string_view event,
     const std::string_view message,
     const std::initializer_list<DiagnosticField> fields) {
+    if (!runtime_features::Enabled(runtime_features::Feature::NativeDiagnostics)) {
+        return;
+    }
     const auto sequence = sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
     std::ostringstream line;
     line << "{\"timestamp\":\"" << UtcTimestamp()

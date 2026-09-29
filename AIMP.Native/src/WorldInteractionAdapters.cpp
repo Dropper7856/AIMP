@@ -1,5 +1,6 @@
 #include "aimp/WorldInteractionAdapters.h"
 #include "aimp/WorldPublicActions.h"
+#include "aimp/RuntimeFeatureFlags.h"
 
 #include "aimp/BuildProfile.h"
 #include "aimp/CathodePrimitiveExecutor.h"
@@ -1651,6 +1652,10 @@ void** __fastcall BuildCallbackValueDetour(
     const auto original = reinterpret_cast<BuildCallbackValueFn>(
         gBuildCallbackValueTrampoline.load(std::memory_order_acquire));
     if (original == nullptr) return destination;
+    if (!runtime_features::Enabled(runtime_features::Feature::WorldSyncHooks)) {
+        return original(manager, destination, sourceSharedRef, constructorFlags,
+            payloadSize, payloadData);
+    }
 
     if (gInitialized.load(std::memory_order_acquire)) {
         auto* traceRegistry = gRegistry.load(std::memory_order_acquire);
@@ -4206,6 +4211,9 @@ std::uint8_t __fastcall LogicSwitchSetDetour(
     const auto original = reinterpret_cast<LogicSwitchInputFn>(
         gLogicSwitchSetTrampoline.load(std::memory_order_acquire));
     if (original == nullptr) return 0U;
+    if (!runtime_features::Enabled(runtime_features::Feature::WorldSyncHooks)) {
+        return original(self, contextA, contextB);
+    }
     if (world_actions::Installed() && !HistoricalLogicDiagnosticsActive()) {
         return original(self, contextA, contextB);
     }
@@ -4285,6 +4293,9 @@ std::uint8_t __fastcall LogicSwitchClearDetour(
     const auto original = reinterpret_cast<LogicSwitchInputFn>(
         gLogicSwitchClearTrampoline.load(std::memory_order_acquire));
     if (original == nullptr) return 0U;
+    if (!runtime_features::Enabled(runtime_features::Feature::WorldSyncHooks)) {
+        return original(self, contextA, contextB);
+    }
     if (world_actions::Installed() && !HistoricalLogicDiagnosticsActive()) {
         return original(self, contextA, contextB);
     }
@@ -4467,6 +4478,10 @@ void* __fastcall BuildInputTargetDetour(
             observedTargetSharedRef != nullptr) {
             observer(observedTargetSharedRef, observedInputShortGuid);
         }
+    }
+
+    if (!runtime_features::Enabled(runtime_features::Feature::WorldSyncHooks)) {
+        return original(targetDescriptor, targetSharedRef, inputShortGuid, delaySeconds);
     }
 
     const bool ws3Installed = world_actions::Installed();
@@ -4852,6 +4867,14 @@ void __fastcall QueueInputDetour(
     void* callbackRecord,
     const double delaySeconds,
     const std::uint32_t retailTailArgument) noexcept {
+    const auto original = reinterpret_cast<QueueInputFn>(
+        gQueueInputTrampoline.load(std::memory_order_acquire));
+    if (original == nullptr) return;
+    if (!runtime_features::Enabled(runtime_features::Feature::WorldSyncHooks)) {
+        original(manager, sourceSharedRef, inputShortGuid, targetDescriptor, callbackRecord,
+            delaySeconds, retailTailArgument);
+        return;
+    }
 #if defined(_MSC_VER) && defined(_M_IX86)
     const auto retailReturnAddress = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
 #elif defined(__GNUC__) || defined(__clang__)
@@ -4861,9 +4884,6 @@ void __fastcall QueueInputDetour(
 #endif
     gObservedSchedulerCalls.fetch_add(1U, std::memory_order_relaxed);
 
-    const auto original = reinterpret_cast<QueueInputFn>(
-        gQueueInputTrampoline.load(std::memory_order_acquire));
-    if (original == nullptr) return;
     const bool ws3Installed = world_actions::Installed();
     if (ws3Installed) {
         gWs3QueueSeen.fetch_add(1U, std::memory_order_relaxed);
@@ -5741,6 +5761,14 @@ void __fastcall QueueTypedMessageDetour(
     const std::size_t payloadSize,
     void* payloadData,
     const double delaySeconds) noexcept {
+    const auto original = reinterpret_cast<QueueTypedMessageFn>(
+        gQueueTypedMessageTrampoline.load(std::memory_order_acquire));
+    if (original == nullptr) return;
+    if (!runtime_features::Enabled(runtime_features::Feature::WorldSyncHooks)) {
+        original(manager, sourceKeyAddress, targetKeyAddress, messageType,
+            payloadSize, payloadData, delaySeconds);
+        return;
+    }
 #if defined(_MSC_VER) && defined(_M_IX86)
     const auto retailReturnAddress = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
 #elif defined(__GNUC__) || defined(__clang__)
@@ -5752,9 +5780,6 @@ void __fastcall QueueTypedMessageDetour(
         reinterpret_cast<const void*>(retailReturnAddress));
     gObservedTypedMessages.fetch_add(1U, std::memory_order_relaxed);
 
-    const auto original = reinterpret_cast<QueueTypedMessageFn>(
-        gQueueTypedMessageTrampoline.load(std::memory_order_acquire));
-    if (original == nullptr) return;
     const bool ws3Installed = world_actions::Installed();
     if (ws3Installed) {
         gWs3TypedSeen.fetch_add(1U, std::memory_order_relaxed);

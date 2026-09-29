@@ -12,6 +12,7 @@ internal sealed class LauncherDiagnostics : IDisposable
     private readonly Queue<string> _entries = new();
     private readonly StreamWriter _writer;
     private int _disposed;
+    private int _enabled = 1;
 
     internal LauncherDiagnostics(string? directory = null)
     {
@@ -29,9 +30,14 @@ internal sealed class LauncherDiagnostics : IDisposable
 
     internal event EventHandler<string>? EntryWritten;
 
+    internal bool Enabled => Volatile.Read(ref _enabled) != 0;
+
+    internal void SetEnabled(bool enabled) =>
+        Volatile.Write(ref _enabled, enabled ? 1 : 0);
+
     internal void Log(string category, string message)
     {
-        if (Volatile.Read(ref _disposed) != 0) return;
+        if (Volatile.Read(ref _disposed) != 0 || Volatile.Read(ref _enabled) == 0) return;
         var entry = $"[{DateTimeOffset.Now:HH:mm:ss}] [{category}] {message}";
         lock (_gate)
         {

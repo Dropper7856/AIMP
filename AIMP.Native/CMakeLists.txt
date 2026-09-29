@@ -45,6 +45,7 @@ set(AIMP_CORE_SOURCES
     src/NetZDiscovery.cpp
     src/ParticipantRegistry.cpp
     src/PlayerSyncObserver.cpp
+    src/RuntimeFeatureFlags.cpp
     src/Protocol.cpp
     src/ReadyReplayGate.cpp
     src/SignatureResolver.cpp

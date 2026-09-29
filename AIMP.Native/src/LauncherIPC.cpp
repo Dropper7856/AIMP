@@ -13,6 +13,7 @@
 #include "aimp/LevelGenerationTracker.h"
 #include "aimp/NetZDiscovery.h"
 #include "aimp/ReplicationCore.h"
+#include "aimp/RuntimeFeatureFlags.h"
 #include "aimp/SpawnCharacterTracker.h"
 #include "aimp/WorldReplicationCodec.h"
 #include "aimp/WorldPublicActions.h"
@@ -2402,11 +2403,11 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
             return false;
         }
         const bool ws3Setting = request.command == "WORLD_WS3_EMPTY_CALLBACK_SET";
-        const bool ws3ProcessSetting = ws3Setting;
-        if (ws3ProcessSetting &&
-            request.portableDummyId != localLauncherPlayerId_) return false;
-        const auto currentGeneration = ws3ProcessSetting ? 0ULL : generations_->CurrentGeneration();
-        if (!ws3ProcessSetting && request.levelGeneration == 0) {
+        const bool performanceSetting = request.command == "PERFORMANCE_ISOLATION_SET";
+        const bool processSetting = ws3Setting || performanceSetting;
+        if (processSetting && request.portableDummyId != localLauncherPlayerId_) return false;
+        const auto currentGeneration = processSetting ? 0ULL : generations_->CurrentGeneration();
+        if (!processSetting && request.levelGeneration == 0) {
             request.levelGeneration = static_cast<std::uint32_t>(
                 (std::min<std::uint64_t>)(
                     currentGeneration,
@@ -2444,6 +2445,36 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
         // A runtime option changes only an atomic, so it is applied and
         // acknowledged on this authenticated IPC connection before engine
         // readiness/dispatcher gates. Reuse normal request reservation/replies.
+        if (performanceSetting) {
+            GameCommandExecutionResult result{};
+            if (!runtime_features::SetByName(
+                    request.performanceIsolationModule,
+                    request.performanceIsolationEnabled)) {
+                result.statusCode = "PERFORMANCE_MODULE_INVALID";
+                result.message = "Unknown performance isolation module.";
+            } else {
+                result.executed = true;
+                result.statusCode = "PERFORMANCE_MODULE_APPLIED";
+                std::ostringstream message;
+                message << "module=" << request.performanceIsolationModule
+                        << " enabled=" << (request.performanceIsolationEnabled ? 1 : 0)
+                        << " mask=" << runtime_features::Mask();
+                result.message = message.str();
+                if (diagnostics_ != nullptr &&
+                    runtime_features::Enabled(runtime_features::Feature::NativeDiagnostics)) {
+                    diagnostics_->Log("info", "performance_isolation_configured",
+                        "Launcher performance isolation setting applied to the injected process.",
+                        {{"module", request.performanceIsolationModule},
+                         {"enabled", request.performanceIsolationEnabled ? "1" : "0", true},
+                         {"featureMask", Diagnostics::Unsigned(runtime_features::Mask()), true},
+                         {"source", "launcher-ipc"}, {"requestId", request.requestId}});
+                }
+            }
+            const auto payload = experimental::EncodeGameCommandResult(request, request.command, result);
+            return CompleteExperimentalRequest(request.requestId, reservation.epoch,
+                protocol::MessageType::GameCommandResult, frame.payload, payload);
+        }
+
         if (ws3Setting) {
             world_actions::SetEmptyCallbackTest(request.worldSync3EmptyCallbackEnabled);
             GameCommandExecutionResult result{};

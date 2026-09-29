@@ -3,6 +3,7 @@
 #include "aimp/BuildProfile.h"
 #include "aimp/CrashGuard.h"
 #include "aimp/SignatureResolver.h"
+#include "aimp/RuntimeFeatureFlags.h"
 
 #include <Windows.h>
 
@@ -37,11 +38,34 @@ struct RawEquipmentState {
     std::uint8_t equipmentActive{};
 };
 
-bool TryReadEquipmentState(
-    const std::uintptr_t equipmentManager,
+bool TryResolveAndReadEquipmentState(
+    const void* globalStateRootAddress,
+    std::uintptr_t& localPlayer,
+    std::uintptr_t& equipmentManager,
     RawEquipmentState& state) noexcept {
 #if defined(_MSC_VER)
+    // One SEH boundary for the complete local-player -> EquipmentController
+    // snapshot. This removes the old chain of VirtualQuery-backed SafeRead
+    // calls from every CharacterManager frame while still failing closed on a
+    // level transition or stale pointer.
     __try {
+        const auto root = *reinterpret_cast<const volatile std::uintptr_t*>(
+            globalStateRootAddress);
+        if (root == 0U) return false;
+        const auto context = *reinterpret_cast<const volatile std::uintptr_t*>(
+            root + kRootContextOffset);
+        if (context == 0U) return false;
+        const auto playerCount = *reinterpret_cast<const volatile std::uint32_t*>(
+            context + kLocalPlayerCountOffset);
+        const auto playerArray = *reinterpret_cast<const volatile std::uintptr_t*>(
+            context + kLocalPlayerArrayOffset);
+        if (playerCount == 0U || playerArray == 0U) return false;
+        localPlayer = *reinterpret_cast<const volatile std::uintptr_t*>(playerArray);
+        if (localPlayer == 0U) return false;
+        equipmentManager = *reinterpret_cast<const volatile std::uintptr_t*>(
+            localPlayer + kEquipmentManagerOffset);
+        if (equipmentManager == 0U) return false;
+
         state.currentEquipmentIndex = *reinterpret_cast<const volatile std::int32_t*>(
             equipmentManager + kCurrentEquipmentOffset);
         state.previousEquipmentIndex = *reinterpret_cast<const volatile std::int32_t*>(
@@ -57,9 +81,31 @@ bool TryReadEquipmentState(
             state.presentationStateObject + kPresentationStateOffset);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        localPlayer = 0U;
+        equipmentManager = 0U;
         return false;
     }
 #else
+    const auto root = crash_guard::SafeRead<std::uintptr_t>(globalStateRootAddress);
+    if (!root.has_value() || *root == 0U) return false;
+    const auto context = crash_guard::SafeRead<std::uintptr_t>(
+        reinterpret_cast<const void*>(*root + kRootContextOffset));
+    if (!context.has_value() || *context == 0U) return false;
+    const auto playerCount = crash_guard::SafeRead<std::uint32_t>(
+        reinterpret_cast<const void*>(*context + kLocalPlayerCountOffset));
+    const auto playerArray = crash_guard::SafeRead<std::uintptr_t>(
+        reinterpret_cast<const void*>(*context + kLocalPlayerArrayOffset));
+    if (!playerCount.has_value() || *playerCount == 0U ||
+        !playerArray.has_value() || *playerArray == 0U) return false;
+    const auto player = crash_guard::SafeRead<std::uintptr_t>(
+        reinterpret_cast<const void*>(*playerArray));
+    if (!player.has_value() || *player == 0U) return false;
+    const auto equipment = crash_guard::SafeRead<std::uintptr_t>(
+        reinterpret_cast<const void*>(*player + kEquipmentManagerOffset));
+    if (!equipment.has_value() || *equipment == 0U) return false;
+    localPlayer = *player;
+    equipmentManager = *equipment;
+
     const auto current = crash_guard::SafeRead<std::int32_t>(
         reinterpret_cast<const void*>(equipmentManager + kCurrentEquipmentOffset));
     const auto previous = crash_guard::SafeRead<std::int32_t>(
@@ -86,7 +132,6 @@ bool TryReadEquipmentState(
     return true;
 #endif
 }
-
 } // namespace
 
 PlayerSyncObserver::PlayerSyncObserver(
@@ -98,53 +143,19 @@ bool PlayerSyncObserver::Available() const noexcept {
 }
 
 void PlayerSyncObserver::ObserveOnGameThread() noexcept {
+    if (!runtime_features::Enabled(runtime_features::Feature::PlayerSyncObserver)) {
+        return;
+    }
     if (!Available()) {
         PublishUnavailable();
         return;
     }
 
-    const auto root = crash_guard::SafeRead<std::uintptr_t>(globalStateRootAddress_);
-    if (!root.has_value() || *root == 0U) {
-        PublishUnavailable();
-        return;
-    }
-
-    const auto context = crash_guard::SafeRead<std::uintptr_t>(
-        reinterpret_cast<const void*>(*root + kRootContextOffset));
-    if (!context.has_value() || *context == 0U) {
-        PublishUnavailable();
-        return;
-    }
-
-    const auto playerCount = crash_guard::SafeRead<std::uint32_t>(
-        reinterpret_cast<const void*>(*context + kLocalPlayerCountOffset));
-    const auto playerArray = crash_guard::SafeRead<std::uintptr_t>(
-        reinterpret_cast<const void*>(*context + kLocalPlayerArrayOffset));
-    if (!playerCount.has_value() || *playerCount == 0U ||
-        !playerArray.has_value() || *playerArray == 0U) {
-        PublishUnavailable();
-        return;
-    }
-
-    const auto localPlayer = crash_guard::SafeRead<std::uintptr_t>(
-        reinterpret_cast<const void*>(*playerArray));
-    if (!localPlayer.has_value() || *localPlayer == 0U) {
-        PublishUnavailable();
-        return;
-    }
-
-    const auto equipmentManager = crash_guard::SafeRead<std::uintptr_t>(
-        reinterpret_cast<const void*>(*localPlayer + kEquipmentManagerOffset));
-    if (!equipmentManager.has_value() || *equipmentManager == 0U) {
-        PublishUnavailable();
-        return;
-    }
-
-    // Once the controller pointer is validated, collect all hot fields in one
-    // SEH-protected block. This avoids multiple VirtualQuery-backed SafeRead
-    // calls every CharacterManager frame.
+    std::uintptr_t localPlayer{};
+    std::uintptr_t equipmentManager{};
     RawEquipmentState raw{};
-    if (!TryReadEquipmentState(*equipmentManager, raw) ||
+    if (!TryResolveAndReadEquipmentState(
+            globalStateRootAddress_, localPlayer, equipmentManager, raw) ||
         !ValidEquipmentIndex(raw.currentEquipmentIndex) ||
         !ValidEquipmentIndex(raw.previousEquipmentIndex) ||
         !ValidPresentationState(raw.presentationState)) {
@@ -153,8 +164,8 @@ void PlayerSyncObserver::ObserveOnGameThread() noexcept {
     }
 
     PlayerEquipmentSnapshot observed{};
-    observed.localPlayer = *localPlayer;
-    observed.equipmentManager = *equipmentManager;
+    observed.localPlayer = localPlayer;
+    observed.equipmentManager = equipmentManager;
     observed.currentEquipmentIndex = raw.currentEquipmentIndex;
     observed.previousEquipmentIndex = raw.previousEquipmentIndex;
     observed.presentationState = raw.presentationState;

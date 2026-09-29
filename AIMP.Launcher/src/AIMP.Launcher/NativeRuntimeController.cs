@@ -15,6 +15,8 @@ internal sealed class NativeRuntimeController : IDisposable
     private readonly ConcurrentDictionary<Guid, byte> _awaitingCommandAcks = new();
     private readonly ConcurrentDictionary<Guid, byte> _earlyFinalCommands = new();
     private readonly ConcurrentDictionary<Guid, byte> _quietCommandIds = new();
+    private readonly ConcurrentDictionary<string, bool> _desiredPerformanceModules =
+        new(PerformanceIsolationNativeModules.All.ToDictionary(name => name, _ => true), StringComparer.Ordinal);
     private NativeRuntimeSnapshot _snapshot = NativeRuntimeSnapshot.Empty;
     private Process? _process;
     private DllIpcSession? _ipc;
@@ -98,6 +100,7 @@ internal sealed class NativeRuntimeController : IDisposable
         // Session validates the connecting Native PID. Configure that instance,
         // including reconnects, before exposing it as ready to gameplay callers.
         await SynchronizeWorldSync3OptionsAsync(session, target.ProcessId, token).ConfigureAwait(false);
+        await SynchronizePerformanceIsolationAsync(session, target.ProcessId, token).ConfigureAwait(false);
         CompleteHandshake(handshake);
         await QueryCapabilitiesAsync(session, token).ConfigureAwait(false);
     }
@@ -121,6 +124,55 @@ internal sealed class NativeRuntimeController : IDisposable
         ProtocolConstants.ExperimentalSchemaVersion, Guid.NewGuid(), 0, _runtimeIdentity,
         GameCommandNames.WorldWs3EmptyCallbackSet,
         new Dictionary<string, string> { ["enabled"] = enabled ? "1" : "0" });
+
+    private async Task SynchronizePerformanceIsolationAsync(
+        DllIpcSession session, int processId, CancellationToken token)
+    {
+        foreach (var module in PerformanceIsolationNativeModules.All.OrderBy(value => value, StringComparer.Ordinal))
+        {
+            var enabled = !_desiredPerformanceModules.TryGetValue(module, out var desired) || desired;
+            var request = CreatePerformanceIsolationRequest(module, enabled);
+            var result = await session.ExecuteGameCommandAsync(request,
+                TimeSpan.FromSeconds(5), token).ConfigureAwait(false);
+            ValidatePerformanceIsolationAck(result, request, module, enabled);
+        }
+        Log($"Native performance isolation state synchronized to AI.exe PID={processId}.");
+    }
+
+    internal async Task SetPerformanceIsolationModuleAsync(
+        string module, bool enabled, CancellationToken cancellationToken = default)
+    {
+        if (!PerformanceIsolationNativeModules.All.Contains(module))
+            throw new ArgumentOutOfRangeException(nameof(module));
+        _desiredPerformanceModules[module] = enabled;
+
+        var state = Snapshot;
+        if (!state.IpcConnected || _ipc is not { IsReady: true }) return;
+        var request = CreatePerformanceIsolationRequest(module, enabled);
+        var result = await _ipc.ExecuteGameCommandAsync(request, TimeSpan.FromSeconds(5),
+            cancellationToken).ConfigureAwait(false);
+        ValidatePerformanceIsolationAck(result, request, module, enabled);
+    }
+
+    private GameCommandExecutePayload CreatePerformanceIsolationRequest(string module, bool enabled) => new(
+        ProtocolConstants.ExperimentalSchemaVersion, Guid.NewGuid(), 0, _runtimeIdentity,
+        GameCommandNames.PerformanceIsolationSet,
+        new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["module"] = module,
+            ["enabled"] = enabled ? "1" : "0"
+        });
+
+    private static void ValidatePerformanceIsolationAck(
+        GameCommandResultPayload result, GameCommandExecutePayload request, string module, bool enabled)
+    {
+        if (!result.Executed || result.Command != request.Command
+            || result.StatusCode != "PERFORMANCE_MODULE_APPLIED"
+            || !result.Message.StartsWith($"module={module} enabled={(enabled ? 1 : 0)} ",
+                StringComparison.Ordinal))
+            throw new ProtocolException(
+                $"Native performance module '{module}' was not acknowledged: {result.StatusCode}.");
+    }
 
     private async Task AttachProcessAsync(AiProcessTarget target)
     {
