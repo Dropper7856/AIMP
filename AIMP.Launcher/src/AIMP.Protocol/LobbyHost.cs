@@ -289,6 +289,13 @@ public sealed class LobbyHost : IAsyncDisposable
         PlayerPositionReceived?.Invoke(this, payload);
     }
 
+    public Task PublishHostAISyncAsync(ReadOnlyMemory<byte> bytes, CancellationToken token = default)
+    {
+        _ = AISyncCodec.DecodeNetwork(bytes, SessionId);
+        if (!AreWorldPeersCompatible()) return Task.CompletedTask;
+        return BroadcastAsync(MessageType.AISyncNetworkState, bytes, token);
+    }
+
     public async Task PublishHostPlayerEquipmentAsync(
         PlayerEquipmentSnapshotPayload payload,
         CancellationToken cancellationToken = default)

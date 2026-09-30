@@ -1,3 +1,4 @@
+#include "aimp/AISync.h"
 #include "aimp/Bootstrap.h"
 
 #include "aimp/AuthorityController.h"
@@ -870,6 +871,7 @@ DWORD Bootstrap::RunImpl() {
                 : "Optional Character/readiness/NetZ diagnostics hooks are disabled; essential engine-thread hooks remain automatic.");
     }
 
+    bool aiSyncLifetimesReady = false;
     // Character Actions are a functional feature, not an optional RE probe.
     // Require both destruction notifications even when catalog hooks are off.
     if (validation.hashMatch && signaturesValid && resolver != nullptr &&
@@ -880,7 +882,8 @@ DWORD Bootstrap::RunImpl() {
                 *captureCatalog, *lifecycleCatalog, *levelGenerations, spawnTracker.get());
         }
         std::string actionError;
-        if (characterHooks->InstallActionLifetimeHooks(*resolver, *hooks, actionError) &&
+        aiSyncLifetimesReady = characterHooks->InstallActionLifetimeHooks(*resolver, *hooks, actionError);
+        if (aiSyncLifetimesReady &&
             character_action_runtime::Install(*resolver, *hooks, *levelGenerations,
                 *gameThreadDispatcher, diagnostics, validation.hashMatch, actionError)) {
             const auto tracked = spawnTracker->Snapshot();
@@ -896,6 +899,17 @@ DWORD Bootstrap::RunImpl() {
     } else {
         diagnostics.Log("warning", "character_action_runtime_unavailable",
             "Character Actions require the exact certified executable plus spawn, lifetime and engine-update hooks.");
+    }
+
+    { // Installed by default; live execution is controlled by AISyncConfigure.
+        std::string aiError;
+        const bool ready = validation.hashMatch && aiSyncLifetimesReady &&
+            gameThreadHooks != nullptr && gameThreadHooks->ManagerUpdateHookInstalled();
+        const bool installed = ready && ai_sync::Install(moduleBase, *hooks,
+            *levelGenerations, *gameThreadDispatcher, aiError);
+        diagnostics.Log(installed ? "info" : "error", "aisync_v1_install",
+            installed ? "AISync V1 installed by default; retail until multiplayer authority. Live toggle: Performance Isolation / AISync. Adapter: resolved common movement + Host execution policy (including move-to-target/backstage-sweep)."
+                : (aiError.empty() ? "AISync requires exact build, both destruction hooks and CharacterManagerUpdate." : aiError));
     }
 
     const auto hashText = Sha256Hex(validation.actual.sha256);
@@ -948,6 +962,7 @@ DWORD Bootstrap::RunImpl() {
     std::uint64_t lastLoggedReadinessPublisher = 0;
     std::uint64_t lastLoggedReadinessBarrier = 0;
     std::uint64_t lastReadinessCounterLogTick = 0;
+    std::uint64_t lastAISyncCounterLogTick = 0;
     std::uint32_t lastLoggedEngineThreadId = 0;
     std::uint32_t lastLoggedMismatchedThreadId = 0;
     RuntimeObservationSnapshot lastRuntime{};
@@ -1232,6 +1247,11 @@ DWORD Bootstrap::RunImpl() {
 
         const auto& readiness = threadEvidence.readiness;
         const auto readinessLogTick = GetTickCount64();
+        if (ai_sync::Installed() && (lastAISyncCounterLogTick == 0U ||
+                readinessLogTick - lastAISyncCounterLogTick >= 5000U)) {
+            lastAISyncCounterLogTick = readinessLogTick;
+            ai_sync::LogDiagnostics(diagnostics);
+        }
         const bool readinessEventChanged =
             readiness.publisher.calls != lastLoggedReadinessPublisher ||
             readiness.barrier.calls != lastLoggedReadinessBarrier;
@@ -1471,6 +1491,8 @@ DWORD Bootstrap::RunImpl() {
         // Only the engine's normal update may apply STOP; this worker just waits.
         Sleep(10U);
     }
+    const bool retainAISyncHooks = ai_sync::Installed();
+    ai_sync::BeginLogicalShutdown();
     const bool retainActionReleaseHook = character_action_runtime::BeginLogicalShutdown();
     character_action_probe::BeginLogicalShutdown();
     world_interactions::BeginLogicalShutdown();
@@ -1489,7 +1511,9 @@ DWORD Bootstrap::RunImpl() {
     gameThreadDispatcher->Clear();
     inboundQueue.Clear();
 
-    bool safeToUnload = !retainActionReleaseHook;
+    bool safeToUnload = !retainActionReleaseHook && !retainAISyncHooks;
+    if (retainAISyncHooks) diagnostics.Log("warning", "aisync_process_lifetime",
+        "Experimental AISync hooks remain resident; pending locomotion releases on the engine thread and Client brains stay passive until process exit.");
     if (retainActionReleaseHook) {
         // A paused/stalled engine must not lose its pending STOP. Keep the
         // forward/release-only detours and their dependencies resident. No
@@ -1497,7 +1521,7 @@ DWORD Bootstrap::RunImpl() {
         diagnostics.Log("warning", "character_action_release_pending",
             "Input release is waiting for natural engine updates; hooks and DLL must remain loaded until process exit.");
     }
-    if (hooks != nullptr && !retainActionReleaseHook) {
+    if (hooks != nullptr && !retainActionReleaseHook && !retainAISyncHooks) {
         std::string error;
         if (!hooks->UninstallAll(error)) {
             safeToUnload = false;
@@ -1550,7 +1574,7 @@ DWORD Bootstrap::RunImpl() {
         captureCatalog.release();
         lifecycleCatalog.release();
     }
-    if (retainGameThreadServices || retainActionReleaseHook) {
+    if (retainGameThreadServices || retainActionReleaseHook || retainAISyncHooks) {
         // The main callback calls the original trampoline before attempting a
         // bounded drain. A pre-detach invocation may therefore still hold
         // these two pointers after the hook prologue is restored.
@@ -1558,10 +1582,10 @@ DWORD Bootstrap::RunImpl() {
         gameThreadDispatcher.release();
     }
     if (retainSpawnTrackerServices || retainCharacterServices ||
-        retainGameThreadServices || retainActionReleaseHook) {
+        retainGameThreadServices || retainActionReleaseHook || retainAISyncHooks) {
         levelGenerations.release();
     }
-    if (retainActionReleaseHook) {
+    if (retainActionReleaseHook || retainAISyncHooks) {
         // HookManager::~HookManager would otherwise remove the pending-release
         // boundary. Small process-lifetime retention is deliberate and bounded.
         hooks.release();

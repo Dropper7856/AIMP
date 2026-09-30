@@ -40,6 +40,8 @@ internal sealed class DllIpcSession : IAsyncDisposable
 
     internal bool IsReady { get; private set; }
 
+    internal bool AISyncAvailable { get; private set; }
+
     internal CapabilityStatePayload? LastCapabilityState { get; private set; }
 
     internal event EventHandler<CapabilityStatePayload>? CapabilityChanged;
@@ -59,6 +61,8 @@ internal sealed class DllIpcSession : IAsyncDisposable
     internal event EventHandler<NativePlayerEquipmentStatePayload>? PlayerSyncStateChanged;
 
     internal event EventHandler<NativePlayerActionEventPayload>? PlayerSyncActionProduced;
+
+    internal event EventHandler<ReadOnlyMemory<byte>>? AISyncStateProduced;
 
     internal event EventHandler<string>? Log;
 
@@ -179,6 +183,9 @@ internal sealed class DllIpcSession : IAsyncDisposable
                 StringComparison.Ordinal))
             throw new ProtocolException(
                 $"Native DLL {hello.DllVersion} is already loaded; restart AI.exe to load {ProductInfo.ExpectedDllVersion}.");
+        AISyncAvailable = hello.AiSyncV1Available;
+        if (!AISyncAvailable)
+            Log?.Invoke(this, "AISync unavailable: native hooks were not installed; inspect aisync_v1_install. IPC remains connected for PlayerSync, WorldSync and diagnostics.");
     }
 
     private bool IsValidHello(HelloPayload hello) =>
@@ -435,6 +442,10 @@ internal sealed class DllIpcSession : IAsyncDisposable
             case MessageType.LevelState: HandleLevel(frame); return true;
             case MessageType.PlayerSyncState: HandlePlayerSyncState(frame); return true;
             case MessageType.PlayerSyncAction: HandlePlayerSyncAction(frame); return true;
+            case MessageType.AISyncState:
+                AISyncCodec.ValidateNative(frame.Payload.Span);
+                AISyncStateProduced?.Invoke(this, frame.Payload);
+                return true;
             default: return false;
         }
     }
@@ -600,6 +611,14 @@ internal sealed class DllIpcSession : IAsyncDisposable
     {
         EnsureReady();
         return NextProcessSequence();
+    }
+
+    internal Task SendAISyncAsync(MessageType type, ReadOnlyMemory<byte> payload, CancellationToken token)
+    {
+        EnsureReady();
+        if (type is not (MessageType.AISyncConfigure or MessageType.AISyncState))
+            throw new ArgumentOutOfRangeException(nameof(type));
+        return SendAsync(type, payload, token);
     }
 
     internal Task SendWorldSyncLifecycleAsync(

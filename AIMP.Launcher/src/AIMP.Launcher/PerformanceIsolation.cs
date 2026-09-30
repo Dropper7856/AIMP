@@ -13,12 +13,13 @@ internal enum PerformanceIsolationModule
     EngineThreadEvidence,
     CharacterLifecycleCapture,
     GameThreadPumps,
-    Diagnostics
+    Diagnostics,
+    AISync
 }
 
 internal sealed class PerformanceIsolationState
 {
-    private const int AllMask = (1 << 12) - 1;
+    private const int AllMask = (1 << 13) - 1;
     private int _mask = AllMask;
 
     internal bool IsEnabled(PerformanceIsolationModule module) =>

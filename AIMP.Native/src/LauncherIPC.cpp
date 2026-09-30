@@ -1,3 +1,4 @@
+#include "aimp/AISync.h"
 #include "aimp/LauncherIPC.h"
 
 #include "aimp/BuildProfile.h"
@@ -643,6 +644,17 @@ void LauncherIPC::AttachPlayerSyncObserver(
     playerSyncObserver_ = &observer;
 }
 
+void LauncherIPC::PublishAISyncTraffic() {
+    ai_sync::State state{};
+    for (std::size_t i = 0U; i < 16U && ai_sync::TryPopObserved(state); ++i) {
+        if (!sessionConfigured_.load(std::memory_order_acquire) ||
+            !worldSyncAuthorityBound_ || !worldSyncAuthorityHost_ || !worldSyncWorldBusActive_) continue;
+        if (!Queue(protocol::MessageType::AISyncState, 0U,
+                localSequence_.fetch_add(1U, std::memory_order_relaxed),
+                std::as_bytes(std::span(&state, 1U)))) break;
+    }
+}
+
 void LauncherIPC::PublishPlayerSyncTraffic() {
     if (playerSyncObserver_ == nullptr) {
         return;
@@ -1085,6 +1097,7 @@ void LauncherIPC::Run() {
 
             PublishWorldReplicationTraffic();
             PublishPlayerSyncTraffic();
+            PublishAISyncTraffic();
 
             if (!FlushOutgoing(96U)) continue;
 
@@ -1181,6 +1194,7 @@ bool LauncherIPC::TryConnect() {
 }
 
 void LauncherIPC::Disconnect(const std::string_view reason) noexcept {
+    ai_sync::TransportLost();
     const auto pipe =
         pipe_.exchange(INVALID_HANDLE_VALUE, std::memory_order_acq_rel);
     const bool wasConnected =
@@ -1484,6 +1498,18 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
         netzReadySent_.store(queued, std::memory_order_release);
         return queued;
     }
+    case protocol::MessageType::AISyncConfigure: {
+        if (!sessionConfigured_.load(std::memory_order_acquire)) return false;
+        if (!ai_sync::Installed()) {
+            diagnostics_->Log("warning", "aisync_v1_unavailable", "AISync hooks are unavailable; restart the game with the patched DLL and inspect aisync_v1_install.");
+            return frame.payload.size() == sizeof(ai_sync::Configuration);
+        }
+        return ai_sync::Configure(frame.payload);
+    }
+    case protocol::MessageType::AISyncState:
+        if (!sessionConfigured_.load(std::memory_order_acquire) || !worldSyncAuthorityBound_ ||
+            worldSyncAuthorityHost_ || !worldSyncWorldBusActive_) return true;
+        return !ai_sync::Installed() || ai_sync::QueueRemote(frame.payload);
     case protocol::MessageType::WorldSyncLifecycle: {
         if (!sessionConfigured_.load(std::memory_order_acquire) ||
             frame.payload.empty() || frame.payload.size() > 16U * 1024U) {
@@ -2846,6 +2872,7 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
             payload);
     }
     case protocol::MessageType::DiagnosticSnapshotRequest: {
+        ai_sync::LogDiagnostics(*diagnostics_);
         experimental::DiagnosticSnapshotRequest request;
         if (!sessionConfigured_.load(std::memory_order_acquire) ||
             !netzReadySent_.load(std::memory_order_acquire) ||
@@ -3811,6 +3838,7 @@ std::vector<std::byte> LauncherIPC::BuildHelloPayload() const {
          << ",\"dllVersion\":\"" << kNativeVersion << "\""
          << ",\"processId\":" << processId_
          << ",\"observationOnly\":true"
+         << ",\"aiSyncV1Available\":" << (ai_sync::Installed() ? "true" : "false")
          << ",\"nonce\":\"" << nonce_ << "\"}";
     return JsonBytes(json.str());
 }

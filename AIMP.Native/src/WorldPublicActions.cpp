@@ -1,3 +1,4 @@
+#include "aimp/AISync.h"
 #include "aimp/WorldPublicActions.h"
 #include "aimp/RuntimeFeatureFlags.h"
 
@@ -314,7 +315,7 @@ void Classify(ActionClass value) noexcept {
     case WorldDomain::Player:
         return SecurityEnabled(AdmissionSecurityGate::PlayerTargetLocalOnly);
     case WorldDomain::AI:
-        return SecurityEnabled(AdmissionSecurityGate::AiTargetLocalOnly);
+        return ai_sync::OwnsAI() || SecurityEnabled(AdmissionSecurityGate::AiTargetLocalOnly);
     case WorldDomain::UI:
         return SecurityEnabled(AdmissionSecurityGate::UiTargetLocalOnly);
     case WorldDomain::AIMP:
@@ -2303,6 +2304,11 @@ void PublicCapture(void* self, void** instance,
     const auto currentId = registry->IdentifyRuntimeEntity(execution, &currentKey);
     const auto currentDomain = currentId
         ? registry->FindWorldEntityDomain(*currentId) : std::nullopt;
+    if (ai_sync::OwnsAI() && currentDomain == WorldDomain::AI) {
+        Classify(ActionClass::LocalOnly);
+        invokeRetailFallback();
+        return;
+    }
     bool currentInputAllowed = false;
     if (probeDirect) {
         if (currentId) ObserveCurrentOwnerHypotheses(*registry, *currentId, guid, currentInputAllowed);
@@ -4037,6 +4043,8 @@ bool PublicRootManifestAdmissionAllowed(
         (flags & 3U) == 3U) {
         return false;
     }
+
+    if (ai_sync::OwnsAI() && registry.FindWorldEntityDomain(target) == WorldDomain::AI) return false;
 
     // ProbeDirect is the controlled transport witness in 0.11.4.72. It must
     // obey the same live admission contract that already accepted it in

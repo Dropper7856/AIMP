@@ -1,3 +1,4 @@
+#include "aimp/AISync.h"
 #include "aimp/CharacterActionRuntime.h"
 #include "aimp/SpawnCharacterTracker.h"
 #include "aimp/BuildProfile.h"
@@ -423,6 +424,7 @@ void SpawnCharacterTracker::ObserveCreated(
         levelGeneration_.load(std::memory_order_acquire) == levelGeneration &&
         spawnKey_.load(std::memory_order_acquire) == spawnKey &&
         ValidCharacterAddress(characterAddress) && ValidAddress(recordAddress);
+    if (owned) ai_sync::ObserveOwnedCharacter(characterAddress);
     character_action_runtime::ObserveCreated(
         characterAddress, spawnKey, levelGeneration, owned);
     if (state_.load(std::memory_order_acquire) !=
