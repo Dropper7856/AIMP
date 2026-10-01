@@ -907,8 +907,8 @@ DWORD Bootstrap::RunImpl() {
             gameThreadHooks != nullptr && gameThreadHooks->ManagerUpdateHookInstalled();
         const bool installed = ready && ai_sync::Install(moduleBase, *hooks,
             *levelGenerations, *gameThreadDispatcher, aiError);
-        diagnostics.Log(installed ? "info" : "error", "aisync_v1_install",
-            installed ? "AISync V1 installed by default; retail until multiplayer authority. Live toggle: Performance Isolation / AISync. Adapter: resolved common movement + Host execution policy (including move-to-target/backstage-sweep)."
+        diagnostics.Log(installed ? "info" : "error", "aisync_v2_install",
+            installed ? "AISync V2 installed by default; retail until multiplayer authority. Live toggle: Performance Isolation / AISync. High-level Character convergence, action identity and resolved interaction carriers are synchronized; retail/CATHODE regenerate animation, audio and consequences locally."
                 : (aiError.empty() ? "AISync requires exact build, both destruction hooks and CharacterManagerUpdate." : aiError));
     }
 

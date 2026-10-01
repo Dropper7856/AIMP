@@ -37,7 +37,7 @@ enum class MessageType : std::uint16_t {
     WorldIntentAbandoned = 21, // Local pre-bus disposition; never a Host rejection.
     PlayerSyncState = 22, // Native -> Launcher local player-state observation only.
     AISyncConfigure = 24, // Local IPC authority/generation configuration.
-    AISyncState = 25, // Native <-> Launcher execution snapshots only.
+    AISyncState = 25, // Native <-> Launcher generic NPC authority snapshots.
     PlayerSyncAction = 23, // Native -> Launcher ordered Aim/Primary/Reload edge.
     TestModeConfigure = 200,
     CapabilityQuery = 201,

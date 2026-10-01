@@ -345,6 +345,11 @@ void SpawnCharacterTracker::DetachLifecycleCatalog() noexcept {
 void SpawnCharacterTracker::Begin(
     const std::uint64_t levelGeneration,
     const std::uint32_t spawnKey) noexcept {
+    // Reserve the runtime id before CharacterCreate. Retail construction may
+    // invoke CharacterManagerUpdate before the create detour has an address to
+    // publish; without this reservation AISync can briefly adopt the remote
+    // player's NPC-backed visual representation as an authoritative AI actor.
+    ai_sync::ObservePlayerRepresentationSpawn(spawnKey);
     Publish(
         levelGeneration,
         spawnKey,
@@ -424,7 +429,7 @@ void SpawnCharacterTracker::ObserveCreated(
         levelGeneration_.load(std::memory_order_acquire) == levelGeneration &&
         spawnKey_.load(std::memory_order_acquire) == spawnKey &&
         ValidCharacterAddress(characterAddress) && ValidAddress(recordAddress);
-    if (owned) ai_sync::ObserveOwnedCharacter(characterAddress);
+    if (owned) ai_sync::ObservePlayerRepresentation(characterAddress);
     character_action_runtime::ObserveCreated(
         characterAddress, spawnKey, levelGeneration, owned);
     if (state_.load(std::memory_order_acquire) !=

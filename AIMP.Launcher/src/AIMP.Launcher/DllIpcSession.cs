@@ -185,7 +185,7 @@ internal sealed class DllIpcSession : IAsyncDisposable
                 $"Native DLL {hello.DllVersion} is already loaded; restart AI.exe to load {ProductInfo.ExpectedDllVersion}.");
         AISyncAvailable = hello.AiSyncV1Available;
         if (!AISyncAvailable)
-            Log?.Invoke(this, "AISync unavailable: native hooks were not installed; inspect aisync_v1_install. IPC remains connected for PlayerSync, WorldSync and diagnostics.");
+            Log?.Invoke(this, "AISync unavailable: native hooks were not installed; inspect aisync_v2_install. IPC remains connected for PlayerSync, WorldSync and diagnostics.");
     }
 
     private bool IsValidHello(HelloPayload hello) =>

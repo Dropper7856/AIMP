@@ -2,6 +2,6 @@ namespace AIMP.Launcher;
 
 internal static class ProductInfo
 {
-    internal const string LauncherVersion = "0.8.4.147";
-    internal const string ExpectedDllVersion = "0.11.4.147-aisync-resolved-policy";
+    internal const string LauncherVersion = "0.8.4.152";
+    internal const string ExpectedDllVersion = "0.11.4.152-aisync-withdraw-authority";
 }

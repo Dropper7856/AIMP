@@ -134,7 +134,9 @@ void Stop() noexcept;
 [[nodiscard]] RuntimeSnapshot Snapshot(std::uintptr_t characterAddress) noexcept;
 
 [[nodiscard]] constexpr std::size_t MaximumConcurrentTargets() noexcept {
-    return 8U;
+    // Remote players plus AISync's bounded set of NPC Characters can be
+    // active together. Slots are fixed-size and never allocate in a detour.
+    return 40U;
 }
 
 struct NativeMovementRvaSet {

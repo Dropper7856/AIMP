@@ -1501,7 +1501,7 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
     case protocol::MessageType::AISyncConfigure: {
         if (!sessionConfigured_.load(std::memory_order_acquire)) return false;
         if (!ai_sync::Installed()) {
-            diagnostics_->Log("warning", "aisync_v1_unavailable", "AISync hooks are unavailable; restart the game with the patched DLL and inspect aisync_v1_install.");
+            diagnostics_->Log("warning", "aisync_v2_unavailable", "AISync hooks are unavailable; restart the game with the patched DLL and inspect aisync_v2_install.");
             return frame.payload.size() == sizeof(ai_sync::Configuration);
         }
         return ai_sync::Configure(frame.payload);

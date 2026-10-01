@@ -65,7 +65,7 @@ internal sealed class AISyncSession : IDisposable
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
             lock (_gate) InvalidateLocked();
-            _diagnostics.Log("AISync", $"V1 configuration refused: {exception.Message}");
+            _diagnostics.Log("AISync", $"V2 configuration refused: {exception.Message}");
         }
         finally { _configureGate.Release(); }
     }
@@ -107,7 +107,7 @@ internal sealed class AISyncSession : IDisposable
             if (!_controller.AISyncAvailable)
             {
                 if (!_availabilityWarningReported)
-                    _diagnostics.Log("AISync", "Native AISync unavailable; execution and transport remain inactive. Inspect aisync_v1_install. Other multiplayer modules keep their IPC connection.");
+                    _diagnostics.Log("AISync", "Native AISync unavailable; execution and transport remain inactive. Inspect aisync_v2_install. Other multiplayer modules keep their IPC connection.");
                 _availabilityWarningReported = true;
                 return;
             }
@@ -120,9 +120,9 @@ internal sealed class AISyncSession : IDisposable
         }
         bool active;
         lock (_gate) active = _active;
-        _diagnostics.Log("AISync", $"V1 enabled={(enabled ? 1 : 0)} role={role} active={(active ? 1 : 0)} " +
+        _diagnostics.Log("AISync", $"V2 enabled={(enabled ? 1 : 0)} role={role} active={(active ? 1 : 0)} " +
             $"nativeGeneration={nativeGeneration} worldGeneration={worldGeneration}; " +
-            "resolved common movement + Host execution policy (including move-to-target/backstage-sweep); control=Performance Isolation.");
+            "high-level Character convergence + resolved action/interaction carriers; animation, audio and CATHODE consequences remain retail-local; control=Performance Isolation.");
     }
     private void OnNativeState(object? sender, ReadOnlyMemory<byte> bytes)
     {
@@ -188,7 +188,7 @@ internal sealed class AISyncSession : IDisposable
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
             lock (_gate) InvalidateLocked();
-            _diagnostics.Log("AISync", $"V1 transport paused: {exception.Message}");
+            _diagnostics.Log("AISync", $"V2 transport paused: {exception.Message}");
             // The native 1.5s deadline cancels movement but keeps a Client passive.
         }
         catch (OperationCanceledException) { }
@@ -214,7 +214,7 @@ internal sealed class AISyncSession : IDisposable
             produced = _nativeProduced; received = _remoteReceived;
             networkSent = _networkSent; nativeSent = _nativeSent; isHost = _isHost;
         }
-        _diagnostics.Log("AISync", $"V1 transport role={(isHost ? "Host" : "Client")} " +
+        _diagnostics.Log("AISync", $"V2 transport role={(isHost ? "Host" : "Client")} " +
             $"nativeProduced={produced} remoteReceived={received} networkSent={networkSent} nativeSent={nativeSent}; cumulative, at most every 5s.");
     }
     public void Dispose()
