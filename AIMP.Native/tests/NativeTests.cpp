@@ -2352,7 +2352,7 @@ void TestCharacterDirectStepNativeLifecycle() {
     CHECK(aimp::character_direct_step_runtime::ReplicatedYawOffset() == 0x0174U);
     CHECK(aimp::character_direct_step_runtime::NativeLocomotionFlagWidth() == 1U);
 
-    CHECK(aimp::character_direct_step_runtime::MaximumConcurrentTargets() == 8U);
+    CHECK(aimp::character_direct_step_runtime::MaximumConcurrentTargets() == 40U);
     constexpr auto registry =
         aimp::character_direct_step_runtime::NativeCharacterRegistry();
     CHECK(registry.table == 0x01307A48U);

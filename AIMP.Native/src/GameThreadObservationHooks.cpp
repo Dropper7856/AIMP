@@ -1,3 +1,4 @@
+#include "aimp/AISync.h"
 #include "aimp/GameThreadObservationHooks.h"
 
 #include "aimp/BuildProfile.h"
@@ -266,6 +267,7 @@ void __fastcall CharacterManagerUpdateDetour(
             character_direct_step_runtime::EnginePumpPhase::PreCharacterManager);
     }
 
+    ai_sync::PumpOnEngineThread();
     const auto original = reinterpret_cast<ManagerUpdate>(
         gManagerUpdateTrampoline.load(std::memory_order_acquire));
     if (original != nullptr) {

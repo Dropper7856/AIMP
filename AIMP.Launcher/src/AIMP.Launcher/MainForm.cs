@@ -107,6 +107,9 @@ internal sealed class MainForm : Form
             "Aim / Primary replication",
             "Stops PlayerSync Aim/Primary events and releases currently-applied remote actions.");
         root.DropDownItems.Add(new ToolStripSeparator());
+        AddPerformanceItem(root, PerformanceIsolationModule.AISync,
+            "AISync / NPC authority",
+            "Stops AISync traffic and native proxy requests, restoring local retail AI. Re-enable to resume the current Host/Client role.");
         AddPerformanceItem(root, PerformanceIsolationModule.WorldSync,
             "WorldSync / CATHODE",
             "Closes the WorldSync bus and bypasses native WorldSync/CATHODE replication hooks.");
@@ -218,6 +221,7 @@ internal sealed class MainForm : Form
             PerformanceIsolationModule.EquipmentSync,
             PerformanceIsolationModule.ActionSync,
             PerformanceIsolationModule.RemoteMovement,
+            PerformanceIsolationModule.AISync,
             PerformanceIsolationModule.WorldSync,
             PerformanceIsolationModule.UiBridge,
             PerformanceIsolationModule.EngineThreadEvidence,

@@ -27,6 +27,8 @@ public enum MessageType : ushort
     WorldIntentAbandoned = 21,
     PlayerSyncState = 22,
     PlayerSyncAction = 23,
+    AISyncConfigure = 24,
+    AISyncState = 25,
 
     LobbyJoin = 100,
     LobbyJoinAccepted = 101,
@@ -48,6 +50,7 @@ public enum MessageType : ushort
     WorldTransactionRecoveryStatus = 117,
     PlayerEquipmentSnapshot = 118,
     PlayerActionEvent = 119,
+    AISyncNetworkState = 120, // Host -> Clients only; never relayed from a Client.
 
     TestModeConfigure = 200,
     CapabilityQuery = 201,

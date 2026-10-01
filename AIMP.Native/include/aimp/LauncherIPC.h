@@ -129,6 +129,7 @@ private:
     void Run();
     void PublishWorldReplicationTraffic();
     void PublishPlayerSyncTraffic();
+    void PublishAISyncTraffic();
     bool TryConnect();
     void Disconnect(std::string_view reason) noexcept;
     bool ReceiveAvailable();

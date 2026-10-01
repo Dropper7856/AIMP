@@ -20,6 +20,7 @@ internal sealed record MultiplayerSessionView(
 internal sealed class MultiplayerSessionCoordinator : IDisposable
 {
     private readonly NativeRuntimeController _controller;
+    private readonly AISyncSession _aiSync;
     private readonly LauncherSettingsStore _settingsStore;
     private readonly ScaleformBridgeListener _bridge;
     private readonly LauncherDiagnostics _diagnostics;
@@ -194,6 +195,11 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         try
         {
             await _controller.SendWorldSyncLifecycleAsync(payload, _lifetime.Token)
+                .ConfigureAwait(false);
+            int aiWorldGeneration;
+            lock (_stateGate) aiWorldGeneration = _localWorldContext?.WorldGeneration ?? 0;
+            await _aiSync.ConfigureAsync(sessionId, isHost, _controller.Snapshot.LevelGeneration,
+                aiWorldGeneration, authorityBound, payload.WorldBusActive, _lifetime.Token)
                 .ConfigureAwait(false);
             lock (_stateGate)
             {
@@ -384,6 +390,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
         _performanceIsolation = performanceIsolation ?? throw new ArgumentNullException(nameof(performanceIsolation));
         _diagnostics = controller.Diagnostics;
+        _aiSync = new AISyncSession(controller, _performanceIsolation);
         _bridge.MessageReceived += OnBridgeMessage;
         _controller.WorldIntentProduced += OnNativeWorldIntentProduced;
         _controller.WorldMutationCompleted += OnNativeWorldMutationCompleted;
@@ -396,6 +403,10 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
     {
         switch (module)
         {
+            case PerformanceIsolationModule.AISync:
+                await _aiSync.SetEnabledAsync(enabled, _lifetime.Token).ConfigureAwait(false);
+                return;
+
             case PerformanceIsolationModule.PositionNetworkTransmit:
                 _performanceIsolation.SetEnabled(module, enabled);
                 if (!enabled)
@@ -648,6 +659,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _lifetime.Cancel();
+        _aiSync.Dispose();
         _bridge.MessageReceived -= OnBridgeMessage;
         _controller.WorldIntentProduced -= OnNativeWorldIntentProduced;
         _controller.WorldMutationCompleted -= OnNativeWorldMutationCompleted;
@@ -2324,6 +2336,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
 
     private void AttachHost(LobbyHost host)
     {
+        _aiSync.BindHost(host);
         host.SnapshotChanged += OnLobbySnapshot;
         host.Started += OnLobbyStarted;
         host.GameplayReadyReceived += OnGameplayReady;
@@ -2340,6 +2353,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
 
     private void DetachHost(LobbyHost host)
     {
+        _aiSync.UnbindHost(host);
         host.SnapshotChanged -= OnLobbySnapshot;
         host.Started -= OnLobbyStarted;
         host.GameplayReadyReceived -= OnGameplayReady;
@@ -2356,6 +2370,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
 
     private void AttachClient(LobbyClient client)
     {
+        _aiSync.BindClient(client);
         client.SnapshotChanged += OnLobbySnapshot;
         client.Started += OnLobbyStarted;
         client.GameplayReadyReceived += OnGameplayReady;
@@ -2375,6 +2390,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
 
     private void DetachClient(LobbyClient client)
     {
+        _aiSync.UnbindClient(client);
         client.SnapshotChanged -= OnLobbySnapshot;
         client.Started -= OnLobbyStarted;
         client.GameplayReadyReceived -= OnGameplayReady;
@@ -4534,7 +4550,8 @@ internal static class LobbyCompatibility
 
     private static string EffectiveProfileId(LauncherSettings settings) => ProfileId +
         ":ws3" +
-        (settings.WorldSync3EmptyCallbackEnabled ? ":probe-callback-test" : ":strict");
+        (settings.WorldSync3EmptyCallbackEnabled ? ":probe-callback-test" : ":strict") +
+        ":aisync-v1";
 
     internal static CompatibilityInfo Create(LauncherSettings settings)
     {

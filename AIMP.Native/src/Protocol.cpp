@@ -74,6 +74,8 @@ bool IsKnownMessageType(const std::uint16_t raw) noexcept {
     case MessageType::WorldIntentAbandoned:
     case MessageType::PlayerSyncState:
     case MessageType::PlayerSyncAction:
+    case MessageType::AISyncConfigure:
+    case MessageType::AISyncState:
     case MessageType::TestModeConfigure:
     case MessageType::CapabilityQuery:
     case MessageType::CapabilityState:
