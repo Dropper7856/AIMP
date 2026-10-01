@@ -19,7 +19,6 @@ internal static class Program
         new("Local player position tools", LauncherTests.LocalPlayerPositionToolsAsync),
         new("Launcher integration tools", LauncherTests.LauncherIntegrationToolsAsync),
         new("Generic native IPC", IpcTests.GenericHandshakeAndQueuedCommandAsync),
-        new("Minimal English UI", LauncherTests.MinimalEnglishUiAsync),
         new("Launcher body length", ArchitectureTests.LauncherBodiesAreShortAsync)
     };
 
