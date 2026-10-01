@@ -1,6 +1,7 @@
 # Native builds
 AIMP.Native/build/
 AIMP.Native/out/
+AIMP.Electron
 *.pdb
 *.ilk
 *.obj
@@ -11,6 +12,11 @@ AIMP.Native/out/
 *.user
 *.suo
 .vs/
+
+# Electron production staging and packages
+AIMP.Electron/node_modules/
+AIMP.Electron/staging/
+dist/
 
 # Runtime diagnostics and local configuration
 logs/
@@ -29,6 +35,7 @@ __pycache__/
 *.zip
 *.ps1
 *.md
+*.bat
 
 tools/
 analysis/

@@ -2,7 +2,6 @@ using AIMP.Launcher;
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text.Json;
-using System.Windows.Forms;
 
 namespace AIMP.Protocol.Tests;
 
@@ -100,25 +99,6 @@ internal static class LauncherTests
             archive.Entries.Select(value => value.FullName).Order(StringComparer.Ordinal));
         AssertDiagnosticReport(archive, snapshot);
     }
-
-    internal static Task MinimalEnglishUiAsync() => RunStaAsync(() =>
-    {
-        using var temporary = new TemporaryDirectory();
-        using var diagnostics = new LauncherDiagnostics(temporary.Combine("logs"));
-        using var controller = new NativeRuntimeController(diagnostics);
-        using var form = new MainForm(controller);
-        var controls = Descendants(form).ToArray();
-
-        AssertEx.SequenceEqual(
-            new[] { "CharacterBase Calculator", "Execute Command",
-                "Export Diagnostics", "Inject DLL", "Launch Game", "Settings" },
-            controls.OfType<Button>().Select(value => value.Text)
-                .Order(StringComparer.Ordinal));
-        AssertStatusSurface(controls);
-        AssertLogSurface(controls);
-        AssertEnglishText(controls);
-    });
-
 
     internal static Task LocalPlayerPositionToolsAsync()
     {
@@ -669,73 +649,4 @@ internal static class LauncherTests
         AssertEx.True(report.GetProperty("LauncherLogs").GetArrayLength() >= 2);
     }
 
-    private static void AssertStatusSurface(IReadOnlyCollection<Control> controls)
-    {
-        var captions = new[] { "AI.exe", "Engine thread", "IPC connection", "Injection",
-            "Lobby network", "Local player position", "Remote Character", "UI bridge" };
-        var labels = controls.OfType<Label>().Select(value => value.Text).ToArray();
-        AssertEx.SequenceEqual(captions, labels.Intersect(captions).Order(StringComparer.Ordinal));
-        var values = new[]
-        {
-            "Disconnected", "Not available (DLL not injected)",
-            "Not injected", "Not running", "Stopped", "Unavailable", "Waiting for AI.exe"
-        };
-        AssertEx.SequenceEqual(values, labels.Intersect(values).Order(StringComparer.Ordinal));
-        AssertEx.Equal(16, labels.Length);
-    }
-
-    private static void AssertLogSurface(IReadOnlyCollection<Control> controls)
-    {
-        var logs = controls.OfType<RichTextBox>().ToArray();
-        AssertEx.Equal(1, logs.Length);
-        AssertEx.True(logs[0].ReadOnly);
-        AssertEx.True(logs[0].Text.Contains(
-            "Launcher diagnostics started.",
-            StringComparison.Ordinal));
-        AssertEx.Equal(1, controls.OfType<GroupBox>().Count(value => value.Text == "Log"));
-    }
-
-    private static void AssertEnglishText(IEnumerable<Control> controls)
-    {
-        var visibleText = controls.Select(value => value.Text)
-            .Where(value => !string.IsNullOrWhiteSpace(value));
-        AssertEx.True(visibleText.All(value => value.All(character => character <= 0x7F)),
-            "The main UI contains non-English text.");
-    }
-
-    private static IEnumerable<Control> Descendants(Control root)
-    {
-        foreach (Control child in root.Controls)
-        {
-            yield return child;
-            foreach (var descendant in Descendants(child))
-            {
-                yield return descendant;
-            }
-        }
-    }
-
-    private static async Task RunStaAsync(Action action)
-    {
-        var completion = new TaskCompletionSource<bool>(
-            TaskCreationOptions.RunContinuationsAsynchronously);
-        var thread = new Thread(() => RunStaAction(action, completion));
-        thread.SetApartmentState(ApartmentState.STA);
-        thread.Start();
-        await completion.Task.WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false);
-        thread.Join();
-    }
-
-    private static void RunStaAction(Action action, TaskCompletionSource<bool> completion)
-    {
-        try
-        {
-            action();
-            completion.TrySetResult(true);
-        }
-        catch (Exception exception)
-        {
-            completion.TrySetException(exception);
-        }
-    }
 }
