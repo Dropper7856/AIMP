@@ -13,7 +13,8 @@ public sealed record HelloPayload(
     string DllVersion,
     int ProcessId,
     bool ObservationOnly,
-    string Nonce);
+    string Nonce,
+    bool AiSyncV1Available = false);
 
 public sealed record HelloAckPayload(
     ushort ProtocolVersion,

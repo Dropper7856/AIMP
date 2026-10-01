@@ -1,3 +1,4 @@
+#include "aimp/AISync.h"
 #include "aimp/CharacterActionRuntime.h"
 #include "aimp/CharacterObservationHooks.h"
 
@@ -153,6 +154,7 @@ void __fastcall CharacterDestroyDetour(
     void*,
     const std::uint32_t spawnKey) noexcept {
     ActiveDetour active;
+    ai_sync::ForgetSpawnKey(spawnKey);
     character_action_runtime::ForgetSpawnKey(spawnKey);
     Lifecycle(
         LifecycleEventKind::CharacterDestroyBegin,
@@ -175,6 +177,7 @@ void __fastcall CharacterFullDestroyDetour(
     void*,
     void* character) noexcept {
     ActiveDetour active;
+    ai_sync::ForgetCharacter(reinterpret_cast<std::uintptr_t>(character));
     character_action_runtime::ForgetCharacter(reinterpret_cast<std::uintptr_t>(character));
     Lifecycle(
         LifecycleEventKind::CharacterFullDestroyBegin,

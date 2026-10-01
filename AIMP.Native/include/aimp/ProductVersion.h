@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.142-performance-isolation";
+    "0.11.4.152-aisync-withdraw-authority";
 
 } // namespace aimp

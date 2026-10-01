@@ -36,6 +36,8 @@ internal sealed class NativeRuntimeController : IDisposable
 
     internal LauncherDiagnostics Diagnostics => _diagnostics;
 
+    internal bool AISyncAvailable => _ipc is { IsReady: true, AISyncAvailable: true };
+
     internal event EventHandler<NativeRuntimeSnapshot>? StateChanged;
 
     internal event EventHandler<WorldIntent>? WorldIntentProduced;
@@ -45,6 +47,8 @@ internal sealed class NativeRuntimeController : IDisposable
     internal event EventHandler<NativePlayerEquipmentStatePayload>? PlayerSyncStateProduced;
 
     internal event EventHandler<NativePlayerActionEventPayload>? PlayerSyncActionProduced;
+
+    internal event EventHandler<ReadOnlyMemory<byte>>? AISyncStateProduced;
 
     internal void RefreshProcessStatus()
     {
@@ -341,6 +345,12 @@ internal sealed class NativeRuntimeController : IDisposable
         return session.ReserveWorldMutationDispatchId();
     }
 
+    internal Task SendAISyncConfigurationAsync(ReadOnlyMemory<byte> payload, CancellationToken token) =>
+        GetCommandSession().SendAISyncAsync(MessageType.AISyncConfigure, payload, token);
+
+    internal Task SendAISyncStateAsync(ReadOnlyMemory<byte> payload, CancellationToken token) =>
+        GetCommandSession().SendAISyncAsync(MessageType.AISyncState, payload, token);
+
     internal Task SendWorldSyncLifecycleAsync(
         WorldSyncLifecyclePayload lifecycle,
         CancellationToken cancellationToken = default)
@@ -538,6 +548,7 @@ internal sealed class NativeRuntimeController : IDisposable
         session.WorldMutationResultReceived += OnWorldMutationResultReceived;
         session.PlayerSyncStateChanged += OnPlayerSyncStateChanged;
         session.PlayerSyncActionProduced += OnPlayerSyncActionProduced;
+        session.AISyncStateProduced += OnAISyncStateProduced;
         session.ConnectionClosed += OnConnectionClosed;
     }
 
@@ -553,6 +564,7 @@ internal sealed class NativeRuntimeController : IDisposable
         session.WorldMutationResultReceived -= OnWorldMutationResultReceived;
         session.PlayerSyncStateChanged -= OnPlayerSyncStateChanged;
         session.PlayerSyncActionProduced -= OnPlayerSyncActionProduced;
+        session.AISyncStateProduced -= OnAISyncStateProduced;
         session.ConnectionClosed -= OnConnectionClosed;
     }
 
@@ -563,6 +575,9 @@ internal sealed class NativeRuntimeController : IDisposable
 
     private void OnWorldMutationResultReceived(object? sender, WorldMutationResult value) =>
         WorldMutationCompleted?.Invoke(this, value);
+
+    private void OnAISyncStateProduced(object? sender, ReadOnlyMemory<byte> value) =>
+        AISyncStateProduced?.Invoke(this, value);
 
     private void OnPlayerSyncStateChanged(
         object? sender,

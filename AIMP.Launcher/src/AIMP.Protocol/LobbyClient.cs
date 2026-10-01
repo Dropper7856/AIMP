@@ -63,6 +63,8 @@ public sealed class LobbyClient : IAsyncDisposable
 
     public event EventHandler<PlayerActionEventPayload>? PlayerActionReceived;
 
+    public event EventHandler<ReadOnlyMemory<byte>>? AISyncStateReceived;
+
     public event EventHandler<WorldNetworkContext>? WorldContextReceived;
 
     public event EventHandler<WorldNetworkMutation>? WorldMutationReceived;
@@ -393,6 +395,10 @@ public sealed class LobbyClient : IAsyncDisposable
                             frame.Payload.Span);
                         ValidatePlayerAction(action);
                         PlayerActionReceived?.Invoke(this, action);
+                        break;
+
+                    case MessageType.AISyncNetworkState:
+                        AISyncStateReceived?.Invoke(this, AISyncCodec.DecodeNetwork(frame.Payload, SessionId));
                         break;
 
                     case MessageType.WorldContext:

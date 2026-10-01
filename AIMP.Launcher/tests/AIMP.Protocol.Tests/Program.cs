@@ -6,6 +6,7 @@ internal static class Program
     {
         new("Protocol frames", ProtocolTests.FrameRoundTripAndValidationAsync),
         new("Protocol models", ProtocolTests.ModelValidationAsync),
+        new("AISync authority codec", AISyncCodecTests.AuthorityStateRoundTripAsync),
         new("WS3 wire, authority and manifest", ProtocolTests.WorldPublicActionContractAsync),
         new("WS3 local effect boundary", WorldPublicActionTests.LocalEffectBoundaryAsync),
         new("Lobby lifecycle", ProtocolTests.LobbyLifecycleAsync),
