@@ -112,10 +112,19 @@ bool HoldWorldReplicationIdle(
     std::uint32_t moveType,
     std::string& error) noexcept;
 
+// Engine thread only, after Arm/HoldWorldReplication succeeds. Selects the
+// NPC follower limits for this owned slot; release/reallocation clears them.
+// PlayerSync and manual movement retain the default profile.
+bool UseAIReplicationProfile(std::uintptr_t characterAddress) noexcept;
+
 bool ApplyReplicatedYaw(
     std::uintptr_t characterAddress,
     float yaw,
     std::string& error) noexcept;
+
+// Engine thread only: leave a completed authoritative attack via the retail
+// Idle transition/destructor. Never touches a victim's death cycle or health.
+bool FinishReplicatedInteraction(std::uintptr_t characterAddress) noexcept;
 
 bool Arm(
     std::uintptr_t characterAddress,

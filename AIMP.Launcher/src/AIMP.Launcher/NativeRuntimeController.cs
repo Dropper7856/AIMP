@@ -15,6 +15,10 @@ internal sealed class NativeRuntimeController : IDisposable
     private readonly ConcurrentDictionary<Guid, byte> _awaitingCommandAcks = new();
     private readonly ConcurrentDictionary<Guid, byte> _earlyFinalCommands = new();
     private readonly ConcurrentDictionary<Guid, byte> _quietCommandIds = new();
+    // Optional exact final-result wait, used for creation requests. A queued
+    // acknowledgement is not proof that a native Character was submitted.
+    private readonly ConcurrentDictionary<Guid, TaskCompletionSource<GameCommandResultPayload>>
+        _commandExecutionWaiters = new();
     private readonly ConcurrentDictionary<string, bool> _desiredPerformanceModules =
         new(PerformanceIsolationNativeModules.All.ToDictionary(name => name, _ => true), StringComparer.Ordinal);
     private NativeRuntimeSnapshot _snapshot = NativeRuntimeSnapshot.Empty;
@@ -308,13 +312,31 @@ internal sealed class NativeRuntimeController : IDisposable
     internal async Task<GameCommandResultPayload> ExecuteCommandAsync(
         string command,
         IReadOnlyDictionary<string, string> arguments,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool waitForExecution = false)
     {
         var session = GetCommandSession();
         var request = CreateCommandRequest(command, arguments);
+        TaskCompletionSource<GameCommandResultPayload>? execution = null;
+        if (waitForExecution)
+        {
+            execution = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            _commandExecutionWaiters.TryAdd(request.RequestId, execution);
+        }
         _awaitingCommandAcks.TryAdd(request.RequestId, 0);
         BeginCommand(command);
-        return await AwaitCommandAsync(session, request, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var result = await AwaitCommandAsync(session, request, cancellationToken)
+                .ConfigureAwait(false);
+            if (execution is not null && IsQueuedResult(result))
+                return await execution.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            return result;
+        }
+        finally
+        {
+            _commandExecutionWaiters.TryRemove(request.RequestId, out _);
+        }
     }
 
     internal async Task<GameCommandResultPayload> ExecuteReplicationCommandAsync(
@@ -756,6 +778,9 @@ internal sealed class NativeRuntimeController : IDisposable
 
     private void OnFinalCommandResult(object? sender, GameCommandResultPayload value)
     {
+        if (!IsQueuedResult(value)
+            && _commandExecutionWaiters.TryGetValue(value.RequestId, out var execution))
+            execution.TrySetResult(value);
         if (_quietCommandIds.TryRemove(value.RequestId, out _)) return;
         lock (_commandResultGate)
         {

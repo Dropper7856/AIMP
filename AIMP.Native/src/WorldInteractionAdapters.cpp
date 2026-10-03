@@ -5905,6 +5905,13 @@ void __fastcall QueueTypedMessageDetour(
                 payloadSize, payloadData, delaySeconds);
             return;
         }
+        if (!cathode_primitives::PrepareTypedMessageForNetwork(messageType,
+                std::span<std::byte>(portablePayload.data(), payloadSize))) {
+            gWs3TypedRootRetailOnly.fetch_add(1U, std::memory_order_relaxed);
+            original(manager, sourceKeyAddress, targetKeyAddress, messageType,
+                payloadSize, payloadData, delaySeconds);
+            return;
+        }
 
         world_actions::ContextTrace cause{};
         const auto submission = world_actions::SubmitTypedMessageRoot(
@@ -6114,7 +6121,9 @@ void __fastcall QueueTypedMessageDetour(
         !CopyBytesSafely(
             payloadData,
             payload.bytes.data() + typedHeaderBytes,
-            payloadSize)) {
+            payloadSize) ||
+        !cathode_primitives::PrepareTypedMessageForNetwork(messageType,
+            std::span<std::byte>(payload.bytes.data() + typedHeaderBytes, payloadSize))) {
         gInvalidTypedMessagesSkipped.fetch_add(1U, std::memory_order_acq_rel);
         original(manager, sourceKeyAddress, targetKeyAddress, messageType,
             payloadSize, payloadData, delaySeconds);

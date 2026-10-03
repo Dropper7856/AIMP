@@ -13,6 +13,12 @@ internal sealed class AISyncSession : IDisposable
     private readonly object _gate = new();
     private readonly SemaphoreSlim _configureGate = new(1, 1);
     private readonly Dictionary<ulong, ReadOnlyMemory<byte>> _pending = new();
+    private readonly Dictionary<ulong, uint> _participants = new();
+    private ulong _localPeer;
+    private byte[]? _lastConfiguration;
+    private int _configurationProcessId;
+    private long _participantRevision;
+    private bool _participantRefreshRunning;
     private readonly CancellationTokenSource _shutdown = new();
     private LobbyHost? _host;
     private LobbyClient? _client;
@@ -49,7 +55,7 @@ internal sealed class AISyncSession : IDisposable
     private void InvalidateLocked() { _active = false; ++_epoch; _pending.Clear(); }
 
     internal async Task ConfigureAsync(Guid session, bool isHost, int nativeGeneration,
-        int worldGeneration, bool bound, bool compatible, CancellationToken token)
+        int worldGeneration, bool bound, bool compatible, ulong localPeer, CancellationToken token)
     {
         await _configureGate.WaitAsync(token).ConfigureAwait(false);
         try
@@ -59,6 +65,7 @@ internal sealed class AISyncSession : IDisposable
                 _session = session; _worldGeneration = worldGeneration;
                 _nativeGeneration = nativeGeneration;
                 _isHost = isHost; _bound = bound; _compatible = compatible;
+                _localPeer = localPeer;
             }
             await ApplyConfigurationAsync(Enabled, token).ConfigureAwait(false);
         }
@@ -68,6 +75,68 @@ internal sealed class AISyncSession : IDisposable
             _diagnostics.Log("AISync", $"V2 configuration refused: {exception.Message}");
         }
         finally { _configureGate.Release(); }
+    }
+
+    internal void SetParticipant(ulong peer, uint character)
+    {
+        lock (_gate)
+        {
+            if (_disposed || peer == 0) return;
+            if (character == 0) { if (!_participants.Remove(peer)) return; }
+            else
+            {
+                if (_participants.TryGetValue(peer, out var old) && old == character) return;
+                if (!_participants.ContainsKey(peer) && _participants.Count >= AISyncCodec.MaximumActors) return;
+                _participants[peer] = character;
+            }
+            ++_participantRevision;
+            ScheduleParticipantRefreshLocked();
+        }
+    }
+    internal void ClearParticipants()
+    {
+        lock (_gate)
+        {
+            if (_participants.Count == 0) return;
+            _participants.Clear(); ++_participantRevision;
+            ScheduleParticipantRefreshLocked();
+        }
+    }
+    private void ScheduleParticipantRefreshLocked()
+    {
+        if (_participantRefreshRunning || _disposed) return;
+        _participantRefreshRunning = true;
+        _ = Task.Run(RefreshParticipantsAsync);
+    }
+    private async Task RefreshParticipantsAsync()
+    {
+        var acquired = false;
+        long attempted = -1;
+        try
+        {
+            await _configureGate.WaitAsync(_shutdown.Token).ConfigureAwait(false);
+            acquired = true;
+            while (!_shutdown.IsCancellationRequested)
+            {
+                lock (_gate) attempted = _participantRevision;
+                await ApplyConfigurationAsync(Enabled, _shutdown.Token).ConfigureAwait(false);
+                lock (_gate) if (attempted == _participantRevision) return;
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception exception)
+        {
+            _diagnostics.Log("AISync", $"Participant binding update failed: {exception.Message}");
+        }
+        finally
+        {
+            if (acquired) _configureGate.Release();
+            lock (_gate)
+            {
+                _participantRefreshRunning = false;
+                if (!_disposed && attempted != _participantRevision) ScheduleParticipantRefreshLocked();
+            }
+        }
     }
 
     internal async Task SetEnabledAsync(bool enabled, CancellationToken token)
@@ -91,14 +160,30 @@ internal sealed class AISyncSession : IDisposable
         int nativeGeneration, worldGeneration;
         bool bound, compatible;
         long epoch;
+        byte[] configuration;
+        int processId;
         lock (_gate)
         {
-            InvalidateLocked(); epoch = _epoch;
             session = _session; nativeGeneration = _nativeGeneration; worldGeneration = _worldGeneration;
             bound = _bound; compatible = _compatible;
             role = !enabled || !bound ? 0U : _isHost ? 1U : compatible ? 2U : 3U;
             if (enabled && bound && (worldGeneration <= 0 || nativeGeneration <= 0))
                 role = _isHost ? 0U : 3U;
+            configuration = AISyncCodec.Configuration(role, Math.Max(nativeGeneration, 0),
+                Math.Max(worldGeneration, 0), session, _localPeer, _participants);
+            var snapshot = _controller.Snapshot;
+            processId = snapshot.ProcessId;
+            var desiredActive = enabled && bound && compatible && (role is 1 or 2) && !_disposed;
+            if (snapshot.IpcConnected && _controller.AISyncAvailable &&
+                _configurationProcessId == processId && _lastConfiguration is not null &&
+                _active == desiredActive && configuration.AsSpan().SequenceEqual(_lastConfiguration)) return;
+            // Only role/session/generation changes invalidate queued NPC states.
+            // A new participant binding must not interrupt an active attack.
+            if (!snapshot.IpcConnected || !_controller.AISyncAvailable ||
+                (_active && !desiredActive) || _configurationProcessId != processId || _lastConfiguration is null ||
+                !configuration.AsSpan(0, 32).SequenceEqual(_lastConfiguration.AsSpan(0, 32)))
+                InvalidateLocked();
+            epoch = _epoch;
         }
         // A menu choice made before injection is retained by the shared state.
         // The first authority binding submits it after the IPC handshake.
@@ -113,10 +198,20 @@ internal sealed class AISyncSession : IDisposable
             }
             _availabilityWarningReported = false;
             await _controller.SendAISyncConfigurationAsync(
-                AISyncCodec.Configuration(role, Math.Max(nativeGeneration, 0),
-                    Math.Max(worldGeneration, 0), session), token).ConfigureAwait(false);
-            lock (_gate) _active = enabled && bound && compatible && (role is 1 or 2)
-                && epoch == _epoch && !_disposed;
+                configuration, token).ConfigureAwait(false);
+            lock (_gate)
+            {
+                if (!_controller.Snapshot.IpcConnected || _controller.Snapshot.ProcessId != processId)
+                {
+                    _lastConfiguration = null;
+                    InvalidateLocked();
+                    return;
+                }
+                _lastConfiguration = configuration;
+                _configurationProcessId = processId;
+                _active = enabled && bound && compatible && (role is 1 or 2)
+                    && epoch == _epoch && !_disposed;
+            }
         }
         bool active;
         lock (_gate) active = _active;

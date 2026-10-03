@@ -4,6 +4,7 @@
 #include "aimp/BuildProfile.h"
 #include "aimp/CapabilityMatrix.h"
 #include "aimp/CaptureCatalog.h"
+#include "aimp/CathodePrimitiveExecutor.h"
 #include "aimp/CharacterDirectStepRuntime.h"
 #include "aimp/Diagnostics.h"
 #include "aimp/DummyPlayerController.h"
@@ -3060,6 +3061,7 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
         const auto ws3 = world_actions::Snapshot();
         const auto replication = replication_core::DiagnosticsSnapshot();
         const auto interactions = world_interactions::DiagnosticsSnapshot();
+        const auto primitives = cathode_primitives::DiagnosticsSnapshot();
         const auto animated = world_animated::DiagnosticsSnapshot();
         diagnostics_->Log(
             "info",
@@ -3358,6 +3360,10 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
              {"ws3TypedRootAwaitAuthority", Diagnostics::Unsigned(interactions.ws3TypedRootAwaitAuthority), true},
              {"ws3TypedRootAuthoritySuppressed", Diagnostics::Unsigned(interactions.ws3TypedRootAuthoritySuppressed), true},
              {"ws3TypedRootLocal", Diagnostics::Unsigned(interactions.ws3TypedRootLocal), true},
+             {"ws3TypedCharacterEventsEncoded", Diagnostics::Unsigned(primitives.typedCharacterEventsEncoded), true},
+             {"ws3TypedCharacterEventsRebuilt", Diagnostics::Unsigned(primitives.typedCharacterEventsRebuilt), true},
+             {"ws3TypedCharacterEventsRejected", Diagnostics::Unsigned(primitives.typedCharacterEventsRejected), true},
+             {"ws3TypedCharacterEventLastKind", Diagnostics::Unsigned(primitives.lastTypedCharacterEventKind), true},
              {"ws3TypedReceiverLocalSuppressed", Diagnostics::Unsigned(interactions.ws3TypedReceiverLocalSuppressed), true},
              {"ws3TypedLastReceiverLocalSuppressedType", Diagnostics::Unsigned(interactions.ws3TypedLastReceiverLocalSuppressedType), true},
              {"ws3TypedBoundaryLastMessageType", Diagnostics::Unsigned(interactions.ws3TypedLastMessageType), true},

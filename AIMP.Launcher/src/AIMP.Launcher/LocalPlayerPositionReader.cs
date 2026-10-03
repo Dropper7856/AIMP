@@ -196,6 +196,7 @@ internal sealed class LocalPlayerPositionReader : IDisposable
     // cadence.  Reuse the buffers instead of allocating several arrays every
     // tick, and read contiguous retail fields as one block where possible.
     private readonly byte[] _positionBytes = new byte[LocalPlayerPositionMemoryLayout.BlockSize];
+    private readonly byte[] _characterPositionBytes = new byte[RemoteCharacterPositionMemoryLayout.BlockSize];
     private readonly byte[] _pointerBytes = new byte[LocalPlayerYawMemoryLayout.PointerSize];
     private readonly byte[] _yawBytes = new byte[LocalPlayerYawMemoryLayout.YawSize];
     private readonly byte[] _moveTypeBytes = new byte[LocalPlayerMovementMemoryLayout.MoveTypeSize * 2];
@@ -221,11 +222,16 @@ internal sealed class LocalPlayerPositionReader : IDisposable
         movementProfile = default;
 
         if (!CanRead(runtime) || !EnsureAttached(runtime.ProcessId)) return false;
-        if (!TryReadPosition(runtime.ModuleBase, out position)) return false;
 
-        // CharacterBase used to be fetched independently by TryReadYaw and
-        // TryReadMovementProfile.  Resolve it once for the whole 60 Hz sample.
-        if (!TryReadCharacterBase(runtime.ModuleBase, out var characterBase)) return true;
+        // A module-global transform can expose a stable bootstrap value before
+        // THE_PLAYER has a live Character. PlayerSync must not publish that
+        // placeholder as a spawn position. Resolve the actual local Character
+        // first and use the same Character + 0x70 world transform used for
+        // remote representations.
+        if (!TryReadCharacterBase(runtime.ModuleBase, out var characterBase)
+            || !TryReadCharacterPosition(characterBase, out position))
+            return false;
+
         yawAvailable = TryReadYaw(characterBase, out yaw);
         movementProfileAvailable = TryReadMovementProfile(characterBase, out movementProfile);
         return true;
@@ -236,9 +242,9 @@ internal sealed class LocalPlayerPositionReader : IDisposable
         out LocalPlayerPosition position)
     {
         position = default;
-        if (!CanRead(runtime)) return false;
-        if (!EnsureAttached(runtime.ProcessId)) return false;
-        return TryReadPosition(runtime.ModuleBase, out position);
+        if (!CanRead(runtime) || !EnsureAttached(runtime.ProcessId)) return false;
+        if (!TryReadCharacterBase(runtime.ModuleBase, out var characterBase)) return false;
+        return TryReadCharacterPosition(characterBase, out position);
     }
 
     internal bool TryReadYaw(NativeRuntimeSnapshot runtime, out float yaw)
@@ -289,6 +295,25 @@ internal sealed class LocalPlayerPositionReader : IDisposable
         return false;
     }
 
+    private bool TryReadCharacterPosition(
+        nint characterBase,
+        out LocalPlayerPosition position)
+    {
+        var address = characterBase + RemoteCharacterPositionMemoryLayout.PositionOffset;
+        if (!ReadBlock(address, _characterPositionBytes))
+        {
+            position = default;
+            return false;
+        }
+        if (RemoteCharacterPositionMemoryLayout.TryDecode(
+                _characterPositionBytes, out position))
+        {
+            LastError = string.Empty;
+            return true;
+        }
+        LastError = "The local Character world position is invalid.";
+        return false;
+    }
     private bool TryReadCharacterBase(nint moduleBase, out nint characterBase)
     {
         var address = LocalPlayerYawMemoryLayout.ResolveCharacterBasePointer(moduleBase);

@@ -83,6 +83,36 @@ wchar_t gCrashReportPath[32768]{};
 LPTOP_LEVEL_EXCEPTION_FILTER gPreviousUnhandledFilter{};
 volatile LONG gExceptionRecorderInstalled{};
 
+bool ReadCrashWord(const std::uintptr_t address, std::uint32_t& word) noexcept {
+    if (address < 0x10000U || address > 0xFFFF0000U) return false;
+#if defined(_MSC_VER)
+    __try {
+        word = *reinterpret_cast<const std::uint32_t*>(address);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+#else
+    return TryCopy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+#endif
+}
+void WriteCrashWords(const HANDLE file, const char* label,
+    const std::uintptr_t address, const std::size_t count) noexcept {
+    // Bounded raw words only; no unwinder, heap allocation, symbol loading or
+    // engine call from the exception filter. ESP[0] preserves an invalid CALL's
+    // return address, which the previous register-only report omitted.
+    for (std::size_t i = 0U; i < count; ++i) {
+        std::uint32_t word{};
+        const auto cursor = address + i * sizeof(word);
+        if (cursor < address || !ReadCrashWord(cursor, word)) break;
+        char line[128]{};
+        const auto length = _snprintf_s(line, sizeof(line), _TRUNCATE,
+            "%s[%02zu]@0x%08llX=0x%08lX\r\n", label, i,
+            static_cast<unsigned long long>(cursor), static_cast<unsigned long>(word));
+        if (length <= 0) break;
+        DWORD written{};
+        static_cast<void>(WriteFile(file, line, static_cast<DWORD>(length), &written, nullptr));
+    }
+}
+
 LONG WINAPI RecordUnhandledException(EXCEPTION_POINTERS* pointers) noexcept {
     if (pointers != nullptr && pointers->ExceptionRecord != nullptr) {
         HANDLE file = CreateFileW(
@@ -115,7 +145,7 @@ LONG WINAPI RecordUnhandledException(EXCEPTION_POINTERS* pointers) noexcept {
                 ? static_cast<unsigned long long>(record->ExceptionInformation[1]) : 0ULL;
             const auto writtenChars = _snprintf_s(
                 text, sizeof(text), _TRUNCATE,
-                "version=1\r\n"
+                "version=2\r\n"
                 "pid=%lu\r\n"
                 "tid=%lu\r\n"
                 "tickMs=%llu\r\n"
@@ -149,6 +179,9 @@ LONG WINAPI RecordUnhandledException(EXCEPTION_POINTERS* pointers) noexcept {
                 DWORD bytesWritten = 0U;
                 static_cast<void>(WriteFile(
                     file, text, static_cast<DWORD>(writtenChars), &bytesWritten, nullptr));
+                WriteCrashWords(file, "stack", esp, 96U);
+                WriteCrashWords(file, "receiver", ecx, 16U);
+                WriteCrashWords(file, "dispatch", eax, 16U);
                 static_cast<void>(FlushFileBuffers(file));
             }
             CloseHandle(file);
