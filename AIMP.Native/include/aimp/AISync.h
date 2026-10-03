@@ -45,11 +45,12 @@ enum InteractionFlag : std::uint32_t {
     InteractionActorIsSource = 1U << 0U,
     InteractionTargetIsParticipant = 1U << 1U,
     InteractionPairValid = 1U << 2U,
+    InteractionCycleActive = 1U << 3U,
 };
 
 #pragma pack(push, 1)
 struct State final {
-    std::uint32_t version{5U};
+    std::uint32_t version{6U};
     std::uint32_t nativeGeneration{}; // informational: generations differ per process
     std::uint64_t sessionCookie{};
     std::uint32_t worldGeneration{};
@@ -83,16 +84,30 @@ struct State final {
     // They are not animation events: a revision means the proxy execution
     // context must be quiesced/rebound before normal convergence resumes.
     std::uint32_t lifecycleRevision{}, lifecycleFlags{};
+    // Participant identity is portable; THE_PLAYER and dynamic CATHODE keys
+    // are process-local. No Character address is carried by an NPC snapshot.
+    std::uint64_t interactionTargetPeer{};
+    std::int32_t interactionTransitionVariant{};
+    std::uint32_t interactionPairRevision{}, interactionTransitionRevision{};
+};
+struct ParticipantBinding final {
+    std::uint64_t peer{};
+    std::uint32_t character{}, reserved{};
 };
 struct Configuration final {
-    std::uint32_t version{1U};
+    std::uint32_t version{2U};
     Role role{Role::Retail};
     std::uint32_t nativeGeneration{}, worldGeneration{};
     std::uint64_t sessionCookie{};
+    // Launcher -> local DLL only. Never passed to the lobby transport.
+    std::uint64_t localPeer{};
+    std::uint32_t participantCount{}, reserved{};
+    ParticipantBinding participants[32]{};
 };
 #pragma pack(pop)
-static_assert(sizeof(State) == 164U);
-static_assert(sizeof(Configuration) == 24U);
+static_assert(sizeof(State) == 184U);
+static_assert(sizeof(ParticipantBinding) == 16U);
+static_assert(sizeof(Configuration) == 552U);
 
 bool Install(std::uintptr_t moduleBase, HookManager& hooks,
     LevelGenerationTracker& generations, GameThreadDispatcher& dispatcher,
@@ -126,12 +141,49 @@ struct Counters final {
     std::uint64_t interactionCaptured{}, interactionApplied{}, interactionRejected{}, interactionRemapped{};
     std::uint64_t pairedTransitionCaptured{}, pairedTransitionApplied{};
     std::uint64_t playerRepresentationsRegistered{}, provisionalPlayerActorsRetired{};
+    std::uint64_t participantCandidates{}, participantTargetRejected{}, deadTargetRecoveries{};
+    std::uint64_t participantCandidatePasses{};
+    std::uint64_t senseEventPasses{};
+    std::uint64_t participantSignalLookups{};
+    std::uint64_t participantSignalRemaps{};
+    std::uint64_t participantSignalRetailMissing{};
+    std::uint64_t participantSignalRetailMismatch{};
+    std::uint64_t participantSignalAmbiguous{};
+    std::uint64_t lastParticipantSignalPeer{};
+    std::uint64_t participantPairLookups{}, participantPairRemaps{};
+    std::uint64_t participantPairRetailMissing{}, participantPairAmbiguous{};
+    std::uint64_t lastParticipantPairPeer{};
+    std::uint64_t pairedInitializeSucceeded{}, pairedInitializeFailed{}, pairedCycleReleased{};
+    std::uint64_t pairedVictimTransitions{}, pairedVictimTransitionRejected{}, pairedVictimInitializeAborted{};
+    std::uint64_t pairedVictimEventsRejected{}, pairedVictimDuplicates{}, pairedVictimBusy{}, pairedVictimNativeDispatches{}, pairedVictimNativeStarted{}, pairedVictimAvailabilityOverrides{};
+    std::uint64_t pairedVictimLocalDispatches{}, pairedVictimLocalStarted{};
+    std::uint64_t pairedVictimConvergenceDetached{}, pairedVictimSnapshotsDeferred{};
+    std::uint64_t pairedVictimHealthContinuations{}, pairedVictimWorkerDispatches{};
+    std::uint64_t pairedVictimLocalAvailabilityOverrides{}, pairedDeadTargetRejected{}, pairedRecoveryDeferred{};
+    std::uint32_t lastVictimAdmissionHp{}, lastVictimAdmissionHealth{}, lastVictimAdmissionEnabled{};
+    std::uint32_t lastRejectedPairedSourceState{}, lastRejectedPairedReason{};
+    std::uint64_t candidateEligibilityChecks{};
+    std::uint64_t candidateEligibilityOverrides{};
+    std::uint64_t recordEligibilityChecks{};
+    std::uint64_t recordEligibilityOverrides{};
+    std::uint64_t participantRecordsValidated{};
+    std::uint64_t participantRecordsRetained{};
+    std::uint64_t participantRecordsRejected{};
+    std::uint64_t participantPerceptionSamples{};
+    std::uint64_t participantPerceptionDropped{};
+    std::uint64_t aiPlayerQueryRemaps{}, aiPlayerSlotRemaps{}, aiPlayerSlotRestoreFailures{};
+    std::uint64_t postDeathDecisionResets{}, postDeathDecisionResetRejected{}, postDeathRoleTaskResets{};
+    std::uint64_t interactionBindingsResolved{}, interactionBindingRejected{};
+    std::uint32_t lastHostAttachment{}, lastLocalAttachment{}, lastTransitionVariant{};
     std::uint32_t role{}, nativeGeneration{}, worldGeneration{};
     std::uint32_t lastEntityA{}, lastEntityB{}, lastCharacterClass{};
     std::uint32_t lastActionTypeRva{}, lastActionPathHash{}, lastActionStatus{};
     std::uint32_t lastRoleTaskTypeRva{}, lastRoleTaskKeyA{}, lastRoleTaskKeyB{};
     std::uint32_t lastLifecycleFlags{}, lastWithdrawState{};
-    std::uint32_t lastInteractionTargetA{}, lastInteractionTargetB{};
+    std::uint32_t lastInteractionTargetA{}, lastInteractionTargetB{}, lastInteractionTargetMode{};
+    std::uint64_t lastInteractionTargetPeer{}, lastAppliedInteractionTargetPeer{};
+    std::uint64_t lastAiPlayerQueryPeer{}, lastAiPlayerSlotPeer{};
+    std::uint32_t lastAppliedInteractionTargetA{}, lastAppliedInteractionTargetB{};
     std::uint32_t lastInteractionTransition{};
     bool stable{};
 };

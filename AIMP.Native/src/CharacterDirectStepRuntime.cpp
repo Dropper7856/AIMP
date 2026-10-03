@@ -59,6 +59,11 @@ constexpr float kFollowerAheadBrakeGain = 0.55F;
 constexpr float kFollowerMinimumSpeedMultiplier = 0.45F;
 constexpr float kFollowerMaximumSpeedMultiplier = 1.35F;
 constexpr float kFollowerHardResyncDistance = 1.50F;
+// AISync can carry faster NPC motion than PlayerSync's human follower. Give
+// native locomotion time to absorb transient drift before an emergency snap.
+constexpr float kAiFollowerMaximumMagnitude = 20.0F;
+constexpr float kAiFollowerHardResyncDistance = 3.50F;
+constexpr std::uint64_t kAiFollowerHardResyncGraceMilliseconds = 500U;
 constexpr std::uint64_t kFollowerHardResyncCooldownMilliseconds = 250U;
 constexpr std::uint64_t kFollowerHardResyncProbeIntervalMilliseconds = 100U;
 constexpr std::uint64_t kMoveTypeValidationIntervalMilliseconds = 250U;
@@ -111,6 +116,8 @@ struct MovementSlot final {
     std::atomic<std::uint64_t> leaseExpiresAtTickMs{0U};
     std::atomic<bool> worldSpace{false};
     std::atomic<bool> hasNetworkTransform{false};
+    std::atomic<bool> aiReplicationProfile{false};
+    std::atomic<std::uint64_t> aiDivergenceSinceTickMs{0U};
     std::atomic<bool> hasReplicatedYaw{false};
     std::atomic<bool> applyPhysicalStep{false};
     std::atomic<bool> nativeStateActive{false};
@@ -292,7 +299,7 @@ void AppendLocomotionFlight(
         "\"activationFailures\":%llu,\"nativeStateLosses\":%llu,"
         "\"reacquireAttempts\":%llu,\"reacquireSuccesses\":%llu,"
         "\"protectedFailures\":%llu,\"hardResyncAttempts\":%llu,"
-        "\"hardResyncApplications\":%llu}\r\n",
+        "\"hardResyncApplications\":%llu,\"aiReplicationProfile\":%s}\r\n",
         static_cast<unsigned long long>(GetTickCount64()), GetCurrentThreadId(), eventName,
         static_cast<unsigned long long>(characterAddress),
         static_cast<unsigned long long>(cycleAddress),
@@ -310,7 +317,8 @@ void AppendLocomotionFlight(
         static_cast<unsigned long long>(slot.nativeStateReacquireSuccesses.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(slot.protectedFailures.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(slot.hardResyncAttempts.load(std::memory_order_relaxed)),
-        static_cast<unsigned long long>(slot.hardResyncApplications.load(std::memory_order_relaxed)));
+        static_cast<unsigned long long>(slot.hardResyncApplications.load(std::memory_order_relaxed)),
+        slot.aiReplicationProfile.load(std::memory_order_relaxed) ? "true" : "false");
     if (length <= 0) return;
     DWORD written = 0U;
     static_cast<void>(WriteFile(
@@ -415,6 +423,8 @@ void ResetPayload(MovementSlot& slot) noexcept {
     slot.leaseExpiresAtTickMs.store(0U, std::memory_order_release);
     slot.worldSpace.store(false, std::memory_order_release);
     slot.hasNetworkTransform.store(false, std::memory_order_release);
+    slot.aiReplicationProfile.store(false, std::memory_order_release);
+    slot.aiDivergenceSinceTickMs.store(0U, std::memory_order_release);
     slot.hasReplicatedYaw.store(false, std::memory_order_release);
     slot.applyPhysicalStep.store(false, std::memory_order_release);
     slot.nativeStateActive.store(false, std::memory_order_release);
@@ -518,6 +528,8 @@ void ReleaseSlot(MovementSlot& slot) noexcept {
     slot.lastHardResyncAttemptTickMs.store(0U, std::memory_order_release);
     slot.lastHardResyncProbeTickMs.store(0U, std::memory_order_release);
     slot.hasNetworkTransform.store(false, std::memory_order_release);
+    slot.aiReplicationProfile.store(false, std::memory_order_release);
+    slot.aiDivergenceSinceTickMs.store(0U, std::memory_order_release);
     slot.hasReplicatedYaw.store(false, std::memory_order_release);
     slot.applyPhysicalStep.store(false, std::memory_order_release);
     slot.stopPending.store(false, std::memory_order_release);
@@ -637,12 +649,25 @@ bool IsNativeLocomotionCycle(const std::uintptr_t cycleAddress) noexcept {
         update == gModuleBase + kNativeRvas.npcLocomotionCycleUpdate;
 }
 
+bool RetailOwnsPhysicalCycle(const std::uintptr_t characterAddress) noexcept {
+    std::uintptr_t cycle{};
+    std::uint8_t state{};
+    std::uint8_t grappled{};
+    std::uint32_t health{};
+    // The victim need not own the attacker's 42/4E cycle. Retail paired
+    // entry marks the victim +297; PlayerSync must respect that same ownership.
+    if (GuardedReadValue(characterAddress + 0x297U, grappled) && grappled != 0U) return true;
+    if (ReadNativeCycle(characterAddress, cycle, state) &&
+        (state == 0x42U || state == 0x4EU || state == 0x4FU || state == 0x47U)) return true;
+    return GuardedReadValue(characterAddress + 0x32CU, health) && health >= 3U;
+}
+
 bool EnsureCertifiedCycle(
     MovementSlot& slot,
     const std::uintptr_t cycleAddress) noexcept {
     if (cycleAddress == 0U) return false;
-    if (slot.certifiedCycleAddress.load(std::memory_order_acquire) == cycleAddress)
-        return true;
+    // Retail reconstructs this persistent address in place for other actions.
+    // An address previously certified as Move does not certify its current type.
     if (!IsNativeLocomotionCycle(cycleAddress)) return false;
     slot.certifiedCycleAddress.store(cycleAddress, std::memory_order_release);
     return true;
@@ -1041,7 +1066,10 @@ bool ApplyHardNetworkResync(
 
     const auto now = GetTickCount64();
     const auto lease = slot.leaseExpiresAtTickMs.load(std::memory_order_acquire);
-    if (lease == 0U || now >= lease) return false;
+    if (lease == 0U || now >= lease) {
+        slot.aiDivergenceSinceTickMs.store(0U, std::memory_order_release);
+        return false;
+    }
 
     // 5.14 performance pass: the normal follower below already reads the
     // character transform every engine frame. Hard resync is only an emergency
@@ -1069,10 +1097,21 @@ bool ApplyHardNetworkResync(
     const auto dy = targetY - currentY;
     const auto dz = targetZ - currentZ;
     const auto distanceSquared = dx * dx + dy * dy + dz * dz;
-    constexpr auto hardDistanceSquared =
-        kFollowerHardResyncDistance * kFollowerHardResyncDistance;
-    if (!std::isfinite(distanceSquared) || distanceSquared < hardDistanceSquared)
+    const auto aiFollower = slot.aiReplicationProfile.load(std::memory_order_acquire);
+    const auto hardDistance = aiFollower
+        ? kAiFollowerHardResyncDistance : kFollowerHardResyncDistance;
+    if (!std::isfinite(distanceSquared) || distanceSquared < hardDistance * hardDistance) {
+        slot.aiDivergenceSinceTickMs.store(0U, std::memory_order_release);
         return false;
+    }
+    if (aiFollower) {
+        auto since = slot.aiDivergenceSinceTickMs.load(std::memory_order_acquire);
+        if (since == 0U) {
+            slot.aiDivergenceSinceTickMs.store(now, std::memory_order_release);
+            return false;
+        }
+        if (now - since < kAiFollowerHardResyncGraceMilliseconds) return false;
+    }
 
     const auto last = slot.lastHardResyncAttemptTickMs.load(std::memory_order_acquire);
     if (last != 0U && now - last < kFollowerHardResyncCooldownMilliseconds)
@@ -1092,6 +1131,7 @@ bool ApplyHardNetworkResync(
     slot.transformApplications.fetch_add(1U, std::memory_order_relaxed);
     slot.teleportApplications.fetch_add(1U, std::memory_order_relaxed);
     slot.hardResyncApplications.fetch_add(1U, std::memory_order_relaxed);
+    slot.aiDivergenceSinceTickMs.store(0U, std::memory_order_release);
     AppendLocomotionFlight("hard_resync_applied", slot, characterAddress,
         slot.stateAddress.load(std::memory_order_relaxed),
         slot.lastObservedNativeState.load(std::memory_order_relaxed));
@@ -1198,7 +1238,8 @@ bool BuildFollowerDemand(
         const auto magnitude = std::clamp(
             inputMagnitude * catchupMultiplier,
             0.35F,
-            kFollowerMaximumMagnitude);
+            slot.aiReplicationProfile.load(std::memory_order_acquire)
+                ? kAiFollowerMaximumMagnitude : kFollowerMaximumMagnitude);
         demand.drive = true;
         demand.directionX = headingX * magnitude;
         demand.directionZ = headingZ * magnitude;
@@ -1331,12 +1372,23 @@ bool SubmitNativeRequest(
 bool SubmitStopRequest(
     MovementSlot& slot,
     const std::uintptr_t characterAddress) noexcept {
+    std::uintptr_t liveCycle{};
+    std::uint8_t liveState{};
+    if (RetailOwnsPhysicalCycle(characterAddress) ||
+        (ReadNativeCycle(characterAddress, liveCycle, liveState) &&
+            !IsNativeLocomotionCycle(liveCycle))) {
+        // The persistent cycle object changes vtable/layout in place. A cached
+        // Move address is now a paired action: writing its old control offsets
+        // would corrupt attack data. Release only our mailbox/ownership.
+        ReleaseSlot(slot);
+        return true;
+    }
     // This is a hard release used for teardown or a failed request. Normal
     // network idle uses HoldWorldReplicationIdle and keeps overriding the AI.
     const auto cycleAddress =
         slot.stateAddress.load(std::memory_order_acquire);
     const NativeCycleControlPlan stoppedPlan{};
-    const auto controlStopped = cycleAddress == 0U ||
+    const auto controlStopped = !IsNativeLocomotionCycle(cycleAddress) ||
         WriteNativeCycleControl(cycleAddress, stoppedPlan);
     const auto cycleStopped = !IsNativeLocomotionCycle(cycleAddress) ||
         CallNativeIdleTransition(slot, characterAddress);
@@ -1397,6 +1449,7 @@ void __fastcall ActivateLocomotionCycleDetour(
     std::uint8_t state = 0U;
     const auto hasState = GuardedReadValue(
         cycleAddress + kNpcLocomotionCycleStateOffset, state);
+    if (RetailOwnsPhysicalCycle(owner)) return;
     if (slot->driveRequested.load(std::memory_order_acquire) &&
         (!hasState || state != kNpcLocomotionMoveState)) {
         original(cycle);
@@ -1434,6 +1487,10 @@ void __fastcall EnterIdleCycleDetour(
         return;
     }
 
+    if (RetailOwnsPhysicalCycle(owner)) {
+        original(cycle); // permit retail attack completion/death cleanup
+        return;
+    }
     // During a network Move, CIVILIAN AI cannot tear down 0x38 underneath the
     // remote controller. Once the network wants Idle, allowing the engine's
     // own Idle transition is harmless and keeps the animation graph natural;
@@ -1459,6 +1516,8 @@ void __cdecl ApplyReplicatedEffectiveMoveType(
     if (slot == nullptr ||
         !slot->driveRequested.load(std::memory_order_acquire))
         return;
+    if (RetailOwnsPhysicalCycle(
+            slot->characterAddress.load(std::memory_order_acquire))) return;
 
     const auto moveType = slot->moveType.load(std::memory_order_acquire);
     if (moveType > 3U) return;
@@ -1498,10 +1557,11 @@ void __cdecl ApplyAtNpcLocomotionPreTransform(
     }
     auto* slot = FindSlot(characterAddress);
     if (slot == nullptr || cycleAddress == 0U) return;
+    if (RetailOwnsPhysicalCycle(characterAddress)) return;
 
     // ESI is the live retail locomotion cycle and characterAddress is read from
-    // ESI+4 by the detour itself. Revalidate owner/type only when the cycle
-    // identity changes; steady-state ticks use the generation-local cache.
+    // ESI+4 by the detour itself. The cycle's address can be reconstructed in
+    // place, so its current type must be certified before any control write.
     if (slot->stateAddress.load(std::memory_order_acquire) != cycleAddress) {
         std::uintptr_t owner = 0U;
         if (!GuardedReadValue(
@@ -1904,6 +1964,14 @@ void PumpSlotOnEngineThread(
     const auto characterAddress =
         slot.characterAddress.load(std::memory_order_acquire);
     if (characterAddress == 0U || characterAddress == kReservedSlot) return;
+
+    // Network locomotion must not reacquire Move/Idle, teleport or rewrite yaw
+    // over an admitted paired attack or a real death. Incoming commands may
+    // update their mailbox, but the retail cycle keeps physical ownership.
+    if (RetailOwnsPhysicalCycle(characterAddress)) {
+        if (slot.stopPending.load(std::memory_order_acquire)) ReleaseSlot(slot);
+        return;
+    }
 
     if (runtime_features::Enabled(
             runtime_features::Feature::NativeDiagnostics)) {
@@ -2586,6 +2654,16 @@ bool HoldWorldReplicationIdle(
     return true;
 }
 
+bool UseAIReplicationProfile(const std::uintptr_t characterAddress) noexcept {
+    auto* slot = FindSlot(characterAddress);
+    if (slot == nullptr || !slot->hasNetworkTransform.load(std::memory_order_acquire)) return false;
+    if (!slot->aiReplicationProfile.exchange(true, std::memory_order_acq_rel)) {
+        slot->aiDivergenceSinceTickMs.store(0U, std::memory_order_release);
+        slot->targetRevision.fetch_add(1U, std::memory_order_release);
+    }
+    return true;
+}
+
 bool ApplyReplicatedYaw(
     const std::uintptr_t characterAddress,
     const float yaw,
@@ -2598,6 +2676,25 @@ bool ApplyReplicatedYaw(
     if (WriteReplicatedYaw(characterAddress, yaw)) return true;
     error = "The replicated Character yaw field could not be written safely";
     return false;
+}
+
+bool FinishReplicatedInteraction(const std::uintptr_t characterAddress) noexcept {
+    std::uintptr_t cycle{};
+    std::uint8_t state{};
+    if (!ReadNativeCycle(characterAddress, cycle, state)) return false;
+    if (state != 0x42U && state != 0x4EU) return true;
+    if (gEnterIdleCycle == nullptr) return false;
+#if defined(_MSC_VER)
+    __try {
+#endif
+        gEnterIdleCycle(reinterpret_cast<void*>(cycle));
+        std::uintptr_t current{};
+        std::uint8_t currentState{};
+        return ReadNativeCycle(characterAddress, current, currentState) &&
+            currentState != 0x42U && currentState != 0x4EU;
+#if defined(_MSC_VER)
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+#endif
 }
 
 bool Arm(

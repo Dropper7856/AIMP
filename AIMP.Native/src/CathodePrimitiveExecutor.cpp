@@ -7,8 +7,10 @@
 
 #include <Windows.h>
 
+#include <array>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <utility>
 
 namespace aimp {
@@ -107,6 +109,55 @@ std::atomic<std::uint64_t> gUnsupportedOperations{0U};
 std::atomic<std::uint64_t> gRuntimeUnavailable{0U};
 std::atomic<std::uint64_t> gNativeFaults{0U};
 std::atomic<std::uint64_t> gImplicitSourceFallbacks{0U};
+std::atomic<std::uint64_t> gTypedCharacterEventsEncoded{}, gTypedCharacterEventsRebuilt{}, gTypedCharacterEventsRejected{};
+std::atomic<std::uint32_t> gLastTypedCharacterEventKind{};
+
+// Certified 00438E30/00438ED0 construct 32-byte Character event values.
+// +00 is a polymorphic vptr, +04/+10 are local list links, +08 is kind
+// 27/26, +0C is a scalar stamp, +14/+18 are entity keys, +1C is a mask.
+// 00499E80 consumes message 6 via value.vtable+28/+2C. Sending the Host's
+// vptr verbatim made the Client call code bytes as a virtual table.
+constexpr std::uint32_t kCharacterEventMessage = 6U;
+constexpr std::uint32_t kCharacterEventWireTag = 0x31564543U; // CEV1
+constexpr std::uintptr_t kCharacterEvent26VtableRva = 0x00DC6A70U;
+constexpr std::uintptr_t kCharacterEvent27VtableRva = 0x00DC6AD8U;
+constexpr std::size_t kCharacterEventBytes = 32U;
+std::uintptr_t gTypedValueModule{};
+
+std::uintptr_t CharacterEventVtable(const std::uint32_t kind) noexcept {
+    if (gTypedValueModule < 0x10000U) return 0U;
+    if (kind == 26U) return gTypedValueModule + kCharacterEvent26VtableRva;
+    if (kind == 27U) return gTypedValueModule + kCharacterEvent27VtableRva;
+    return 0U;
+}
+bool CertifiedCharacterEventVtable(const std::uint32_t kind) noexcept {
+    const auto table = CharacterEventVtable(kind);
+    std::array<std::uintptr_t, 2U> slots{};
+    if (table == 0U || !crash_guard::TryCopy(slots.data(),
+            reinterpret_cast<const void*>(table + 0x28U), sizeof(slots))) return false;
+    const auto self = gTypedValueModule + 0x000A4610U; // MOV EAX,ECX; RET
+    const auto none = gTypedValueModule + 0x0090FB70U; // XOR EAX,EAX; RET
+    return kind == 26U ? slots[0] == self && slots[1] == none
+        : slots[0] == none && slots[1] == self;
+}
+bool RebuildTypedMessageData(const std::uint32_t messageType,
+    const std::span<const std::byte> data,
+    std::array<std::byte, kCharacterEventBytes>& rebuilt,
+    std::span<const std::byte>& nativeData) noexcept {
+    nativeData = data;
+    if (messageType != kCharacterEventMessage || data.empty()) return true;
+    std::array<std::uint32_t, 8U> words{};
+    if (data.size() != sizeof(words)) return false;
+    std::memcpy(words.data(), data.data(), sizeof(words));
+    if (words[0] != kCharacterEventWireTag || words[1] != 0U || words[4] != 0U ||
+        !CertifiedCharacterEventVtable(words[2])) return false;
+    words[0] = static_cast<std::uint32_t>(CharacterEventVtable(words[2]));
+    std::memcpy(rebuilt.data(), words.data(), sizeof(words));
+    nativeData = std::span<const std::byte>(rebuilt);
+    gLastTypedCharacterEventKind.store(words[2], std::memory_order_relaxed);
+    gTypedCharacterEventsRebuilt.fetch_add(1U, std::memory_order_relaxed);
+    return true;
+}
 
 const void* gManagerRootAddress{};
 const void* gDispatchInputAddress{};
@@ -451,6 +502,7 @@ bool Initialize(const SignatureResolver& resolver, std::string& error) noexcept 
     }
 
     gManagerRootAddress = resolver.Resolve(SymbolId::CathodeEntityManagerRoot);
+    gTypedValueModule = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
     gExecuteWork = reinterpret_cast<ExecuteWorkFn>(const_cast<void*>(resolver.Resolve(SymbolId::CathodeWorkItemExecute)));
     gAssignEntityRef = reinterpret_cast<AssignEntityRefFn>(
         const_cast<void*>(resolver.Resolve(SymbolId::CathodeAssignEntityRef)));
@@ -528,6 +580,10 @@ RuntimeDiagnostics DiagnosticsSnapshot() noexcept {
     result.runtimeUnavailable = gRuntimeUnavailable.load(std::memory_order_acquire);
     result.nativeFaults = gNativeFaults.load(std::memory_order_acquire);
     result.implicitSourceFallbacks = gImplicitSourceFallbacks.load(std::memory_order_acquire);
+    result.typedCharacterEventsEncoded = gTypedCharacterEventsEncoded.load(std::memory_order_relaxed);
+    result.typedCharacterEventsRebuilt = gTypedCharacterEventsRebuilt.load(std::memory_order_relaxed);
+    result.typedCharacterEventsRejected = gTypedCharacterEventsRejected.load(std::memory_order_relaxed);
+    result.lastTypedCharacterEventKind = gLastTypedCharacterEventKind.load(std::memory_order_relaxed);
     return result;
 }
 
@@ -958,6 +1014,31 @@ ExecuteStatus CreateNativeContextFrame(const WorldEntityLease& context,
     return ExecuteStatus::Queued;
 }
 
+bool PrepareTypedMessageForNetwork(const std::uint32_t messageType,
+    const std::span<std::byte> copiedData) noexcept {
+    if (messageType != kCharacterEventMessage || copiedData.empty()) return true;
+    std::array<std::uint32_t, 8U> words{};
+    if (!Initialized() || copiedData.size() != sizeof(words)) {
+        gTypedCharacterEventsRejected.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+    std::memcpy(words.data(), copiedData.data(), sizeof(words));
+    if (words[0] != CharacterEventVtable(words[2]) ||
+        !CertifiedCharacterEventVtable(words[2])) {
+        gTypedCharacterEventsRejected.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+    // Native clone 00439330/004393A0 copies the scalar body into a new node.
+    // The receiver receives that single value, never the sender's list links.
+    words[0] = kCharacterEventWireTag;
+    words[1] = 0U;
+    words[4] = 0U;
+    std::memcpy(copiedData.data(), words.data(), sizeof(words));
+    gLastTypedCharacterEventKind.store(words[2], std::memory_order_relaxed);
+    gTypedCharacterEventsEncoded.fetch_add(1U, std::memory_order_relaxed);
+    return true;
+}
+
 ExecuteResult ExecuteTypedMessage(
     const std::uint32_t messageType,
     const std::span<const std::byte> data,
@@ -976,13 +1057,20 @@ ExecuteResult ExecuteTypedMessage(
         gRuntimeUnavailable.fetch_add(1U, std::memory_order_acq_rel);
         return {ExecuteStatus::RuntimeUnavailable, false};
     }
+    std::array<std::byte, kCharacterEventBytes> rebuilt{};
+    std::span<const std::byte> nativeData{};
+    if (!RebuildTypedMessageData(messageType, data, rebuilt, nativeData)) {
+        gTypedCharacterEventsRejected.fetch_add(1U, std::memory_order_relaxed);
+        gInvalidPayloads.fetch_add(1U, std::memory_order_acq_rel);
+        return {ExecuteStatus::InvalidPayload, false};
+    }
     auto* manager = ReadManager();
     if (manager == nullptr) {
         gRuntimeUnavailable.fetch_add(1U, std::memory_order_acq_rel);
         return {ExecuteStatus::RuntimeUnavailable, false};
     }
     if (!InvokeTypedMessageSafely(
-            manager, gQueueTypedMessage, sourceKey, targetKey, messageType, data,
+            manager, gQueueTypedMessage, sourceKey, targetKey, messageType, nativeData,
             relativeDelaySeconds)) {
         gNativeFaults.fetch_add(1U, std::memory_order_acq_rel);
         return {ExecuteStatus::NativeFault, false};

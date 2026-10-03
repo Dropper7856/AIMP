@@ -59,6 +59,8 @@ struct RuntimeDiagnostics final {
     std::uint64_t runtimeUnavailable{};
     std::uint64_t nativeFaults{};
     std::uint64_t implicitSourceFallbacks{};
+    std::uint64_t typedCharacterEventsEncoded{}, typedCharacterEventsRebuilt{}, typedCharacterEventsRejected{};
+    std::uint32_t lastTypedCharacterEventKind{};
 };
 
 [[nodiscard]] constexpr ModuleReport Report() noexcept {
@@ -155,6 +157,13 @@ private:
     std::uint32_t inputShortGuid, std::uint32_t constructorFlags,
     std::uint32_t descriptorDelayBits, std::span<const std::byte> payload,
     const NativeCallbackLease* retainedParent, NativeCallbackLease& output) noexcept;
+
+// Message 6 carries a polymorphic Character event value, not an opaque blob.
+// Replace its certified local vptr with a wire tag on a COPY of native data.
+// ExecuteTypedMessage rebuilds that vptr locally before retail owns the copy.
+// Unsupported nonempty message-6 layouts remain local to their origin.
+[[nodiscard]] bool PrepareTypedMessageForNetwork(
+    std::uint32_t messageType, std::span<std::byte> copiedData) noexcept;
 
 [[nodiscard]] ExecuteResult ExecuteTypedMessage(
     std::uint32_t messageType,

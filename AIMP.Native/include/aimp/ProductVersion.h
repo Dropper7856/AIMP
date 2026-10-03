@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.152-aisync-withdraw-authority";
+    "0.11.4.169-aisync-native-victim-admission";
 
 } // namespace aimp

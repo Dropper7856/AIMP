@@ -116,6 +116,8 @@ enum class SymbolId : std::uint16_t {
     CharacterCurrentEquipmentItem,
     CharacterActionFrameDelta,
     CharacterItemInitializeNpcResources,
+    CharacterDeathSoloGameOver,
+    CharacterDeathSoloGameOverEpilogue,
 };
 
 struct MaskedBytes {

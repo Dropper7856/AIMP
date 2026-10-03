@@ -35,6 +35,7 @@
 #include "aimp/ParticipantRegistry.h"
 #include "aimp/ProductVersion.h"
 #include "aimp/PlayerSyncObserver.h"
+#include "aimp/PlayerLifecycle.h"
 #include "aimp/PeerManager.h"
 #include "aimp/RangeProvider.h"
 #include "aimp/SignatureResolver.h"
@@ -620,6 +621,19 @@ DWORD Bootstrap::RunImpl() {
         acceptedExecutable,
         true);
 
+    {
+        std::string lifecycleError;
+        const bool installed = signaturesValid && resolver != nullptr &&
+            player_lifecycle::Install(profile, *resolver, *hooks,
+                validation.hashMatch, lifecycleError);
+        diagnostics.Log(installed ? "info" : "error", "playerlifecycle_initialized",
+            installed
+                ? "[PlayerLifecycle] initialized: local death cleanup preserved; automatic solo GameOver tail gated by THE_PLAYER and existing AIMP gameplay authority."
+                : (lifecycleError.empty()
+                    ? "[PlayerLifecycle] unavailable: exact executable/profile signatures required."
+                    : lifecycleError));
+    }
+
     if (signaturesValid && resolver != nullptr) {
         std::string spawnTrackerHookError;
         if (spawnTracker->Install(
@@ -967,6 +981,7 @@ DWORD Bootstrap::RunImpl() {
     std::uint32_t lastLoggedMismatchedThreadId = 0;
     RuntimeObservationSnapshot lastRuntime{};
     while (WaitForSingleObject(stopEvent, 250) == WAIT_TIMEOUT) {
+        player_lifecycle::DrainDiagnostics(diagnostics);
         if (ipc.ShutdownRequested()) {
             RequestStop();
             break;
@@ -1485,6 +1500,8 @@ DWORD Bootstrap::RunImpl() {
         &state_,
         static_cast<LONG>(BootstrapState::ShuttingDown));
     ipc.Stop();
+    player_lifecycle::Shutdown();
+    player_lifecycle::DrainDiagnostics(diagnostics);
     character_action_runtime::RequestStopAll();
     const auto actionReleaseDeadline = GetTickCount64() + 5500U;
     while (!character_action_runtime::InputsReleased() && GetTickCount64() < actionReleaseDeadline) {
