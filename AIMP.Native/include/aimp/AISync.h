@@ -39,6 +39,9 @@ enum LifecycleFlag : std::uint32_t {
     LifecycleWithdrawn = 1U << 2U,
     LifecycleWithdrawState2 = 1U << 3U,
     LifecycleHostDormant = 1U << 4U,
+    // Generic retail Character backstage (+2DA), independent of Alien withdraw.
+    // Persistent value survives skipped/coalesced vent enter/exit snapshots.
+    LifecycleCharacterBackstage = 1U << 5U,
 };
 
 enum InteractionFlag : std::uint32_t {
@@ -137,6 +140,8 @@ struct Counters final {
     std::uint64_t actionCaptured{}, actionTransitions{};
     std::uint64_t roleTaskCaptured{}, roleTaskTransitions{};
     std::uint64_t lifecycleCaptured{}, lifecycleApplied{}, lifecycleSnaps{}, executionBarriers{};
+    std::uint64_t backstageCaptured{}, backstageTransitions{}, backstageApplied{}, backstageRejected{};
+    std::uint64_t placementVerified{}, placementRejected{}, lifecycleRetries{};
     std::uint64_t withdrawSamples{}, withdrawTransitions{}, withdrawApplied{};
     std::uint64_t interactionCaptured{}, interactionApplied{}, interactionRejected{}, interactionRemapped{};
     std::uint64_t pairedTransitionCaptured{}, pairedTransitionApplied{};
@@ -156,10 +161,15 @@ struct Counters final {
     std::uint64_t pairedInitializeSucceeded{}, pairedInitializeFailed{}, pairedCycleReleased{};
     std::uint64_t pairedVictimTransitions{}, pairedVictimTransitionRejected{}, pairedVictimInitializeAborted{};
     std::uint64_t pairedVictimEventsRejected{}, pairedVictimDuplicates{}, pairedVictimBusy{}, pairedVictimNativeDispatches{}, pairedVictimNativeStarted{}, pairedVictimAvailabilityOverrides{};
+    std::uint64_t pairedPlayerPreparationRemaps{}, pairedPlayerCategoryRemaps{};
     std::uint64_t pairedVictimLocalDispatches{}, pairedVictimLocalStarted{};
     std::uint64_t pairedVictimConvergenceDetached{}, pairedVictimSnapshotsDeferred{};
     std::uint64_t pairedVictimHealthContinuations{}, pairedVictimWorkerDispatches{};
     std::uint64_t pairedVictimLocalAvailabilityOverrides{}, pairedDeadTargetRejected{}, pairedRecoveryDeferred{};
+    std::uint64_t pairedSourcePlacements{}, pairedSourcePlacementRejected{}, pairedObserverSnapshotsDeferred{};
+    std::uint64_t pairedSourcePlacementDeferred{}, pairedSourcePlacementResumed{}, pairedSourcePlacementCancelled{};
+    std::uint64_t pairedSourcePlacementExpired{}, pairedSourcePoseSuppressed{};
+    std::uint64_t presentationSamples{}, presentationDropped{};
     std::uint32_t lastVictimAdmissionHp{}, lastVictimAdmissionHealth{}, lastVictimAdmissionEnabled{};
     std::uint32_t lastRejectedPairedSourceState{}, lastRejectedPairedReason{};
     std::uint64_t candidateEligibilityChecks{};
@@ -172,6 +182,8 @@ struct Counters final {
     std::uint64_t participantPerceptionSamples{};
     std::uint64_t participantPerceptionDropped{};
     std::uint64_t aiPlayerQueryRemaps{}, aiPlayerSlotRemaps{}, aiPlayerSlotRestoreFailures{};
+    std::uint64_t postDeathMeleeSelectionChecks{}, postDeathMeleeSelectionRejects{};
+    std::uint64_t postDeathMeleeSelectionWriteFailures{}, lastPostDeathRetiredPeer{};
     std::uint64_t postDeathDecisionResets{}, postDeathDecisionResetRejected{}, postDeathRoleTaskResets{};
     std::uint64_t interactionBindingsResolved{}, interactionBindingRejected{};
     std::uint32_t lastHostAttachment{}, lastLocalAttachment{}, lastTransitionVariant{};

@@ -28,13 +28,17 @@ constexpr std::uint32_t kStateFlags = PoseValid | Moving | ActionValid | Interac
 constexpr std::uint32_t kInteractionFlags = InteractionActorIsSource |
     InteractionTargetIsParticipant | InteractionPairValid | InteractionCycleActive;
 constexpr std::uint32_t kLifecycleFlags = LifecycleSpatialDiscontinuity | LifecycleTraversalAction |
-    LifecycleWithdrawn | LifecycleWithdrawState2 | LifecycleHostDormant;
+    LifecycleWithdrawn | LifecycleWithdrawState2 | LifecycleHostDormant | LifecycleCharacterBackstage;
 constexpr float kLifecycleDiscontinuityDistance = 3.5F;
 constexpr float kLifecycleVerticalDiscontinuity = 2.5F;
 constexpr std::uintptr_t kPositionOffset = 0x70U, kYawOffset = 0x174U;
 constexpr std::uintptr_t kInteractionManagerGlobalRva = 0x012F0C88U;
 constexpr std::uintptr_t kRoleTaskCleanupRva = 0x00361A90U;
 constexpr auto kCharacterRegistry = character_direct_step_runtime::NativeCharacterRegistry();
+constexpr std::uintptr_t kCharacterBackstageRva = 0x0038B140U;
+constexpr std::uintptr_t kCharacterFrontstageRva = 0x003C0220U;
+constexpr std::uintptr_t kCharacterRelocateRva = 0x003C6330U;
+constexpr float kPlacementTolerance = 0.25F;
 constexpr float kMotionThreshold = 0.02F, kMaximumVelocity = 20.0F;
 using ManagerUpdate = void(__thiscall*)(void*, std::uint32_t, float);
 using Coordinator = void(__thiscall*)(void*, std::uint32_t);
@@ -66,9 +70,10 @@ using ThePlayerResolver = std::uintptr_t(__cdecl*)();
 using TargetEligibility = std::uint32_t(__thiscall*)(void*);
 using RecordInvalid = std::uint8_t(__thiscall*)(void*);
 constexpr ULONGLONG kParticipantProbePeriod = 1000ULL;
+constexpr ULONGLONG kPairPlacementReadyTimeout = 250ULL;
 constexpr std::size_t kParticipantProbeRing = 256U;
 struct ParticipantProbe final {
-    std::uint64_t sessionCookie{}, peer{}, selectedPeer{}, tick{};
+    std::uint64_t sessionCookie{}, peer{}, selectedPeer{}, pendingPeer{}, tick{};
     std::uint32_t nativeGeneration{}, worldGeneration{}, entityA{}, entityB{}, characterClass{};
     std::uint32_t retailEligibility{}, executionStateA{}, executionStateB{}, executionPhase{};
     std::uint32_t activeSenseMask{}, primarySenseIndex{0xFFFFFFFFU}, recentSenseIndex{0xFFFFFFFFU};
@@ -79,6 +84,8 @@ struct ParticipantProbe final {
     bool ownerExecutionReadable{}, ownerGatesReadable{};
     bool living{}, pairReadable{}, paired{}, executionReadable{}, sensesReadable{}, recordPresent{};
     bool recordReadable{}, selectedReadable{}, selectedPresent{}, threatReadable{}, threatPresent{};
+    bool selectedTerminalDead{}, pendingReadable{}, pendingPresent{}, pendingLiving{}, targetSignalsReadable{};
+    std::uint8_t haveTargetSignal{}, haveNextTargetSignal{};
     float sightInput{}, sightTimestamp{};
     bool signalRegistryReadable{}, signalRegistryFound{}, signalRegistryMatches{};
     bool visibilityFlagsReadable{};
@@ -95,7 +102,7 @@ struct Actor {
     State desired{}, previous{};
     ULONGLONG lastSend{}, lastReceive{}, lastManagerUpdate{};
     ULONGLONG lastPoseSample{}, lastProxyRefresh{}, lastInteractionAttempt{}, lastInteractionCapture{};
-    ULONGLONG deadTargetSince{}, stationarySince{}, lastParticipantProbe{};
+    ULONGLONG deadTargetSince{}, stationarySince{}, lastParticipantProbe{}, lastPresentationProbe{};
     std::uint32_t participantProbeCursor{};
     std::uint32_t completedRevision{}, completedInteractionRevision{};
     std::uint32_t completedActionRevision{}, completedRoleTaskRevision{}, completedLifecycleRevision{};
@@ -105,13 +112,42 @@ struct Actor {
     std::int32_t localPairAttachment{-1};
     std::uintptr_t resolvedPairTarget{};
     std::int32_t resolvedSourceVariant{};
+    // Engine-thread-only placement preparation, scoped to the exact live pair.
+    // No victim/health/animation state is held or authored by this record.
+    ULONGLONG pairPlacementSince{};
+    std::uintptr_t pairPlacementTarget{};
+    std::uint32_t pairPlacementBirth{}, pairPlacementPair{}, pairPlacementTransition{}, pairPlacementTargetBirth{};
+    bool pairPlacementPending{};
     std::uint32_t remoteBirth{}, remoteRevision{};
     float lastPosition[3]{};
     bool blocked{}, duplicate{}, faulted{}, hasLastPosition{}, interactionOwnsCycle{};
     bool traversalAction{}, hostDormant{}, withdrawKnown{};
+    bool backstageKnown{}, backstage{}, placementPending{};
     std::uint32_t withdrawState{};
 };
 std::array<Actor, kActors> gActors{}; // engine thread only
+// Value-only observations distinguish transport liveness, physical drift and
+// hidden presentation. One sample/actor/second plus pair admission boundaries.
+struct PresentationProbe final {
+    std::uint64_t sessionCookie{}, peer{}, tick{};
+    std::uint32_t nativeGeneration{}, worldGeneration{}, role{}, phase{};
+    std::uint32_t entityA{}, entityB{}, birth{}, revision{}, pairRevision{}, lifecycleFlags{};
+    std::uint32_t cycleType{}, stage{0xFFFFFFFFU}, withdrawState{0xFFFFFFFFU};
+    float local[3]{}, authority[3]{}, victim[3]{}, authorityVictim[3]{};
+    std::uint8_t cycleState{}, hidden{}, enabled{};
+    std::uint16_t victimHp{};
+    std::uint32_t victimHealthState{};
+    bool victimHealthReadable{};
+    bool positionReadable{}, victimReadable{}, visibilityReadable{}, cycleReadable{}, ownsPair{}, placementPending{}, pairPlacementPending{};
+};
+std::array<PresentationProbe, kParticipantProbeRing> gPresentationProbes{};
+std::atomic<std::uint32_t> gPresentationProbeWrite{}, gPresentationProbeRead{};
+std::atomic<std::uint64_t> gPresentationSamples{}, gPresentationDropped{};
+std::atomic<std::uint64_t> gPairedSourcePlacements{}, gPairedSourcePlacementRejected{};
+std::atomic<std::uint64_t> gPairedSourcePlacementDeferred{}, gPairedSourcePlacementResumed{};
+std::atomic<std::uint64_t> gPairedSourcePlacementCancelled{}, gPairedSourcePlacementExpired{};
+std::atomic<std::uint64_t> gPairedSourcePoseSuppressed{};
+std::atomic<std::uint64_t> gPairedObserverSnapshotsDeferred{};
 // Engine-published identities for retail worker callbacks. Every field is
 // atomic: a sequence check over plain fields would still be a C++ data race.
 struct PairBinding final {
@@ -135,7 +171,7 @@ struct NativeVictimSubmission final {
     std::uintptr_t sourceCycle{}, source{}, victim{};
     PairIdentity victimBefore{};
     std::uint8_t sourceSerial{};
-    bool livingBefore{}, captured{};
+    bool livingBefore{}, captured{}, playerPreparation{};
 };
 thread_local NativeVictimSubmission* gNativeVictimSubmission{};
 // NPC-backed Characters created by AIMP represent remote human players. Their
@@ -173,6 +209,11 @@ std::atomic<void*> gPairedVictimEventOriginal{}, gPairedVictimSubmitPublished{};
 void* gPairedVictimEventTrampoline{}, *gPairedVictimSubmitTrampoline{}, *gPairedVictimSubmitContinue{};
 std::atomic<void*> gPairedVictimPrepareOriginal{};
 void* gPairedVictimPrepareTrampoline{};
+// Only complete MOV instructions are displaced; each untouched path uses its
+// own relocation-free trampoline. Adapted paths resume at retail player logic.
+void* gPlayerPreparationTrampoline{}, *gPlayerPreparationContinue{};
+void* gPlayerCategoryTrampoline{}, *gPlayerCategoryContinue{};
+std::atomic<void*> gPlayerPreparationPublished{}, gPlayerCategoryPublished{};
 void* gSenseEventTrampoline{}, *gSoundEventTrampoline{};
 void* gRecordInvalidTrampoline{};
 void* gCandidatesTrampoline{}, *gHostilityTrampoline{}, *gThePlayerTrampoline{};
@@ -220,12 +261,16 @@ std::atomic<std::uint64_t> gActionCaptured{}, gActionTransitions{};
 std::atomic<std::uint64_t> gRoleTaskCaptured{}, gRoleTaskTransitions{};
 std::atomic<std::uint64_t> gLifecycleCaptured{}, gLifecycleApplied{}, gLifecycleSnaps{}, gExecutionBarriers{};
 std::atomic<std::uint64_t> gWithdrawSamples{}, gWithdrawTransitions{}, gWithdrawApplied{};
+std::atomic<std::uint64_t> gBackstageCaptured{}, gBackstageTransitions{}, gBackstageApplied{}, gBackstageRejected{};
+std::atomic<std::uint64_t> gPlacementVerified{}, gPlacementRejected{}, gLifecycleRetries{};
 std::atomic<std::uint64_t> gInteractionCaptured{}, gInteractionApplied{}, gInteractionRejected{};
 std::atomic<std::uint64_t> gInteractionRemapped{};
 std::atomic<std::uint64_t> gPairedTransitionCaptured{}, gPairedTransitionApplied{};
 std::atomic<std::uint64_t> gPlayerRepresentationsRegistered{};
 std::atomic<std::uint64_t> gProvisionalPlayerActorsRetired{};
 std::atomic<std::uint64_t> gParticipantCandidates{}, gParticipantTargetRejected{}, gDeadTargetRecoveries{};
+std::atomic<std::uint64_t> gPostDeathMeleeSelectionChecks{}, gPostDeathMeleeSelectionRejects{};
+std::atomic<std::uint64_t> gPostDeathMeleeSelectionWriteFailures{}, gLastPostDeathRetiredPeer{};
 std::atomic<std::uint64_t> gParticipantCandidatePasses{};
 std::atomic<std::uint64_t> gSenseEventPasses{};
 std::atomic<std::uint64_t> gParticipantSignalLookups{};
@@ -244,6 +289,7 @@ std::atomic<std::uint64_t> gPairedVictimInitializeAborted{};
 std::atomic<std::uint64_t> gPairedVictimEventsRejected{}, gPairedVictimDuplicates{}, gPairedVictimBusy{};
 std::atomic<std::uint64_t> gPairedVictimNativeDispatches{}, gPairedVictimNativeStarted{};
 std::atomic<std::uint64_t> gPairedVictimAvailabilityOverrides{};
+std::atomic<std::uint64_t> gPairedPlayerPreparationRemaps{}, gPairedPlayerCategoryRemaps{};
 std::atomic<std::uint64_t> gPairedVictimLocalDispatches{}, gPairedVictimLocalStarted{};
 std::atomic<std::uint64_t> gPairedVictimConvergenceDetached{}, gPairedVictimSnapshotsDeferred{};
 std::atomic<std::uint32_t> gLastRejectedPairedReason{};
@@ -1093,6 +1139,7 @@ bool TraversalActionType(const std::uint32_t typeRva) noexcept {
 std::uint32_t SemanticLifecycleFlags(const Actor& actor) noexcept {
     std::uint32_t flags{};
     if (actor.hostDormant) flags |= LifecycleHostDormant;
+    if (actor.backstageKnown && actor.backstage) flags |= LifecycleCharacterBackstage;
     if (actor.withdrawKnown && actor.withdrawState != 0U) {
         flags |= LifecycleWithdrawn;
         if (actor.withdrawState == 2U) flags |= LifecycleWithdrawState2;
@@ -1112,6 +1159,66 @@ void MarkLifecycle(Actor& actor, const std::uint32_t flags) noexcept {
     RefreshLifecycleFlags(actor, flags);
     gLifecycleCaptured.fetch_add(1U, std::memory_order_relaxed);
     gLastLifecycleFlags.store(actor.desired.lifecycleFlags, std::memory_order_relaxed);
+}
+
+void CaptureCharacterBackstage(Actor& actor) noexcept {
+    std::uint8_t hidden{};
+    if (!Read(actor.character + 0x2DAU, hidden)) return;
+    const bool backstage = hidden != 0U;
+    gBackstageCaptured.fetch_add(1U, std::memory_order_relaxed);
+    const bool changed = actor.backstageKnown && actor.backstage != backstage;
+    const bool initialHidden = !actor.backstageKnown && backstage;
+    actor.backstageKnown = true; actor.backstage = backstage;
+    if (changed || initialHidden) {
+        gBackstageTransitions.fetch_add(1U, std::memory_order_relaxed);
+        MarkLifecycle(actor, LifecycleSpatialDiscontinuity);
+    } else RefreshLifecycleFlags(actor, actor.desired.lifecycleFlags);
+}
+
+// Match retail's backstage restore: ECX Character, one byte stack argument,
+// RET 4, followed on re-entry by animated Character vfunc+1C / frontstage reset.
+// The native entries update presentation/collision ownership themselves.
+bool SetCharacterBackstage(const std::uintptr_t character, const bool backstage) noexcept {
+    if (!EngineThread() || !Stable() || !Client() || character == 0U) return false;
+    __try {
+        using Set = void(__thiscall*)(void*, std::uint8_t);
+        reinterpret_cast<Set>(gBase + kCharacterBackstageRva)(
+            reinterpret_cast<void*>(character), backstage ? 1U : 0U);
+        if (!backstage) {
+            std::uintptr_t table{}, getter{};
+            if (!Read(character, table) || !Read(table + 0x1CU, getter) ||
+                getter < gBase + 0x1000U || getter >= gBase + 0x00D9E13BU) return false;
+            const auto animated = reinterpret_cast<std::uintptr_t(__thiscall*)(void*)>(getter)(
+                reinterpret_cast<void*>(character));
+            if (animated == 0U) return false;
+            reinterpret_cast<void(__thiscall*)(void*)>(gBase + kCharacterFrontstageRva)(
+                reinterpret_cast<void*>(animated));
+        }
+        std::uint8_t actual{};
+        return Read(character + 0x2DAU, actual) && (actual != 0U) == backstage;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        gFaults.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+}
+
+bool ApplyAuthoritativeBackstage(Actor& actor, const State& state) noexcept {
+    const bool backstage = (state.lifecycleFlags & LifecycleCharacterBackstage) != 0U;
+    // Preserve the withdraw controller's own presentation while Host dormancy
+    // has no live Character sample. A live frontstage snapshot repairs it.
+    if (!backstage && (state.lifecycleFlags & (LifecycleWithdrawn | LifecycleHostDormant)) != 0U)
+        return true;
+    std::uint8_t actual{};
+    if (!Read(actor.character + 0x2DAU, actual)) return false;
+    if ((actual != 0U) == backstage) return true;
+    if (!SetCharacterBackstage(actor.character, backstage)) {
+        gBackstageRejected.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+    actor.completedRevision = 0U; actor.lastProxyRefresh = 0U;
+    actor.placementPending = !backstage;
+    gBackstageApplied.fetch_add(1U, std::memory_order_relaxed);
+    return true;
 }
 
 bool ResolveAlienWithdrawContext(const std::uintptr_t character,
@@ -1188,7 +1295,7 @@ bool ApplyAuthoritativeWithdraw(Actor& actor, const State& state) noexcept {
 }
 
 bool ProxyWithdrawn(const State& state) noexcept {
-    return (state.lifecycleFlags & (LifecycleWithdrawn | LifecycleHostDormant)) != 0U;
+    return (state.lifecycleFlags & (LifecycleWithdrawn | LifecycleHostDormant | LifecycleCharacterBackstage)) != 0U;
 }
 
 bool ResolveRoleTaskExecutor(const std::uintptr_t character,
@@ -1235,14 +1342,29 @@ bool QuiesceProxyExecution(Actor& actor) noexcept {
     return tree && task;
 }
 
-bool TeleportCharacterEntry(const std::uintptr_t entry, const float* position) noexcept {
-    // Keep SEH in a trivial helper. MSVC rejects __try in callers that require
-    // C++ object unwinding (SnapAuthoritativePose owns std::array/std::string).
+bool CharacterAtPlacement(const std::uintptr_t character, const float* coordinates) noexcept {
+    float distanceSquared{};
+    for (std::size_t i = 0U; i < 3U; ++i) {
+        float actual{};
+        if (!Read(character + kPositionOffset + i * sizeof(float), actual) ||
+            !FiniteCoordinate(actual)) return false;
+        const auto delta = actual - coordinates[i];
+        distanceSquared += delta * delta;
+    }
+    return std::isfinite(distanceSquared) && distanceSquared <= kPlacementTolerance * kPlacementTolerance;
+}
+
+bool RelocateCharacterEntry(const std::uintptr_t character, const float* position, const float yaw) noexcept {
     __try {
-        using Teleport = void(__thiscall*)(void*, const float*);
-        reinterpret_cast<Teleport>(gBase +
-            character_direct_step_runtime::NativeMovementRvas().teleportCharacter)(
-                reinterpret_cast<void*>(entry), position);
+        // FUN_007C6330 is the Character-level retail placement carrier used by
+        // vent exits and scripted relocation. ECX Character, position/yaw/mode
+        // on the stack, RET 0C. It sets the pose and requests retail physical
+        // reconciliation; it works before a hidden body's registry is ready.
+        // Registry FUN_007ECCA0 refreshes the current physical transform and
+        // cannot certify that a requested pose actually reached the Character.
+        using Relocate = void(__thiscall*)(void*, const float*, float, std::uint32_t);
+        reinterpret_cast<Relocate>(gBase + kCharacterRelocateRva)(
+            reinterpret_cast<void*>(character), position, yaw, 1U);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         gFaults.fetch_add(1U, std::memory_order_relaxed);
@@ -1250,25 +1372,35 @@ bool TeleportCharacterEntry(const std::uintptr_t entry, const float* position) n
     }
 }
 
-bool SnapAuthoritativePose(Actor& actor, const State& state) noexcept {
-    if ((state.stateFlags & PoseValid) == 0U || actor.character == 0U) return false;
-    const auto table = gBase + kCharacterRegistry.table;
-    std::uintptr_t entry{};
-    for (std::size_t index = 0U; index < kCharacterRegistry.capacity; ++index) {
-        const auto candidate = table + index * kCharacterRegistry.stride;
-        std::uintptr_t character{};
-        std::uint8_t active{};
-        if (!Read(candidate + kCharacterRegistry.character, character) ||
-            !Read(candidate + kCharacterRegistry.active, active)) return false;
-        if (active != 0U && character == actor.character) { entry = candidate; break; }
+bool PlaceCharacterPose(const std::uintptr_t character, const float* coordinates, const float yaw) noexcept {
+    if (!EngineThread() || !Stable() || !Client() || character == 0U || coordinates == nullptr ||
+        !std::isfinite(yaw) || std::abs(yaw) > 3.3F) return false;
+    for (std::size_t i = 0U; i < 3U; ++i)
+        if (!FiniteCoordinate(coordinates[i])) return false;
+    // Do not re-enter native relocation every pair retry: it deliberately
+    // disables execution for one retail frame while the physical pose settles.
+    if (CharacterAtPlacement(character, coordinates)) {
+        std::string error;
+        if (character_direct_step_runtime::ApplyReplicatedYaw(character, yaw, error)) {
+            gPlacementVerified.fetch_add(1U, std::memory_order_relaxed);
+            return true;
+        }
+    } else {
+        alignas(16) const std::array<float, 4> position{
+            coordinates[0], coordinates[1], coordinates[2], 0.0F};
+        if (RelocateCharacterEntry(character, position.data(), yaw) &&
+            CharacterAtPlacement(character, coordinates)) {
+            gPlacementVerified.fetch_add(1U, std::memory_order_relaxed);
+            return true;
+        }
     }
-    if (entry == 0U) return false;
-    alignas(16) const std::array<float, 4> position{
-        state.position[0], state.position[1], state.position[2], 0.0F};
-    if (!TeleportCharacterEntry(entry, position.data())) return false;
-    std::string error;
-    if (!character_direct_step_runtime::ApplyReplicatedYaw(actor.character, state.yaw, error))
-        return false;
+    gPlacementRejected.fetch_add(1U, std::memory_order_relaxed);
+    return false;
+}
+
+bool SnapAuthoritativePose(Actor& actor, const State& state) noexcept {
+    if ((state.stateFlags & PoseValid) == 0U ||
+        !PlaceCharacterPose(actor.character, state.position, state.yaw)) return false;
     actor.completedRevision = 0U;
     actor.lastProxyRefresh = 0U;
     gLifecycleSnaps.fetch_add(1U, std::memory_order_relaxed);
@@ -1431,6 +1563,21 @@ void CapturePose(Actor& actor, const ULONGLONG now) noexcept {
         actor.lastPosition[i] = position[i]; actor.desired.position[i] = position[i];
     }
     actor.hasLastPosition = true; actor.lastPoseSample = now;
+    if ((actor.desired.interactionFlags & InteractionCycleActive) != 0U) {
+        const auto target = (actor.desired.interactionFlags & InteractionTargetIsParticipant) != 0U
+            ? ParticipantForPeer(actor.desired.interactionTargetPeer)
+            : FindCharacterByIdentity(actor.desired.interactionTargetA, actor.desired.interactionTargetB);
+        float targetPosition[3]{};
+        bool readable = target != 0U;
+        for (std::size_t i = 0U; i < 3U; ++i) {
+            const bool coordinate = target != 0U &&
+                Read(target + kPositionOffset + i * sizeof(float), targetPosition[i]) &&
+                FiniteCoordinate(targetPosition[i]);
+            readable = readable && coordinate;
+        }
+        if (readable)
+            for (std::size_t i = 0U; i < 3U; ++i) actor.desired.interactionTargetPosition[i] = targetPosition[i];
+    }
     actor.desired.yaw = yaw;
     actor.desired.velocityX = velocityX; actor.desired.velocityZ = velocityZ;
     const auto speed = std::hypot(velocityX, velocityZ);
@@ -1607,15 +1754,19 @@ bool NativeVictimFlowRunning(const std::uintptr_t source, const std::uintptr_t v
     // Health changes at the beginning of a fatal 4F graph, not its end.
     return ValidPairedVictimLink(victim, source, sourceCycle, rejectedState);
 }
-bool LocalClientVictimOwnsPair(const std::uintptr_t source) noexcept {
-    PairIdentity local{};
-    std::uintptr_t cycle{};
-    std::uint8_t interactive{};
+bool ClientNativeVictimOwnsPair(const std::uintptr_t source) noexcept {
+    PairIdentity participant{};
+    std::uintptr_t sourceCycle{}, target{}, victimCycle{};
+    std::uint8_t state{}, interactive{};
+    // An observer's NPC-backed player victim owns a genuine fatal graph too.
+    // Protect the exact current pair for every human participant, not only the
+    // first-person local player. A live interactive struggle remains interruptible.
     return gRole.load(std::memory_order_acquire) == Role::Client &&
-        LoadPairBinding(gPairParticipants[0], local) && PairIdentityLive(local) &&
-        NativeVictimFlowRunning(source, local.character) &&
-        Read(local.character + 0x36CU, cycle) && Read(cycle + 0xDAU, interactive) &&
-        (interactive == 0U || TerminalDeadCharacter(local.character));
+        Read(source + 0x36CU, sourceCycle) && Read(sourceCycle + 0x1AU, state) && state == 0x4EU &&
+        Read(sourceCycle + 0x44U, target) && PublishedPairParticipant(target, participant) &&
+        NativeVictimFlowRunning(source, target) &&
+        Read(target + 0x36CU, victimCycle) && Read(victimCycle + 0xDAU, interactive) &&
+        (interactive == 0U || TerminalDeadCharacter(target));
 }
 void __fastcall PairedVictimConvergenceDetour(void* context, void* victimContext,
     const std::uintptr_t victim, const std::uint32_t victimFlag) noexcept {
@@ -1686,6 +1837,141 @@ bool BeginVictimAdmission(const std::uintptr_t victim, const std::uintptr_t sour
         return false;
     }
     return true;
+}
+// A PlayerSync representation has an NPC controller. Retail 00662670
+// consequently skips the player damage/nonfatal choice, and 006E3960 filters
+// its animation definitions as an NPC. The actual Client still takes both
+// player branches. Recognize the same remote participant at these two queries,
+// only inside its already leased Host preparation. Keep every subsequent
+// retail difficulty, health, geometry, definition and fatal-fallback decision.
+bool RemotePlayerPreparation(const std::uintptr_t victim,
+    const std::uintptr_t sourceCycle) noexcept {
+    const auto* submission = gNativeVictimSubmission;
+    if (gRole.load(std::memory_order_acquire) != Role::Host ||
+        !PairGenerationStable() || submission == nullptr || !submission->livingBefore ||
+        submission->captured || submission->sourceCycle != sourceCycle ||
+        submission->victimBefore.character != victim || submission->victimBefore.peer == 0U ||
+        !PairIdentityLive(submission->victimBefore) || !RegisteredPlayerRepresentation(victim) ||
+        !VictimAdmissionMatches(victim, submission->source, sourceCycle)) return false;
+    std::uintptr_t current{}, source{}, target{};
+    std::uint32_t birth{};
+    std::uint8_t serial{}, state{}, flags{};
+    return Read(submission->source + 0x36CU, current) && current == sourceCycle &&
+        Read(sourceCycle + 4U, source) && source == submission->source &&
+        Read(sourceCycle + 0x44U, target) && target == victim &&
+        Read(sourceCycle + 0x48U, birth) && birth == submission->victimBefore.runtimeId &&
+        Read(sourceCycle + 0x19U, serial) && serial == submission->sourceSerial &&
+        Read(sourceCycle + 0x1AU, state) && state == 0x4EU &&
+        Read(sourceCycle + 8U, flags) && (flags & 6U) == 0U;
+}
+int __cdecl PlayerPreparationBoundary(const std::uintptr_t victim,
+    const std::uintptr_t sourceCycle) noexcept {
+    if (!RemotePlayerPreparation(victim, sourceCycle)) return 0;
+    gNativeVictimSubmission->playerPreparation = true;
+    gPairedPlayerPreparationRemaps.fetch_add(1U, std::memory_order_relaxed);
+    return 1;
+}
+int __cdecl PlayerCategoryBoundary(const std::uintptr_t victim) noexcept {
+    const auto* submission = gNativeVictimSubmission;
+    if (submission == nullptr || !submission->playerPreparation ||
+        !RemotePlayerPreparation(victim, submission->sourceCycle)) return 0;
+    gPairedPlayerCategoryRemaps.fetch_add(1U, std::memory_order_relaxed);
+    return 1;
+}
+// Interior query: all GPRs, EFLAGS and eight SSE registers survive.
+// No controller, health, source parameters, animation or target is written.
+__declspec(naked) void PlayerPreparationShim() {
+    __asm {
+        pushfd
+        pushad
+        sub esp, 80h
+        movdqu xmmword ptr [esp + 0h], xmm0
+        movdqu xmmword ptr [esp + 10h], xmm1
+        movdqu xmmword ptr [esp + 20h], xmm2
+        movdqu xmmword ptr [esp + 30h], xmm3
+        movdqu xmmword ptr [esp + 40h], xmm4
+        movdqu xmmword ptr [esp + 50h], xmm5
+        movdqu xmmword ptr [esp + 60h], xmm6
+        movdqu xmmword ptr [esp + 70h], xmm7
+        push esi
+        push ecx
+        call PlayerPreparationBoundary
+        add esp, 8
+        test eax, eax
+        jnz player
+        movdqu xmm0, xmmword ptr [esp + 0h]
+        movdqu xmm1, xmmword ptr [esp + 10h]
+        movdqu xmm2, xmmword ptr [esp + 20h]
+        movdqu xmm3, xmmword ptr [esp + 30h]
+        movdqu xmm4, xmmword ptr [esp + 40h]
+        movdqu xmm5, xmmword ptr [esp + 50h]
+        movdqu xmm6, xmmword ptr [esp + 60h]
+        movdqu xmm7, xmmword ptr [esp + 70h]
+        add esp, 80h
+        popad
+        popfd
+        jmp dword ptr [gPlayerPreparationTrampoline]
+    player:
+        movdqu xmm0, xmmword ptr [esp + 0h]
+        movdqu xmm1, xmmword ptr [esp + 10h]
+        movdqu xmm2, xmmword ptr [esp + 20h]
+        movdqu xmm3, xmmword ptr [esp + 30h]
+        movdqu xmm4, xmmword ptr [esp + 40h]
+        movdqu xmm5, xmmword ptr [esp + 50h]
+        movdqu xmm6, xmmword ptr [esp + 60h]
+        movdqu xmm7, xmmword ptr [esp + 70h]
+        add esp, 80h
+        popad
+        popfd
+        jmp dword ptr [gPlayerPreparationContinue]
+    }
+}
+// Interior query: all GPRs, EFLAGS and eight SSE registers survive.
+// No controller, health, source parameters, animation or target is written.
+__declspec(naked) void PlayerCategoryShim() {
+    __asm {
+        pushfd
+        pushad
+        sub esp, 80h
+        movdqu xmmword ptr [esp + 0h], xmm0
+        movdqu xmmword ptr [esp + 10h], xmm1
+        movdqu xmmword ptr [esp + 20h], xmm2
+        movdqu xmmword ptr [esp + 30h], xmm3
+        movdqu xmmword ptr [esp + 40h], xmm4
+        movdqu xmmword ptr [esp + 50h], xmm5
+        movdqu xmmword ptr [esp + 60h], xmm6
+        movdqu xmmword ptr [esp + 70h], xmm7
+        push esi
+        call PlayerCategoryBoundary
+        add esp, 4
+        test eax, eax
+        jnz player
+        movdqu xmm0, xmmword ptr [esp + 0h]
+        movdqu xmm1, xmmword ptr [esp + 10h]
+        movdqu xmm2, xmmword ptr [esp + 20h]
+        movdqu xmm3, xmmword ptr [esp + 30h]
+        movdqu xmm4, xmmword ptr [esp + 40h]
+        movdqu xmm5, xmmword ptr [esp + 50h]
+        movdqu xmm6, xmmword ptr [esp + 60h]
+        movdqu xmm7, xmmword ptr [esp + 70h]
+        add esp, 80h
+        popad
+        popfd
+        jmp dword ptr [gPlayerCategoryTrampoline]
+    player:
+        movdqu xmm0, xmmword ptr [esp + 0h]
+        movdqu xmm1, xmmword ptr [esp + 10h]
+        movdqu xmm2, xmmword ptr [esp + 20h]
+        movdqu xmm3, xmmword ptr [esp + 30h]
+        movdqu xmm4, xmmword ptr [esp + 40h]
+        movdqu xmm5, xmmword ptr [esp + 50h]
+        movdqu xmm6, xmmword ptr [esp + 60h]
+        movdqu xmm7, xmmword ptr [esp + 70h]
+        add esp, 80h
+        popad
+        popfd
+        jmp dword ptr [gPlayerCategoryContinue]
+    }
 }
 void __fastcall PairedVictimEventDetour(const void* packet, void*, void* character) noexcept {
     const auto original = reinterpret_cast<PairedVictimEvent>(gPairedVictimEventOriginal.load(std::memory_order_acquire));
@@ -1953,6 +2239,59 @@ __declspec(naked) void PairedVictimAvailabilityShim() {
         call PairedVictimAvailabilityDetour
         ret
     }
+}
+void SamplePresentation(Actor& actor, const ULONGLONG now, const std::uint32_t phase = 0U) noexcept {
+    if (!EngineThread() || !Stable() || actor.character == 0U || actor.duplicate) return;
+    if (phase == 0U && now - actor.lastPresentationProbe < kParticipantProbePeriod) return;
+    actor.lastPresentationProbe = now;
+    PresentationProbe sample{};
+    const auto& state = actor.desired;
+    sample.sessionCookie = gCurrent.sessionCookie; sample.tick = now;
+    sample.nativeGeneration = gCurrent.nativeGeneration; sample.worldGeneration = gCurrent.worldGeneration;
+    sample.role = static_cast<std::uint32_t>(gRole.load(std::memory_order_acquire)); sample.phase = phase;
+    sample.entityA = actor.entityA; sample.entityB = actor.entityB;
+    sample.birth = Client() ? actor.remoteBirth : actor.birth; sample.revision = state.revision;
+    sample.pairRevision = state.interactionPairRevision; sample.peer = state.interactionTargetPeer;
+    sample.lifecycleFlags = state.lifecycleFlags; sample.ownsPair = actor.interactionOwnsCycle;
+    sample.placementPending = actor.placementPending;
+    sample.pairPlacementPending = actor.pairPlacementPending;
+    sample.positionReadable = true;
+    for (std::size_t i = 0U; i < 3U; ++i) {
+        const bool readable = Read(actor.character + kPositionOffset + i * sizeof(float), sample.local[i]) &&
+            FiniteCoordinate(sample.local[i]);
+        sample.positionReadable = sample.positionReadable && readable;
+        sample.authority[i] = state.position[i]; sample.authorityVictim[i] = state.interactionTargetPosition[i];
+    }
+    sample.visibilityReadable = Read(actor.character + 0x2DAU, sample.hidden) &&
+        Read(actor.character + 0x2FAU, sample.enabled);
+    std::uintptr_t cycle{}, table{};
+    sample.cycleReadable = Read(actor.character + 0x36CU, cycle) && cycle != 0U &&
+        Read(cycle + 0x1AU, sample.cycleState) && Read(cycle, table) && table >= gBase;
+    if (sample.cycleReadable) {
+        sample.cycleType = static_cast<std::uint32_t>(table - gBase);
+        if (sample.cycleState == 0x4EU && table == gBase + 0x00EAE5D0U)
+            static_cast<void>(Read(cycle + 0xE0U, sample.stage));
+    }
+    std::uintptr_t withdraw{};
+    static_cast<void>(ResolveAlienWithdrawContext(actor.character, withdraw, sample.withdrawState));
+    const auto target = (state.interactionFlags & InteractionTargetIsParticipant) != 0U
+        ? ParticipantForPeer(state.interactionTargetPeer)
+        : FindCharacterByIdentity(state.interactionTargetA, state.interactionTargetB);
+    sample.victimReadable = target != 0U;
+    sample.victimHealthReadable = target != 0U && Read(target + 0x33CU, sample.victimHp) &&
+        Read(target + 0x32CU, sample.victimHealthState);
+    for (std::size_t i = 0U; i < 3U; ++i) {
+        const bool readable = target != 0U && Read(target + kPositionOffset + i * sizeof(float), sample.victim[i]) &&
+            FiniteCoordinate(sample.victim[i]);
+        sample.victimReadable = sample.victimReadable && readable;
+    }
+    const auto write = gPresentationProbeWrite.load(std::memory_order_relaxed);
+    if (write - gPresentationProbeRead.load(std::memory_order_acquire) >= kParticipantProbeRing) {
+        gPresentationDropped.fetch_add(1U, std::memory_order_relaxed); return;
+    }
+    gPresentationProbes[write % kParticipantProbeRing] = sample;
+    gPresentationProbeWrite.store(write + 1U, std::memory_order_release);
+    gPresentationSamples.fetch_add(1U, std::memory_order_relaxed);
 }
 bool Release(Actor& actor) noexcept;
 Actor* Admit(const std::uintptr_t c) noexcept {
@@ -2244,11 +2583,88 @@ bool ResolveLocalPairBinding(Actor& actor, const std::uintptr_t target) noexcept
         return false;
     }
 }
+void ClearPairPlacement(Actor& actor, const bool cancelled = true) noexcept {
+    if (actor.pairPlacementPending && cancelled)
+        gPairedSourcePlacementCancelled.fetch_add(1U, std::memory_order_relaxed);
+    actor.pairPlacementPending = false;
+    actor.pairPlacementSince = 0U; actor.pairPlacementTarget = 0U;
+    actor.pairPlacementBirth = 0U; actor.pairPlacementPair = 0U;
+    actor.pairPlacementTransition = 0U; actor.pairPlacementTargetBirth = 0U;
+}
+bool PairPlacementMatchesState(const Actor& actor, const State& state) noexcept {
+    return actor.pairPlacementPending && actor.pairPlacementBirth == state.birth &&
+        actor.pairPlacementPair == state.interactionPairRevision &&
+        actor.pairPlacementTransition == state.interactionTransitionRevision &&
+        (state.stateFlags & (PoseValid | InteractionValid)) == (PoseValid | InteractionValid) &&
+        state.interactionTransition != 0U &&
+        (state.interactionFlags & InteractionCycleActive) != 0U && !ProxyWithdrawn(state);
+}
+bool PlaceReplicatedPairSource(Actor& actor, const std::uintptr_t target, const ULONGLONG now) noexcept {
+    const auto& state = actor.desired;
+    float placement[3]{};
+    // Translate the authoritative source/victim offset into this process's
+    // exact victim frame. A delayed follower or a remote-player correction
+    // must not start a native kill metres away. Never move the real player or
+    // choose another target. Retail owns all following paired root motion.
+    std::uint32_t targetBirth{};
+    if ((state.stateFlags & PoseValid) == 0U ||
+        !Read(target + 0x50U, targetBirth) || targetBirth == 0U) {
+        ClearPairPlacement(actor); return false;
+    }
+    if (actor.pairPlacementPending &&
+        (!PairPlacementMatchesState(actor, state) || actor.pairPlacementTarget != target ||
+         actor.pairPlacementTargetBirth != targetBirth)) ClearPairPlacement(actor);
+    if (actor.pairPlacementPending && now - actor.pairPlacementSince > kPairPlacementReadyTimeout) {
+        gPairedSourcePlacementExpired.fetch_add(1U, std::memory_order_relaxed);
+        ClearPairPlacement(actor); return false;
+    }
+    for (std::size_t i = 0U; i < 3U; ++i) {
+        float localVictim{};
+        if (!Read(target + kPositionOffset + i * sizeof(float), localVictim) ||
+            !FiniteCoordinate(localVictim)) {
+            ClearPairPlacement(actor); return false;
+        }
+        placement[i] = state.position[i] + localVictim - state.interactionTargetPosition[i];
+        if (!FiniteCoordinate(placement[i])) {
+            ClearPairPlacement(actor); return false;
+        }
+    }
+    if (!PlaceCharacterPose(actor.character, placement, state.yaw)) {
+        ClearPairPlacement(actor); return false;
+    }
+    // FUN_007C6330 deliberately clears Character+2FA during relocation. This
+    // is preparation, not rejection. Keep the follower OFF, then revisit this
+    // exact pair on the next engine update, without the ordinary 250ms backoff.
+    // Re-read the actual victim frame above; never move/freeze the human player.
+    if (!CharacterReady(actor)) {
+        if (!actor.pairPlacementPending) actor.pairPlacementSince = now;
+        actor.pairPlacementPending = true;
+        actor.pairPlacementTarget = target; actor.pairPlacementTargetBirth = targetBirth;
+        actor.pairPlacementBirth = state.birth; actor.pairPlacementPair = state.interactionPairRevision;
+        actor.pairPlacementTransition = state.interactionTransitionRevision;
+        return false;
+    }
+    if (actor.pairPlacementPending)
+        gPairedSourcePlacementResumed.fetch_add(1U, std::memory_order_relaxed);
+    ClearPairPlacement(actor, false);
+    actor.lastProxyRefresh = 0U; actor.completedRevision = 0U;
+    gPairedSourcePlacements.fetch_add(1U, std::memory_order_relaxed);
+    return true;
+}
 bool ApplyAuthoritativeInteraction(Actor& actor, const ULONGLONG now) noexcept {
     if (PairSourceBusy(actor.character)) return true;
     const auto& state = actor.desired;
+    if (actor.pairPlacementPending && !PairPlacementMatchesState(actor, state))
+        ClearPairPlacement(actor);
+    if (actor.pairPlacementPending && now - actor.pairPlacementSince > kPairPlacementReadyTimeout) {
+        gPairedSourcePlacementExpired.fetch_add(1U, std::memory_order_relaxed);
+        ClearPairPlacement(actor); actor.lastInteractionAttempt = now;
+        return true; // bounded wait even if target binding becomes unavailable
+    }
     if ((state.stateFlags & InteractionValid) == 0U ||
-        actor.completedInteractionRevision == state.interactionRevision) return true;
+        actor.completedInteractionRevision == state.interactionRevision) {
+        ClearPairPlacement(actor); return true;
+    }
     // A pair-only packet lacks the source definition needed to bind its bone.
     // Retain it until the following resolved transition arrives; no fabrication.
     if (state.interactionTransition == 0U) return true;
@@ -2259,7 +2675,10 @@ bool ApplyAuthoritativeInteraction(Actor& actor, const ULONGLONG now) noexcept {
         actor.completedInteractionRevision = state.interactionRevision;
         return true;
     }
-    if (actor.lastInteractionAttempt != 0U && now - actor.lastInteractionAttempt < 250ULL) return true;
+    // Prepared placement needs the next retail engine frame, not another
+    // quarter-second relocation/follower loop. Other failures keep their backoff.
+    if (!actor.pairPlacementPending && actor.lastInteractionAttempt != 0U &&
+        now - actor.lastInteractionAttempt < 250ULL) return true;
     actor.lastInteractionAttempt = now;
     const bool participant = (state.interactionFlags & InteractionTargetIsParticipant) != 0U;
     const auto target = participant ? ParticipantForPeer(state.interactionTargetPeer)
@@ -2305,6 +2724,21 @@ bool ApplyAuthoritativeInteraction(Actor& actor, const ULONGLONG now) noexcept {
             // memory even when the call did not raise an immediate exception.
             if (original == nullptr || !Read(gBase + kInteractionManagerGlobalRva, root) ||
                 !Read(root, manager) || manager == 0U) return false;
+            SamplePresentation(actor, now, 1U);
+            // Release only locomotion before pair admission. A native paired
+            // message can immediately acquire the victim's physical cycle.
+            if (!character_direct_step_runtime::Stop(actor.character) ||
+                (RegisteredPlayerRepresentation(target) && !character_direct_step_runtime::Stop(target))) {
+                ClearPairPlacement(actor);
+                gPairedSourcePlacementRejected.fetch_add(1U, std::memory_order_relaxed);
+                return true;
+            }
+            if (!PlaceReplicatedPairSource(actor, target, now)) {
+                if (actor.pairPlacementPending)
+                    gPairedSourcePlacementDeferred.fetch_add(1U, std::memory_order_relaxed);
+                else gPairedSourcePlacementRejected.fetch_add(1U, std::memory_order_relaxed);
+                return true; // exact event retained; no native pair acknowledged yet
+            }
             if ((original(reinterpret_cast<void*>(manager + 0x90U),
                     sourceA, sourceB, destinationA, destinationB, payload,
                     actor.localPairAttachment) & 0xFFU) == 0U) {
@@ -2348,6 +2782,7 @@ bool ApplyAuthoritativeInteraction(Actor& actor, const ULONGLONG now) noexcept {
         return false;
     }
     actor.completedInteractionRevision = state.interactionRevision;
+    SamplePresentation(actor, now, 2U);
     gInteractionApplied.fetch_add(1U, std::memory_order_relaxed);
     return true;
 }
@@ -2355,7 +2790,7 @@ bool PairedTransitionOwnsCycle(Actor& actor, const ULONGLONG) noexcept {
     // Do not reuse the source layout while a retail worker admits its victim.
     if (PairSourceBusy(actor.character)) return true;
     if (!actor.interactionOwnsCycle) return false;
-    if (LocalClientVictimOwnsPair(actor.character)) return true;
+    if (ClientNativeVictimOwnsPair(actor.character)) return true;
     // BT revisions and a paired type alone do not prove an animation is still
     // running. A completed/failed local cycle must not hold PoseSync forever
     // while waiting for the next authoritative completion snapshot.
@@ -2385,9 +2820,9 @@ void CaptureInteractionCycle(Actor& actor) noexcept {
 void RecoverDeadParticipantTarget(Actor& actor, const ULONGLONG now) noexcept {
     if (PairSourceBusy(actor.character)) return;
     const auto& state = actor.desired;
-    // The supplied Host remains in ATOMIC_MELEE_ATTACK_TARGET (EC B770),
-    // status 2, for 25s after THE_PLAYER reaches Health.state 4. Only leave
-    // that certified stale attack; never cancel traversal or a live victim.
+    // EC B770 is the retail ActionMeleeAttack vtable (factory 006F6640).
+    // Retire only this exact completed paired attack; never cancel
+    // traversal or a live victim.
     if (state.interactionTargetPeer == 0U || state.actionTypeRva != 0x00ECB770U ||
         !PairedCycleMatches(actor.character, state) ||
         actor.recoveredInteractionRevision == state.interactionRevision) {
@@ -2438,9 +2873,90 @@ void RecoverDeadParticipantTarget(Actor& actor, const ULONGLONG now) noexcept {
     gDeadTargetRecoveries.fetch_add(1U, std::memory_order_relaxed);
 }
 
+// .174 observed 17,523 new pair attempts against the terminally dead Host,
+// after a successful BT reset and an Idle source. ActionMeleeAttack's start
+// checks record lifetime, not health. Reject its NEW candidate during retail
+// root selection, before promotion/execution; failure 8 is propagated by
+// FUN_00726190 to the parent, which owns fallback and target switching.
+// This does not edit target records/signals or call SetPending/Commit.
+bool RecordMatches(std::uintptr_t record, std::uintptr_t owner, std::uintptr_t target) noexcept;
+bool RetiredMeleeSelection(void* node, const std::uintptr_t owner,
+    const std::uintptr_t execution, const std::uintptr_t tree, std::uint64_t& peer) noexcept {
+    peer = 0U;
+    if (gRole.load(std::memory_order_acquire) != Role::Host || !EngineThread() ||
+        !Stable() || owner == 0U || gAiPlayerQueryOwner != owner) return false;
+    std::uintptr_t table{}, frameNode{}, frameTree{}, treeOwner{}, waiter{}, waiterControl{};
+    std::uint32_t mode{}, status{};
+    std::uint8_t deferred{}, closed{};
+    // Factory 006F0A10 initializes mode 3 for selection, an unstarted frame,
+    // and empty waiter handles. Mode 1 belongs to execution and is untouched.
+    if (!Read(reinterpret_cast<std::uintptr_t>(node), table) || table != gBase + 0x00ECB770U ||
+        !Read(execution + 0x10U, frameNode) || frameNode != reinterpret_cast<std::uintptr_t>(node) ||
+        !Read(execution + 0x14U, frameTree) || frameTree != tree ||
+        !Read(tree + 0xCU, treeOwner) || treeOwner != owner ||
+        !Read(execution + 8U, mode) || mode != 3U ||
+        !Read(execution + 4U, status) || status != 0U ||
+        !Read(execution + 0x1FU, deferred) || deferred == 0U ||
+        !Read(execution + 0x1EU, closed) || closed != 0U ||
+        !Read(execution + 0x2CU, waiter) || waiter != 0U ||
+        !Read(execution + 0x30U, waiterControl) || waiterControl != 0U) return false;
+    auto* actor = Find(owner);
+    std::uint32_t runtimeId{};
+    if (actor == nullptr || actor->tree != tree || actor->blocked || actor->faulted || actor->duplicate ||
+        !Read(owner + 0x50U, runtimeId) || runtimeId != actor->runtimeId || PairSourceBusy(owner)) return false;
+    gPostDeathMeleeSelectionChecks.fetch_add(1U, std::memory_order_relaxed);
+    const auto& state = actor->desired;
+    if ((state.stateFlags & InteractionValid) == 0U || state.interactionTargetPeer == 0U ||
+        state.interactionRevision == 0U || actor->recoveredInteractionRevision != state.interactionRevision)
+        return false;
+    const auto target = ParticipantForPeer(state.interactionTargetPeer);
+    if (target == 0U || !TerminalDeadCharacter(target) || NativeVictimFlowRunning(owner, target)) return false;
+    std::uintptr_t cycle{};
+    std::uint8_t cycleState{};
+    bool active{};
+    if (!ReadPairedCycleActivity(owner, cycle, cycleState, active) || cycleState != 1U || active) return false;
+    std::uintptr_t selection{}, manager{}, selectedOwner{}, record{}, selectedTarget{};
+    if (!Read(owner + 0x34A8U, selection) || selection == 0U ||
+        !Read(selection + 4U, manager) || manager == 0U ||
+        !Read(manager + 0x128U, selectedOwner) || selectedOwner != owner ||
+        !Read(selection + 0x10U, record) || record == 0U ||
+        !Read(record + 0x42CU, selectedTarget) || selectedTarget != target ||
+        !RecordMatches(record, owner, target)) return false;
+    peer = state.interactionTargetPeer;
+    return true;
+}
+void __fastcall MeleeSelectionDetour(void* node, void*, const std::uintptr_t owner,
+    const std::uintptr_t execution, const std::uintptr_t tree,
+    const std::uint32_t previousFailure, const std::uint32_t previousSuccess) noexcept {
+    // The redirected CALL is ONLY in root selection (007261EB). The distinct
+    // execution CALL in 00712E20, active animation updates, and victim workers
+    // remain retail. ECX=node, FIVE stack arguments, RET 14h (20 bytes).
+    using Dispatch = void(__thiscall*)(void*, std::uintptr_t, std::uintptr_t,
+        std::uintptr_t, std::uint32_t, std::uint32_t);
+    const auto original = reinterpret_cast<Dispatch>(gBase + 0x002D0260U);
+    std::uint64_t peer{};
+    const bool reject = RetiredMeleeSelection(node, owner, execution, tree, peer);
+    original(node, owner, execution, tree, previousFailure, previousSuccess);
+    if (!reject) return;
+    std::uint32_t status{};
+    // For this certified deferred leaf, the original selection callback is
+    // empty (00AEF7B0/RET 14h) and leaves status 1. No cycle/waiter has begun.
+    // Retail unwinding then releases this native frame and tries alternatives.
+    if (!Read(execution + 4U, status) || status != 1U || !Write(execution + 4U, std::uint32_t{8U})) {
+        gPostDeathMeleeSelectionWriteFailures.fetch_add(1U, std::memory_order_relaxed);
+        return;
+    }
+    gPostDeathMeleeSelectionRejects.fetch_add(1U, std::memory_order_relaxed);
+    gLastPostDeathRetiredPeer.store(peer, std::memory_order_relaxed);
+}
+
 bool ApplyAuthoritativePose(Actor& actor, const ULONGLONG now) noexcept {
     const auto& state = actor.desired;
     if (PairSourceBusy(actor.character)) return true;
+    if (actor.pairPlacementPending) {
+        gPairedSourcePoseSuppressed.fetch_add(1U, std::memory_order_relaxed);
+        return true;
+    }
     if ((state.stateFlags & PoseValid) == 0U) return false;
     if (actor.completedRevision == state.revision && actor.lastProxyRefresh != 0U &&
         now - actor.lastProxyRefresh < 250ULL) return true;
@@ -2508,9 +3024,11 @@ void Publish(Actor& actor) noexcept {
         actor.desired.interactionTransitionFlags = 0U;
     }
     CaptureWithdrawState(actor);
+    CaptureCharacterBackstage(actor);
     CapturePose(actor, now);
     CaptureActiveAction(actor);
     CaptureRoleTask(actor);
+    SamplePresentation(actor, now);
     const bool changed = !SameState(actor.desired, actor.previous);
     if (!changed && now - actor.lastSend < kRefreshPeriod) return;
     auto state = actor.desired;
@@ -2535,7 +3053,10 @@ void PublishDormantHostActor(Actor& actor, const ULONGLONG now,
     const bool characterPresent) noexcept {
     if (PairSourceBusy(actor.character) || now - actor.lastSend < kRefreshPeriod) return;
 
-    if (characterPresent) CaptureWithdrawState(actor);
+    if (characterPresent) {
+        CaptureWithdrawState(actor);
+        CaptureCharacterBackstage(actor);
+    }
     if (!actor.hostDormant) {
         actor.hostDormant = true;
         MarkLifecycle(actor, LifecycleSpatialDiscontinuity |
@@ -2554,6 +3075,7 @@ void PublishDormantHostActor(Actor& actor, const ULONGLONG now,
     actor.desired.stateFlags &= ~Moving;
     actor.desired.velocityX = 0.0F;
     actor.desired.velocityZ = 0.0F;
+    SamplePresentation(actor, now);
 
     const auto changed = !SameState(actor.desired, actor.previous);
     auto state = actor.desired;
@@ -2757,8 +3279,26 @@ void SampleParticipantPerception(Actor& actor, const std::uintptr_t manager, con
             sample.selectedReadable = true;
             sample.selectedPresent = true;
             sample.selectedPeer = PeerForParticipant(selectedTarget);
+            sample.selectedTerminalDead = TerminalDeadCharacter(selectedTarget);
         }
     }
+    // Pending remains the retail choice. Record it separately so the next
+    // trace distinguishes fallback from an absent eligible replacement.
+    std::uintptr_t pendingRecord{}, pendingTarget{}, haveTarget{}, haveNextTarget{};
+    if (selection != 0U && Read(selection + 0x14U, pendingRecord)) {
+        sample.pendingReadable = pendingRecord == 0U;
+        if (pendingRecord != 0U && Read(pendingRecord + 0x42CU, pendingTarget) &&
+            pendingTarget != 0U && RecordMatches(pendingRecord, actor.character, pendingTarget)) {
+            sample.pendingReadable = true;
+            sample.pendingPresent = true;
+            sample.pendingPeer = PeerForParticipant(pendingTarget);
+            sample.pendingLiving = LivingCharacter(pendingTarget);
+        }
+    }
+    sample.targetSignalsReadable = Read(actor.character + 0x3154U, haveTarget) &&
+        Read(actor.character + 0x31E8U, haveNextTarget) &&
+        (haveTarget == 0U || Read(haveTarget + 0x10U, sample.haveTargetSignal)) &&
+        (haveNextTarget == 0U || Read(haveNextTarget + 0x10U, sample.haveNextTargetSignal));
     // Generic threat-manager entries: +18/count+1C, stride 6C, Character+4,
     // native state+58 (FUN_0071AEC0 / FUN_0071AFE0). No state is rewritten.
     std::uintptr_t threats{}, entries{};
@@ -2861,25 +3401,43 @@ void __fastcall UpdateDetour(void* manager, void*, std::uint32_t previousTime, f
         SampleParticipantPerception(*actor, reinterpret_cast<std::uintptr_t>(manager), now);
         Publish(*actor);
     } else if (Client()) {
-        // First-person and NPC victim graphs can finish at different times.
-        // Keep retail housekeeping above, but do not cut the real player's
-        // native death graph with Host completion/withdraw/pose convergence.
-        if (LocalClientVictimOwnsPair(actor->character)) return;
         const auto now = GetTickCount64();
+        SamplePresentation(*actor, now);
+        // Both first-person and observer victim graphs must keep their actual
+        // attacker until native fatal completion. Housekeeping still ran above.
+        if (ClientNativeVictimOwnsPair(actor->character)) return;
         const bool withdrawn = ProxyWithdrawn(actor->desired);
         if (!Stable() || gRole.load(std::memory_order_acquire) == Role::FrozenClient ||
             actor->faulted || now - actor->lastReceive > kTimeout ||
-            (!withdrawn && ((actor->desired.stateFlags & PoseValid) == 0U ||
-                !CharacterReady(*actor)))) {
+            (!withdrawn && (actor->desired.stateFlags & PoseValid) == 0U)) {
+            ClearPairPlacement(*actor);
             static_cast<void>(Release(*actor));
-        } else if (!ApplyAuthoritativeWithdraw(*actor, actor->desired)) {
+        } else if (!withdrawn && !CharacterReady(*actor)) {
+            if (actor->pairPlacementPending &&
+                now - actor->pairPlacementSince <= kPairPlacementReadyTimeout) {
+                // A native placement temporarily disables execution. Let retail
+                // reconcile its body; keep the pair token and follower stopped.
+                static_cast<void>(character_direct_step_runtime::Stop(actor->character));
+            } else {
+                if (actor->pairPlacementPending)
+                    gPairedSourcePlacementExpired.fetch_add(1U, std::memory_order_relaxed);
+                ClearPairPlacement(*actor);
+                static_cast<void>(Release(*actor));
+            }
+        } else if (!ApplyAuthoritativeWithdraw(*actor, actor->desired) ||
+            !ApplyAuthoritativeBackstage(*actor, actor->desired)) {
+            actor->placementPending = true;
             static_cast<void>(Release(*actor));
         } else if (withdrawn) {
-            // Host has no frontstage AI to converge against. Keep the proxy
-            // quiesced and let the retail Alien withdraw controller own its
-            // visibility/backstage presentation until Host returns.
+            ClearPairPlacement(*actor);
+            // Host is backstage/withdrawn/dormant. Keep the follower quiesced
+            // until the Host's explicit live frontstage state returns.
             static_cast<void>(character_direct_step_runtime::Stop(actor->character));
             actor->lastProxyRefresh = now;
+        } else if (actor->placementPending) {
+            // The CharacterManager snapshot pump retries placement independently
+            // of a sleeping BehaviourManager. Do not arm a stale follower/pair.
+            static_cast<void>(character_direct_step_runtime::Stop(actor->character));
         } else if (!ApplyAuthoritativeInteraction(*actor, now) ||
             (!PairedTransitionOwnsCycle(*actor, now) &&
                 !ApplyAuthoritativePose(*actor, now))) {
@@ -3072,6 +3630,105 @@ bool ValidateRoleTaskCleanupAbi(std::string& error) {
         !MatchRetailBytes(0x0036735BU,
             {0x56,0xE8,0x2F,0xA7,0xFF,0xFF})) {
         error = "aisync role-task cleanup: certified ECX/stack argument/RET 4 bytes mismatch";
+        return false;
+    }
+    return true;
+}
+bool HookPairedPlayerClassification(HookManager& hooks, std::string& error) {
+    // 006626F7: ECX=victim, ESI=source 4E cycle, EBX=0. Skip only the
+    // NPC-controller test; 0066270E retains 29B/difficulty/health/fallback.
+    // 006E3A4D: ESI=victim, EBX=filter. Resume at MOV EAX,1 (player category)
+    // then the original three-argument filter call, with ECX/EDX unchanged.
+    if (!MatchRetailBytes(0x002626F4U,
+            {0x8B,0x4E,0x44,0x8B,0x81,0x1C,0x03,0x00,0x00,0x3B,0xC3,
+             0x0F,0x84,0xFE,0x00,0x00,0x00,0x38,0x58,0x48,0x0F,0x84,0xF5,0x00,0x00,0x00}) ||
+        !MatchRetailBytes(0x0026270EU,
+            {0x38,0x99,0x9B,0x02,0x00,0x00,0x0F,0x85,0xE9,0x00,0x00,0x00}) ||
+        !MatchRetailBytes(0x00262730U,
+            {0x8B,0x4E,0x04,0x8B,0x01,0x8B,0x50,0x1C,0xFF,0xD2,
+             0x8B,0x80,0x34,0x42,0x00,0x00,0x83,0x78,0x74,0x02,0x0F,0x8C,0xB9,0x00,0x00,0x00}) ||
+        !MatchRetailBytes(0x002627FAU, {0xE8,0xD1,0x8B,0x09,0x00,0x3B,0xC3,0x75,0x34}) ||
+        !MatchRetailBytes(0x002FB437U, {0xC2,0x10,0x00}) ||
+        !MatchRetailBytes(0x002FB446U, {0xC2,0x10,0x00}) ||
+        !MatchRetailBytes(0x002E3A4DU,
+            {0x8B,0x86,0x1C,0x03,0x00,0x00,0x85,0xC0,0x74,0x0D,0x80,0x78,0x48,0x00,0x74,0x07,
+             0xB8,0x01,0x00,0x00,0x00,0xEB,0x11}) ||
+        !MatchRetailBytes(0x002E3A75U,
+            {0x50,0x51,0x52,0x8B,0xCB,0xE8,0x41,0x23,0xFF,0xFF}) ||
+        !MatchRetailBytes(0x002E3B06U,
+            {0x5F,0x5E,0xB0,0x01,0x5B,0x8B,0xE5,0x5D,0xC2,0x14,0x00}) ||
+        !MatchRetailBytes(0x002D5E25U, {0x5F,0x5B,0x5E,0x5D,0xC2,0x0C,0x00})) {
+        error = "aisync paired player classification: certified victim/register/branch/stack bytes mismatch";
+        return false;
+    }
+    gPlayerPreparationContinue = reinterpret_cast<void*>(gBase + 0x0026270EU);
+    gPlayerCategoryContinue = reinterpret_cast<void*>(gBase + 0x002E3A5DU);
+    return Hook(hooks, "aisync_paired_player_preparation", 0x002626F7U,
+        reinterpret_cast<void*>(&PlayerPreparationShim), {0x8B,0x81,0x1C,0x03,0x00,0x00},
+        &gPlayerPreparationTrampoline, &gPlayerPreparationPublished, error) &&
+        Hook(hooks, "aisync_paired_player_category", 0x002E3A4DU,
+        reinterpret_cast<void*>(&PlayerCategoryShim), {0x8B,0x86,0x1C,0x03,0x00,0x00},
+        &gPlayerCategoryTrampoline, &gPlayerCategoryPublished, error);
+}
+
+bool HookPostDeathMeleeSelection(HookManager& hooks, std::string& error) {
+    std::uintptr_t callback{};
+    // These are ActionMeleeAttack's callbacks, not an Alien class test.
+    // Compare relocated pointers by RVA; all byte ranges below contain no
+    // HIGHLOW operands. Installation is refused on an unrecognized contract.
+    if (!Read(gBase + 0x00ECB770U + 0x30U, callback) || callback != gBase + 0x006EF7B0U ||
+        !Read(gBase + 0x00ECB770U + 0x34U, callback) || callback != gBase + 0x00317D90U ||
+        !Read(gBase + 0x00ECB770U + 0x48U, callback) || callback != gBase + 0x002F0A10U ||
+        !Read(gBase + 0x00ECB770U + 0x3D8U, callback) || callback != gBase + 0x00AA70F0U ||
+        !MatchRetailBytes(0x006EF7B0U, {0xC2,0x14,0x00}) ||
+        !MatchRetailBytes(0x00AA70F0U, {0xB0,0x01,0xC3}) ||
+        !MatchRetailBytes(0x003261DDU,
+            {0x52,0x0F,0xB6,0x11,0x8B,0x4E,0x0C,0x52,0x56,0x50,0x51,0x8B,0x48,0x10,
+             0xE8,0x70,0xA0,0xFA,0xFF}) ||
+        !MatchRetailBytes(0x002D0260U,
+            {0x56,0x8B,0x74,0x24,0x0C,0x80,0x7E,0x1F,0x00,0x57,0x8B,0xF9,0x74,0x4C,
+             0x8B,0x07,0x8B,0x90,0xD8,0x03,0x00,0x00,0xFF,0xD2,0x84,0xC0,0x74,0x3E,
+             0xB8,0x01,0x00,0x00,0x00,0x39,0x46,0x08,0x74,0x0A,0x89,0x46,0x04,
+             0x8B,0x07,0x8B,0x40,0x30,0xEB,0x36}) ||
+        !MatchRetailBytes(0x002D02B5U, {0x5F,0x5E,0xC2,0x14,0x00}) ||
+        !MatchRetailBytes(0x002D02DFU, {0x5F,0x5E,0xC2,0x14,0x00}) ||
+        !MatchRetailBytes(0x002F0A33U,
+            {0x8B,0x74,0x24,0x08,0x89,0x48,0x10,0x8B,0x4C,0x24,0x0C,0x89,0x70,0x08,
+             0x89,0x50,0x04,0x89,0x50,0x0C,0x89,0x48,0x14,0x89,0x50,0x18,0x89,0x50,0x20,
+             0x89,0x50,0x24,0x88,0x50,0x28,0xC7,0x40,0x1C,0x00,0x00,0x00,0x01}) ||
+        !MatchRetailBytes(0x002F0A63U,
+            {0x89,0x50,0x2C,0x89,0x50,0x30,0x5E,0xC2,0x08,0x00}) ||
+        !MatchRetailBytes(0x0032630BU,
+            {0x8B,0x4F,0x10,0x8B,0x11,0x8B,0x46,0x0C,0x8B,0x52,0x44,0x56,
+             0x6A,0x08,0x57,0x50,0xFF,0xD2})) {
+        error = "aisync post-death melee selection: certified mode/frame/ECX/five arguments/RET 14h mismatch";
+        return false;
+    }
+    CallRedirectRequest selection;
+    selection.name = "aisync_post_death_melee_selection";
+    selection.callSite = reinterpret_cast<void*>(gBase + 0x003261EBU);
+    selection.expectedTarget = reinterpret_cast<void*>(gBase + 0x002D0260U);
+    selection.detour = reinterpret_cast<void*>(&MeleeSelectionDetour);
+    return hooks.InstallCallRedirect(selection, error);
+}
+bool ValidateCharacterLifecycleAbi(std::string& error) {
+    if (!MatchRetailBytes(0x0038B140U,
+            {0x53,0x8B,0x5C,0x24,0x08,0x56,0x8B,0xF1,0x8D,0x8E,0xF0,0x03,0x00,0x00,
+             0x88,0x9E,0xDA,0x02,0x00,0x00,0x88,0x9E,0xD9,0x02,0x00,0x00}) ||
+        !MatchRetailBytes(0x0038B15EU, {0x53,0xE8,0x9C,0x69,0xF0,0xFF}) ||
+        !MatchRetailBytes(0x0038B177U, {0x53,0xE8,0xF3,0x76,0xFF,0xFF}) ||
+        !MatchRetailBytes(0x0038B17DU, {0x5E,0x5B,0xC2,0x04,0x00}) ||
+        !MatchRetailBytes(0x003C2A65U,
+            {0x53,0x8B,0xCE,0xE8,0xD3,0x86,0xFC,0xFF,0x8B,0x06,0x8B,0x50,0x1C,
+             0x8B,0xCE,0xFF,0xD2,0x8B,0xC8,0xE8,0xA3,0xD7,0xFF,0xFF}) ||
+        !MatchRetailBytes(0x003C0238U, {0x53,0x56,0x8B,0xF1,0x33,0xDB,0x38,0x9E,0xF8,0x02,0x00,0x00}) ||
+        !MatchRetailBytes(0x003C03A7U, {0x83,0xC4,0x28,0xC3}) ||
+        !MatchRetailBytes(0x003C6330U,
+            {0x53,0x8B,0x5C,0x24,0x08,0x55,0x8B,0x6C,0x24,0x14,0x57,0x8B,0xF9}) ||
+        !MatchRetailBytes(0x003C6389U,
+            {0xF3,0x0F,0x10,0x44,0x24,0x14,0x6A,0x00,0x55,0x51,0xF3,0x0F,0x11,0x04,0x24,
+             0x53,0x8B,0xCF,0xE8,0x70,0xC3,0xFF,0xFF,0x5F,0x5D,0x5B,0xC2,0x0C,0x00})) {
+        error = "aisync Character lifecycle: certified backstage/frontstage/placement ABI mismatch";
         return false;
     }
     return true;
@@ -3280,7 +3937,7 @@ bool Install(const std::uintptr_t base, HookManager& hooks, LevelGenerationTrack
         return false;
     }
     gBase = base; gGenerations = &generations; gDispatcher = &dispatcher;
-    if (!ValidateRoleTaskCleanupAbi(error)) return false;
+    if (!ValidateRoleTaskCleanupAbi(error) || !ValidateCharacterLifecycleAbi(error)) return false;
     gBranchExit = reinterpret_cast<void*>(base + 0x003344D4U);
     const auto first = hooks.InstalledCount();
     // Complete instructions; no relative CALL/Jcc in a prefix. The PUSH
@@ -3291,6 +3948,8 @@ bool Install(const std::uintptr_t base, HookManager& hooks, LevelGenerationTrack
         HookParticipantPairedIdentity(hooks, error) &&
         HookPairedVictimGuards(hooks, error) &&
         HookParticipantEligibility(hooks, error) &&
+        HookPostDeathMeleeSelection(hooks, error) &&
+        HookPairedPlayerClassification(hooks, error) &&
         Hook(hooks, "aisync_participant_record_validation", 0x002CDB00U,
             reinterpret_cast<void*>(&RecordInvalidDetour),
             {0x56,0x8B,0xF1,0x83,0xBE,0x2C,0x04,0x00,0x00,0x00},
@@ -3473,27 +4132,39 @@ void PumpOnEngineThread() noexcept {
         // Retain this latest snapshot until the worker admission has returned;
         // birth/withdraw/task cleanup must not reconstruct its source cycle.
         if (PairSourceBusy(actor.character)) continue;
-        if (value.birth == actor.remoteBirth && LocalClientVictimOwnsPair(actor.character)) {
-            // Retain the latest Host snapshot until the exact native victim
-            // ends. Do not let a new target, withdrawal or task cleanup reuse
-            // the source while it still belongs to this first-person pair.
+        if (value.birth == actor.remoteBirth && ClientNativeVictimOwnsPair(actor.character)) {
+            // Retain the latest Host snapshot until this exact fatal victim
+            // finishes, including an observer's remote human representation.
+            // No task/lifecycle cleanup may reuse the paired source meanwhile.
             actor.lastReceive = now;
             gPairedVictimSnapshotsDeferred.fetch_add(1U, std::memory_order_relaxed);
+            if (!LocalClientVictim(ParticipantForPeer(actor.desired.interactionTargetPeer)))
+                gPairedObserverSnapshotsDeferred.fetch_add(1U, std::memory_order_relaxed);
             continue;
         }
         gIncomingUsed[i] = false;
         if (value.birth < actor.remoteBirth ||
             (value.birth == actor.remoteBirth && value.revision < actor.remoteRevision)) continue;
 
+        if (actor.pairPlacementPending && !PairPlacementMatchesState(actor, value))
+            ClearPairPlacement(actor);
         const bool hadRemote = actor.remoteBirth != 0U;
         const bool birthChanged = value.birth != actor.remoteBirth;
         const bool taskChanged = hadRemote && value.roleTaskRevision != actor.desired.roleTaskRevision;
         const bool lifecycleChanged = hadRemote && value.lifecycleRevision != actor.desired.lifecycleRevision;
         const bool poseMissing = (value.stateFlags & PoseValid) == 0U;
-        const auto persistent = LifecycleWithdrawn | LifecycleWithdrawState2 | LifecycleHostDormant;
-        const bool placementChanged = birthChanged || (lifecycleChanged &&
-            ((value.lifecycleFlags & LifecycleSpatialDiscontinuity) != 0U ||
-             ((value.lifecycleFlags ^ actor.desired.lifecycleFlags) & persistent) != 0U));
+        const auto persistent = LifecycleWithdrawn | LifecycleWithdrawState2 | LifecycleHostDormant |
+            LifecycleCharacterBackstage;
+        std::uint8_t localHidden{};
+        const bool visibilityMismatch = Read(actor.character + 0x2DAU, localHidden) &&
+            (((value.lifecycleFlags & LifecycleCharacterBackstage) != 0U && localHidden == 0U) ||
+             (!ProxyWithdrawn(value) && localHidden != 0U));
+        // Compare persistent values even if a coalesced packet has no new
+        // event revision. A local vent callback can also hide the proxy later.
+        const bool placementChanged = birthChanged || actor.placementPending || visibilityMismatch ||
+            ((value.lifecycleFlags ^ actor.desired.lifecycleFlags) & persistent) != 0U ||
+            (lifecycleChanged && (value.lifecycleFlags & LifecycleSpatialDiscontinuity) != 0U);
+        bool lifecycleApplied = false;
 
         if (birthChanged) {
             if (actor.interactionOwnsCycle)
@@ -3521,37 +4192,37 @@ void PumpOnEngineThread() noexcept {
             static_cast<void>(Release(actor));
         }
 
-        // Backstage/withdraw is a real Alien runtime state, not a pose. Mirror
-        // the retail withdraw controller first. While Host is withdrawn/dormant
-        // the Client must NOT keep forcing the last corridor transform: doing so
-        // leaves a visible, brainless Alien fighting the backstage subsystem.
-        if (!actor.faulted && placementChanged &&
-            !ApplyAuthoritativeWithdraw(actor, value)) {
-            actor.faulted = true;
-            gFaults.fetch_add(1U, std::memory_order_relaxed);
-        }
-
-        // On frontstage re-entry, leave withdraw first, then perform exactly one
-        // authoritative placement. Normal PoseSync resumes only after this snap.
-        if (!actor.faulted && !ProxyWithdrawn(value) &&
-            (value.stateFlags & PoseValid) != 0U &&
-            placementChanged && !pairedPlacement) {
-            if (!SnapAuthoritativePose(actor, value)) {
-                actor.faulted = true;
-                gFaults.fetch_add(1U, std::memory_order_relaxed);
-            } else {
-                gLifecycleApplied.fetch_add(1U, std::memory_order_relaxed);
+        // Withdraw state remains separate from Character backstage: in the
+        // failing .170 run the Alien's withdraw state stayed zero in the vents.
+        // Return through native frontstage before placement or pair admission.
+        if (!actor.faulted && placementChanged) {
+            actor.placementPending = true;
+            if (!ApplyAuthoritativeWithdraw(actor, value) ||
+                !ApplyAuthoritativeBackstage(actor, value)) {
+                gLifecycleRetries.fetch_add(1U, std::memory_order_relaxed);
+            } else if (ProxyWithdrawn(value)) {
+                actor.placementPending = false;
+                lifecycleApplied = true;
+            } else if ((value.stateFlags & PoseValid) != 0U && !pairedPlacement) {
+                if (SnapAuthoritativePose(actor, value)) {
+                    actor.placementPending = false;
+                    lifecycleApplied = true;
+                } else {
+                    // Keep authority/transport live and retry against the
+                    // newest pose. An unready body is not a permanent AI fault.
+                    gLifecycleRetries.fetch_add(1U, std::memory_order_relaxed);
+                }
+            } else if (pairedPlacement) {
+                actor.placementPending = false; // retail already owns its pair
             }
-        } else if (!actor.faulted && ProxyWithdrawn(value) &&
-            placementChanged) {
-            gLifecycleApplied.fetch_add(1U, std::memory_order_relaxed);
         }
+        if (lifecycleApplied) gLifecycleApplied.fetch_add(1U, std::memory_order_relaxed);
 
         actor.remoteBirth = value.birth; actor.remoteRevision = value.revision;
         actor.desired = value; actor.lastReceive = now;
         actor.completedActionRevision = value.actionRevision;
         actor.completedRoleTaskRevision = value.roleTaskRevision;
-        actor.completedLifecycleRevision = value.lifecycleRevision;
+        if (lifecycleApplied) actor.completedLifecycleRevision = value.lifecycleRevision;
         gApplied.fetch_add(1U, std::memory_order_relaxed);
     }
 }
@@ -3677,6 +4348,13 @@ Counters DiagnosticsSnapshot() noexcept {
     value.lifecycleCaptured = gLifecycleCaptured.load();
     value.lifecycleApplied = gLifecycleApplied.load();
     value.lifecycleSnaps = gLifecycleSnaps.load();
+    value.backstageCaptured = gBackstageCaptured.load();
+    value.backstageTransitions = gBackstageTransitions.load();
+    value.backstageApplied = gBackstageApplied.load();
+    value.backstageRejected = gBackstageRejected.load();
+    value.placementVerified = gPlacementVerified.load();
+    value.placementRejected = gPlacementRejected.load();
+    value.lifecycleRetries = gLifecycleRetries.load();
     value.executionBarriers = gExecutionBarriers.load();
     value.withdrawSamples = gWithdrawSamples.load();
     value.withdrawTransitions = gWithdrawTransitions.load();
@@ -3716,6 +4394,8 @@ Counters DiagnosticsSnapshot() noexcept {
     value.pairedVictimNativeDispatches = gPairedVictimNativeDispatches.load();
     value.pairedVictimNativeStarted = gPairedVictimNativeStarted.load();
     value.pairedVictimAvailabilityOverrides = gPairedVictimAvailabilityOverrides.load();
+    value.pairedPlayerPreparationRemaps = gPairedPlayerPreparationRemaps.load();
+    value.pairedPlayerCategoryRemaps = gPairedPlayerCategoryRemaps.load();
     value.pairedVictimLocalDispatches = gPairedVictimLocalDispatches.load();
     value.pairedVictimLocalStarted = gPairedVictimLocalStarted.load();
     value.pairedVictimConvergenceDetached = gPairedVictimConvergenceDetached.load();
@@ -3725,6 +4405,16 @@ Counters DiagnosticsSnapshot() noexcept {
     value.pairedVictimLocalAvailabilityOverrides = gPairedVictimLocalAvailabilityOverrides.load();
     value.pairedDeadTargetRejected = gPairedDeadTargetRejected.load();
     value.pairedRecoveryDeferred = gPairedRecoveryDeferred.load();
+    value.pairedSourcePlacements = gPairedSourcePlacements.load();
+    value.pairedSourcePlacementRejected = gPairedSourcePlacementRejected.load();
+    value.pairedSourcePlacementDeferred = gPairedSourcePlacementDeferred.load();
+    value.pairedSourcePlacementResumed = gPairedSourcePlacementResumed.load();
+    value.pairedSourcePlacementCancelled = gPairedSourcePlacementCancelled.load();
+    value.pairedSourcePlacementExpired = gPairedSourcePlacementExpired.load();
+    value.pairedSourcePoseSuppressed = gPairedSourcePoseSuppressed.load();
+    value.pairedObserverSnapshotsDeferred = gPairedObserverSnapshotsDeferred.load();
+    value.presentationSamples = gPresentationSamples.load();
+    value.presentationDropped = gPresentationDropped.load();
     value.lastVictimAdmissionHp = gLastVictimAdmissionHp.load();
     value.lastVictimAdmissionHealth = gLastVictimAdmissionHealth.load();
     value.lastVictimAdmissionEnabled = gLastVictimAdmissionEnabled.load();
@@ -3743,6 +4433,10 @@ Counters DiagnosticsSnapshot() noexcept {
     value.aiPlayerQueryRemaps = gAiPlayerQueryRemaps.load();
     value.aiPlayerSlotRemaps = gAiPlayerSlotRemaps.load();
     value.aiPlayerSlotRestoreFailures = gAiPlayerSlotRestoreFailures.load();
+    value.postDeathMeleeSelectionChecks = gPostDeathMeleeSelectionChecks.load();
+    value.postDeathMeleeSelectionRejects = gPostDeathMeleeSelectionRejects.load();
+    value.postDeathMeleeSelectionWriteFailures = gPostDeathMeleeSelectionWriteFailures.load();
+    value.lastPostDeathRetiredPeer = gLastPostDeathRetiredPeer.load();
     value.postDeathDecisionResets = gPostDeathDecisionResets.load();
     value.postDeathDecisionResetRejected = gPostDeathDecisionResetRejected.load();
     value.postDeathRoleTaskResets = gPostDeathRoleTaskResets.load();
@@ -3800,6 +4494,13 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"lifecycleCaptured", Diagnostics::Unsigned(ai.lifecycleCaptured), true},
          {"lifecycleApplied", Diagnostics::Unsigned(ai.lifecycleApplied), true},
          {"lifecycleSnaps", Diagnostics::Unsigned(ai.lifecycleSnaps), true},
+         {"backstageCaptured", Diagnostics::Unsigned(ai.backstageCaptured), true},
+         {"backstageTransitions", Diagnostics::Unsigned(ai.backstageTransitions), true},
+         {"backstageApplied", Diagnostics::Unsigned(ai.backstageApplied), true},
+         {"backstageRejected", Diagnostics::Unsigned(ai.backstageRejected), true},
+         {"placementVerified", Diagnostics::Unsigned(ai.placementVerified), true},
+         {"placementRejected", Diagnostics::Unsigned(ai.placementRejected), true},
+         {"lifecycleRetries", Diagnostics::Unsigned(ai.lifecycleRetries), true},
          {"executionBarriers", Diagnostics::Unsigned(ai.executionBarriers), true},
          {"withdrawSamples", Diagnostics::Unsigned(ai.withdrawSamples), true},
          {"withdrawTransitions", Diagnostics::Unsigned(ai.withdrawTransitions), true},
@@ -3839,6 +4540,8 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"pairedVictimNativeDispatches", Diagnostics::Unsigned(ai.pairedVictimNativeDispatches), true},
          {"pairedVictimNativeStarted", Diagnostics::Unsigned(ai.pairedVictimNativeStarted), true},
          {"pairedVictimAvailabilityOverrides", Diagnostics::Unsigned(ai.pairedVictimAvailabilityOverrides), true},
+         {"pairedPlayerPreparationRemaps", Diagnostics::Unsigned(ai.pairedPlayerPreparationRemaps), true},
+         {"pairedPlayerCategoryRemaps", Diagnostics::Unsigned(ai.pairedPlayerCategoryRemaps), true},
          {"pairedVictimLocalDispatches", Diagnostics::Unsigned(ai.pairedVictimLocalDispatches), true},
          {"pairedVictimLocalStarted", Diagnostics::Unsigned(ai.pairedVictimLocalStarted), true},
          {"pairedVictimConvergenceDetached", Diagnostics::Unsigned(ai.pairedVictimConvergenceDetached), true},
@@ -3848,6 +4551,16 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"pairedVictimLocalAvailabilityOverrides", Diagnostics::Unsigned(ai.pairedVictimLocalAvailabilityOverrides), true},
          {"pairedDeadTargetRejected", Diagnostics::Unsigned(ai.pairedDeadTargetRejected), true},
          {"pairedRecoveryDeferred", Diagnostics::Unsigned(ai.pairedRecoveryDeferred), true},
+         {"pairedSourcePlacements", Diagnostics::Unsigned(ai.pairedSourcePlacements), true},
+         {"pairedSourcePlacementRejected", Diagnostics::Unsigned(ai.pairedSourcePlacementRejected), true},
+         {"pairedSourcePlacementDeferred", Diagnostics::Unsigned(ai.pairedSourcePlacementDeferred), true},
+         {"pairedSourcePlacementResumed", Diagnostics::Unsigned(ai.pairedSourcePlacementResumed), true},
+         {"pairedSourcePlacementCancelled", Diagnostics::Unsigned(ai.pairedSourcePlacementCancelled), true},
+         {"pairedSourcePlacementExpired", Diagnostics::Unsigned(ai.pairedSourcePlacementExpired), true},
+         {"pairedSourcePoseSuppressed", Diagnostics::Unsigned(ai.pairedSourcePoseSuppressed), true},
+         {"pairedObserverSnapshotsDeferred", Diagnostics::Unsigned(ai.pairedObserverSnapshotsDeferred), true},
+         {"presentationSamples", Diagnostics::Unsigned(ai.presentationSamples), true},
+         {"presentationDropped", Diagnostics::Unsigned(ai.presentationDropped), true},
          {"lastVictimAdmissionHp", Diagnostics::Unsigned(ai.lastVictimAdmissionHp), true},
          {"lastVictimAdmissionHealth", Diagnostics::Unsigned(ai.lastVictimAdmissionHealth), true},
          {"lastVictimAdmissionEnabled", Diagnostics::Unsigned(ai.lastVictimAdmissionEnabled), true},
@@ -3866,6 +4579,10 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"aiPlayerQueryRemaps", Diagnostics::Unsigned(ai.aiPlayerQueryRemaps), true},
          {"aiPlayerSlotRemaps", Diagnostics::Unsigned(ai.aiPlayerSlotRemaps), true},
          {"aiPlayerSlotRestoreFailures", Diagnostics::Unsigned(ai.aiPlayerSlotRestoreFailures), true},
+         {"postDeathMeleeSelectionChecks", Diagnostics::Unsigned(ai.postDeathMeleeSelectionChecks), true},
+         {"postDeathMeleeSelectionRejects", Diagnostics::Unsigned(ai.postDeathMeleeSelectionRejects), true},
+         {"postDeathMeleeSelectionWriteFailures", Diagnostics::Unsigned(ai.postDeathMeleeSelectionWriteFailures), true},
+         {"lastPostDeathRetiredPeer", Diagnostics::Unsigned(ai.lastPostDeathRetiredPeer), true},
          {"postDeathDecisionResets", Diagnostics::Unsigned(ai.postDeathDecisionResets), true},
          {"postDeathDecisionResetRejected", Diagnostics::Unsigned(ai.postDeathDecisionResetRejected), true},
          {"postDeathRoleTaskResets", Diagnostics::Unsigned(ai.postDeathRoleTaskResets), true},
@@ -3906,6 +4623,54 @@ void LogDiagnostics(Diagnostics& diagnostics) {
     // Bootstrap and IPC can both request diagnostics. Serialize consumers
     // only; the engine-thread producer never takes this mutex.
     std::lock_guard sampleLock(gParticipantProbeConsumerMutex);
+    for (std::size_t i = 0U; i < kParticipantProbeRing; ++i) {
+        const auto read = gPresentationProbeRead.load(std::memory_order_relaxed);
+        if (read == gPresentationProbeWrite.load(std::memory_order_acquire)) break;
+        const auto sample = gPresentationProbes[read % kParticipantProbeRing];
+        gPresentationProbeRead.store(read + 1U, std::memory_order_release);
+        diagnostics.Log("info", "aisync_presentation", "Native source/victim placement, cycle and visibility; phase 0=periodic, 1=before admission, 2=after transition.",
+            {{"sessionCookie", Diagnostics::Unsigned(sample.sessionCookie), true},
+             {"nativeGeneration", Diagnostics::Unsigned(sample.nativeGeneration), true},
+             {"worldGeneration", Diagnostics::Unsigned(sample.worldGeneration), true},
+             {"sampleTick", Diagnostics::Unsigned(sample.tick), true},
+             {"role", Diagnostics::Unsigned(sample.role), true},
+             {"phase", Diagnostics::Unsigned(sample.phase), true},
+             {"entityA", Diagnostics::Unsigned(sample.entityA), true},
+             {"entityB", Diagnostics::Unsigned(sample.entityB), true},
+             {"birth", Diagnostics::Unsigned(sample.birth), true},
+             {"revision", Diagnostics::Unsigned(sample.revision), true},
+             {"pairRevision", Diagnostics::Unsigned(sample.pairRevision), true},
+             {"peer", Diagnostics::Unsigned(sample.peer), true},
+             {"lifecycleFlags", Diagnostics::Unsigned(sample.lifecycleFlags), true},
+             {"cycleType", Diagnostics::Unsigned(sample.cycleType), true},
+             {"cycleState", Diagnostics::Unsigned(sample.cycleState), true},
+             {"stage", Diagnostics::Unsigned(sample.stage), true},
+             {"withdrawState", Diagnostics::Unsigned(sample.withdrawState), true},
+             {"hidden", Diagnostics::Unsigned(sample.hidden), true},
+             {"enabled", Diagnostics::Unsigned(sample.enabled), true},
+             {"positionReadable", Diagnostics::Boolean(sample.positionReadable), true},
+             {"victimReadable", Diagnostics::Boolean(sample.victimReadable), true},
+             {"victimHealthReadable", Diagnostics::Boolean(sample.victimHealthReadable), true},
+             {"victimHp", sample.victimHealthReadable ? Diagnostics::Unsigned(sample.victimHp) : "null", true},
+             {"victimHealthState", sample.victimHealthReadable ? Diagnostics::Unsigned(sample.victimHealthState) : "null", true},
+             {"visibilityReadable", Diagnostics::Boolean(sample.visibilityReadable), true},
+             {"cycleReadable", Diagnostics::Boolean(sample.cycleReadable), true},
+             {"ownsPair", Diagnostics::Boolean(sample.ownsPair), true},
+             {"placementPending", Diagnostics::Boolean(sample.placementPending), true},
+             {"pairPlacementPending", Diagnostics::Boolean(sample.pairPlacementPending), true},
+             {"localX", sample.positionReadable ? std::to_string(sample.local[0]) : "null", true},
+             {"localY", sample.positionReadable ? std::to_string(sample.local[1]) : "null", true},
+             {"localZ", sample.positionReadable ? std::to_string(sample.local[2]) : "null", true},
+             {"authorityX", std::to_string(sample.authority[0]), true},
+             {"authorityY", std::to_string(sample.authority[1]), true},
+             {"authorityZ", std::to_string(sample.authority[2]), true},
+             {"victimX", sample.victimReadable ? std::to_string(sample.victim[0]) : "null", true},
+             {"victimY", sample.victimReadable ? std::to_string(sample.victim[1]) : "null", true},
+             {"victimZ", sample.victimReadable ? std::to_string(sample.victim[2]) : "null", true},
+             {"authorityVictimX", std::to_string(sample.authorityVictim[0]), true},
+             {"authorityVictimY", std::to_string(sample.authorityVictim[1]), true},
+             {"authorityVictimZ", std::to_string(sample.authorityVictim[2]), true}});
+    }
     for (std::size_t i = 0U; i < kParticipantProbeRing; ++i) {
         const auto read = gParticipantProbeRead.load(std::memory_order_relaxed);
         if (read == gParticipantProbeWrite.load(std::memory_order_acquire)) break;
@@ -3957,7 +4722,15 @@ void LogDiagnostics(Diagnostics& diagnostics) {
              {"threatState", Diagnostics::Unsigned(sample.threatState), true},
              {"selectedReadable", Diagnostics::Boolean(sample.selectedReadable), true},
              {"selectedPresent", Diagnostics::Boolean(sample.selectedPresent), true},
-             {"selectedPeer", Diagnostics::Unsigned(sample.selectedPeer), true}});
+             {"selectedPeer", Diagnostics::Unsigned(sample.selectedPeer), true},
+             {"selectedTerminalDead", Diagnostics::Boolean(sample.selectedTerminalDead), true},
+             {"pendingReadable", Diagnostics::Boolean(sample.pendingReadable), true},
+             {"pendingPresent", Diagnostics::Boolean(sample.pendingPresent), true},
+             {"pendingPeer", Diagnostics::Unsigned(sample.pendingPeer), true},
+             {"pendingLiving", Diagnostics::Boolean(sample.pendingLiving), true},
+             {"targetSignalsReadable", Diagnostics::Boolean(sample.targetSignalsReadable), true},
+             {"haveTargetSignal", Diagnostics::Unsigned(sample.haveTargetSignal), true},
+             {"haveNextTargetSignal", Diagnostics::Unsigned(sample.haveNextTargetSignal), true}});
     }
 }
 } // namespace aimp::ai_sync
