@@ -19,7 +19,7 @@ public static class AISyncCodec
     private const uint InteractionValid = 1U << 3;
     private const uint RoleTaskValid = 1U << 4;
     private const uint KnownStateFlags = PoseValid | Moving | ActionValid | InteractionValid | RoleTaskValid;
-    private const uint KnownLifecycleFlags = 31U;
+    private const uint KnownLifecycleFlags = 63U; // includes Character backstage (bit 5)
     private const uint InteractionPairValid = 1U << 2;
     private const uint KnownInteractionFlags = 15U;
 
