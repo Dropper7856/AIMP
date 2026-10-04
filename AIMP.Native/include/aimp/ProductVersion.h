@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.176-aisync-paired-player-classification";
+    "0.11.4.177-aisync-native-paired-outcomes";
 
 } // namespace aimp

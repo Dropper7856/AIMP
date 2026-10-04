@@ -2,7 +2,8 @@ using AIMP.Protocol;
 
 namespace AIMP.Launcher;
 
-// One serialized sender per direction; at most one latest snapshot per actor.
+// One serialized sender per direction; one latest motion snapshot per actor
+// and a bounded, ordered queue for irreversible native paired results.
 // Socket/pipe backpressure never creates an unbounded Task or packet queue.
 internal sealed class AISyncSession : IDisposable
 {
@@ -13,6 +14,8 @@ internal sealed class AISyncSession : IDisposable
     private readonly object _gate = new();
     private readonly SemaphoreSlim _configureGate = new(1, 1);
     private readonly Dictionary<ulong, ReadOnlyMemory<byte>> _pending = new();
+    private readonly Queue<ReadOnlyMemory<byte>> _outcomes = new();
+    private readonly Dictionary<ulong, (uint Birth, uint Pair, uint Revision)> _lastOutcome = new();
     private readonly Dictionary<ulong, uint> _participants = new();
     private ulong _localPeer;
     private byte[]? _lastConfiguration;
@@ -52,7 +55,10 @@ internal sealed class AISyncSession : IDisposable
         client.AISyncStateReceived -= OnRemoteState;
         lock (_gate) if (ReferenceEquals(_client, client)) { _client = null; _bound = false; InvalidateLocked(); }
     }
-    private void InvalidateLocked() { _active = false; ++_epoch; _pending.Clear(); }
+    private void InvalidateLocked()
+    {
+        _active = false; ++_epoch; _pending.Clear(); _outcomes.Clear(); _lastOutcome.Clear();
+    }
 
     internal async Task ConfigureAsync(Guid session, bool isHost, int nativeGeneration,
         int worldGeneration, bool bound, bool compatible, ulong localPeer, CancellationToken token)
@@ -217,7 +223,7 @@ internal sealed class AISyncSession : IDisposable
         lock (_gate) active = _active;
         _diagnostics.Log("AISync", $"V2 enabled={(enabled ? 1 : 0)} role={role} active={(active ? 1 : 0)} " +
             $"nativeGeneration={nativeGeneration} worldGeneration={worldGeneration}; " +
-            "high-level Character convergence + resolved action/interaction carriers; animation, audio and CATHODE consequences remain retail-local; control=Performance Isolation.");
+            "Character convergence + Host native paired outcomes; animation/audio and CATHODE world consequences run locally; control=Performance Isolation.");
     }
     private void OnNativeState(object? sender, ReadOnlyMemory<byte> bytes)
     {
@@ -242,6 +248,22 @@ internal sealed class AISyncSession : IDisposable
     {
         var key = AISyncCodec.ActorKey(bytes.Span);
         if (!_pending.ContainsKey(key) && _pending.Count >= AISyncCodec.MaximumActors) return;
+        var outcome = AISyncCodec.OutcomeKey(bytes.Span);
+        if (outcome.Revision != 0 && (!_lastOutcome.TryGetValue(key, out var previous)
+            || outcome.Birth > previous.Birth || outcome.Birth == previous.Birth
+                && (outcome.Pair > previous.Pair || outcome.Pair == previous.Pair && outcome.Revision > previous.Revision)))
+        {
+            if (_outcomes.Count >= 256)
+            {
+                InvalidateLocked();
+                _diagnostics.Log("AISync", "Native outcome queue exceeded 256 events; authority transport paused. No independent attack result is authorized.");
+                return;
+            }
+            _outcomes.Enqueue(bytes);
+            if (!_lastOutcome.ContainsKey(key) && _lastOutcome.Count >= AISyncCodec.MaximumActors)
+                _lastOutcome.Remove(_lastOutcome.Keys.First());
+            _lastOutcome[key] = outcome;
+        }
         _pending[key] = bytes;
         if (_sending) return;
         _sending = true;
@@ -260,9 +282,13 @@ internal sealed class AISyncSession : IDisposable
                 long epoch;
                 lock (_gate)
                 {
-                    if (!Enabled || !_active || _pending.Count == 0) return;
-                    var next = _pending.First();
-                    bytes = next.Value; _pending.Remove(next.Key);
+                    if (!Enabled || !_active || (_pending.Count == 0 && _outcomes.Count == 0)) return;
+                    if (_outcomes.Count != 0) bytes = _outcomes.Dequeue();
+                    else
+                    {
+                        var next = _pending.First();
+                        bytes = next.Value; _pending.Remove(next.Key);
+                    }
                     host = _host; session = _session; epoch = _epoch;
                 }
                 lock (_gate) if (!Enabled || !_active || epoch != _epoch) continue;
@@ -292,7 +318,7 @@ internal sealed class AISyncSession : IDisposable
             lock (_gate)
             {
                 _sending = false;
-                if (Enabled && _active && _pending.Count != 0 && !_disposed)
+                if (Enabled && _active && (_pending.Count != 0 || _outcomes.Count != 0) && !_disposed)
                 { _sending = true; _ = Task.Run(PumpAsync); }
             }
         }

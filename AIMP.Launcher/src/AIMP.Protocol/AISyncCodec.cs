@@ -5,11 +5,11 @@ namespace AIMP.Protocol;
 // Generic high-level NPC authority, not a serialized Behaviour Tree, animation
 // stream or WorldMutation. Fixed-size payloads carry no process addresses,
 // ObjectRef pointers, clips, audio events or mutable BT state. Retail/CATHODE
-// regenerate downstream presentation and consequences on each process.
+// regenerate presentation locally; resolved paired health/outcomes come from Host.
 public static class AISyncCodec
 {
-    public const uint StateVersion = 6;
-    public const int NativeStateBytes = 184;
+    public const uint StateVersion = 7;
+    public const int NativeStateBytes = 232;
     public const int ConfigurationBytes = 552;
     public const int NetworkStateBytes = 16 + NativeStateBytes;
     public const int MaximumActors = 32;
@@ -21,7 +21,7 @@ public static class AISyncCodec
     private const uint KnownStateFlags = PoseValid | Moving | ActionValid | InteractionValid | RoleTaskValid;
     private const uint KnownLifecycleFlags = 63U; // includes Character backstage (bit 5)
     private const uint InteractionPairValid = 1U << 2;
-    private const uint KnownInteractionFlags = 15U;
+    private const uint KnownInteractionFlags = 31U;
 
     public static ulong SessionCookie(Guid session)
     {
@@ -38,7 +38,7 @@ public static class AISyncCodec
             || (U32(bytes, 20) == 0 && U32(bytes, 24) == 0) || U32(bytes, 32) == 0
             || U32(bytes, 36) == 0
             || !AllowedCharacterClass(U32(bytes, 28)))
-            throw new ProtocolException("Invalid AISync authority snapshot v6.");
+            throw new ProtocolException("Invalid AISync authority snapshot v7.");
         ValidateAuthorityState(bytes);
     }
 
@@ -79,6 +79,26 @@ public static class AISyncCodec
         if ((U32(bytes, 160) & ~KnownLifecycleFlags) != 0
             || U32(bytes, 160) != 0 && U32(bytes, 156) == 0)
             throw new ProtocolException("Invalid AISync lifecycle flags.");
+        var outcomeRevision = U32(bytes, 184);
+        var outcomeFlags = U32(bytes, 188);
+        var kind = U32(bytes, 196);
+        var hpBefore = U32(bytes, 200);
+        var hpPrepared = U32(bytes, 204);
+        var hpReaction = U32(bytes, 208);
+        var healthReaction = U32(bytes, 212);
+        if ((outcomeFlags & ~63U) != 0 || U32(bytes, 192) > 0xFFFF
+            || kind is not (0 or 1 or 3) || hpBefore > 0xFFFF || hpPrepared > 0xFFFF
+            || hpReaction > 0xFFFF || healthReaction > 4
+            || (outcomeRevision == 0) != (outcomeFlags == 0)
+            || (outcomeFlags & 32U) != 0 && (outcomeFlags & 2U) == 0
+            || ((outcomeFlags & 16U) != 0) != (outcomeRevision != 0 && hpReaction == 0 && healthReaction == 4)
+            || outcomeRevision != 0 && ((flags & InteractionValid) == 0 || targetPeer == 0
+                || U32(bytes, 108) == 0 || (interactionFlags & 16U) == 0
+                || (outcomeFlags & 1U) == 0 || hpBefore == 0 || hpPrepared > hpBefore))
+            throw new ProtocolException("Invalid AISync native attack outcome.");
+        for (var offset = 216; offset <= 228; offset += 4)
+            if (!float.IsFinite(Float(bytes, offset)) || Math.Abs(Float(bytes, offset)) > 100000)
+                throw new ProtocolException("Invalid AISync native outcome geometry.");
     }
 
     private static void ValidatePose(ReadOnlySpan<byte> bytes)
@@ -102,6 +122,10 @@ public static class AISyncCodec
 
     public static ulong ActorKey(ReadOnlySpan<byte> bytes) =>
         ((ulong)U32(bytes, 20) << 32) | U32(bytes, 24);
+
+    // Irreversible native results cannot be merged like motion snapshots.
+    public static (uint Birth, uint Pair, uint Revision) OutcomeKey(ReadOnlySpan<byte> bytes) =>
+        (U32(bytes, 32), U32(bytes, 176), U32(bytes, 184));
 
     public static byte[] EncodeNetwork(Guid session, ReadOnlySpan<byte> native)
     {
