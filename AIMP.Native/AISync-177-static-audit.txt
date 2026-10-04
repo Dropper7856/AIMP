@@ -1,0 +1,204 @@
+AIMP .177 — analyse statique des attaques natives 4E/4F
+Date : 2026-10-03. Aucune compilation, aucun test, aucun benchmark ni lancement du jeu.
+
+Sources examinées : les deux archives .176 fournies, AISync/PlayerSync/PlayerLifecycle,
+les transports launcher/IPC, AI.exe.c et les instructions de AI.exe.
+SHA-256 du AI.exe lu :
+00D6BB846AC5A78916BAF363EB148AA255A23BF216A271CFD23A0ECE3C368364.
+Les adresses natives ci-dessous sont les VA préférées pour une base 00400000,
+pas les adresses ASLR des processus des diagnostics. Le code utilise gBase + RVA.
+
+1. Ce que montrent effectivement les diagnostics .176
+
+Les deux runtime-diagnostics.json déclarent Launcher 0.8.4.176 et Native
+0.11.4.176-aisync-paired-player-classification.
+Peer host : 503111595711436144 ; peer client : 6339684676943878387.
+L'acteur IA observé dans cette session a entityA=3009426460, entityB=1279389103,
+birth=1. Ces valeurs servent uniquement à lire ces traces ; le correctif ne
+contient aucun de ces identifiants ni aucune condition de niveau/position.
+
+Host, logs/native.log :
+- séquence 269, sampleTick 256021296 : pairRevision=1, victime=peer host,
+  cycle source 4E, stage=2, victimHp=0, victimHealthState=4.
+- séquence 282, timestamp du drainage 18:46:57.934Z : frontière locale
+  PlayerLifecycle, Character 0x2BD42780, HP=0, santé=4 ; GameOver solo supprimé.
+- séquence 321, drainage 18:47:11.390Z : les deux adaptations .176 ont chacune
+  été exécutées une fois ; ce n'est donc pas un patch resté inactif.
+- séquence 322, sampleTick 256031328 : pairRevision=3, victime=peer client,
+  représentation PlayerSync terminale (0 HP / santé 4).
+- séquence 331, sampleTick 256031203 : ce peer client n'est plus vivant pour
+  la perception du host. L'ordre des sampleTick prime sur celui du drainage.
+- séquence 362, sampleTick 256046359 : source 4D, hidden=1, lifecycleFlags=33
+  (discontinuité + backstage), puis cet état reste publié jusqu'à la fin.
+
+Client, logs/native.log :
+- pairRevision=1 désigne la représentation distante du HOST, pas le joueur local.
+  Elle passe 1000/0 -> 0/4 -> 1000/0 (sampleTick 69864406). Cette dernière
+  observation n'est pas une résurrection du véritable host.
+- pairRevision=3 désigne le peer CLIENT. La cible remappée à l'admission est
+  entityA=1634254492, entityB=3284364809 ; LocalDispatches/LocalStarted=1.
+- séquence 274 : dernière mesure d'admission 650 HP / santé 1.
+- séquences 275/276, phase avant/après transition : encore 1000/0. La transition
+  source précède la préparation exécutée par le worker d'animation.
+- séquence 278, sampleTick 69870250 : 650/1 ; séquence 279 : toujours 650/1.
+- séquence 281, sampleTick 69873250 : victime résolue 0/4, source revenue en
+  cycle 38. Aucun événement de frontière de mort locale PlayerLifecycle.
+- séquence 296, sampleTick 69885250 : hidden=1, lifecycleFlags=33 ; les états
+  AISync continuent à être reçus/appliqués. Compteurs finaux : applied=633,
+  poseApplied=397, faults=0 ; aucun crash relevé.
+
+Les sampleTick sont des horloges monotones propres à chaque processus ; ne pas
+soustraire directement un tick host d'un tick client. Les timestamps sont des
+horodatages de drainage, pas ceux de chaque callback natif.
+
+ParticipantForPeer(peer local) résout LocalPlayer ; les autres peers exigent une
+représentation PlayerSync enregistrée dans la génération. Un GUID/spawn key seul
+ne désigne pas le même Character entre les deux processus. L'admission locale
+est identifiée par le peer, le remappage et LocalStarted ; ce compteur atteste
+une acquisition D9 du cycle 4F, pas l'achèvement du flow de mort.
+
+Les échantillons .176 tardifs ne contiennent ni pointeur/runtimeId de la victime,
+ni lecture simultanée du véritable LocalPlayer, ni D8/D9/DA du cycle victime.
+Ils désignent le peer client et le Character résolu à cet instant, mais ne
+permettent pas d'établir la continuité du même objet ni une mort locale achevée.
+Le témoignage « encore jouable » ne peut donc pas être annulé par la seule
+valeur 0/4. .177 ajoute ces identités, lectures simultanées et étapes natives.
+
+2. Chaîne causale établie et limites de l'attribution
+
+Avant ce correctif, le paquet AISync v6 de 184 octets transporte la paire,
+l'identité portable du peer, le payload/attachment, la variante de transition,
+les révisions et la pose/lifecycle de la SOURCE. Il ne transporte pas la
+définition native finale, les HP résultants ou le passage effectif par la mise
+à mort. ApplyAuthoritativeInteraction rejoue les frontières natives côté client.
+
+AI.exe.c, FUN_00662670 (définition vers la ligne 480541), et le désassemblage
+montrent ensuite une nouvelle décision sur chaque processus :
+- 0066270E..00662790 : flags victime, difficulté et santé ;
+- 006627B1 : dégâts de préparation via 007CC900 ;
+- 006627FA : candidat interactif 006FB3D0, selon les définitions et la géométrie ;
+- 00662803..00662832 : repli vers 00710CA0 si le candidat n'est pas utilisable ;
+- 00662837 : stockage de la définition FINALE en source+4C ;
+- 006628CF : index natif de cette définition, stocké en source+108 ;
+- 00662C61 : publication du message natif 17 vers la victime ;
+- 00675F10 : 4F acquiert cette définition. Kind 0 est interactif ; kinds 1/3
+  passent par les contrôles natifs, 007D0C10 et 0079A3C0(state=1) ;
+- 00655B4A..00655B88 : un 4F interactif peut ensuite passer par une mise à mort
+  tardive, contrôlée par DA et Character+29B, avec kill, state=2 et finition.
+
+.176 adapte deux classifications côté host, mais laisse ces choix/résultats
+être recalculés côté client. Une représentation distante et le véritable joueur
+ont des contextes de contrôle, géométrie et dégâts différents. Le défaut établi
+est l'absence d'autorité sur le résultat, avec divergence observée 0/4 côté host
+et 650/1 à l'admission locale. Les traces anciennes ne consignent pas la
+définition finale : le déclencheur précis du repli fatal ou d'une conversion
+tardive dans CE test reste indéterminé.
+
+Ensuite, les helpers de survivants et les sens natifs du host lisent la santé de
+ses propres Characters. Le host mort et la représentation client terminale ne
+fournissent plus de participant vivant. Le retrait observé et sa réplication
+persistante concordent avec cette situation ; ils ne prouvent pas un blocage du
+transport ou un crash d'IA. Aucun retour du conduit n'est forcé par ce patch.
+
+3. Correction réalisée
+
+Le paquet v7 fait 232 octets : le bloc NativeOutcome ajouté à l'offset 184 fait
+48 octets. Il porte révision, flags, index/kind final, HP avant préparation,
+après préparation et après réaction, état de santé, orientation et décalage
+relatif natif. Il ne transporte aucun pointeur de processus.
+
+L'identité d'une attaque est source/birth + pairRevision + targetPeer dans la
+session/génération. Les pointeurs/runtimeId/epoch/serial sont revalidés localement
+pour chaque accès natif. Une représentation remplacée ne réarme pas les dégâts
+d'une attaque déjà consommée par ce peer.
+
+Le host continue à exécuter ses décisions et effets natifs. Son joueur réel garde
+le dispatch inline ; les victimes distantes gardent le dispatch différé sécurisé
+de .176. Le résultat est pris après la préparation et l'admission natives puis
+mis à jour par le 4F. Les flags distinguent explicitement : santé terminale,
+acquisition victime, fin source/victime et passage natif par la mise à mort.
+Ce dernier est constaté après le bloc natif, pas déduit de HP=0.
+
+Le client résout l'index avec le getter certifié de son propre manager, contrôle
+le kind, et reprend à 00662837. Il saute les choix locaux de difficulté,
+dégâts/candidat/repli. Les dégâts passent une fois par 007CC900 ; la santé
+confirmée utilise 007B4AD0 et ses callbacks de machine d'état, sans écriture
+isolée de Character+33C. Le message 17 et le 4F natifs conservent les animations,
+la prise de contrôle et les transitions de mort.
+
+Pour kind 0, une condition locale Character+29B ne peut plus créer seule une
+issue fatale contradictoire. La mort tardive exige le résultat terminal ET le
+passage host attesté par le bloc natif. Le client consomme alors l'ensemble du
+bloc kill/control/state/finish une seule fois, même si la santé avait déjà atteint
+zéro. Une interruption nonterminal sans acquisition 4F garde ses dégâts de
+préparation et emprunte l'épilogue natif d'échec, sans inventer de graphe victime.
+
+Les résultats ont une file native de sortie distincte du mouvement, une FIFO
+launcher et une FIFO d'entrée native bornées à 256. L'admission précède les
+états de retrait/conduit suivants ; un résultat tardif de mise à mort conserve
+également sa source jusqu'à la transition native. La pose de préparation est
+conservée si la première publication arrive après un retrait. Les protections
+contre la réutilisation de source pendant un flow fatal restent actives.
+
+4. ABI et pile vérifiées dans l'exécutable, sans exécution
+
+- 00662670 : ECX seul, RET simple ; frame alignée + SEH conservées.
+- interception 006626F7 : ECX=victime, ESI=source 4E, EBX=0 ; MOV déplacé de
+  6 octets. Reprise résolue à 00662837 avec EAX=définition locale ; échec à
+  006626CC avec la pile/ExceptionList retail intactes.
+- getter 006D60F0, vtable 012CC330+34 : ECX=manager, un index DWORD sur pile,
+  EAX=pointeur local, RET 4 sur les deux chemins. Index >=19h donne NULL.
+  Le call retail 0066BF29..0066BF48 confirme l'interface utilisée.
+- 007CC900 : ECX=Character, NEUF mots de pile, RET 24h. Les paramètres omis
+  dans la décompilation comprennent le descripteur et les deux flags terminaux.
+- 007B4AD0 : ECX=Character+320, HP et source sur pile, RET 8. Passage par
+  007AD730 et callbacks ; refus natif de ressusciter un composant déjà à 0 HP.
+- 007D0C10 : ECX=Character, source sur pile, RET 4.
+- 00675F10 : ECX seul, RET simple. Le code 006762DB..00676325 confirme le
+  choix DA, le retrait du contrôle et les appels kill/state de l'initialisation.
+- 00655B30 : ECX seul, RET simple ; épilogue à 00655DFA (pas 00655E23).
+- interception 00655B4A : ESI=4F, CMP déplacé de 7 octets ; chemin retail
+  rejoue CMP/JE, nonfatal reprend à 00655B8D, fatal reprend à 00655B5F avec
+  EAX restauré à [ESI+4]. Aucun argument natif n'est ajouté à la pile.
+- CALL 00655B88 -> 00649FA0 : ECX=4F, aucun argument de pile, RET simple
+  à 0064A078. Le marqueur de mise à mort tardive est posé après cet appel,
+  effectivement atteint après kill/state=2, jamais sur la seule lecture de 29B.
+- message 17 : ECX=packet, Character sur pile, RET 4 ; transition victime
+  0065C450 avec trois arguments, RET 0C. Contrats existants conservés.
+
+Les deux shims modifiés/nouveaux sauvegardent PUSHFD/PUSHAD et une zone FXSAVE
+alignée de 512 octets (x87/MMX/XMM/MXCSR). EDI conserve la frame PUSHAD ; ECX
+sauvé=+18h, ESI=+4, EAX=+1Ch. FXRSTOR puis restauration exacte de ESP précèdent
+toute reprise. Les octets d'entrée, continuations et RET critiques sont contrôlés
+à l'installation ; getter non reconnu => refus, sans recalcul local de secours.
+
+5. Portée, fichiers et limites restantes
+
+Fichiers source modifiés :
+- AIMP.Native/src/AISync.cpp
+- AIMP.Native/include/aimp/AISync.h
+- AIMP.Launcher/src/AIMP.Protocol/AISyncCodec.cs
+- AIMP.Launcher/src/AIMP.Launcher/AISyncSession.cs
+- AIMP.Native/include/aimp/ProductVersion.h
+- AIMP.Launcher/src/AIMP.Launcher/ProductInfo.cs
+Versions source : Launcher 0.8.4.177 / Native 0.11.4.177-aisync-native-paired-outcomes.
+Le protocole v7 exige les mêmes nouvelles versions aux deux extrémités.
+
+Le correctif couvre le chemin partagé 4E/4F des familles déjà admises par AISync,
+sans règle Alien/map/GUID pour sélectionner une cible. Les autres chemins,
+notamment le carrier 42 et les attaques à distance, ne deviennent pas un nouveau
+protocole complet de dégâts dans cette correction. Les helpers host de survie,
+le heartbeat de conduit, PlayerSync, équipements, WS3, PlayerLifecycle et
+Performance Isolation ne sont pas refondus. Le spectateur et la fin de manche
+quand tous les joueurs sont morts restent à développer.
+
+Une observation terminale sans acquisition 4F reconnue ne permet pas d'inventer
+une mise à mort native : elle est refusée/diagnostiquée. Une définition, liaison
+ou génération non reconnue est également refusée. La saturation à 256 résultats
+reste une limite de transport : refus compté côté natif, pause explicite côté
+launcher ; il n'y a pas ici de nouvel ACK réseau/reprise persistante de session.
+
+Relecture statique des offsets et transports, désassemblage et git diff --check
+uniquement. Aucun binaire .177 n'a été construit et aucun comportement en jeu,
+retour de conduit, crash ou niveau de FPS n'a été validé. Ces observations
+devront venir de la compilation et des essais Windows effectués par l'utilisateur.

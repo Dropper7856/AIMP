@@ -16,8 +16,9 @@ namespace ai_sync {
 // retail NPC Character at the Character/behaviour-runtime boundary. Like
 // WorldSync, the wire carries stable identities plus high-level resolved
 // carriers only. Animation clips/frames, skeleton state, audio, particles and
-// downstream CATHODE consequences are deliberately absent: retail systems
-// regenerate them locally after the carrier is applied.
+// downstream CATHODE world consequences are deliberately absent: retail systems
+// regenerate them locally after the carrier is applied. Paired attack results
+// carry the Host's resolved native definition and health, without clip frames.
 // Process pointers and species-specific state never cross the network.
 enum class Role : std::uint32_t { Retail, Host, Client, FrozenClient };
 
@@ -49,11 +50,29 @@ enum InteractionFlag : std::uint32_t {
     InteractionTargetIsParticipant = 1U << 1U,
     InteractionPairValid = 1U << 2U,
     InteractionCycleActive = 1U << 3U,
+    InteractionNativeOutcomeRequired = 1U << 4U,
+};
+
+enum OutcomeFlag : std::uint32_t {
+    OutcomePrepared = 1U << 0U,
+    OutcomeVictimAdmitted = 1U << 1U,
+    OutcomeSourceEnded = 1U << 2U,
+    OutcomeVictimEnded = 1U << 3U,
+    // Native health observation, NOT completion of the local death flow.
+    OutcomeTerminal = 1U << 4U,
+    // Fatal 4F initialization or the certified late kill/control/finish block
+    // actually ran on Host. Distinct from HP=0 and from death-flow completion.
+    OutcomeNativeDeath = 1U << 5U,
 };
 
 #pragma pack(push, 1)
+struct NativeOutcome final {
+    std::uint32_t revision{}, flags{}, definition{}, kind{};
+    std::uint32_t hpBefore{}, hpPrepared{}, hpReaction{}, healthReaction{};
+    float sourceYaw{}, targetOffset[3]{};
+};
 struct State final {
-    std::uint32_t version{6U};
+    std::uint32_t version{7U};
     std::uint32_t nativeGeneration{}; // informational: generations differ per process
     std::uint64_t sessionCookie{};
     std::uint32_t worldGeneration{};
@@ -92,6 +111,10 @@ struct State final {
     std::uint64_t interactionTargetPeer{};
     std::int32_t interactionTransitionVariant{};
     std::uint32_t interactionPairRevision{}, interactionTransitionRevision{};
+    // Result of the admitted 4E/4F native preparation, keyed by this source
+    // birth + pair revision + target peer. Definition is a retail manager index,
+    // never an animation pointer. Clients consume it instead of choosing again.
+    NativeOutcome outcome{};
 };
 struct ParticipantBinding final {
     std::uint64_t peer{};
@@ -108,7 +131,9 @@ struct Configuration final {
     ParticipantBinding participants[32]{};
 };
 #pragma pack(pop)
-static_assert(sizeof(State) == 184U);
+static_assert(sizeof(NativeOutcome) == 48U);
+static_assert(offsetof(State, outcome) == 184U);
+static_assert(sizeof(State) == 232U);
 static_assert(sizeof(ParticipantBinding) == 16U);
 static_assert(sizeof(Configuration) == 552U);
 
