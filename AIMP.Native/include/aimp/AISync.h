@@ -51,6 +51,9 @@ enum InteractionFlag : std::uint32_t {
     InteractionPairValid = 1U << 2U,
     InteractionCycleActive = 1U << 3U,
     InteractionNativeOutcomeRequired = 1U << 4U,
+    // The Host still owns the exact source 42/4E cycle, including its outro
+    // after the active attack/victim graph ends. Distinct from Active/health.
+    InteractionSourceCycleRetained = 1U << 5U,
 };
 
 enum OutcomeFlag : std::uint32_t {
@@ -72,7 +75,7 @@ struct NativeOutcome final {
     float sourceYaw{}, targetOffset[3]{};
 };
 struct State final {
-    std::uint32_t version{7U};
+    std::uint32_t version{8U};
     std::uint32_t nativeGeneration{}; // informational: generations differ per process
     std::uint64_t sessionCookie{};
     std::uint32_t worldGeneration{};

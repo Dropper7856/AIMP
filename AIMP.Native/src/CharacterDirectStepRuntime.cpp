@@ -62,6 +62,9 @@ constexpr float kFollowerHardResyncDistance = 1.50F;
 // AISync can carry faster NPC motion than PlayerSync's human follower. Give
 // native locomotion time to absorb transient drift before an emergency snap.
 constexpr float kAiFollowerMaximumMagnitude = 20.0F;
+constexpr float kAiFollowerPositionGain = 2.5F;
+constexpr float kAiFollowerMaximumCorrectionSpeed = 4.0F;
+constexpr float kAiFollowerMaximumSettlingMagnitude = 2.5F;
 constexpr float kAiFollowerHardResyncDistance = 3.50F;
 constexpr std::uint64_t kAiFollowerHardResyncGraceMilliseconds = 500U;
 constexpr std::uint64_t kFollowerHardResyncCooldownMilliseconds = 250U;
@@ -1187,6 +1190,26 @@ bool BuildFollowerDemand(
     demand.networkFollower = hasTarget;
 
     if (demand.inputMoving) {
+        if (slot.aiReplicationProfile.load(std::memory_order_acquire) && hasTarget) {
+            // NPC intent is sampled native displacement, rather than human
+            // input. Follow the buffered path with bounded positional feedback
+            // in both axes; the human forward-only/lateral-blend policy leaves
+            // an NPC behind at corners until its emergency resync fires.
+            const auto correctionSpeed = std::min(planarError * kAiFollowerPositionGain,
+                kAiFollowerMaximumCorrectionSpeed);
+            const auto correctionScale = planarError > kMoveRequestEpsilon ? correctionSpeed / planarError : 0.0F;
+            auto velocityX = inputX + errorX * correctionScale;
+            auto velocityZ = inputZ + errorZ * correctionScale;
+            const auto magnitude = std::hypot(velocityX, velocityZ);
+            if (magnitude > kAiFollowerMaximumMagnitude) {
+                velocityX *= kAiFollowerMaximumMagnitude / magnitude;
+                velocityZ *= kAiFollowerMaximumMagnitude / magnitude;
+            }
+            demand.drive = magnitude > kMoveRequestEpsilon;
+            demand.directionX = velocityX; demand.directionZ = velocityZ;
+            demand.intensity = demand.drive ? intensity : 0.0F;
+            return true;
+        }
         auto headingX = inputX / inputMagnitude;
         auto headingZ = inputZ / inputMagnitude;
         auto alongTrackError = 0.0F;
@@ -1253,7 +1276,8 @@ bool BuildFollowerDemand(
         const auto magnitude = std::clamp(
             planarError * 2.5F,
             kFollowerMinimumSettlingMagnitude,
-            kFollowerMaximumSettlingMagnitude);
+            slot.aiReplicationProfile.load(std::memory_order_acquire)
+                ? kAiFollowerMaximumSettlingMagnitude : kFollowerMaximumSettlingMagnitude);
         demand.drive = true;
         demand.directionX = errorX / planarError * magnitude;
         demand.directionZ = errorZ / planarError * magnitude;
@@ -2658,6 +2682,10 @@ bool UseAIReplicationProfile(const std::uintptr_t characterAddress) noexcept {
     auto* slot = FindSlot(characterAddress);
     if (slot == nullptr || !slot->hasNetworkTransform.load(std::memory_order_acquire)) return false;
     if (!slot->aiReplicationProfile.exchange(true, std::memory_order_acq_rel)) {
+        // AISync owns birth/frontstage/real discontinuity placement itself.
+        // Re-arming after a native attack must converge from its current pose,
+        // not teleport on first bind to a potentially older network position.
+        slot->initialPlacementPending.store(false, std::memory_order_release);
         slot->aiDivergenceSinceTickMs.store(0U, std::memory_order_release);
         slot->targetRevision.fetch_add(1U, std::memory_order_release);
     }
