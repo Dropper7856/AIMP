@@ -1,0 +1,157 @@
+AIMP .179 - contexte des participants dans les conduits
+=====================================================
+Audit du 2026-10-04. Verification exclusivement statique.
+Aucune compilation, aucun test, aucun lancement du moteur ou benchmark.
+
+Sources et diagnostics
+---------------------
+Host : AIMP-Diagnostics-20261004-100158.zip, PID 2448.
+Client : AIMP-Diagnostics-20261004-090153.zip, PID 7660.
+Les deux processus utilisent Launcher .178 / Native .178.
+AI.exe.c et AI.exe presents a la racine ont ete inspectes.
+AI.exe SHA256 :
+00D6BB846AC5A78916BAF363EB148AA255A23BF216A271CFD23A0ECE3C368364
+Les adresses natives ci-dessous sont des VA preferees (base 00400000).
+Le code utilise des RVA et valide les octets apres ASLR.
+
+Chronologie et identites observees
+---------------------------------
+Session : 5389006834099816885.
+Host peer : 17325642112225448902.
+Client peer : 12635333337940481594.
+Alien : entite 3009426460/1279389103, birth 1, runtimeId 3.
+Ces valeurs documentent ce diagnostic ; aucune n'est utilisee dans le correctif.
+
+Host Alien : 2C0CCD20 ; vrai joueur local Host : 2C0C4780.
+Client Alien : 2AB00D20 ; vrai joueur local Client : 2AAF8780.
+Victime resolue sur Client : 2AAFCA50, representation du peer Host,
+victimLocal=false / victimRepresentation=true. Le vrai joueur Client reste
+a 1000 PV, sante 0, sans frontiere PlayerLifecycle de mort locale.
+
+Utiliser sampleTick et les revisions, pas les heures de vidage des probes.
+Les horloges monotones des deux processus ne sont pas comparables entre elles.
+
+Host, ticks :
+332334171 : attaque paire 1, source 4E/stage 2, Host terminal, victime non achevee.
+332341828 : source 4E/stage 6, victime achevee, outcome revision 3 / flags 63.
+332343828 : source 37 ; retention et activite de la paire liberees.
+332350843 : source 12 (traversal), revision 428, encore visible.
+332351843 : source 4D, revision 438, hidden=1, lifecycleFlags=33.
+332526890 : meme revision, meme pose et meme etat cache, environ 175 s apres.
+
+Client : paire native admise, victime Host achevee, puis source liberee.
+pairedCycleReleased=1 ; pairedHostCycleWaits=483 ne continue pas a augmenter.
+A partir du tick 690421 jusqu'a 859437, revision 438 / etat cache identique.
+1072 etats appliques au dernier compteur ; reception et heartbeat continuent.
+Host : 1142 publications ; AI callbacks actifs ; aucun fault ni exception.
+Le peer Client reste living=true, cible visible, mais selectedPeer et pendingPeer
+restent nuls. Le dernier type d'action Host est ActionBackstageAreaSweep
+(vtable RVA 00EBC8B8, factory 006ED630), statut 2.
+
+Le blocage se produit donc sur l'autorite Host apres le retrait natif, puis
+est replique sur Client. Il ne vient pas d'une paire client encore retenue ou
+d'un arret du transport. Le Character du Host mort reste resolu jusqu'a la fin
+des probes : sa disparition visuelle ne prouve pas sa destruction.
+
+Defaut de compatibilite dans le chemin natif
+-------------------------------------------
+L'ancien AiPlayerSlotScope projette un participant vivant uniquement pendant
+les callbacks AI certifies, tout en restaurant le vrai joueur local ensuite.
+Les remaps fonctionnent (33312 sur Host) mais ne fournissent pas les composants
+reserves au joueur solo sur une representation PlayerSync de type NPC.
+
+007216A0 -> 0040C1C0 : la recherche backstage prend le choix natif du senseur
+0040A3D0, sinon THE_PLAYER. 0040C29F..0040C2AD exigent ensuite Character+31C
+et son marqueur +48 (controle du joueur solo). Si ce prerequis manque, la
+branche 0040C2E0 annule la recherche ; changer le slot ne suffit donc pas.
+
+Si la cible est admise, 0040C2CB -> 0040BBF0 charge Character+3500.
+Un cache absent retourne immediatement a 0040BC06..0040BC10, avant le choix
+de conduits et avant le fallback natif de conduits scripts 0040AD00.
+00733850 n'alloue ce cache (+120 du BehaviourManager = Character+3500) que
+pour les templates joueur (+1C). L'execution AI des representations PlayerSync
+est volontairement supprimee ; elle ne doit pas etre reactivee pour obtenir
+ce service de navigation.
+
+004015E0, update physique du cycle 4D, s'execute hors du callback AI normal.
+Il demande le joueur le plus proche a 007798D0, qui ne consulte que le tableau
+de joueurs natif. Sans scope, il continue a consulter le Host mort.
+
+Limite de preuve : .178 ne journalise pas +31C/+48, +3500 ni l'etat interne
+de recherche backstage. Le defaut de compatibilite est etabli dans le code
+et le binaire ; ces ZIP ne prouvent pas quelle branche exacte de ces gardes
+a ete prise a chaque frame. Les nouvelles probes rendent cela observable.
+Le retour en jeu apres ce correctif reste a confirmer sur Windows.
+
+Correction .179
+---------------
+1. Encadrer la recherche backstage et le cycle physique 4D avec le meme
+   contexte de participant vivant que les decisions Host. Restaurer le slot
+   et le contexte TLS a la sortie ; conserver l'identite du vrai joueur local.
+2. Ignorer un participant terminal dans le getter utilise par cette recherche
+   apres achevement de son flow natif, afin que le fallback natif puisse
+   consulter le participant vivant. Garder la victime pendant sa mort native.
+3. Adapter seulement la garde solo de 0040C29F pour un peer PlayerSync vivant
+   dont la generation et le proprietaire AI sont certifies. Ne pas fabriquer
+   de controleur FPS ou modifier Character+31C.
+4. Donner au planner 0040BBF0 un cache de navigation prive par participant si
+   son cache natif optionnel manque. Le pointeur est fourni dans EDI, uniquement
+   dans cette fonction ; Character+3500 n'est jamais modifie.
+   Cache de donnees de 458 octets, initialise comme 006EE5B0. Il appartient
+   a AISync ; les requetes et leur consommation restent natives (00721270).
+   Le but vient du dernier objectif natif active du vrai joueur Host, lie a la
+   session et aux generations. Aucun point, conduit ou GUID n'est invente.
+   Sans objectif connu, la route reste vide : le fallback script natif reste
+   accessible. Il n'y a pas de sortie de conduit forcee ni de timer de relance.
+5. Liberer les references natives de requetes lors de la destruction du
+   Character, disparition du peer, changement de generations/session/role.
+   Aucun dereferencement de l'ancien Character n'est requis pour cette liberation.
+   Une exception met le cache en quarantaine, sans reutilisation.
+
+Budget : 32 caches fixes, aucune allocation AIMP par frame, maintenance 250 ms,
+update de navigation natif borne a 50 ms par participant demande au planner.
+Aucun logging ni attente dans les nouvelles interceptions moteur.
+Les requetes de navigation peuvent allouer dans le moteur comme celles retail.
+Les mesures de performance et le comportement visible ne sont pas valides ici.
+
+ABI x86 verifiee par desassemblage
+--------------------------------
+0040C1C0 : ECX=sweep, pas d'argument pile, resultat AL, RET simple.
+0040C285 : CALL original 0040A3D0, ECX=selection, resultat EAX, RET simple.
+0040C29F : ESI=sweep, EDI=cible ; deplacement de MOV EAX,[EDI+31C] (6 octets).
+Succes : reprise 0040C2AF, sans modifier le reste des decisions natives.
+Refus : trampoline original puis TEST et branches retail.
+0040BBFA : EBP=cible, ECX=sweep ; remplace MOV EDI,[EBP+3500] (6 octets).
+Reprise 0040BC00 ; EDI est sauvegarde par la fonction et restaure a ses retours.
+0040BBF0 : argument cible sur la pile, RET 4 conserve par la fonction originale.
+004015E0 : ECX=cycle ; frame alignee, ESI sauvegarde ; epilogue RET simple.
+007798D0 : ECX=contexte joueurs, position en pile ; RET 4, conserve original.
+006C5D70 : ECX=cache, pointeur de but en pile ; RET 4 aux deux retours.
+00721270 : ECX=cache, pas d'argument pile, RET simple ou tail-JMP 006D8280.
+006D8280 : ECX=cache, EBX/ESI/EDI sauvegardes selon chemin ; RET simples.
+006F58D0 : ECX=reference partagee, pas d'argument pile ; RET simple ou
+tail-JMP au destructeur du bloc de controle. Aucun Character n'est dereference.
+
+Les deux shims interieurs sauvegardent PUSHFD/PUSHAD, FXSAVE aligne de 512
+octets (x87/MMX/XMM), deux arguments cdecl et ADD ESP,8, puis FXRSTOR et
+restaurent exactement ESP. La garde modifie EAX, ensuite ecrase par les
+operations originales ou inutilise avant CMP. Le cache modifie uniquement
+EDI via l'emplacement PUSHAD +0 ; les autres registres et flags sont conserves.
+Les quatre prefixes sont des instructions completes, sans operande relatif.
+25 plages/prefixes du profil correspondent aux octets de AI.exe inspecte.
+Le profil runtime refuse l'installation si les octets certifies divergent.
+Verification complementaire : diff sans erreur d'espacement.
+
+Fichiers de cette correction
+---------------------------
+AIMP.Native/src/AISync.cpp : contexte backstage, cache prive, ABI et probes.
+AIMP.Native/include/aimp/ProductVersion.h : Native .179.
+AIMP.Launcher/src/AIMP.Launcher/ProductInfo.cs : Launcher .179 et DLL attendue.
+AIMP.Native/AISync-179-static-audit.txt : cet audit.
+
+Les changements .178 deja presents (interpolation, retention de la source
+jusqu'a sa liberation Host, include algorithm pour std::clamp) sont conserves.
+Format reseau v8/232 octets conserve. Aucun changement aux dommages/outcomes,
+flows de mort, PlayerLifecycle, PlayerSync, equipements, WS3 ou Performance
+Isolation dans cette correction. La suppression preexistante de l'audit .177
+est conservee.

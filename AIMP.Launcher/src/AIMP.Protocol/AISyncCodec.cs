@@ -8,7 +8,7 @@ namespace AIMP.Protocol;
 // regenerate presentation locally; resolved paired health/outcomes come from Host.
 public static class AISyncCodec
 {
-    public const uint StateVersion = 7;
+    public const uint StateVersion = 8;
     public const int NativeStateBytes = 232;
     public const int ConfigurationBytes = 552;
     public const int NetworkStateBytes = 16 + NativeStateBytes;
@@ -21,7 +21,7 @@ public static class AISyncCodec
     private const uint KnownStateFlags = PoseValid | Moving | ActionValid | InteractionValid | RoleTaskValid;
     private const uint KnownLifecycleFlags = 63U; // includes Character backstage (bit 5)
     private const uint InteractionPairValid = 1U << 2;
-    private const uint KnownInteractionFlags = 31U;
+    private const uint KnownInteractionFlags = 63U; // includes retained source cycle (bit 5)
 
     public static ulong SessionCookie(Guid session)
     {
@@ -38,7 +38,7 @@ public static class AISyncCodec
             || (U32(bytes, 20) == 0 && U32(bytes, 24) == 0) || U32(bytes, 32) == 0
             || U32(bytes, 36) == 0
             || !AllowedCharacterClass(U32(bytes, 28)))
-            throw new ProtocolException("Invalid AISync authority snapshot v7.");
+            throw new ProtocolException("Invalid AISync authority snapshot v8.");
         ValidateAuthorityState(bytes);
     }
 
@@ -71,6 +71,9 @@ public static class AISyncCodec
             throw new ProtocolException("Invalid AISync interaction identity.");
         if ((flags & InteractionValid) == 0 && U32(bytes, 108) != 0)
             throw new ProtocolException("AISync transition requires an interaction event.");
+        if ((interactionFlags & 32U) != 0 && ((flags & InteractionValid) == 0
+            || U32(bytes, 108) == 0 || (interactionFlags & InteractionPairValid) == 0))
+            throw new ProtocolException("AISync retained source requires an identified paired transition.");
         if (U32(bytes, 108) != 0 && U32(bytes, 180) == 0)
             throw new ProtocolException("AISync transition requires its own revision.");
         if ((flags & RoleTaskValid) != 0

@@ -114,6 +114,8 @@ bool HoldWorldReplicationIdle(
 
 // Engine thread only, after Arm/HoldWorldReplication succeeds. Selects the
 // NPC follower limits for this owned slot; release/reallocation clears them.
+// AISync already owns placement boundaries: initial follower binding converges
+// from the current native pose without an implicit placement teleport.
 // PlayerSync and manual movement retain the default profile.
 bool UseAIReplicationProfile(std::uintptr_t characterAddress) noexcept;
 
