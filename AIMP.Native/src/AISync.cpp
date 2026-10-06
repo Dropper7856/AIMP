@@ -83,6 +83,10 @@ using TargetEligibility = std::uint32_t(__thiscall*)(void*);
 using RecordInvalid = std::uint8_t(__thiscall*)(void*);
 using BackstageUpdate = std::uint8_t(__thiscall*)(void*);
 using BackstageHoldUpdate = void(__thiscall*)(void*);
+// FUN_006D85E0: ECX=Alien AI controller, no stack arguments, plain RET.
+// It is the native producer for sweep+0x51; feeding a transient request here
+// preserves its explicit Character restrictions instead of forcing the sweep.
+using BackstageActivationRefresh = void(__thiscall*)(void*);
 using NavigationGoal = void(__thiscall*)(void*, const float*);
 using NavigationUpdate = void(__thiscall*)(void*);
 // Owned shared path-query reference at +0/+4, ECX only, plain RET.
@@ -316,6 +320,9 @@ std::atomic<void*> gBackstageNavigationPublished{};
 std::atomic<std::uint64_t> gBackstageEligibilityOverrides{}, gBackstageNavigationPlans{};
 std::atomic<std::uint64_t> gBackstageNavigationUpdates{}, gBackstageNavigationRejected{};
 std::atomic<std::uint64_t> gBackstageDeadTargetsRejected{}, gBackstageHoldContexts{};
+std::atomic<std::uint64_t> gBackstageSurvivorRearmAttempts{}, gBackstageSurvivorRearms{};
+std::atomic<std::uint64_t> gBackstageSurvivorRearmRestricted{}, gBackstageSurvivorRearmFailures{};
+std::atomic<std::uint64_t> gLastBackstageSurvivorPeer{};
 // Same data layout as the optional player route cache made by 006EE5B0.
 // Only AISync owns these buffers and their +0/+4 shared query references.
 // No player controller is fabricated or installed on a PlayerSync Character.
@@ -331,8 +338,9 @@ std::array<ParticipantNavigation, kActors> gParticipantNavigation{};
 float gPlayerNavigationGoal[3]{};
 bool gPlayerNavigationGoalKnown{};
 bool gNavigationHostActive{};
-std::uint64_t gNavigationSession{}, gNavigationTrackerGeneration{};
-std::uint32_t gNavigationNativeGeneration{}, gNavigationWorld{};
+std::uint64_t gNavigationSession{};
+std::uint64_t gNavigationGeneration{};
+std::uint32_t gNavigationWorld{};
 ULONGLONG gNavigationMaintenance{};
 // Only the certified sense-event dispatchers set this scope. CATHODE's
 // global entity resolver and unrelated callers keep their retail semantics.
@@ -784,15 +792,13 @@ void PumpHostNavigationContext() noexcept {
     const bool host = gRole.load(std::memory_order_acquire) == Role::Host;
     if (!host && !gNavigationHostActive) return;
     gNavigationHostActive = host;
-    const bool changed = generation != gNavigationTrackerGeneration ||
-        gCurrent.nativeGeneration != gNavigationNativeGeneration ||
+    const bool changed = generation != gNavigationGeneration ||
         gCurrent.sessionCookie != gNavigationSession || gCurrent.worldGeneration != gNavigationWorld;
     if (!host || changed) {
         for (auto& navigation : gParticipantNavigation)
             if (navigation.initialized) static_cast<void>(ReleaseParticipantNavigation(navigation));
         gPlayerNavigationGoalKnown = false;
-        gNavigationTrackerGeneration = generation;
-        gNavigationNativeGeneration = gCurrent.nativeGeneration;
+        gNavigationGeneration = generation;
         gNavigationSession = gCurrent.sessionCookie;
         gNavigationWorld = gCurrent.worldGeneration;
         gNavigationMaintenance = 0U;
@@ -851,8 +857,7 @@ std::uint32_t __cdecl BackstageParticipantEligibility(
 bool UpdateParticipantNavigation(ParticipantNavigation& navigation, const ULONGLONG now) noexcept {
     if (navigation.faulted) return false;
     if (!gPlayerNavigationGoalKnown || navigation.sessionCookie != gNavigationSession ||
-        navigation.nativeGeneration != gNavigationNativeGeneration ||
-        navigation.worldGeneration != gNavigationWorld ||
+        navigation.nativeGeneration != gNavigationGeneration || navigation.worldGeneration != gNavigationWorld ||
         (navigation.lastUpdate != 0U && now - navigation.lastUpdate < kSendPeriod)) return true;
     __try {
         // 006C5D70: ECX=route cache, goal pointer on stack, RET 4.
@@ -914,6 +919,86 @@ std::uintptr_t __cdecl BackstageParticipantNavigation(
     return reinterpret_cast<std::uintptr_t>(found->native.data());
 }
 bool NativeVictimFlowRunning(std::uintptr_t source, std::uintptr_t victim) noexcept;
+bool HiddenBackstageCycle(const std::uintptr_t owner) noexcept {
+    std::uintptr_t cycle{}, cycleOwner{};
+    std::uint8_t state{};
+    return owner != 0U && Read(owner + 0x36CU, cycle) && cycle != 0U &&
+        Read(cycle + 4U, cycleOwner) && cycleOwner == owner &&
+        Read(cycle + 0x1AU, state) && state == 0x4DU;
+}
+bool RearmBackstageSearchForSurvivor(const std::uintptr_t owner,
+    const std::uintptr_t sweep) noexcept {
+    // Retail has only one human player. Once that Character is terminal-dead,
+    // its ordinary producers can leave controller +0C/+0D/+0E all clear after
+    // the Alien withdraws. The physical 4D cycle then keeps running, but
+    // FUN_006D85E0 continually leaves sweep+51 disabled and 0040C1C0 returns
+    // before AIMP's participant eligibility/navigation adaptations are reached.
+    //
+    // Adapt only that impossible-in-retail multiplayer state: an authoritative
+    // Host whose real local player is terminal-dead, an Alien already in its
+    // hidden 4D cycle, and at least one living registered participant. A
+    // transient +0D request is supplied only while the native producer runs;
+    // the controller field is restored immediately. The producer itself still
+    // owns sweep+51, so Character flag 0x1D and the native 0x18 policy remain
+    // authoritative and can refuse the re-arm.
+    if (owner == 0U || sweep == 0U || !HiddenBackstageCycle(owner)) return false;
+
+    const auto realLocal = LocalPlayer();
+    if (!TerminalDeadCharacter(realLocal) || NativeVictimFlowRunning(owner, realLocal)) return false;
+
+    std::uint64_t peer{};
+    if (LivingAiParticipant(owner, peer) == 0U || peer == 0U) return false;
+
+    std::uintptr_t controller{}, ownedSweep{};
+    std::uint8_t enabled{}, requestC{}, requestD{}, requestE{};
+    if (!Read(owner + 0x34F0U, controller) || controller == 0U ||
+        !Read(controller + 0x1CU, ownedSweep) || ownedSweep != sweep ||
+        !Read(sweep + 0x51U, enabled) ||
+        !Read(controller + 0x0CU, requestC) || !Read(controller + 0x0DU, requestD) ||
+        !Read(controller + 0x0EU, requestE) || enabled != 0U) return false;
+
+    // If retail already has a request but still disabled the sweep, an
+    // independent native restriction is active. Never override that state.
+    if (requestC != 0U || requestD != 0U || requestE != 0U) return false;
+
+    gBackstageSurvivorRearmAttempts.fetch_add(1U, std::memory_order_relaxed);
+    constexpr std::uint8_t kSurvivorRequest = 1U;
+    if (!Write(controller + 0x0DU, kSurvivorRequest)) {
+        gBackstageSurvivorRearmFailures.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+
+    bool refreshed{};
+    __try {
+        reinterpret_cast<BackstageActivationRefresh>(gBase + 0x002D85E0U)(
+            reinterpret_cast<void*>(controller));
+        refreshed = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        refreshed = false;
+    }
+
+    const bool restored = Write(controller + 0x0DU, requestD);
+    if (!refreshed || !restored) {
+        gBackstageSurvivorRearmFailures.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+
+    std::uint8_t after{};
+    if (!Read(sweep + 0x51U, after)) {
+        gBackstageSurvivorRearmFailures.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+    if (after == 0U) {
+        // Most importantly, this covers Character flag 0x1D: the native
+        // producer saw our request and still rejected the search.
+        gBackstageSurvivorRearmRestricted.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+
+    gBackstageSurvivorRearms.fetch_add(1U, std::memory_order_relaxed);
+    gLastBackstageSurvivorPeer.store(peer, std::memory_order_relaxed);
+    return true;
+}
 std::uintptr_t __fastcall BackstageSelectedTargetDetour(void* selection, void*) noexcept {
     const auto target = reinterpret_cast<std::uintptr_t(__thiscall*)(void*)>(gBase + 0x0000A3D0U)(selection);
     const auto owner = gAiPlayerQueryOwner;
@@ -931,7 +1016,11 @@ std::uint8_t __fastcall BackstageUpdateDetour(void* sweep, void*) noexcept {
     if (original == nullptr) return 0U;
     const auto owner = HostBackstageOwner(reinterpret_cast<std::uintptr_t>(sweep));
     const auto previous = gAiPlayerQueryOwner;
-    if (owner != 0U) gAiPlayerQueryOwner = owner;
+    if (owner != 0U) {
+        gAiPlayerQueryOwner = owner;
+        static_cast<void>(RearmBackstageSearchForSurvivor(
+            owner, reinterpret_cast<std::uintptr_t>(sweep)));
+    }
     std::uint8_t result{};
     { AiPlayerSlotScope context(owner); result = original(sweep); }
     gAiPlayerQueryOwner = previous;
@@ -4102,9 +4191,7 @@ void SampleParticipantPerception(Actor& actor, const std::uintptr_t manager, con
         Read(sweep + 0x2CU, sample.backstageKeyA) && Read(sweep + 0x30U, sample.backstageKeyB) &&
         Read(sweep + 0x51U, sample.backstageEnabled) && Read(sweep + 0x53U, sample.backstagePolicy);
     sample.navigationGoalKnown = gPlayerNavigationGoalKnown && gCurrent.sessionCookie == gNavigationSession &&
-        gCurrent.nativeGeneration == gNavigationNativeGeneration &&
-        gCurrent.worldGeneration == gNavigationWorld &&
-        gGenerations->CurrentGeneration() == gNavigationTrackerGeneration;
+        gCurrent.nativeGeneration == gNavigationGeneration && gCurrent.worldGeneration == gNavigationWorld;
     for (const auto& cached : gParticipantNavigation) {
         if (!cached.initialized || cached.faulted || cached.peer != peer || cached.character != target ||
             cached.nativeGeneration != gCurrent.nativeGeneration || cached.worldGeneration != gCurrent.worldGeneration ||
@@ -5670,6 +5757,11 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"backstageNavigationRejected", Diagnostics::Unsigned(gBackstageNavigationRejected.load(std::memory_order_relaxed)), true},
          {"backstageDeadTargetsRejected", Diagnostics::Unsigned(gBackstageDeadTargetsRejected.load(std::memory_order_relaxed)), true},
          {"backstageHoldContexts", Diagnostics::Unsigned(gBackstageHoldContexts.load(std::memory_order_relaxed)), true},
+         {"backstageSurvivorRearmAttempts", Diagnostics::Unsigned(gBackstageSurvivorRearmAttempts.load(std::memory_order_relaxed)), true},
+         {"backstageSurvivorRearms", Diagnostics::Unsigned(gBackstageSurvivorRearms.load(std::memory_order_relaxed)), true},
+         {"backstageSurvivorRearmRestricted", Diagnostics::Unsigned(gBackstageSurvivorRearmRestricted.load(std::memory_order_relaxed)), true},
+         {"backstageSurvivorRearmFailures", Diagnostics::Unsigned(gBackstageSurvivorRearmFailures.load(std::memory_order_relaxed)), true},
+         {"lastBackstageSurvivorPeer", Diagnostics::Unsigned(gLastBackstageSurvivorPeer.load(std::memory_order_relaxed)), true},
          {"poseRejected", Diagnostics::Unsigned(ai.poseRejected), true},
          {"actionCaptured", Diagnostics::Unsigned(ai.actionCaptured), true},
          {"actionTransitions", Diagnostics::Unsigned(ai.actionTransitions), true},
