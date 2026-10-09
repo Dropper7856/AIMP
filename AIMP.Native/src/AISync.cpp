@@ -22,11 +22,17 @@ namespace aimp::ai_sync {
 namespace {
 static_assert(sizeof(void*) == 4U);
 static_assert(std::is_trivially_copyable_v<State>);
+static_assert(std::is_trivially_copyable_v<ImpactEvent>);
 constexpr std::size_t kActors = 32U, kRing = 256U;
 constexpr ULONGLONG kSendPeriod = 50ULL, kRefreshPeriod = 250ULL, kTimeout = 1500ULL;
 constexpr ULONGLONG kManagerDormancyPeriod = 500ULL;
 constexpr ULONGLONG kDeadTargetGracePeriod = 1500ULL;
-constexpr std::uint32_t kStateFlags = PoseValid | Moving | ActionValid | InteractionValid | RoleTaskValid;
+constexpr ULONGLONG kPostDeathArbitrationGracePeriod = 2000ULL;
+constexpr ULONGLONG kPostDeathRecentSenseHold = 2000ULL;
+constexpr ULONGLONG kRemoteObserverStage2ReleaseGrace = 350ULL;
+constexpr std::uint32_t kStateFlags = PoseValid | Moving | ActionValid | InteractionValid | RoleTaskValid |
+    ExecutionValid;
+constexpr std::uint32_t kExecutionFlags = ExecutionTransition | ExecutionCertified | ExecutionPaired;
 constexpr std::uint32_t kInteractionFlags = InteractionActorIsSource |
     InteractionTargetIsParticipant | InteractionPairValid | InteractionCycleActive | InteractionNativeOutcomeRequired |
     InteractionSourceCycleRetained;
@@ -43,8 +49,14 @@ constexpr auto kCharacterRegistry = character_direct_step_runtime::NativeCharact
 constexpr std::uintptr_t kCharacterBackstageRva = 0x0038B140U;
 constexpr std::uintptr_t kCharacterFrontstageRva = 0x003C0220U;
 constexpr std::uintptr_t kCharacterRelocateRva = 0x003C6330U;
+constexpr std::uintptr_t kCharacterResolverRegistryRva = 0x0134EF40U;
+constexpr std::uintptr_t kCharacterResolverRva = 0x002545C0U;
+constexpr std::uintptr_t kResolveImpactDamageRva = 0x003A0A40U;
 constexpr float kPlacementTolerance = 0.25F;
 constexpr float kMotionThreshold = 0.02F, kMaximumVelocity = 20.0F;
+constexpr float kIntentCatastrophicDistance = 8.0F;
+constexpr float kIntentCatastrophicVerticalDistance = 4.0F;
+constexpr ULONGLONG kIntentCatastrophicGrace = 2000ULL;
 using ManagerUpdate = void(__thiscall*)(void*, std::uint32_t, float);
 using Coordinator = void(__thiscall*)(void*, std::uint32_t);
 using CharacterInteraction = std::uint32_t(__thiscall*)(void*, std::uint32_t, std::uint32_t,
@@ -53,6 +65,7 @@ using PairedTransitionA = void(__thiscall*)(void*, std::uintptr_t, std::int32_t,
 using PairedTransitionB = void(__thiscall*)(void*, std::uintptr_t, std::int32_t,
     std::uint32_t, std::uint32_t);
 using CharacterImpact = void(__thiscall*)(void*, int*);
+using ResolveImpactDamage = std::int16_t(__fastcall*)(int*);
 using SensesCandidates = void(__thiscall*)(void*);
 using SenseEvent = void(__thiscall*)(void*, std::uintptr_t);
 using SenseCharacterResolver = std::uintptr_t(__thiscall*)(void*, const std::uint32_t*);
@@ -124,9 +137,41 @@ struct ParticipantProbe final {
 // never pointers to Characters/records that a later worker might dereference.
 std::array<ParticipantProbe, kParticipantProbeRing> gParticipantProbes{};
 std::atomic<std::uint32_t> gParticipantProbeWrite{}, gParticipantProbeRead{};
+
+enum class TargetSuccessionPhase : std::uint32_t {
+    UpdateEntry = 1U,
+    PostRecovery = 2U,
+    PostRetailUpdate = 3U,
+    RecoveryEvaluation = 4U,
+    PairRetired = 5U,
+    SuccessorPreserved = 6U,
+    FallbackReset = 7U,
+    FallbackResetRejected = 8U,
+    InteractionAdvanced = 9U,
+    PostPrepass = 10U,
+    PostCoordinator = 11U
+};
+struct TargetSelectionSnapshot final {
+    std::uintptr_t selectedRecord{}, selectedTarget{}, pendingRecord{}, pendingTarget{};
+    std::uint64_t selectedPeer{}, pendingPeer{};
+    std::uint32_t selectedBirth{}, pendingBirth{};
+    std::uint8_t haveTargetSignal{}, haveNextTargetSignal{};
+    bool selectionReadable{}, selectedReadable{}, selectedPresent{}, selectedLiving{}, selectedTerminalDead{};
+    bool pendingReadable{}, pendingPresent{}, pendingLiving{}, pendingTerminalDead{}, targetSignalsReadable{};
+};
+struct TargetSuccessionProbe final {
+    std::uint64_t sessionCookie{}, tick{}, retiredPeer{}, selectedPeer{}, pendingPeer{};
+    std::uint32_t nativeGeneration{}, worldGeneration{}, entityA{}, entityB{}, birth{};
+    std::uint32_t interactionRevision{}, pairRevision{}, phase{};
+    std::uint32_t selectedBirth{}, pendingBirth{};
+    std::uint8_t haveTargetSignal{}, haveNextTargetSignal{};
+    bool selectionReadable{}, selectedReadable{}, selectedPresent{}, selectedLiving{}, selectedTerminalDead{};
+    bool pendingReadable{}, pendingPresent{}, pendingLiving{}, pendingTerminalDead{}, targetSignalsReadable{};
+};
+std::array<TargetSuccessionProbe, kParticipantProbeRing> gTargetSuccessionProbes{};
+std::atomic<std::uint32_t> gTargetSuccessionProbeWrite{}, gTargetSuccessionProbeRead{};
 std::mutex gParticipantProbeConsumerMutex;
 constexpr std::size_t kPoseHistory = 8U;
-constexpr ULONGLONG kPosePresentationDelay = 100ULL;
 struct PoseSample final {
     ULONGLONG tick{};
     float position[3]{}, yaw{}, velocityX{}, velocityZ{};
@@ -138,9 +183,22 @@ struct Actor {
     ULONGLONG lastSend{}, lastReceive{}, lastManagerUpdate{};
     ULONGLONG lastPoseSample{}, lastProxyRefresh{}, lastInteractionAttempt{}, lastInteractionCapture{};
     ULONGLONG deadTargetSince{}, stationarySince{}, lastParticipantProbe{}, lastPresentationProbe{};
+    ULONGLONG intentDivergenceSince{}, postDeathArbitrationSince{}, lastLivingParticipantSense{};
+    std::uint64_t lastLivingParticipantSensePeer{};
+    std::uint32_t postDeathArbitrationRevision{};
+    std::uint64_t postDeathRetiredPeer{};
+    std::uintptr_t observedSelectedRecord{}, observedPendingRecord{};
+    std::uint64_t observedSelectedPeer{}, observedPendingPeer{};
+    std::uint32_t observedSelectedBirth{}, observedPendingBirth{};
+    std::uint8_t observedHaveTargetSignal{}, observedHaveNextTargetSignal{};
+    bool observedSelectedPresent{}, observedSelectedLiving{}, observedSelectedTerminalDead{};
+    bool observedPendingPresent{}, observedPendingLiving{}, observedPendingTerminalDead{};
+    bool observedSelectionReadable{}, observedSelectedReadable{}, observedPendingReadable{}, observedTargetSignalsReadable{};
+    bool targetSelectionObserved{};
     std::uint32_t participantProbeCursor{};
     std::uint32_t completedRevision{}, completedInteractionRevision{};
     std::uint32_t completedActionRevision{}, completedRoleTaskRevision{}, completedLifecycleRevision{};
+    std::uint32_t completedExecutionRevision{};
     std::uint32_t interactionActionRevision{}, interactionActionPathHash{};
     std::uint32_t completedPairRevision{}, completedTransitionRevision{}, recoveredInteractionRevision{};
     std::uint32_t resolvedPairRevision{}, localPairFlagsLow{}, localPairFlagsHigh{};
@@ -153,6 +211,21 @@ struct Actor {
     std::uintptr_t pairPlacementTarget{};
     std::uint32_t pairPlacementBirth{}, pairPlacementPair{}, pairPlacementTransition{}, pairPlacementTargetBirth{};
     bool pairPlacementPending{};
+    // Client-observer only: remembers a remote fatal pair that has completed
+    // locally so delayed Host outro snapshots cannot reopen its 4E presentation.
+    // Revisions are value-only authority epochs; no native pointer crosses this
+    // boundary or survives a birth/world/session reset.
+    std::uint32_t observerReleasedBirth{}, observerReleasedPairRevision{};
+    std::uint32_t observerReleasedInteractionRevision{}, observerReleasedActionRevision{};
+    std::uint32_t observerReleasedExecutionRevision{}, observerReleasedRoleTaskRevision{};
+    std::uint32_t observerReleasedLifecycleRevision{}, observerReleasedLocomotionRevision{};
+    std::uint64_t observerReleasedTargetPeer{};
+    // Remote-observer-only watchdog for the terminal kind=1 stage-2 hold.
+    // It never applies to the local victim and carries no pointer across frames.
+    ULONGLONG observerStage2Since{};
+    std::uint32_t observerStage2PairRevision{};
+    std::uint64_t observerStage2TargetPeer{};
+    bool observerHandoffNeutral{};
     std::uint32_t remoteBirth{}, remoteRevision{};
     float lastPosition[3]{};
     bool blocked{}, duplicate{}, faulted{}, hasLastPosition{}, interactionOwnsCycle{};
@@ -172,6 +245,7 @@ struct PresentationProbe final {
     std::uint64_t sessionCookie{}, peer{}, tick{};
     std::uint32_t nativeGeneration{}, worldGeneration{}, role{}, phase{};
     std::uint32_t entityA{}, entityB{}, birth{}, revision{}, pairRevision{}, lifecycleFlags{}, interactionFlags{};
+    std::uint32_t observerReleasedPairRevision{};
     std::uint32_t cycleType{}, stage{0xFFFFFFFFU}, withdrawState{0xFFFFFFFFU};
     float local[3]{}, authority[3]{}, victim[3]{}, authorityVictim[3]{};
     std::uint8_t cycleState{}, hidden{}, enabled{};
@@ -186,6 +260,7 @@ struct PresentationProbe final {
     std::uint8_t victimCycleState{}, victimAcquired{}, victimEnded{}, victimInteractive{};
     bool victimLocal{}, victimRepresentation{}, localHealthReadable{};
     bool positionReadable{}, victimReadable{}, visibilityReadable{}, cycleReadable{}, ownsPair{}, placementPending{}, pairPlacementPending{};
+    bool observerHandoffNeutral{};
 };
 std::array<PresentationProbe, kParticipantProbeRing> gPresentationProbes{};
 std::atomic<std::uint32_t> gPresentationProbeWrite{}, gPresentationProbeRead{};
@@ -250,6 +325,15 @@ std::atomic<std::uint32_t> gWrite{}, gRead{};
 // Motion backpressure cannot consume the capacity reserved for native results.
 std::array<State, kRing> gOutgoingOutcomes{};
 std::atomic<std::uint32_t> gOutcomeWrite{}, gOutcomeRead{};
+// Client weapon impacts travel in the reverse direction from ordinary AISync
+// state. Fixed-size rings avoid allocation inside Character impact detours.
+std::mutex gImpactMailboxMutex;
+std::array<ImpactEvent, kRing> gOutgoingImpacts{}, gIncomingImpacts{};
+std::size_t gOutgoingImpactRead{}, gOutgoingImpactWrite{};
+std::size_t gIncomingImpactRead{}, gIncomingImpactWrite{};
+std::uint32_t gImpactSequence{};
+struct ImpactSequence final { std::uint64_t peer{}; std::uint32_t sequence{}; };
+std::array<ImpactSequence, kActors> gLastImpactSequence{};
 std::mutex gMailboxMutex;
 Configuration gRequested{};
 bool gConfigurationPending{};
@@ -335,8 +419,6 @@ struct ParticipantNavigation final {
     bool initialized{}, faulted{};
 };
 std::array<ParticipantNavigation, kActors> gParticipantNavigation{};
-float gPlayerNavigationGoal[3]{};
-bool gPlayerNavigationGoalKnown{};
 bool gNavigationHostActive{};
 std::uint64_t gNavigationSession{};
 std::uint64_t gNavigationGeneration{};
@@ -364,9 +446,12 @@ std::atomic<std::uint64_t> gMissing{};
 std::atomic<std::uint64_t> gManagerUpdates{}, gAdmitted{}, gIdentityRejected{}, gTreeUnavailable{}, gOwnerMismatch{};
 std::atomic<std::uint64_t> gRemoteQueued{};
 std::atomic<std::uint64_t> gPoseCaptured{}, gPoseApplied{}, gPoseRejected{};
+std::atomic<std::uint64_t> gIntentCaptured{}, gIntentApplied{}, gIntentRejected{}, gIntentRecoveries{};
 std::atomic<std::uint64_t> gActionCaptured{}, gActionTransitions{};
+std::atomic<std::uint64_t> gExecutionCaptured{}, gExecutionTransitions{}, gExecutionReplayed{}, gExecutionReplayRejected{};
 std::atomic<std::uint64_t> gRoleTaskCaptured{}, gRoleTaskTransitions{};
 std::atomic<std::uint64_t> gLifecycleCaptured{}, gLifecycleApplied{}, gLifecycleSnaps{}, gExecutionBarriers{};
+std::atomic<std::uint64_t> gImpactCaptured{}, gImpactQueued{}, gImpactApplied{}, gImpactRejected{};
 std::atomic<std::uint64_t> gWithdrawSamples{}, gWithdrawTransitions{}, gWithdrawApplied{};
 std::atomic<std::uint64_t> gBackstageCaptured{}, gBackstageTransitions{}, gBackstageApplied{}, gBackstageRejected{};
 std::atomic<std::uint64_t> gPlacementVerified{}, gPlacementRejected{}, gLifecycleRetries{};
@@ -392,6 +477,10 @@ std::atomic<std::uint64_t> gParticipantPairRetailMissing{}, gParticipantPairAmbi
 std::atomic<std::uint64_t> gLastParticipantPairPeer{};
 std::atomic<std::uint64_t> gPairedInitializeSucceeded{}, gPairedInitializeFailed{};
 std::atomic<std::uint64_t> gPairedCycleReleased{};
+std::atomic<std::uint64_t> gPairedObserverCompletions{}, gPairedObserverReleaseAttempts{};
+std::atomic<std::uint64_t> gPairedObserverReleases{}, gPairedObserverReleaseRejected{};
+std::atomic<std::uint64_t> gPairedObserverPairReopenSuppressed{}, gPairedObserverNeutralHolds{};
+std::atomic<std::uint64_t> gPairedObserverHandoffResumed{};
 std::atomic<std::uint64_t> gPairedVictimTransitions{}, gPairedVictimTransitionRejected{};
 std::atomic<std::uint64_t> gPairedVictimInitializeAborted{};
 std::atomic<std::uint64_t> gPairedVictimEventsRejected{}, gPairedVictimDuplicates{}, gPairedVictimBusy{};
@@ -410,6 +499,8 @@ std::atomic<std::uint64_t> gCandidateEligibilityChecks{}, gCandidateEligibilityO
 std::atomic<std::uint64_t> gRecordEligibilityChecks{}, gRecordEligibilityOverrides{};
 std::atomic<std::uint64_t> gParticipantRecordsValidated{}, gParticipantRecordsRetained{}, gParticipantRecordsRejected{};
 std::atomic<std::uint64_t> gParticipantPerceptionSamples{}, gParticipantPerceptionDropped{};
+std::atomic<std::uint64_t> gTargetSuccessionSamples{}, gTargetSuccessionDropped{};
+std::atomic<std::uint64_t> gPostDeathSuccessionsPreserved{}, gPostDeathArbitrationDeferrals{}, gPostDeathDecisionUncertain{};
 std::atomic<std::uint64_t> gAiPlayerQueryRemaps{}, gAiPlayerSlotRemaps{}, gAiPlayerSlotRestoreFailures{};
 std::atomic<std::uint64_t> gPostDeathDecisionResets{}, gPostDeathDecisionResetRejected{}, gPostDeathRoleTaskResets{};
 std::atomic<std::uint64_t> gInteractionBindingsResolved{}, gInteractionBindingRejected{};
@@ -417,6 +508,8 @@ std::atomic<std::uint32_t> gLastHostAttachment{}, gLastLocalAttachment{}, gLastT
 std::atomic<std::uint32_t> gActiveNativeGeneration{}, gActiveWorldGeneration{};
 std::atomic<std::uint32_t> gLastEntityA{}, gLastEntityB{}, gLastCharacterClass{};
 std::atomic<std::uint32_t> gLastActionTypeRva{}, gLastActionPathHash{}, gLastActionStatus{};
+std::atomic<std::uint32_t> gLastExecutionTypeRva{}, gLastExecutionState{}, gLastExecutionFlags{};
+std::atomic<std::uint32_t> gLastRejectedExecutionTypeRva{}, gLastRejectedExecutionState{};
 std::atomic<std::uint32_t> gLastRoleTaskTypeRva{}, gLastRoleTaskKeyA{}, gLastRoleTaskKeyB{};
 std::atomic<std::uint32_t> gLastLifecycleFlags{};
 std::atomic<std::uint32_t> gLastWithdrawState{};
@@ -455,6 +548,7 @@ bool Stable() noexcept {
 bool FiniteCoordinate(const float value) noexcept {
     return std::isfinite(value) && std::abs(value) <= 100000.0F;
 }
+bool CertifiedExecutionCycle(std::uint32_t typeRva, std::uint32_t state) noexcept;
 // Certified retail NPC Character families currently admitted by AISync. Keep
 // this authority boundary fail-closed. The native Character class enum is an
 // appearance/runtime family, not a network participant identity: class 0 is
@@ -474,7 +568,7 @@ bool AICharacterClass(const std::uint32_t type) noexcept {
     }
 }
 bool Valid(const State& s) noexcept {
-    if (s.version != 8U || s.nativeGeneration == 0U || s.sessionCookie == 0U ||
+    if (s.version != 10U || s.nativeGeneration == 0U || s.sessionCookie == 0U ||
         s.worldGeneration == 0U || (s.entityA == 0U && s.entityB == 0U) ||
         s.birth == 0U || s.revision == 0U || !AICharacterClass(s.characterClass) ||
         (s.stateFlags & ~kStateFlags) != 0U || s.moveType > 3U ||
@@ -483,16 +577,19 @@ bool Valid(const State& s) noexcept {
         s.interactionTransition > 2U || (s.interactionTransitionFlags & ~0xFFFFU) != 0U ||
         s.interactionVariant < -1 || s.interactionVariant > 0xFFFF ||
         s.interactionTransitionVariant < -1 || s.interactionTransitionVariant > 0xFFFF ||
-        (s.lifecycleFlags & ~kLifecycleFlags) != 0U) return false;
+        (s.lifecycleFlags & ~kLifecycleFlags) != 0U ||
+        (s.executionFlags & ~kExecutionFlags) != 0U || s.executionCycleState > 0xFFU) return false;
     for (const auto coordinate : s.position)
         if (!FiniteCoordinate(coordinate)) return false;
     for (const auto coordinate : s.interactionTargetPosition)
         if (!FiniteCoordinate(coordinate)) return false;
     if (!std::isfinite(s.yaw) || std::abs(s.yaw) > 3.3F ||
         !std::isfinite(s.velocityX) || !std::isfinite(s.velocityZ) ||
-        std::abs(s.velocityX) > kMaximumVelocity || std::abs(s.velocityZ) > kMaximumVelocity)
+        std::abs(s.velocityX) > kMaximumVelocity || std::abs(s.velocityZ) > kMaximumVelocity ||
+        !std::isfinite(s.locomotionIntensity) || s.locomotionIntensity < 0.0F ||
+        s.locomotionIntensity > 64.0F)
         return false;
-    if ((s.stateFlags & PoseValid) == 0U && (s.stateFlags & Moving) != 0U) return false;
+    if ((s.stateFlags & Moving) != 0U && s.locomotionRevision == 0U) return false;
     if ((s.interactionFlags & InteractionSourceCycleRetained) != 0U &&
         ((s.stateFlags & InteractionValid) == 0U || s.interactionTransition == 0U ||
          (s.interactionFlags & InteractionPairValid) == 0U)) return false;
@@ -507,6 +604,12 @@ bool Valid(const State& s) noexcept {
     if (s.interactionTransition != 0U && s.interactionTransitionRevision == 0U) return false;
     if ((s.stateFlags & RoleTaskValid) != 0U &&
         (s.roleTaskRevision == 0U || s.roleTaskTypeRva == 0U)) return false;
+    if (s.executionFlags != 0U && (s.stateFlags & ExecutionValid) == 0U) return false;
+    if ((s.stateFlags & ExecutionValid) != 0U &&
+        (s.executionRevision == 0U || s.executionCycleTypeRva == 0U)) return false;
+    if ((s.executionFlags & ExecutionCertified) != 0U &&
+        ((s.executionFlags & ExecutionTransition) == 0U ||
+         !CertifiedExecutionCycle(s.executionCycleTypeRva, s.executionCycleState))) return false;
     if (s.lifecycleFlags != 0U && s.lifecycleRevision == 0U) return false;
     const auto& o = s.outcome;
     if ((o.flags & ~kOutcomeFlags) != 0U || o.definition > 0xFFFFU ||
@@ -797,7 +900,6 @@ void PumpHostNavigationContext() noexcept {
     if (!host || changed) {
         for (auto& navigation : gParticipantNavigation)
             if (navigation.initialized) static_cast<void>(ReleaseParticipantNavigation(navigation));
-        gPlayerNavigationGoalKnown = false;
         gNavigationGeneration = generation;
         gNavigationSession = gCurrent.sessionCookie;
         gNavigationWorld = gCurrent.worldGeneration;
@@ -807,19 +909,6 @@ void PumpHostNavigationContext() noexcept {
     const auto now = GetTickCount64();
     if (!changed && now - gNavigationMaintenance < kRefreshPeriod) return;
     gNavigationMaintenance = now;
-    // Read the actual player's native objective, never the temporary AI slot.
-    // Keep the last enabled goal if death suspends the solo player's manager.
-    // It is shared world context, not an injected AI target or a vent identity.
-    std::uintptr_t path{};
-    std::uint8_t enabled{};
-    float goal[3]{};
-    if (Read(LocalPlayer() + 0x3500U, path) && path != 0U &&
-        Read(path + 0x455U, enabled) && enabled != 0U &&
-        Read(path + 0xCU, goal[0]) && Read(path + 0x10U, goal[1]) && Read(path + 0x14U, goal[2]) &&
-        FiniteCoordinate(goal[0]) && FiniteCoordinate(goal[1]) && FiniteCoordinate(goal[2])) {
-        std::memcpy(gPlayerNavigationGoal, goal, sizeof(goal));
-        gPlayerNavigationGoalKnown = true;
-    }
     for (auto& navigation : gParticipantNavigation) {
         if (!navigation.initialized || navigation.faulted) continue;
         std::uint32_t birth{};
@@ -856,15 +945,32 @@ std::uint32_t __cdecl BackstageParticipantEligibility(
 }
 bool UpdateParticipantNavigation(ParticipantNavigation& navigation, const ULONGLONG now) noexcept {
     if (navigation.faulted) return false;
-    if (!gPlayerNavigationGoalKnown || navigation.sessionCookie != gNavigationSession ||
+    if (navigation.sessionCookie != gNavigationSession ||
         navigation.nativeGeneration != gNavigationGeneration || navigation.worldGeneration != gNavigationWorld ||
         (navigation.lastUpdate != 0U && now - navigation.lastUpdate < kSendPeriod)) return true;
+
+    // The retail game only ever needed a route toward THE_PLAYER. In AIMP the
+    // Host's real player can be terminal-dead while the backstage sweep is
+    // evaluating a living PlayerRepresentation. Using the dead Host's old
+    // Character+3500 objective leaves this synthetic cache enabled but with no
+    // destination. Give each participant cache the position of the exact
+    // participant for which retail requested navigation instead. This does NOT
+    // choose an AI target: the native sweep still owns candidate selection,
+    // eligibility and route consumption.
+    const auto target = navigation.character;
+    std::uint32_t birth{};
+    float goal[3]{};
+    if (target == 0U || ParticipantForPeer(navigation.peer) != target || !LivingCharacter(target) ||
+        !Read(target + 0x50U, birth) || birth != navigation.runtimeId ||
+        !Read(target + 0x70U, goal[0]) || !Read(target + 0x74U, goal[1]) ||
+        !Read(target + 0x78U, goal[2]) || !FiniteCoordinate(goal[0]) ||
+        !FiniteCoordinate(goal[1]) || !FiniteCoordinate(goal[2])) return false;
+
     __try {
         // 006C5D70: ECX=route cache, goal pointer on stack, RET 4.
         // 00721270: ECX=route cache, plain RET. Only updates/consumes the
         // native path request; does not run the participant's suppressed AI.
-        reinterpret_cast<NavigationGoal>(gBase + 0x002C5D70U)(
-            navigation.native.data(), gPlayerNavigationGoal);
+        reinterpret_cast<NavigationGoal>(gBase + 0x002C5D70U)(navigation.native.data(), goal);
         reinterpret_cast<NavigationUpdate>(gBase + 0x00321270U)(navigation.native.data());
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         navigation.faulted = true;
@@ -2010,17 +2116,62 @@ void CaptureActiveAction(Actor& actor) noexcept {
     }
 }
 
-std::uint32_t MoveTypeForSpeed(const float speed) noexcept {
-    if (speed < 0.65F) return 0U;
-    if (speed < 1.8F) return 1U;
-    if (speed < 3.2F) return 2U;
-    return 3U;
+bool CertifiedExecutionCycle(const std::uint32_t typeRva,
+    const std::uint32_t state) noexcept {
+    switch (state) {
+    case 0x37U: return typeRva == 0x00EABE00U;
+    case 0x03U: return typeRva == 0x00EABA40U;
+    case 0x09U: return typeRva == 0x00EAC1C0U;
+    case 0x10U: return typeRva == 0x00EADC18U;
+    case 0x5CU: return typeRva == 0x00EACDA8U;
+    case 0x51U: return typeRva == 0x00EAC608U;
+    default: return false;
+    }
 }
 
+void CaptureExecutionCycle(Actor& actor) noexcept {
+    std::uintptr_t cycle{}, owner{}, vtable{};
+    std::uint8_t state{};
+    const bool valid = Read(actor.character + 0x36CU, cycle) && cycle != 0U &&
+        Read(cycle + 4U, owner) && owner == actor.character && Read(cycle, vtable) &&
+        vtable > gBase && vtable - gBase <= 0x02000000U && Read(cycle + 0x1AU, state);
+    const auto typeRva = valid ? static_cast<std::uint32_t>(vtable - gBase) : 0U;
+    std::uint32_t flags{};
+    if (valid) {
+        const bool paired = state == 0x42U || state == 0x47U || state == 0x4EU || state == 0x4FU;
+        const bool transition = state != 0x01U && state != 0x38U && !paired;
+        if (paired) flags |= ExecutionPaired;
+        if (transition) flags |= ExecutionTransition;
+        if (transition && CertifiedExecutionCycle(typeRva, state)) flags |= ExecutionCertified;
+    }
+    const bool wasValid = (actor.desired.stateFlags & ExecutionValid) != 0U;
+    const bool changed = valid != wasValid || actor.desired.executionCycleTypeRva != typeRva ||
+        actor.desired.executionCycleState != static_cast<std::uint32_t>(state) ||
+        actor.desired.executionFlags != flags;
+    if (changed) {
+        ++actor.desired.executionRevision;
+        if (actor.desired.executionRevision == 0U) actor.desired.executionRevision = 1U;
+        actor.lastSend = 0U;
+        gExecutionTransitions.fetch_add(1U, std::memory_order_relaxed);
+    }
+    actor.desired.executionCycleTypeRva = typeRva;
+    actor.desired.executionCycleState = valid ? static_cast<std::uint32_t>(state) : 0U;
+    actor.desired.executionFlags = flags;
+    if (valid) {
+        actor.desired.stateFlags |= ExecutionValid;
+        gExecutionCaptured.fetch_add(1U, std::memory_order_relaxed);
+        gLastExecutionTypeRva.store(typeRva, std::memory_order_relaxed);
+        gLastExecutionState.store(static_cast<std::uint32_t>(state), std::memory_order_relaxed);
+        gLastExecutionFlags.store(flags, std::memory_order_relaxed);
+    } else {
+        actor.desired.stateFlags &= ~ExecutionValid;
+    }
+}
+
+
 void CapturePose(Actor& actor, const ULONGLONG now) noexcept {
-    // An unchanged snapshot can be examined again before it is sent. Sampling
-    // against lastSend then differentiated one-frame/sub-5ms steps and emitted
-    // zero velocity between moving samples. Keep an independent 20Hz clock.
+    // Pose is recovery/lifecycle evidence only. Continuous AI movement is
+    // captured independently from the native locomotion-intent tap below.
     if (actor.hasLastPosition && now - actor.lastPoseSample < kSendPeriod) return;
     float position[3]{}, yaw{};
     if (!Read(actor.character + kPositionOffset, position[0]) ||
@@ -2029,52 +2180,29 @@ void CapturePose(Actor& actor, const ULONGLONG now) noexcept {
         !Read(actor.character + kYawOffset, yaw) ||
         !FiniteCoordinate(position[0]) || !FiniteCoordinate(position[1]) ||
         !FiniteCoordinate(position[2]) || !std::isfinite(yaw) || std::abs(yaw) > 3.3F) {
-        actor.desired.stateFlags &= ~(PoseValid | Moving);
+        actor.desired.stateFlags &= ~PoseValid;
         gPoseRejected.fetch_add(1U, std::memory_order_relaxed);
         return;
     }
-    float velocityX{}, velocityZ{};
-    bool discontinuity = false;
+
     if (actor.hasLastPosition && now > actor.lastPoseSample) {
         const auto elapsed = now - actor.lastPoseSample;
         const auto dx = position[0] - actor.lastPosition[0];
         const auto dy = position[1] - actor.lastPosition[1];
         const auto dz = position[2] - actor.lastPosition[2];
-        const auto distance = std::hypot(dx, dz);
         const auto spatialDistance = std::sqrt(dx * dx + dy * dy + dz * dz);
         if (elapsed <= 500ULL && std::isfinite(spatialDistance) &&
             (spatialDistance >= kLifecycleDiscontinuityDistance ||
              std::abs(dy) >= kLifecycleVerticalDiscontinuity)) {
-            discontinuity = true;
             MarkLifecycle(actor, LifecycleSpatialDiscontinuity |
                 (actor.traversalAction ? LifecycleTraversalAction : 0U));
         }
-        if (elapsed >= 5ULL && elapsed <= 250ULL && std::isfinite(distance) && distance < 2.0F) {
-            const auto scale = 1000.0F / static_cast<float>(elapsed);
-            velocityX = dx * scale; velocityZ = dz * scale;
-            if (!std::isfinite(velocityX) || !std::isfinite(velocityZ) ||
-                std::abs(velocityX) > kMaximumVelocity || std::abs(velocityZ) > kMaximumVelocity) {
-                velocityX = 0.0F; velocityZ = 0.0F;
-            }
-        }
-    }
-    const auto measuredSpeed = std::hypot(velocityX, velocityZ);
-    if (!discontinuity && measuredSpeed >= 0.05F) {
-        actor.stationarySince = 0U;
-        // Two samples damp gait oscillation without extrapolating a teleport.
-        velocityX = velocityX * 0.7F + actor.desired.velocityX * 0.3F;
-        velocityZ = velocityZ * 0.7F + actor.desired.velocityZ * 0.3F;
-    } else if (!discontinuity) {
-        if (actor.stationarySince == 0U) actor.stationarySince = now;
-        if (now - actor.stationarySince < 100ULL) {
-            velocityX = actor.desired.velocityX;
-            velocityZ = actor.desired.velocityZ;
-        } else { velocityX = 0.0F; velocityZ = 0.0F; }
     }
     for (std::size_t i = 0U; i < 3U; ++i) {
         actor.lastPosition[i] = position[i]; actor.desired.position[i] = position[i];
     }
     actor.hasLastPosition = true; actor.lastPoseSample = now;
+
     if ((actor.desired.interactionFlags & InteractionCycleActive) != 0U) {
         const auto target = (actor.desired.interactionFlags & InteractionTargetIsParticipant) != 0U
             ? ParticipantForPeer(actor.desired.interactionTargetPeer)
@@ -2091,28 +2219,67 @@ void CapturePose(Actor& actor, const ULONGLONG now) noexcept {
             for (std::size_t i = 0U; i < 3U; ++i) actor.desired.interactionTargetPosition[i] = targetPosition[i];
     }
     actor.desired.yaw = yaw;
-    actor.desired.velocityX = velocityX; actor.desired.velocityZ = velocityZ;
-    const auto speed = std::hypot(velocityX, velocityZ);
-    std::uintptr_t movement{};
-    std::uint32_t nativeGait{};
-    // +198 is retail's resolved gait; +194 is the requested gait. Prefer the
-    // actual gait over speed thresholds (especially during Alien transitions).
-    if (Read(actor.character + 0x42A8U, movement) && movement != 0U &&
-        Read(movement + 0x198U, nativeGait) && nativeGait <= 3U)
-        actor.desired.moveType = nativeGait;
-    else
-        actor.desired.moveType = MoveTypeForSpeed(speed);
     actor.desired.stateFlags |= PoseValid;
-    if (std::isfinite(speed) && speed >= kMotionThreshold)
-        actor.desired.stateFlags |= Moving;
-    else
+
+    // The pre-transform intent tap only runs for the retail Move cycle. A Host
+    // transition to Idle therefore closes the current intention here rather
+    // than relying solely on the Client lease timeout.
+    std::uintptr_t cycle{};
+    std::uint8_t cycleState{};
+    if (Read(actor.character + 0x36CU, cycle) && cycle != 0U &&
+        Read(cycle + 0x1AU, cycleState) && cycleState != 0x38U &&
+        (actor.desired.stateFlags & Moving) != 0U) {
         actor.desired.stateFlags &= ~Moving;
+        actor.desired.velocityX = actor.desired.velocityZ = 0.0F;
+        actor.desired.locomotionIntensity = 0.0F;
+        ++actor.desired.locomotionRevision;
+        if (actor.desired.locomotionRevision == 0U) actor.desired.locomotionRevision = 1U;
+    }
     gPoseCaptured.fetch_add(1U, std::memory_order_relaxed);
 }
 
 Actor* Find(const std::uintptr_t c) noexcept {
     for (auto& actor : gActors) if (actor.character == c) return &actor;
     return nullptr;
+}
+
+void ObserveNativeAIIntent(const std::uintptr_t character,
+    const character_direct_step_runtime::NativeAIIntent& intent) noexcept {
+    if (gRole.load(std::memory_order_acquire) != Role::Host || !EngineThread() || !Stable() || character == 0U ||
+        PairSourceBusy(character) || PlayerRepresentation(character)) return;
+    auto* actor = Find(character);
+    if (actor == nullptr || actor->duplicate || actor->faulted || actor->blocked) return;
+
+    auto x = intent.moving ? intent.directionX : 0.0F;
+    auto z = intent.moving ? intent.directionZ : 0.0F;
+    auto intensity = intent.moving ? intent.intensity : 0.0F;
+    const auto magnitude = std::hypot(x, z);
+    if (!std::isfinite(x) || !std::isfinite(z) || !std::isfinite(intensity) ||
+        !std::isfinite(magnitude) || magnitude > kMaximumVelocity ||
+        intensity < 0.0F || intensity > 64.0F ||
+        (intent.moveType > 3U && intent.moveType != 0xFFFFFFFFU)) {
+        gIntentRejected.fetch_add(1U, std::memory_order_relaxed);
+        return;
+    }
+    const bool wasMoving = (actor->desired.stateFlags & Moving) != 0U;
+    const bool moving = intent.moving && magnitude >= kMotionThreshold;
+    const auto moveType = intent.moveType <= 3U ? intent.moveType : actor->desired.moveType;
+    const bool changed = wasMoving != moving || actor->desired.moveType != moveType ||
+        std::abs(actor->desired.velocityX - x) > 0.002F ||
+        std::abs(actor->desired.velocityZ - z) > 0.002F ||
+        std::abs(actor->desired.locomotionIntensity - intensity) > 0.002F;
+    actor->desired.velocityX = moving ? x : 0.0F;
+    actor->desired.velocityZ = moving ? z : 0.0F;
+    actor->desired.locomotionIntensity = moving ? intensity : 0.0F;
+    actor->desired.moveType = moveType;
+    if (moving) actor->desired.stateFlags |= Moving;
+    else actor->desired.stateFlags &= ~Moving;
+    if (changed) {
+        ++actor->desired.locomotionRevision;
+        if (actor->desired.locomotionRevision == 0U) actor->desired.locomotionRevision = 1U;
+        actor->lastSend = 0U;
+    }
+    gIntentCaptured.fetch_add(1U, std::memory_order_relaxed);
 }
 std::uint8_t __fastcall PairedInitializeDetour(void* context, void*,
     const std::uint32_t* identity, const std::int32_t variant) noexcept {
@@ -2279,6 +2446,147 @@ bool ClientNativeVictimOwnsPair(const std::uintptr_t source) noexcept {
         NativeVictimFlowRunning(source, target) &&
         Read(target + 0x36CU, victimCycle) && Read(victimCycle + 0xDAU, interactive) &&
         (interactive == 0U || TerminalDeadCharacter(target));
+}
+
+enum class RemoteObserverVictimState : std::uint8_t {
+    Unknown = 0U,
+    Active = 1U,
+    Complete = 2U
+};
+
+RemoteObserverVictimState ReadRemoteObserverVictimState(const Actor& actor,
+    const std::uintptr_t target, const OutcomeBinding& binding) noexcept {
+    if (gRole.load(std::memory_order_acquire) != Role::Client || target == 0U ||
+        LocalClientVictim(target) || binding.victim.character != target ||
+        binding.state.birth != actor.desired.birth ||
+        binding.state.interactionPairRevision != actor.desired.interactionPairRevision ||
+        binding.state.interactionTargetPeer != actor.desired.interactionTargetPeer ||
+        !PairIdentityLive(binding.victim)) return RemoteObserverVictimState::Unknown;
+
+    std::uintptr_t sourceCycle{}, victimCycle{}, owner{}, table{}, linkedSource{}, linkedCycle{}, current{};
+    std::uint32_t cachedBirth{};
+    std::uint8_t sourceState{}, victimState{}, acquired{}, ended{}, flags{}, interactive{};
+    if (!Read(actor.character + 0x36CU, sourceCycle) || sourceCycle == 0U ||
+        !Read(sourceCycle + 0x1AU, sourceState) || sourceState != 0x4EU ||
+        !Read(target + 0x36CU, victimCycle) || victimCycle == 0U ||
+        !Read(victimCycle + 4U, owner) || owner != target ||
+        !Read(victimCycle, table) || table != gBase + 0x00EAE690U ||
+        !Read(victimCycle + 0x1AU, victimState) || victimState != 0x4FU ||
+        !Read(victimCycle + 0x68U, linkedSource) || linkedSource != actor.character ||
+        !Read(victimCycle + 0x6CU, cachedBirth) || cachedBirth != binding.source.runtimeId ||
+        !Read(victimCycle + 0xB0U, linkedCycle) || linkedCycle != sourceCycle ||
+        !Read(actor.character + 0x36CU, current) || current != sourceCycle ||
+        !Read(victimCycle + 0xD9U, acquired) ||
+        !Read(victimCycle + 0xD8U, ended) ||
+        !Read(victimCycle + 8U, flags) ||
+        !Read(victimCycle + 0xDAU, interactive))
+        return RemoteObserverVictimState::Unknown;
+
+    if (acquired == 0U) return RemoteObserverVictimState::Active;
+    if (interactive != 0U) return RemoteObserverVictimState::Active;
+    if (ended != 0U || (flags & 6U) != 0U) return RemoteObserverVictimState::Complete;
+    return RemoteObserverVictimState::Active;
+}
+
+bool RemoteObserverTerminalStage2ReleaseReady(Actor& actor, const ULONGLONG now) noexcept {
+    auto reset = [&]() noexcept {
+        actor.observerStage2Since = 0U;
+        actor.observerStage2PairRevision = 0U;
+        actor.observerStage2TargetPeer = 0U;
+    };
+    if (gRole.load(std::memory_order_acquire) != Role::Client ||
+        !actor.interactionOwnsCycle || actor.desired.interactionPairRevision == 0U ||
+        actor.desired.interactionTargetPeer == 0U || actor.desired.outcome.revision == 0U ||
+        actor.desired.outcome.kind != 1U) {
+        reset();
+        return false;
+    }
+    const auto fatalFlags = OutcomeVictimAdmitted | OutcomeNativeDeath | OutcomeTerminal;
+    if ((actor.desired.outcome.flags & fatalFlags) != fatalFlags) {
+        reset();
+        return false;
+    }
+    const auto target = ParticipantForPeer(actor.desired.interactionTargetPeer);
+    if (target == 0U || LocalClientVictim(target) || !RegisteredPlayerRepresentation(target) ||
+        !TerminalDeadCharacter(target)) {
+        reset();
+        return false;
+    }
+    OutcomeBinding binding{};
+    if (!LoadOutcome(actor.character, target, binding) || !binding.claimed ||
+        binding.state.birth != actor.desired.birth ||
+        binding.state.interactionPairRevision != actor.desired.interactionPairRevision ||
+        binding.state.interactionTargetPeer != actor.desired.interactionTargetPeer ||
+        !PairIdentityLive(binding.victim)) {
+        reset();
+        return false;
+    }
+    // The victim graph must be the exact admitted remote 4F and must still be
+    // running. This is not a generic HP==0 shortcut; local-player death remains
+    // strict and an unreadable graph is never treated as safe completion.
+    if (ReadRemoteObserverVictimState(actor, target, binding) != RemoteObserverVictimState::Active) {
+        reset();
+        return false;
+    }
+    std::uintptr_t sourceCycle{}, victimCycle{}, linkedSource{}, linkedCycle{};
+    std::uint8_t sourceState{}, acquired{}, ended{}, interactive{};
+    std::uint32_t stage{};
+    if (!Read(actor.character + 0x36CU, sourceCycle) || sourceCycle == 0U ||
+        !Read(sourceCycle + 0x1AU, sourceState) || sourceState != 0x4EU ||
+        !Read(sourceCycle + 0xE0U, stage) || stage != 2U ||
+        !Read(target + 0x36CU, victimCycle) || victimCycle == 0U ||
+        !Read(victimCycle + 0xD9U, acquired) || acquired == 0U ||
+        !Read(victimCycle + 0xD8U, ended) || ended != 0U ||
+        !Read(victimCycle + 0xDAU, interactive) || interactive != 0U ||
+        !Read(victimCycle + 0x68U, linkedSource) || linkedSource != actor.character ||
+        !Read(victimCycle + 0xB0U, linkedCycle) || linkedCycle != sourceCycle) {
+        reset();
+        return false;
+    }
+    if (actor.observerStage2PairRevision != actor.desired.interactionPairRevision ||
+        actor.observerStage2TargetPeer != actor.desired.interactionTargetPeer ||
+        actor.observerStage2Since == 0U) {
+        actor.observerStage2PairRevision = actor.desired.interactionPairRevision;
+        actor.observerStage2TargetPeer = actor.desired.interactionTargetPeer;
+        actor.observerStage2Since = now;
+        return false;
+    }
+    return now - actor.observerStage2Since >= kRemoteObserverStage2ReleaseGrace;
+}
+
+bool ObserverReleasedPairMatches(const Actor& actor, const State& state) noexcept {
+    return actor.observerReleasedBirth != 0U &&
+        actor.observerReleasedBirth == state.birth &&
+        actor.observerReleasedPairRevision == state.interactionPairRevision &&
+        actor.observerReleasedTargetPeer == state.interactionTargetPeer;
+}
+
+void ClearObserverReleaseMemory(Actor& actor) noexcept {
+    actor.observerReleasedBirth = 0U;
+    actor.observerReleasedPairRevision = 0U;
+    actor.observerReleasedInteractionRevision = 0U;
+    actor.observerReleasedActionRevision = 0U;
+    actor.observerReleasedExecutionRevision = 0U;
+    actor.observerReleasedRoleTaskRevision = 0U;
+    actor.observerReleasedLifecycleRevision = 0U;
+    actor.observerReleasedLocomotionRevision = 0U;
+    actor.observerReleasedTargetPeer = 0U;
+    actor.observerStage2Since = 0U;
+    actor.observerStage2PairRevision = 0U;
+    actor.observerStage2TargetPeer = 0U;
+    actor.observerHandoffNeutral = false;
+}
+
+bool ObserverHandoffHasNewAuthority(const Actor& actor, const State& state) noexcept {
+    if (!actor.observerHandoffNeutral) return true;
+    if (!ObserverReleasedPairMatches(actor, state)) return true;
+    return state.actionRevision > actor.observerReleasedActionRevision ||
+        state.executionRevision > actor.observerReleasedExecutionRevision ||
+        state.roleTaskRevision > actor.observerReleasedRoleTaskRevision ||
+        state.lifecycleRevision > actor.observerReleasedLifecycleRevision ||
+        state.locomotionRevision > actor.observerReleasedLocomotionRevision ||
+        (state.interactionRevision > actor.observerReleasedInteractionRevision &&
+            (state.interactionFlags & (InteractionCycleActive | InteractionSourceCycleRetained)) == 0U);
 }
 void __fastcall PairedVictimConvergenceDetour(void* context, void* victimContext,
     const std::uintptr_t victim, const std::uint32_t victimFlag) noexcept {
@@ -3029,6 +3337,8 @@ void SamplePresentation(Actor& actor, const ULONGLONG now, const std::uint32_t p
     sample.outcome = state.outcome;
     sample.interactionFlags = state.interactionFlags;
     sample.lifecycleFlags = state.lifecycleFlags; sample.ownsPair = actor.interactionOwnsCycle;
+    sample.observerReleasedPairRevision = actor.observerReleasedPairRevision;
+    sample.observerHandoffNeutral = actor.observerHandoffNeutral;
     sample.placementPending = actor.placementPending;
     sample.pairPlacementPending = actor.pairPlacementPending;
     sample.positionReadable = true;
@@ -3480,6 +3790,26 @@ bool PlaceReplicatedPairSource(Actor& actor, const std::uintptr_t target, const 
 bool ApplyAuthoritativeInteraction(Actor& actor, const ULONGLONG now) noexcept {
     if (PairSourceBusy(actor.character)) return true;
     const auto& state = actor.desired;
+    if (actor.observerReleasedBirth != 0U && !ObserverReleasedPairMatches(actor, state)) {
+        const bool wasNeutral = actor.observerHandoffNeutral;
+        ClearObserverReleaseMemory(actor);
+        if (wasNeutral) {
+            gPairedObserverHandoffResumed.fetch_add(1U, std::memory_order_relaxed);
+            SamplePresentation(actor, now, 6U);
+        }
+    }
+    if (ObserverReleasedPairMatches(actor, state)) {
+        // Same-pair progress/outro packets are still authoritative metadata, but
+        // this observer has already completed the remote 4F and retired its 4E.
+        // Never reopen the old presentation because a delayed snapshot carries
+        // a newer interaction revision or repeats SourceCycleRetained.
+        if (state.interactionRevision > actor.completedInteractionRevision)
+            actor.completedInteractionRevision = state.interactionRevision;
+        if (state.interactionTransitionRevision > actor.completedTransitionRevision)
+            actor.completedTransitionRevision = state.interactionTransitionRevision;
+        gPairedObserverPairReopenSuppressed.fetch_add(1U, std::memory_order_relaxed);
+        return true;
+    }
     if (actor.pairPlacementPending && !PairPlacementMatchesState(actor, state))
         ClearPairPlacement(actor);
     if (actor.pairPlacementPending && now - actor.pairPlacementSince > kPairPlacementReadyTimeout) {
@@ -3616,46 +3946,107 @@ bool ApplyAuthoritativeInteraction(Actor& actor, const ULONGLONG now) noexcept {
     gInteractionApplied.fetch_add(1U, std::memory_order_relaxed);
     return true;
 }
-bool PairedTransitionOwnsCycle(Actor& actor, const ULONGLONG) noexcept {
+bool PairedTransitionOwnsCycle(Actor& actor, const ULONGLONG now) noexcept {
     // Do not reuse the source layout while a retail worker admits its victim.
     if (PairSourceBusy(actor.character)) return true;
     if (!actor.interactionOwnsCycle) return false;
     // A replacement event is admitted below after the old local victim lease
     // has ended. Its new Host cycle cannot extend ownership of our old pair.
     if (actor.completedPairRevision != actor.desired.interactionPairRevision) return false;
+
+    bool remoteObserverFatalComplete{};
+    const bool remoteObserverTerminalStage2Release =
+        RemoteObserverTerminalStage2ReleaseReady(actor, now);
+    const auto target = ParticipantForPeer(actor.desired.interactionTargetPeer);
     if (actor.desired.outcome.revision != 0U) {
         OutcomeBinding binding{};
-        if (!LoadOutcome(actor.character, ParticipantForPeer(actor.desired.interactionTargetPeer), binding) ||
-            !binding.claimed) return true;
-        if (binding.state.outcome.kind == 0U &&
-            (binding.state.outcome.flags & (OutcomeNativeDeath | OutcomeTerminal)) == (OutcomeNativeDeath | OutcomeTerminal) &&
-            !binding.lateFinishClaimed) return true;
+        if (!LoadOutcome(actor.character, target, binding) || !binding.claimed) return true;
+        const auto fatalFlags = OutcomeVictimAdmitted | OutcomeNativeDeath | OutcomeTerminal;
+        const bool fatalKind0 = binding.state.outcome.kind == 0U &&
+            (binding.state.outcome.flags & (OutcomeNativeDeath | OutcomeTerminal)) ==
+                (OutcomeNativeDeath | OutcomeTerminal);
+        if (fatalKind0 && !binding.lateFinishClaimed) return true;
+
+        // kind=0 has its certified late control/finish block and therefore keeps
+        // the existing lateFinishClaimed contract. kind=1 follows a different
+        // native path: for a remote observer, completion is proven by the exact
+        // local 4F graph ending plus terminal authoritative consequences.
+        if (fatalKind0) {
+            remoteObserverFatalComplete = binding.lateFinishClaimed && target != 0U &&
+                !LocalClientVictim(target) && TerminalDeadCharacter(target);
+        } else if (binding.state.outcome.kind == 1U &&
+            (binding.state.outcome.flags & fatalFlags) == fatalFlags && target != 0U &&
+            !LocalClientVictim(target) && TerminalDeadCharacter(target)) {
+            const auto victimState = ReadRemoteObserverVictimState(actor, target, binding);
+            if (victimState == RemoteObserverVictimState::Complete) {
+                std::uintptr_t cycle{};
+                std::uint8_t nativeState{};
+                bool localActive{};
+                if (ReadPairedCycleActivity(actor.character, cycle, nativeState, localActive) &&
+                    nativeState == 0x4EU && !localActive) {
+                    remoteObserverFatalComplete = true;
+                    gPairedObserverCompletions.fetch_add(1U, std::memory_order_relaxed);
+                    SamplePresentation(actor, now, 4U);
+                }
+            }
+        }
     }
-    if (ClientNativeVictimOwnsPair(actor.character)) return true;
+    if (!remoteObserverTerminalStage2Release && ClientNativeVictimOwnsPair(actor.character)) return true;
     const bool withdrawn = ProxyWithdrawn(actor.desired);
-    if (!withdrawn && (actor.desired.interactionFlags & InteractionSourceCycleRetained) != 0U) {
-        // Observer 4F can finish much earlier than Host first-person 4F. Keep
-        // its attacker through the Host's real 4E outro instead of feeding that
-        // graph's root-motion/temporary placement poses into ordinary Move.
+    if (!withdrawn && (actor.desired.interactionFlags & InteractionSourceCycleRetained) != 0U &&
+        !remoteObserverFatalComplete && !remoteObserverTerminalStage2Release) {
+        // While the local victim graph still matters, keep the attacker through
+        // the Host's real 4E outro. A completed remote observer graph is allowed
+        // to release so the next authoritative execution can take over.
         gPairedHostCycleWaits.fetch_add(1U, std::memory_order_relaxed);
         return true;
     }
     // BT revisions and a paired type alone do not prove an animation is still
-    // running. A completed/failed local cycle must not hold PoseSync forever
+    // running. A completed/failed local cycle must not hold presentation forever
     // while waiting for the next authoritative completion snapshot.
     std::uintptr_t cycle{};
     std::uint8_t state{};
     bool localActive{};
-    if (!withdrawn && (actor.desired.interactionFlags & InteractionCycleActive) != 0U &&
+    if (!remoteObserverTerminalStage2Release && !withdrawn &&
+        (actor.desired.interactionFlags & InteractionCycleActive) != 0U &&
         (!ReadPairedCycleActivity(actor.character, cycle, state, localActive) || localActive)) return true;
-    if (!character_direct_step_runtime::FinishReplicatedInteraction(actor.character)) return true;
+
+    const bool observerRelease = remoteObserverFatalComplete || remoteObserverTerminalStage2Release;
+    if (observerRelease) {
+        gPairedObserverReleaseAttempts.fetch_add(1U, std::memory_order_relaxed);
+        if (remoteObserverTerminalStage2Release) SamplePresentation(actor, now, 7U);
+    }
+    if (!character_direct_step_runtime::FinishReplicatedInteraction(actor.character)) {
+        if (observerRelease)
+            gPairedObserverReleaseRejected.fetch_add(1U, std::memory_order_relaxed);
+        return true;
+    }
     actor.interactionOwnsCycle = false;
     gPairedCycleReleased.fetch_add(1U, std::memory_order_relaxed);
+    if (observerRelease) {
+        // Remember the exact released pair so repeated Host outro snapshots can
+        // update metadata without reacquiring the old local 4E. Until a newer
+        // decision epoch arrives, stay in the retail Idle reached above instead
+        // of replaying a locomotion request captured before/during the kill.
+        actor.observerReleasedBirth = actor.desired.birth;
+        actor.observerReleasedPairRevision = actor.desired.interactionPairRevision;
+        actor.observerReleasedInteractionRevision = actor.desired.interactionRevision;
+        actor.observerReleasedActionRevision = actor.desired.actionRevision;
+        actor.observerReleasedExecutionRevision = actor.desired.executionRevision;
+        actor.observerReleasedRoleTaskRevision = actor.desired.roleTaskRevision;
+        actor.observerReleasedLifecycleRevision = actor.desired.lifecycleRevision;
+        actor.observerReleasedLocomotionRevision = actor.desired.locomotionRevision;
+        actor.observerReleasedTargetPeer = actor.desired.interactionTargetPeer;
+        actor.observerHandoffNeutral = true;
+        gPairedObserverReleases.fetch_add(1U, std::memory_order_relaxed);
+        SamplePresentation(actor, now, 5U);
+    }
     actor.lastProxyRefresh = 0U;
     actor.completedRevision = 0U;
     actor.poseCount = 0U; actor.poseRevision = 0U; actor.poseInterpolating = false;
     return false;
 }
+
 void CaptureInteractionCycle(Actor& actor) noexcept {
     auto& state = actor.desired;
     if ((state.stateFlags & InteractionValid) == 0U || state.interactionTransition == 0U) return;
@@ -3691,12 +4082,236 @@ void CaptureInteractionCycle(Actor& actor) noexcept {
         state.outcome = binding.state.outcome;
     }
 }
+bool ReadTargetSelectionSnapshot(const Actor& actor, TargetSelectionSnapshot& snapshot) noexcept {
+    snapshot = {};
+    std::uintptr_t selection{};
+    if (!Read(actor.character + 0x34A8U, selection)) return false;
+    snapshot.selectionReadable = true;
+    if (selection == 0U) {
+        snapshot.selectedReadable = true;
+        snapshot.pendingReadable = true;
+    } else {
+        if (Read(selection + 0x10U, snapshot.selectedRecord)) {
+            snapshot.selectedReadable = snapshot.selectedRecord == 0U;
+            if (snapshot.selectedRecord != 0U) {
+                std::uintptr_t recordOwner{}, target{};
+                std::uint32_t recordBirth{}, currentBirth{};
+                if (Read(snapshot.selectedRecord + 8U, recordOwner) && recordOwner == actor.character &&
+                    Read(snapshot.selectedRecord + 0x42CU, target) && target != 0U &&
+                    Read(snapshot.selectedRecord + 0x430U, recordBirth) &&
+                    Read(target + 0x50U, currentBirth) && recordBirth == currentBirth) {
+                    snapshot.selectedReadable = true;
+                    snapshot.selectedPresent = true;
+                    snapshot.selectedTarget = target;
+                    snapshot.selectedBirth = currentBirth;
+                    snapshot.selectedPeer = PeerForParticipant(target);
+                    snapshot.selectedLiving = LivingCharacter(target);
+                    snapshot.selectedTerminalDead = TerminalDeadCharacter(target);
+                }
+            }
+        }
+        if (Read(selection + 0x14U, snapshot.pendingRecord)) {
+            snapshot.pendingReadable = snapshot.pendingRecord == 0U;
+            if (snapshot.pendingRecord != 0U) {
+                std::uintptr_t recordOwner{}, target{};
+                std::uint32_t recordBirth{}, currentBirth{};
+                if (Read(snapshot.pendingRecord + 8U, recordOwner) && recordOwner == actor.character &&
+                    Read(snapshot.pendingRecord + 0x42CU, target) && target != 0U &&
+                    Read(snapshot.pendingRecord + 0x430U, recordBirth) &&
+                    Read(target + 0x50U, currentBirth) && recordBirth == currentBirth) {
+                    snapshot.pendingReadable = true;
+                    snapshot.pendingPresent = true;
+                    snapshot.pendingTarget = target;
+                    snapshot.pendingBirth = currentBirth;
+                    snapshot.pendingPeer = PeerForParticipant(target);
+                    snapshot.pendingLiving = LivingCharacter(target);
+                    snapshot.pendingTerminalDead = TerminalDeadCharacter(target);
+                }
+            }
+        }
+    }
+    std::uintptr_t haveTarget{}, haveNextTarget{};
+    snapshot.targetSignalsReadable = Read(actor.character + 0x3154U, haveTarget) &&
+        Read(actor.character + 0x31E8U, haveNextTarget) &&
+        (haveTarget == 0U || Read(haveTarget + 0x10U, snapshot.haveTargetSignal)) &&
+        (haveNextTarget == 0U || Read(haveNextTarget + 0x10U, snapshot.haveNextTargetSignal));
+    return snapshot.selectionReadable;
+}
+bool TargetSelectionCertain(const TargetSelectionSnapshot& snapshot) noexcept {
+    return snapshot.selectionReadable && snapshot.selectedReadable && snapshot.pendingReadable;
+}
+bool HasLivingSuccessor(const TargetSelectionSnapshot& snapshot) noexcept {
+    return (snapshot.selectedPresent && snapshot.selectedLiving) ||
+        (snapshot.pendingPresent && snapshot.pendingLiving);
+}
+void QueueTargetSuccessionProbe(const Actor& actor, const TargetSelectionSnapshot& snapshot,
+    const TargetSuccessionPhase phase, const ULONGLONG now) noexcept {
+    TargetSuccessionProbe probe{};
+    probe.sessionCookie = gCurrent.sessionCookie;
+    probe.tick = now;
+    probe.retiredPeer = actor.postDeathRetiredPeer;
+    probe.selectedPeer = snapshot.selectedPeer;
+    probe.pendingPeer = snapshot.pendingPeer;
+    probe.nativeGeneration = gCurrent.nativeGeneration;
+    probe.worldGeneration = gCurrent.worldGeneration;
+    probe.entityA = actor.entityA;
+    probe.entityB = actor.entityB;
+    probe.birth = actor.birth;
+    probe.interactionRevision = actor.desired.interactionRevision;
+    probe.pairRevision = actor.desired.interactionPairRevision;
+    probe.phase = static_cast<std::uint32_t>(phase);
+    probe.selectedBirth = snapshot.selectedBirth;
+    probe.pendingBirth = snapshot.pendingBirth;
+    probe.haveTargetSignal = snapshot.haveTargetSignal;
+    probe.haveNextTargetSignal = snapshot.haveNextTargetSignal;
+    probe.selectionReadable = snapshot.selectionReadable;
+    probe.selectedReadable = snapshot.selectedReadable;
+    probe.selectedPresent = snapshot.selectedPresent;
+    probe.selectedLiving = snapshot.selectedLiving;
+    probe.selectedTerminalDead = snapshot.selectedTerminalDead;
+    probe.pendingReadable = snapshot.pendingReadable;
+    probe.pendingPresent = snapshot.pendingPresent;
+    probe.pendingLiving = snapshot.pendingLiving;
+    probe.pendingTerminalDead = snapshot.pendingTerminalDead;
+    probe.targetSignalsReadable = snapshot.targetSignalsReadable;
+    const auto write = gTargetSuccessionProbeWrite.load(std::memory_order_relaxed);
+    if (write - gTargetSuccessionProbeRead.load(std::memory_order_acquire) >= kParticipantProbeRing) {
+        gTargetSuccessionDropped.fetch_add(1U, std::memory_order_relaxed);
+        return;
+    }
+    gTargetSuccessionProbes[write % kParticipantProbeRing] = probe;
+    gTargetSuccessionProbeWrite.store(write + 1U, std::memory_order_release);
+    gTargetSuccessionSamples.fetch_add(1U, std::memory_order_relaxed);
+}
+void TraceTargetSelection(Actor& actor, const TargetSuccessionPhase phase,
+    const ULONGLONG now, const bool force) noexcept {
+    TargetSelectionSnapshot snapshot{};
+    static_cast<void>(ReadTargetSelectionSnapshot(actor, snapshot));
+    const bool changed = !actor.targetSelectionObserved ||
+        actor.observedSelectedRecord != snapshot.selectedRecord ||
+        actor.observedPendingRecord != snapshot.pendingRecord ||
+        actor.observedSelectedPeer != snapshot.selectedPeer ||
+        actor.observedPendingPeer != snapshot.pendingPeer ||
+        actor.observedSelectedBirth != snapshot.selectedBirth ||
+        actor.observedPendingBirth != snapshot.pendingBirth ||
+        actor.observedHaveTargetSignal != snapshot.haveTargetSignal ||
+        actor.observedHaveNextTargetSignal != snapshot.haveNextTargetSignal ||
+        actor.observedSelectedPresent != snapshot.selectedPresent ||
+        actor.observedSelectedLiving != snapshot.selectedLiving ||
+        actor.observedSelectedTerminalDead != snapshot.selectedTerminalDead ||
+        actor.observedPendingPresent != snapshot.pendingPresent ||
+        actor.observedPendingLiving != snapshot.pendingLiving ||
+        actor.observedPendingTerminalDead != snapshot.pendingTerminalDead ||
+        actor.observedSelectionReadable != snapshot.selectionReadable ||
+        actor.observedSelectedReadable != snapshot.selectedReadable ||
+        actor.observedPendingReadable != snapshot.pendingReadable ||
+        actor.observedTargetSignalsReadable != snapshot.targetSignalsReadable;
+    actor.targetSelectionObserved = true;
+    actor.observedSelectedRecord = snapshot.selectedRecord;
+    actor.observedPendingRecord = snapshot.pendingRecord;
+    actor.observedSelectedPeer = snapshot.selectedPeer;
+    actor.observedPendingPeer = snapshot.pendingPeer;
+    actor.observedSelectedBirth = snapshot.selectedBirth;
+    actor.observedPendingBirth = snapshot.pendingBirth;
+    actor.observedHaveTargetSignal = snapshot.haveTargetSignal;
+    actor.observedHaveNextTargetSignal = snapshot.haveNextTargetSignal;
+    actor.observedSelectedPresent = snapshot.selectedPresent;
+    actor.observedSelectedLiving = snapshot.selectedLiving;
+    actor.observedSelectedTerminalDead = snapshot.selectedTerminalDead;
+    actor.observedPendingPresent = snapshot.pendingPresent;
+    actor.observedPendingLiving = snapshot.pendingLiving;
+    actor.observedPendingTerminalDead = snapshot.pendingTerminalDead;
+    actor.observedSelectionReadable = snapshot.selectionReadable;
+    actor.observedSelectedReadable = snapshot.selectedReadable;
+    actor.observedPendingReadable = snapshot.pendingReadable;
+    actor.observedTargetSignalsReadable = snapshot.targetSignalsReadable;
+    if (force || changed) QueueTargetSuccessionProbe(actor, snapshot, phase, now);
+}
+bool PostKillTargetTraceActive(const Actor& actor) noexcept {
+    if (actor.postDeathArbitrationRevision != 0U) return true;
+    const auto& state = actor.desired;
+    if (state.interactionTargetPeer == 0U || state.actionTypeRva != 0x00ECB770U) return false;
+    const auto target = ParticipantForPeer(state.interactionTargetPeer);
+    return target != 0U && TerminalDeadCharacter(target);
+}
+void ClearPostDeathArbitration(Actor& actor) noexcept {
+    actor.postDeathArbitrationRevision = 0U;
+    actor.postDeathArbitrationSince = 0U;
+    actor.postDeathRetiredPeer = 0U;
+}
 void RecoverDeadParticipantTarget(Actor& actor, const ULONGLONG now) noexcept {
     if (PairSourceBusy(actor.character)) return;
     const auto& state = actor.desired;
+
+    // Once the old pair has been physically retired, give retail arbitration a
+    // bounded opportunity to promote/reacquire a valid successor before using
+    // the legacy global cleanup as a last-resort recovery. The dead-melee guard
+    // is armed by recoveredInteractionRevision independently of this reset.
+    if (actor.postDeathArbitrationRevision != 0U) {
+        if (state.interactionRevision != actor.postDeathArbitrationRevision) {
+            TraceTargetSelection(actor, TargetSuccessionPhase::InteractionAdvanced, now, true);
+            ClearPostDeathArbitration(actor);
+            actor.deadTargetSince = 0U;
+            return;
+        }
+        TargetSelectionSnapshot selection{};
+        static_cast<void>(ReadTargetSelectionSnapshot(actor, selection));
+        TraceTargetSelection(actor, TargetSuccessionPhase::RecoveryEvaluation, now, false);
+        if (!TargetSelectionCertain(selection)) {
+            gPostDeathDecisionUncertain.fetch_add(1U, std::memory_order_relaxed);
+            return;
+        }
+        if (HasLivingSuccessor(selection)) {
+            gPostDeathSuccessionsPreserved.fetch_add(1U, std::memory_order_relaxed);
+            TraceTargetSelection(actor, TargetSuccessionPhase::SuccessorPreserved, now, true);
+            ClearPostDeathArbitration(actor);
+            actor.deadTargetSince = 0U;
+            return;
+        }
+        // A live participant can become visible just after the old paired kill
+        // retires. In .186 the one-second fallback reset landed in exactly that
+        // window and erased retail arbitration before pending/selected could be
+        // rebuilt. Keep the BT intact while a real participant sense is recent;
+        // this never invents sight, threat or a target.
+        const auto sensedParticipant = ParticipantForPeer(actor.lastLivingParticipantSensePeer);
+        if (actor.lastLivingParticipantSense != 0U && sensedParticipant != 0U &&
+            LivingCharacter(sensedParticipant) &&
+            now - actor.lastLivingParticipantSense < kPostDeathRecentSenseHold) {
+            gPostDeathArbitrationDeferrals.fetch_add(1U, std::memory_order_relaxed);
+            return;
+        }
+        if (now - actor.postDeathArbitrationSince < kPostDeathArbitrationGracePeriod) {
+            gPostDeathArbitrationDeferrals.fetch_add(1U, std::memory_order_relaxed);
+            return;
+        }
+        bool survivor = LivingCharacter(LocalPlayer());
+        for (std::uint32_t i = 0U; !survivor && i < gCurrent.participantCount; ++i)
+            survivor = LivingCharacter(ParticipantForPeer(gCurrent.participants[i].peer));
+        if (!survivor) return;
+
+        const bool hadRoleTask = actor.lastRoleTask != 0U;
+        const bool treeReset = SuspendExistingTree(actor);
+        const bool roleReset = ClearRoleTaskExecutor(actor);
+        if (roleReset) {
+            if (hadRoleTask) gPostDeathRoleTaskResets.fetch_add(1U, std::memory_order_relaxed);
+            actor.lastRoleTask = 0U;
+        }
+        if (treeReset && roleReset) {
+            gPostDeathDecisionResets.fetch_add(1U, std::memory_order_relaxed);
+            TraceTargetSelection(actor, TargetSuccessionPhase::FallbackReset, now, true);
+        } else {
+            gPostDeathDecisionResetRejected.fetch_add(1U, std::memory_order_relaxed);
+            TraceTargetSelection(actor, TargetSuccessionPhase::FallbackResetRejected, now, true);
+        }
+        ClearPostDeathArbitration(actor);
+        actor.deadTargetSince = 0U;
+        return;
+    }
+
     // EC B770 is the retail ActionMeleeAttack vtable (factory 006F6640).
-    // Retire only this exact completed paired attack; never cancel
-    // traversal or a live victim.
+    // Retire only this exact completed paired attack; never cancel traversal or
+    // a live victim. A previously retired revision is handled by the bounded
+    // arbitration phase above, not by another destructive cleanup.
     if (state.interactionTargetPeer == 0U || state.actionTypeRva != 0x00ECB770U ||
         !PairedCycleMatches(actor.character, state) ||
         actor.recoveredInteractionRevision == state.interactionRevision) {
@@ -3712,39 +4327,54 @@ void RecoverDeadParticipantTarget(Actor& actor, const ULONGLONG now) noexcept {
         return;
     }
     if (NativeVictimFlowRunning(actor.character, target)) {
-        // Native fatal initialization has already set HP=0. This is still the
-        // current death graph; do not retire/reconstruct its attacker early.
         actor.deadTargetSince = 0U;
         gPairedRecoveryDeferred.fetch_add(1U, std::memory_order_relaxed);
         return;
     }
     if (actor.deadTargetSince == 0U) actor.deadTargetSince = now;
     if (now - actor.deadTargetSince < kDeadTargetGracePeriod) return;
+
+    TargetSelectionSnapshot before{};
+    static_cast<void>(ReadTargetSelectionSnapshot(actor, before));
+    TraceTargetSelection(actor, TargetSuccessionPhase::RecoveryEvaluation, now, true);
+    // Unknown selector state is not equivalent to "no successor". Do not run a
+    // destructive recovery until selected/pending can both be revalidated.
+    if (!TargetSelectionCertain(before)) {
+        gPostDeathDecisionUncertain.fetch_add(1U, std::memory_order_relaxed);
+        return;
+    }
     bool survivor = LivingCharacter(LocalPlayer());
     for (std::uint32_t i = 0U; !survivor && i < gCurrent.participantCount; ++i)
         survivor = LivingCharacter(ParticipantForPeer(gCurrent.participants[i].peer));
     if (!survivor || !character_direct_step_runtime::FinishReplicatedInteraction(actor.character)) return;
 
-    // A paired kill can leave both the selected BT path and the admitted role
-    // task anchored to the participant which has just died. Retire both through
-    // their certified retail cleanup helpers. On the very next manager frame,
-    // normal arbitration rebuilds from current senses/roles and the scoped
-    // multiplayer player context; AIMP still injects no target or action.
-    const bool hadRoleTask = actor.lastRoleTask != 0U;
-    const bool treeReset = SuspendExistingTree(actor);
-    const bool roleReset = ClearRoleTaskExecutor(actor);
-    if (roleReset) {
-        if (hadRoleTask) gPostDeathRoleTaskResets.fetch_add(1U, std::memory_order_relaxed);
-        actor.lastRoleTask = 0U;
-    }
-    if (treeReset && roleReset)
-        gPostDeathDecisionResets.fetch_add(1U, std::memory_order_relaxed);
-    else
-        gPostDeathDecisionResetRejected.fetch_add(1U, std::memory_order_relaxed);
-
+    // The old pair is now retired. Arm the dead-melee guard immediately, even
+    // though no global BT/task reset has happened. This keeps a new melee leaf
+    // from being admitted against the terminal incarnation while retail gets a
+    // chance to preserve/promote another target naturally.
     actor.recoveredInteractionRevision = state.interactionRevision;
+    actor.postDeathArbitrationRevision = state.interactionRevision;
+    actor.postDeathArbitrationSince = now;
+    actor.postDeathRetiredPeer = state.interactionTargetPeer;
     actor.deadTargetSince = 0U;
     gDeadTargetRecoveries.fetch_add(1U, std::memory_order_relaxed);
+    TraceTargetSelection(actor, TargetSuccessionPhase::PairRetired, now, true);
+
+    TargetSelectionSnapshot after{};
+    static_cast<void>(ReadTargetSelectionSnapshot(actor, after));
+    if (!TargetSelectionCertain(after)) {
+        gPostDeathDecisionUncertain.fetch_add(1U, std::memory_order_relaxed);
+        return;
+    }
+    if (HasLivingSuccessor(after)) {
+        gPostDeathSuccessionsPreserved.fetch_add(1U, std::memory_order_relaxed);
+        TraceTargetSelection(actor, TargetSuccessionPhase::SuccessorPreserved, now, true);
+        ClearPostDeathArbitration(actor);
+        return;
+    }
+    // Deliberately return to the retail manager for at least a bounded window.
+    // The fallback reset is evaluated on subsequent manager frames only.
+    gPostDeathArbitrationDeferrals.fetch_add(1U, std::memory_order_relaxed);
 }
 
 // .174 observed 17,523 new pair attempts against the terminally dead Host,
@@ -3842,75 +4472,169 @@ void RememberPresentationPose(Actor& actor, const State& state, const ULONGLONG 
     sample.yaw = state.yaw; sample.velocityX = state.velocityX; sample.velocityZ = state.velocityZ;
     actor.poseRevision = state.revision;
 }
-bool InterpolatePresentationPose(const Actor& actor, const ULONGLONG now, State& state) noexcept {
-    if (actor.poseCount == 0U) return false;
-    const auto tick = now > kPosePresentationDelay ? now - kPosePresentationDelay : 0ULL;
-    const PoseSample* before = &actor.poses[0];
-    const PoseSample* after = before;
-    for (std::size_t i = 1U; i < actor.poseCount; ++i) {
-        after = &actor.poses[i];
-        if (after->tick >= tick) break;
-        before = after;
+bool RecoverCatastrophicIntentDivergence(Actor& actor, const State& state,
+    const ULONGLONG now) noexcept {
+    const bool hostTransitionOwnsMotion = (state.stateFlags & ExecutionValid) != 0U &&
+        (state.executionFlags & ExecutionTransition) != 0U;
+    if ((state.stateFlags & PoseValid) == 0U || ProxyWithdrawn(state) ||
+        (state.lifecycleFlags & (LifecycleSpatialDiscontinuity | LifecycleTraversalAction)) != 0U ||
+        PairSourceBusy(actor.character) || actor.interactionOwnsCycle || hostTransitionOwnsMotion) {
+        actor.intentDivergenceSince = 0U;
+        return true;
     }
-    const auto alpha = after->tick > before->tick && tick > before->tick
-        ? std::clamp(static_cast<float>(tick - before->tick) / static_cast<float>(after->tick - before->tick), 0.0F, 1.0F)
-        : 0.0F;
+    float current[3]{};
     for (std::size_t i = 0U; i < 3U; ++i)
-        state.position[i] = before->position[i] + (after->position[i] - before->position[i]) * alpha;
-    constexpr float twoPi = 6.28318530717958647692F;
-    state.yaw = std::remainder(before->yaw + std::remainder(after->yaw - before->yaw, twoPi) * alpha, twoPi);
-    state.velocityX = before->velocityX + (after->velocityX - before->velocityX) * alpha;
-    state.velocityZ = before->velocityZ + (after->velocityZ - before->velocityZ) * alpha;
-    // Freeze at the newest received pose when the buffer runs dry. Do not run
-    // unbounded velocity prediction toward an unknown corner/vent/next attack.
-    if (tick > actor.poses[actor.poseCount - 1U].tick) state.velocityX = state.velocityZ = 0.0F;
-    if (std::hypot(state.velocityX, state.velocityZ) >= kMotionThreshold) state.stateFlags |= Moving;
-    else state.stateFlags &= ~Moving;
-    return after != before && alpha < 1.0F;
+        if (!Read(actor.character + kPositionOffset + i * sizeof(float), current[i]) ||
+            !FiniteCoordinate(current[i])) return true;
+    const auto dx = state.position[0] - current[0];
+    const auto dy = state.position[1] - current[1];
+    const auto dz = state.position[2] - current[2];
+    const auto planar = std::hypot(dx, dz);
+    if (!std::isfinite(planar) ||
+        (planar < kIntentCatastrophicDistance &&
+         std::abs(dy) < kIntentCatastrophicVerticalDistance)) {
+        actor.intentDivergenceSince = 0U;
+        return true;
+    }
+    if (actor.intentDivergenceSince == 0U) {
+        actor.intentDivergenceSince = now;
+        return true;
+    }
+    if (now - actor.intentDivergenceSince < kIntentCatastrophicGrace) return true;
+
+    // This is intentionally not part of normal movement. It is a last-resort
+    // recovery after seconds of multi-metre divergence, using the retail
+    // Character relocation carrier. Ordinary corners/obstacles remain entirely
+    // under local CATHODE locomotion/collision and can never trigger the old
+    // 3.5m/500ms follower teleport.
+    if (!PlaceCharacterPose(actor.character, state.position, state.yaw)) {
+        gIntentRejected.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+    actor.intentDivergenceSince = 0U;
+    actor.completedRevision = 0U;
+    gIntentRecoveries.fetch_add(1U, std::memory_order_relaxed);
+    return true;
 }
-bool ApplyAuthoritativePose(Actor& actor, const ULONGLONG now) noexcept {
-    auto state = actor.desired;
+
+bool ApplyAuthoritativeExecution(Actor& actor) noexcept {
+    const auto& state = actor.desired;
+    if ((state.stateFlags & ExecutionValid) == 0U || state.executionRevision == 0U ||
+        state.executionRevision == actor.completedExecutionRevision) return true;
+
+    // Move/Idle and paired graphs already have stronger dedicated carriers.
+    if ((state.executionFlags & ExecutionPaired) != 0U ||
+        state.executionCycleState == 0x01U || state.executionCycleState == 0x38U) {
+        actor.completedExecutionRevision = state.executionRevision;
+        return true;
+    }
+    if ((state.executionFlags & ExecutionTransition) == 0U) {
+        actor.completedExecutionRevision = state.executionRevision;
+        return true;
+    }
+
+    std::string error;
+    const auto result = character_direct_step_runtime::ReplayAIExecutionTransition(
+        actor.character, state.executionCycleTypeRva, state.executionCycleState, error);
+    if (result == character_direct_step_runtime::AIExecutionReplayResult::Applied) {
+        static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
+        actor.completedExecutionRevision = state.executionRevision;
+        actor.intentDivergenceSince = 0U;
+        gExecutionReplayed.fetch_add(1U, std::memory_order_relaxed);
+        return true;
+    }
+    if (result == character_direct_step_runtime::AIExecutionReplayResult::NotRequired) {
+        actor.completedExecutionRevision = state.executionRevision;
+        return true;
+    }
+
+    // Unknown transitions are metadata-only. Drop AIMP's steering lease so it
+    // cannot overwrite the retail Character cycle, but never fabricate state
+    // or fault the whole actor. Certified failures remain visible in counters.
+    static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
+    actor.completedExecutionRevision = state.executionRevision;
+    gExecutionReplayRejected.fetch_add(1U, std::memory_order_relaxed);
+    gLastRejectedExecutionTypeRva.store(state.executionCycleTypeRva, std::memory_order_relaxed);
+    gLastRejectedExecutionState.store(state.executionCycleState, std::memory_order_relaxed);
+    return true;
+}
+
+bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
+    const auto& state = actor.desired;
     if (PairSourceBusy(actor.character)) return true;
+    if (actor.observerHandoffNeutral) {
+        if (ObserverHandoffHasNewAuthority(actor, state)) {
+            // Resume motion/execution, but retain the released-pair identity until
+            // a new pair/birth arrives so delayed same-pair outro snapshots can
+            // never reconstruct the old 4E.
+            actor.observerHandoffNeutral = false;
+            gPairedObserverHandoffResumed.fetch_add(1U, std::memory_order_relaxed);
+            SamplePresentation(actor, now, 6U);
+        } else {
+            // FinishReplicatedInteraction has already returned the source to a
+            // retail Idle. Do not overwrite it with stale steering from the
+            // released kill snapshot while Host is still finishing its outro.
+            actor.completedRevision = state.revision;
+            actor.lastProxyRefresh = now;
+            gPairedObserverNeutralHolds.fetch_add(1U, std::memory_order_relaxed);
+            return true;
+        }
+    }
     if (actor.pairPlacementPending) {
         gPairedSourcePoseSuppressed.fetch_add(1U, std::memory_order_relaxed);
         return true;
     }
-    if ((state.stateFlags & PoseValid) == 0U) return false;
     if (actor.lastProxyRefresh == now) return true;
-    const bool interpolating = InterpolatePresentationPose(actor, now, state);
-    const bool wasInterpolating = actor.poseInterpolating;
-    actor.poseInterpolating = interpolating;
-    if (!interpolating && !wasInterpolating && actor.completedRevision == state.revision && actor.lastProxyRefresh != 0U &&
-        now - actor.lastProxyRefresh < kRefreshPeriod) return true;
-    if (interpolating) gPoseInterpolated.fetch_add(1U, std::memory_order_relaxed);
+    if (!RecoverCatastrophicIntentDivergence(actor, state, now)) return false;
+    if (!ApplyAuthoritativeExecution(actor)) return false;
+
+    // A Host-owned retail transition (for example 37 after a paired kill)
+    // owns motion until Host returns to Move/Idle. Do not immediately stomp it
+    // with HoldAIIntentIdle merely because the Move intent tap is inactive.
+    if ((state.stateFlags & ExecutionValid) != 0U &&
+        (state.executionFlags & ExecutionTransition) != 0U) {
+        actor.completedRevision = state.revision;
+        actor.lastProxyRefresh = now;
+        gIntentApplied.fetch_add(1U, std::memory_order_relaxed);
+        return true;
+    }
+
+    // Host BT/RoleTask revisions define the authoritative decision epoch.
+    // Native C++ BT/task objects themselves are never serialized or fabricated
+    // on the Client. Their resolved locomotion output is replayed through the
+    // same retail Move/Idle boundary, while interactions continue to use their
+    // certified native carriers.
     std::string error;
     const bool moving = (state.stateFlags & Moving) != 0U;
-    // This supplies only spatial/locomotion intent. CharacterDirectStep enters
-    // the retail Move/Idle cycle, which owns gait selection and animation; no
-    // animation phase, clip or bone transform is transported by AISync.
     const bool applied = moving
-        ? character_direct_step_runtime::ArmWorldReplication(actor.character,
-            state.velocityX, state.velocityZ, 1.1F,
-            state.position[0], state.position[1], state.position[2], state.yaw,
-            state.moveType, 0xFFFFFFFFU, error)
-        : character_direct_step_runtime::HoldWorldReplicationIdle(actor.character,
-            state.position[0], state.position[1], state.position[2], state.yaw,
-            state.moveType, error);
-    if (!applied || !character_direct_step_runtime::UseAIReplicationProfile(actor.character)) {
-        gPoseRejected.fetch_add(1U, std::memory_order_relaxed);
+        ? character_direct_step_runtime::ArmAIIntentReplication(
+            actor.character, state.velocityX, state.velocityZ,
+            state.locomotionIntensity, state.moveType, error)
+        : character_direct_step_runtime::HoldAIIntentIdle(
+            actor.character, state.moveType, error);
+    if (!applied) {
+        gIntentRejected.fetch_add(1U, std::memory_order_relaxed);
         return false;
     }
     actor.completedRevision = state.revision;
     actor.lastProxyRefresh = now;
+    gIntentApplied.fetch_add(1U, std::memory_order_relaxed);
     gPoseApplied.fetch_add(1U, std::memory_order_relaxed);
     return true;
 }
+
 bool SameState(const State& a, const State& b) noexcept {
     if (std::memcmp(&a.outcome, &b.outcome, sizeof(a.outcome)) != 0) return false;
     if (a.stateFlags != b.stateFlags || a.moveType != b.moveType ||
+        a.locomotionRevision != b.locomotionRevision ||
+        std::abs(a.locomotionIntensity - b.locomotionIntensity) > 0.002F ||
         a.actionTypeRva != b.actionTypeRva || a.actionPathHash != b.actionPathHash ||
         a.actionRevision != b.actionRevision || a.actionStatus != b.actionStatus ||
         a.actionDepth != b.actionDepth ||
+        a.executionRevision != b.executionRevision ||
+        a.executionCycleTypeRva != b.executionCycleTypeRva ||
+        a.executionCycleState != b.executionCycleState ||
+        a.executionFlags != b.executionFlags ||
         a.roleTaskRevision != b.roleTaskRevision || a.roleTaskTypeRva != b.roleTaskTypeRva ||
         a.lifecycleRevision != b.lifecycleRevision || a.lifecycleFlags != b.lifecycleFlags ||
         a.interactionRevision != b.interactionRevision ||
@@ -3927,16 +4651,31 @@ bool SameState(const State& a, const State& b) noexcept {
         a.interactionPairRevision != b.interactionPairRevision ||
         a.interactionTransitionRevision != b.interactionTransitionRevision) return false;
     for (std::size_t i = 0U; i < 3U; ++i)
-        if (std::abs(a.position[i] - b.position[i]) > 0.01F ||
-            std::abs(a.interactionTargetPosition[i] - b.interactionTargetPosition[i]) > 0.01F)
+        if (std::abs(a.interactionTargetPosition[i] - b.interactionTargetPosition[i]) > 0.01F)
             return false;
-    return std::abs(a.yaw - b.yaw) <= 0.01F &&
-        std::abs(a.velocityX - b.velocityX) <= 0.05F &&
-        std::abs(a.velocityZ - b.velocityZ) <= 0.05F;
+    // Ordinary world pose is recovery evidence, not a movement driver. Do not
+    // wake the network for every centimetre of Host travel; current pose still
+    // rides on intent/heartbeat packets and lifecycle/pair transitions force
+    // their own revisions. During a live pair, source placement remains exact.
+    const bool pairSensitive =
+        ((a.stateFlags | b.stateFlags) & InteractionValid) != 0U ||
+        ((a.lifecycleFlags | b.lifecycleFlags) &
+            (LifecycleSpatialDiscontinuity | LifecycleTraversalAction)) != 0U;
+    if (pairSensitive) {
+        for (std::size_t i = 0U; i < 3U; ++i)
+            if (std::abs(a.position[i] - b.position[i]) > 0.01F) return false;
+        if (std::abs(a.yaw - b.yaw) > 0.01F) return false;
+    }
+    return std::abs(a.velocityX - b.velocityX) <= 0.02F &&
+        std::abs(a.velocityZ - b.velocityZ) <= 0.02F;
 }
 void Publish(Actor& actor) noexcept {
     if (PairSourceBusy(actor.character)) return;
     CaptureOutcome(actor);
+    // Execution cycles can be shorter than the 20 Hz network cadence. Observe
+    // them on every certified BehaviourManager update; a cycle change clears
+    // lastSend so the exact transition gets an immediate authority snapshot.
+    CaptureExecutionCycle(actor);
     const auto now = GetTickCount64();
     bool newOutcome = actor.desired.outcome.revision != 0U &&
         (actor.desired.interactionPairRevision != actor.previous.interactionPairRevision ||
@@ -4015,6 +4754,7 @@ void PublishDormantHostActor(Actor& actor, const ULONGLONG now,
     if (characterPresent) {
         CaptureWithdrawState(actor);
         CaptureCharacterBackstage(actor);
+        CaptureExecutionCycle(actor);
     }
     if (!actor.hostDormant) {
         actor.hostDormant = true;
@@ -4190,15 +4930,15 @@ void SampleParticipantPerception(Actor& actor, const std::uintptr_t manager, con
         sweepOwner == actor.character && Read(sweep + 0x28U, sample.backstageState) &&
         Read(sweep + 0x2CU, sample.backstageKeyA) && Read(sweep + 0x30U, sample.backstageKeyB) &&
         Read(sweep + 0x51U, sample.backstageEnabled) && Read(sweep + 0x53U, sample.backstagePolicy);
-    sample.navigationGoalKnown = gPlayerNavigationGoalKnown && gCurrent.sessionCookie == gNavigationSession &&
-        gCurrent.nativeGeneration == gNavigationGeneration && gCurrent.worldGeneration == gNavigationWorld;
     for (const auto& cached : gParticipantNavigation) {
         if (!cached.initialized || cached.faulted || cached.peer != peer || cached.character != target ||
             cached.nativeGeneration != gCurrent.nativeGeneration || cached.worldGeneration != gCurrent.worldGeneration ||
             cached.sessionCookie != gCurrent.sessionCookie) continue;
         sample.navigationCached = true;
-        static_cast<void>(Read(reinterpret_cast<std::uintptr_t>(cached.native.data()) + 0x450U,
-            sample.navigationRouteCount));
+        const auto address = reinterpret_cast<std::uintptr_t>(cached.native.data());
+        std::uint8_t goalEnabled{};
+        sample.navigationGoalKnown = Read(address + 0x455U, goalEnabled) && goalEnabled != 0U;
+        static_cast<void>(Read(address + 0x450U, sample.navigationRouteCount));
         break;
     }
     sample.signalRegistryReadable = ProbeParticipantSignalRegistry(target, sample);
@@ -4298,6 +5038,11 @@ void SampleParticipantPerception(Actor& actor, const std::uintptr_t manager, con
             break;
         }
     }
+    if (sample.living && sample.recordPresent && sample.recordReadable && sample.recordActive != 0U &&
+        (sample.sightInput > 0.0F || sample.activeSenseMask != 0U)) {
+        actor.lastLivingParticipantSense = now;
+        actor.lastLivingParticipantSensePeer = peer;
+    }
     const auto write = gParticipantProbeWrite.load(std::memory_order_relaxed);
     if (write - gParticipantProbeRead.load(std::memory_order_acquire) >= kParticipantProbeRing) {
         gParticipantPerceptionDropped.fetch_add(1U, std::memory_order_relaxed); return;
@@ -4348,6 +5093,7 @@ void __fastcall UpdateDetour(void* manager, void*, std::uint32_t previousTime, f
     }
     auto* previous = gUpdating;
     const auto previousQueryOwner = gAiPlayerQueryOwner;
+    bool traceTargetSuccession{};
     gUpdating = actor;
     if (actor != nullptr) {
         actor->blocked = Client();
@@ -4356,14 +5102,28 @@ void __fastcall UpdateDetour(void* manager, void*, std::uint32_t previousTime, f
             // Preserve the retail player's pre-death alliance before a kill can
             // move THE_PLAYER to the dead alliance used by the solo game.
             CacheLivingPlayerAlliance();
+            traceTargetSuccession = PostKillTargetTraceActive(*actor);
+            if (traceTargetSuccession)
+                TraceTargetSelection(*actor, TargetSuccessionPhase::UpdateEntry, GetTickCount64(), false);
+            else
+                actor->targetSelectionObserved = false;
         }
         if (actor->blocked) gSuspended.fetch_add(1U, std::memory_order_relaxed);
-        else RecoverDeadParticipantTarget(*actor, GetTickCount64());
+        else {
+            RecoverDeadParticipantTarget(*actor, GetTickCount64());
+            if (gRole.load(std::memory_order_acquire) == Role::Host &&
+                (traceTargetSuccession || actor->targetSelectionObserved || PostKillTargetTraceActive(*actor)))
+                TraceTargetSelection(*actor, TargetSuccessionPhase::PostRecovery, GetTickCount64(), false);
+        }
     }
     {
         AiPlayerSlotScope playerContext(actor != nullptr && !actor->blocked ? actor->character : 0U);
         original(manager, previousTime, delta);
     }
+    if (actor != nullptr && actor != &refused && actor->character == c &&
+        gRole.load(std::memory_order_acquire) == Role::Host &&
+        (traceTargetSuccession || actor->targetSelectionObserved || PostKillTargetTraceActive(*actor)))
+        TraceTargetSelection(*actor, TargetSuccessionPhase::PostRetailUpdate, GetTickCount64(), false);
     gAiPlayerQueryOwner = previousQueryOwner;
     gUpdating = previous;
     if (actor == nullptr || actor == &refused || actor->character != c) return;
@@ -4386,7 +5146,8 @@ void __fastcall UpdateDetour(void* manager, void*, std::uint32_t previousTime, f
         SamplePresentation(*actor, now);
         // Both first-person and observer victim graphs must keep their actual
         // attacker until native fatal completion. Housekeeping still ran above.
-        if (ClientNativeVictimOwnsPair(actor->character)) return;
+        if (ClientNativeVictimOwnsPair(actor->character) &&
+            !(actor->interactionOwnsCycle && RemoteObserverTerminalStage2ReleaseReady(*actor, now))) return;
         if (gRole.load(std::memory_order_acquire) == Role::Client && Stable() &&
             !actor->faulted && now - actor->lastReceive <= kTimeout &&
             actor->interactionOwnsCycle && PairedTransitionOwnsCycle(*actor, now)) return;
@@ -4424,7 +5185,7 @@ void __fastcall UpdateDetour(void* manager, void*, std::uint32_t previousTime, f
             static_cast<void>(character_direct_step_runtime::Stop(actor->character));
         } else if (!ApplyAuthoritativeInteraction(*actor, now) ||
             (!PairedTransitionOwnsCycle(*actor, now) &&
-                !ApplyAuthoritativePose(*actor, now))) {
+                !ApplyAuthoritativeIntent(*actor, now))) {
             static_cast<void>(Release(*actor));
         }
     }
@@ -4451,6 +5212,11 @@ void __fastcall PrepassDetour(void* context, void*) noexcept {
         AiPlayerSlotScope playerContext(gAiPlayerQueryOwner == owner ? owner : 0U);
         original(context);
     }
+    if (gRole.load(std::memory_order_acquire) == Role::Host && EngineThread() && Stable()) {
+        if (auto* actor = Find(owner); actor != nullptr &&
+            (actor->targetSelectionObserved || PostKillTargetTraceActive(*actor)))
+            TraceTargetSelection(*actor, TargetSuccessionPhase::PostPrepass, GetTickCount64(), false);
+    }
     gAiPlayerQueryOwner = previousQueryOwner;
 }
 void __fastcall CoordinatorDetour(void* tree, void*, std::uint32_t execute) noexcept {
@@ -4471,12 +5237,17 @@ void __fastcall CoordinatorDetour(void* tree, void*, std::uint32_t execute) noex
         AiPlayerSlotScope playerContext(gAiPlayerQueryOwner == owner ? owner : 0U);
         original(tree, execute);
     }
+    if (gRole.load(std::memory_order_acquire) == Role::Host && EngineThread() && Stable()) {
+        if (auto* actor = Find(owner); actor != nullptr &&
+            (actor->targetSelectionObserved || PostKillTargetTraceActive(*actor)))
+            TraceTargetSelection(*actor, TargetSuccessionPhase::PostCoordinator, GetTickCount64(), false);
+    }
     gAiPlayerQueryOwner = previousQueryOwner;
 }
 
-bool SuppressClientAIImpact(void* receiver) noexcept {
+bool ClientAIImpactVictim(void* receiver, std::uintptr_t& victim) noexcept {
+    victim = 0U;
     if (!Client() || receiver == nullptr) return false;
-    std::uintptr_t victim{};
     std::uint32_t type{};
     // Both certified Character impact receivers keep their owning Character at
     // +0x24. On a Client, AISync-owned NPC consequences are Host-authoritative:
@@ -4485,18 +5256,111 @@ bool SuppressClientAIImpact(void* receiver) noexcept {
     return Read(reinterpret_cast<std::uintptr_t>(receiver) + 0x24U, victim) &&
         victim != 0U && Eligible(victim, type);
 }
+
+std::uintptr_t ResolveImpactSource(int* hit) noexcept {
+    if (hit == nullptr || gBase == 0U) return 0U;
+    std::uintptr_t resources{};
+    if (!Read(gBase + kCharacterResolverRegistryRva, resources) || resources == 0U) return 0U;
+    __try {
+        return reinterpret_cast<SenseCharacterResolver>(gBase + kCharacterResolverRva)(
+            reinterpret_cast<void*>(resources), reinterpret_cast<const std::uint32_t*>(hit));
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0U; }
+}
+
+// Keep SEH in leaf functions that do not require C++ object unwinding. MSVC
+// rejects __try in callers that also own std::lock_guard or other unwindable
+// objects (C2712). These helpers isolate the retail calls without changing
+// the authority semantics of the impact pipeline.
+bool ResolveImpactDamageSafe(int* hit, std::int32_t& damage) noexcept {
+    damage = 0;
+    if (hit == nullptr || gBase == 0U) return false;
+    __try {
+        damage = static_cast<std::int32_t>(
+            reinterpret_cast<ResolveImpactDamage>(gBase + kResolveImpactDamageRva)(hit));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        damage = 0;
+        return false;
+    }
+}
+
+bool ApplyNativeImpactDamageSafe(const std::uintptr_t target, const std::uint32_t damage,
+    const std::uintptr_t source, const std::uint32_t descriptor) noexcept {
+    if (target == 0U || source == 0U || damage == 0U || gBase == 0U) return false;
+    __try {
+        reinterpret_cast<NativeDamage>(gBase + 0x003CC900U)(
+            reinterpret_cast<void*>(target), damage, source, 0.0F,
+            0U, 1U, 0U, descriptor, 0U, 0U);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool PublishClientImpact(const std::uintptr_t victim, int* hit,
+    const std::uint32_t channel) noexcept {
+    if (gRole.load(std::memory_order_acquire) != Role::Client || !EngineThread() || !Stable() || victim == 0U ||
+        hit == nullptr || gCurrent.localPeer == 0U || (channel != 1U && channel != 2U)) return false;
+    if (ResolveImpactSource(hit) != LocalPlayer()) return false;
+
+    std::int32_t damage{};
+    if (channel == 1U) {
+        if (!ResolveImpactDamageSafe(hit, damage)) return false;
+    } else {
+        std::uint16_t secondary{};
+        if (!Read(reinterpret_cast<std::uintptr_t>(hit) + 0x38U, secondary)) return false;
+        damage = static_cast<std::int32_t>(secondary);
+    }
+    if (damage <= 0 || damage > 0xFFFF) return false;
+
+    std::uint32_t entityA{}, entityB{}, type{}, birth{}, descriptor{};
+    if (!CharacterIdentity(victim, entityA, entityB, type) || !AICharacterClass(type) ||
+        !Read(victim + 0x50U, birth) || birth == 0U ||
+        !Read(reinterpret_cast<std::uintptr_t>(hit) + 0x18U, descriptor)) return false;
+
+    ImpactEvent event{};
+    event.nativeGeneration = gCurrent.nativeGeneration;
+    event.sessionCookie = gCurrent.sessionCookie;
+    event.worldGeneration = gCurrent.worldGeneration;
+    event.sourcePeer = gCurrent.localPeer;
+    event.targetA = entityA; event.targetB = entityB; event.targetClass = type; event.targetBirth = birth;
+    event.damage = static_cast<std::uint32_t>(damage);
+    event.descriptor = descriptor;
+    event.channel = channel;
+
+    std::lock_guard lock(gImpactMailboxMutex);
+    const auto pending = gOutgoingImpactWrite - gOutgoingImpactRead;
+    if (pending >= kRing) {
+        gImpactRejected.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+    event.sequence = ++gImpactSequence;
+    if (event.sequence == 0U) event.sequence = ++gImpactSequence;
+    gOutgoingImpacts[gOutgoingImpactWrite % kRing] = event;
+    ++gOutgoingImpactWrite;
+    gImpactCaptured.fetch_add(1U, std::memory_order_relaxed);
+    return true;
+}
 void __fastcall CharacterImpactDetour(void* receiver, void*, int* hit) noexcept {
     const auto original = reinterpret_cast<CharacterImpact>(
         gCharacterImpactOriginal.load(std::memory_order_acquire));
     if (original == nullptr) return;
-    if (SuppressClientAIImpact(receiver)) return;
+    std::uintptr_t victim{};
+    if (ClientAIImpactVictim(receiver, victim)) {
+        static_cast<void>(PublishClientImpact(victim, hit, 1U));
+        return;
+    }
     original(receiver, hit);
 }
 void __fastcall CharacterImpactSecondaryDetour(void* receiver, void*, int* hit) noexcept {
     const auto original = reinterpret_cast<CharacterImpact>(
         gCharacterImpactSecondaryOriginal.load(std::memory_order_acquire));
     if (original == nullptr) return;
-    if (SuppressClientAIImpact(receiver)) return;
+    std::uintptr_t victim{};
+    if (ClientAIImpactVictim(receiver, victim)) {
+        static_cast<void>(PublishClientImpact(victim, hit, 2U));
+        return;
+    }
     original(receiver, hit);
 }
 bool RefuseDeadPairedTarget(const std::uintptr_t source, const std::uintptr_t target) noexcept {
@@ -5145,6 +6009,7 @@ bool Install(const std::uintptr_t base, HookManager& hooks, LevelGenerationTrack
         if (!rollback.empty()) error += "; rollback: " + rollback;
         return false;
     }
+    character_direct_step_runtime::SetNativeAIIntentObserver(&ObserveNativeAIIntent);
     gInstalled.store(true, std::memory_order_release);
     return true;
 }
@@ -5177,9 +6042,23 @@ bool Configure(const std::span<const std::byte> payload) noexcept {
         gIncomingUsed.fill(false);
         for (auto& queue : gIncomingOutcomes) queue.clear();
         gLastQueuedOutcome.fill({}); gIncomingOutcomeCount = 0U;
+        std::lock_guard impactLock(gImpactMailboxMutex);
+        gOutgoingImpactRead = gOutgoingImpactWrite = 0U;
+        gIncomingImpactRead = gIncomingImpactWrite = 0U;
+        gImpactSequence = 0U;
+        gLastImpactSequence.fill({});
     }
     return true;
 }
+
+bool ValidImpactEvent(const ImpactEvent& value) noexcept {
+    return value.version == 1U && value.nativeGeneration != 0U && value.sessionCookie != 0U &&
+        value.worldGeneration != 0U && value.sequence != 0U && value.sourcePeer != 0U &&
+        (value.targetA != 0U || value.targetB != 0U) && AICharacterClass(value.targetClass) &&
+        value.targetBirth != 0U && value.damage != 0U && value.damage <= 0xFFFFU &&
+        (value.channel == 1U || value.channel == 2U) && value.reserved == 0U;
+}
+
 bool QueueRemote(const std::span<const std::byte> payload) noexcept {
     State value{};
     if (payload.size() != sizeof(value) || !Installed()) return false;
@@ -5218,6 +6097,29 @@ bool QueueRemote(const std::span<const std::byte> payload) noexcept {
     if (selected == free) gNextIdentityProbe[selected] = 0ULL;
     return true;
 }
+
+bool QueueRemoteImpact(const std::span<const std::byte> payload) noexcept {
+    ImpactEvent value{};
+    if (payload.size() != sizeof(value) || !Installed()) return false;
+    std::memcpy(&value, payload.data(), sizeof(value));
+    if (!ValidImpactEvent(value)) return false;
+    std::lock_guard mailboxLock(gMailboxMutex);
+    std::lock_guard lock(gImpactMailboxMutex);
+    if (gRequested.role != Role::Host || value.sessionCookie != gRequested.sessionCookie ||
+        value.worldGeneration != gRequested.worldGeneration || value.sourcePeer == gRequested.localPeer) {
+        gImpactRejected.fetch_add(1U, std::memory_order_relaxed);
+        return true;
+    }
+    if (gIncomingImpactWrite - gIncomingImpactRead >= kRing) {
+        gImpactRejected.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+    gIncomingImpacts[gIncomingImpactWrite % kRing] = value;
+    ++gIncomingImpactWrite;
+    gImpactQueued.fetch_add(1U, std::memory_order_relaxed);
+    return true;
+}
+
 bool TryPopObserved(State& state) noexcept {
     const auto resultRead = gOutcomeRead.load(std::memory_order_relaxed);
     if (resultRead != gOutcomeWrite.load(std::memory_order_acquire)) {
@@ -5231,6 +6133,73 @@ bool TryPopObserved(State& state) noexcept {
     gRead.store(read + 1U, std::memory_order_release);
     return true;
 }
+
+bool TryPopObservedImpact(ImpactEvent& impact) noexcept {
+    std::lock_guard lock(gImpactMailboxMutex);
+    if (gOutgoingImpactRead == gOutgoingImpactWrite) return false;
+    impact = gOutgoingImpacts[gOutgoingImpactRead % kRing];
+    ++gOutgoingImpactRead;
+    return true;
+}
+
+bool AcceptImpactSequence(const std::uint64_t peer, const std::uint32_t sequence) noexcept {
+    ImpactSequence* free{};
+    for (auto& entry : gLastImpactSequence) {
+        if (entry.peer == peer) {
+            if (sequence <= entry.sequence) return false;
+            entry.sequence = sequence;
+            return true;
+        }
+        if (entry.peer == 0U && free == nullptr) free = &entry;
+    }
+    if (free == nullptr) return false;
+    free->peer = peer; free->sequence = sequence;
+    return true;
+}
+
+void PumpHostImpacts() noexcept {
+    if (gRole.load(std::memory_order_acquire) != Role::Host || !Stable()) return;
+    std::array<ImpactEvent, 32U> batch{};
+    std::size_t count{};
+    {
+        std::lock_guard lock(gImpactMailboxMutex);
+        while (count < batch.size() && gIncomingImpactRead != gIncomingImpactWrite) {
+            batch[count++] = gIncomingImpacts[gIncomingImpactRead % kRing];
+            ++gIncomingImpactRead;
+        }
+    }
+    for (std::size_t i = 0U; i < count; ++i) {
+        const auto& impact = batch[i];
+        if (!ValidImpactEvent(impact) || impact.sessionCookie != gCurrent.sessionCookie ||
+            impact.worldGeneration != gCurrent.worldGeneration || impact.sourcePeer == gCurrent.localPeer ||
+            !AcceptImpactSequence(impact.sourcePeer, impact.sequence)) {
+            gImpactRejected.fetch_add(1U, std::memory_order_relaxed);
+            continue;
+        }
+        const auto source = ParticipantForPeer(impact.sourcePeer);
+        const auto target = FindCharacterByIdentity(impact.targetA, impact.targetB);
+        std::uint32_t entityA{}, entityB{}, type{}, birth{};
+        if (source == 0U || !RegisteredPlayerRepresentation(source) || target == 0U ||
+            !CharacterIdentity(target, entityA, entityB, type) || entityA != impact.targetA ||
+            entityB != impact.targetB || type != impact.targetClass || !Read(target + 0x50U, birth) ||
+            birth != impact.targetBirth || TerminalDeadCharacter(target)) {
+            gImpactRejected.fetch_add(1U, std::memory_order_relaxed);
+            continue;
+        }
+        std::uint32_t eligibleType{};
+        if (!Eligible(target, eligibleType) || eligibleType != type) {
+            gImpactRejected.fetch_add(1U, std::memory_order_relaxed);
+            continue;
+        }
+        if (!ApplyNativeImpactDamageSafe(target, impact.damage, source, impact.descriptor)) {
+            gImpactRejected.fetch_add(1U, std::memory_order_relaxed);
+            continue;
+        }
+        if (auto* actor = Find(target); actor != nullptr) actor->lastSend = 0U;
+        gImpactApplied.fetch_add(1U, std::memory_order_relaxed);
+    }
+}
+
 void PumpOnEngineThread() noexcept {
     if (!Installed() || !EngineThread()) return;
     // Own native path-query references independently of Characters. Maintain
@@ -5272,8 +6241,16 @@ void PumpOnEngineThread() noexcept {
         gIncomingUsed.fill(false);
         for (auto& queue : gIncomingOutcomes) queue.clear();
         gLastQueuedOutcome.fill({}); gIncomingOutcomeCount = 0U;
+        {
+            std::lock_guard impactLock(gImpactMailboxMutex);
+            gOutgoingImpactRead = gOutgoingImpactWrite = 0U;
+            gIncomingImpactRead = gIncomingImpactWrite = 0U;
+            gImpactSequence = 0U;
+            gLastImpactSequence.fill({});
+        }
     }
     if (Stable()) RefreshPairBindings();
+    PumpHostImpacts();
     // Host publication must survive AI-manager dormancy (vent/backstage).
     // CharacterManager invokes this pump independently of each NPC brain.
     PumpHostAuthority();
@@ -5336,7 +6313,8 @@ void PumpOnEngineThread() noexcept {
         // Retain this latest snapshot until the worker admission has returned;
         // birth/withdraw/task cleanup must not reconstruct its source cycle.
         if (PairSourceBusy(actor.character)) continue;
-        if (value.birth == actor.remoteBirth && ClientNativeVictimOwnsPair(actor.character)) {
+        if (value.birth == actor.remoteBirth && ClientNativeVictimOwnsPair(actor.character) &&
+            !(actor.interactionOwnsCycle && RemoteObserverTerminalStage2ReleaseReady(actor, now))) {
             // Retain the latest Host snapshot until this exact fatal victim
             // finishes, including an observer's remote human representation.
             // No task/lifecycle cleanup may reuse the paired source meanwhile.
@@ -5392,6 +6370,7 @@ void PumpOnEngineThread() noexcept {
         const bool hadRemote = actor.remoteBirth != 0U;
         const bool birthChanged = value.birth != actor.remoteBirth;
         const bool taskChanged = hadRemote && value.roleTaskRevision != actor.desired.roleTaskRevision;
+        const bool actionChanged = hadRemote && value.actionRevision != actor.desired.actionRevision;
         const bool lifecycleChanged = hadRemote && value.lifecycleRevision != actor.desired.lifecycleRevision;
         const bool poseMissing = (value.stateFlags & PoseValid) == 0U;
         const auto persistent = LifecycleWithdrawn | LifecycleWithdrawState2 | LifecycleHostDormant |
@@ -5410,7 +6389,7 @@ void PumpOnEngineThread() noexcept {
         // owns it. Persistent visibility is reconciled on actual source release.
         const bool persistentChanged = ((value.lifecycleFlags ^ actor.desired.lifecycleFlags) & persistent) != 0U;
         if (pairedPlacement && (persistentChanged || visibilityMismatch)) actor.placementPending = true;
-        if (pairedPlacement && taskChanged) actor.roleTaskCleanupPending = true;
+        if (pairedPlacement && (taskChanged || actionChanged)) actor.roleTaskCleanupPending = true;
         const bool placementChanged = !pairedPlacement && (birthChanged || actor.placementPending || visibilityMismatch ||
             ((value.lifecycleFlags ^ actor.desired.lifecycleFlags) & persistent) != 0U ||
             (lifecycleChanged && (value.lifecycleFlags & LifecycleSpatialDiscontinuity) != 0U));
@@ -5420,23 +6399,32 @@ void PumpOnEngineThread() noexcept {
             if (actor.interactionOwnsCycle)
                 static_cast<void>(character_direct_step_runtime::FinishReplicatedInteraction(actor.character));
             actor.interactionOwnsCycle = false;
+            ClearObserverReleaseMemory(actor);
             actor.completedInteractionRevision = 0U;
             actor.completedPairRevision = 0U;
             actor.completedTransitionRevision = 0U;
             actor.resolvedPairRevision = 0U;
+            actor.completedExecutionRevision = 0U;
         }
 
-        // A BT path/status change is metadata, not a Move/Idle or animation
-        // boundary. Only a real birth/withdraw/placement change stops the
-        // follower. Task cleanup still excludes stale autonomous execution.
+        // BT and RoleTask remain Host-authoritative decision epochs. Clients do
+        // not run an autonomous alternative tree/task: on a Host transition,
+        // quiesce any stale local execution before replaying the new resolved
+        // native locomotion intention. This is an execution barrier, not C++
+        // task-object deserialization.
         if (placementChanged) {
             if (!QuiesceProxyExecution(actor)) {
                 actor.faulted = true;
                 gFaults.fetch_add(1U, std::memory_order_relaxed);
             }
-        } else if (!pairedPlacement && (taskChanged || actor.roleTaskCleanupPending)) {
-            if (!ClearRoleTaskExecutor(actor)) actor.faulted = true;
-            else actor.roleTaskCleanupPending = false;
+        } else if (!pairedPlacement && (taskChanged || actionChanged || actor.roleTaskCleanupPending)) {
+            const bool tree = actor.tree == 0U || SuspendExistingTree(actor);
+            const bool task = ClearRoleTaskExecutor(actor);
+            if (!tree || !task) actor.faulted = true;
+            else {
+                actor.roleTaskCleanupPending = false;
+                gExecutionBarriers.fetch_add(1U, std::memory_order_relaxed);
+            }
         } else if (!pairedPlacement && poseMissing) {
             static_cast<void>(Release(actor));
         }
@@ -5584,6 +6572,13 @@ void TransportLost() noexcept {
     gConfigurationPending = true; gIncomingUsed.fill(false);
     for (auto& queue : gIncomingOutcomes) queue.clear();
     gLastQueuedOutcome.fill({}); gIncomingOutcomeCount = 0U;
+    {
+        std::lock_guard impactLock(gImpactMailboxMutex);
+        gOutgoingImpactRead = gOutgoingImpactWrite = 0U;
+        gIncomingImpactRead = gIncomingImpactWrite = 0U;
+        gImpactSequence = 0U;
+        gLastImpactSequence.fill({});
+    }
 }
 void BeginLogicalShutdown() noexcept {
     if (gDispatcher != nullptr) gShutdownEngineThread.store(gDispatcher->EngineThreadId());
@@ -5603,8 +6598,15 @@ Counters DiagnosticsSnapshot() noexcept {
     value.identityRejected = gIdentityRejected.load(); value.treeUnavailable = gTreeUnavailable.load();
     value.ownerMismatch = gOwnerMismatch.load(); value.remoteQueued = gRemoteQueued.load();
     value.poseCaptured = gPoseCaptured.load(); value.poseApplied = gPoseApplied.load();
-    value.poseRejected = gPoseRejected.load(); value.actionCaptured = gActionCaptured.load();
+    value.poseRejected = gPoseRejected.load();
+    value.intentCaptured = gIntentCaptured.load(); value.intentApplied = gIntentApplied.load();
+    value.intentRejected = gIntentRejected.load(); value.intentRecoveries = gIntentRecoveries.load();
+    value.actionCaptured = gActionCaptured.load();
     value.actionTransitions = gActionTransitions.load();
+    value.executionCaptured = gExecutionCaptured.load();
+    value.executionTransitions = gExecutionTransitions.load();
+    value.executionReplayed = gExecutionReplayed.load();
+    value.executionReplayRejected = gExecutionReplayRejected.load();
     value.roleTaskCaptured = gRoleTaskCaptured.load();
     value.roleTaskTransitions = gRoleTaskTransitions.load();
     value.lifecycleCaptured = gLifecycleCaptured.load();
@@ -5618,6 +6620,10 @@ Counters DiagnosticsSnapshot() noexcept {
     value.placementRejected = gPlacementRejected.load();
     value.lifecycleRetries = gLifecycleRetries.load();
     value.executionBarriers = gExecutionBarriers.load();
+    value.impactCaptured = gImpactCaptured.load();
+    value.impactQueued = gImpactQueued.load();
+    value.impactApplied = gImpactApplied.load();
+    value.impactRejected = gImpactRejected.load();
     value.withdrawSamples = gWithdrawSamples.load();
     value.withdrawTransitions = gWithdrawTransitions.load();
     value.withdrawApplied = gWithdrawApplied.load();
@@ -5647,6 +6653,13 @@ Counters DiagnosticsSnapshot() noexcept {
     value.pairedInitializeSucceeded = gPairedInitializeSucceeded.load();
     value.pairedInitializeFailed = gPairedInitializeFailed.load();
     value.pairedCycleReleased = gPairedCycleReleased.load();
+    value.pairedObserverCompletions = gPairedObserverCompletions.load();
+    value.pairedObserverReleaseAttempts = gPairedObserverReleaseAttempts.load();
+    value.pairedObserverReleases = gPairedObserverReleases.load();
+    value.pairedObserverReleaseRejected = gPairedObserverReleaseRejected.load();
+    value.pairedObserverPairReopenSuppressed = gPairedObserverPairReopenSuppressed.load();
+    value.pairedObserverNeutralHolds = gPairedObserverNeutralHolds.load();
+    value.pairedObserverHandoffResumed = gPairedObserverHandoffResumed.load();
     value.pairedVictimTransitions = gPairedVictimTransitions.load();
     value.pairedVictimTransitionRejected = gPairedVictimTransitionRejected.load();
     value.pairedVictimInitializeAborted = gPairedVictimInitializeAborted.load();
@@ -5691,6 +6704,11 @@ Counters DiagnosticsSnapshot() noexcept {
     value.participantRecordsRejected = gParticipantRecordsRejected.load();
     value.participantPerceptionSamples = gParticipantPerceptionSamples.load();
     value.participantPerceptionDropped = gParticipantPerceptionDropped.load();
+    value.targetSuccessionSamples = gTargetSuccessionSamples.load();
+    value.targetSuccessionDropped = gTargetSuccessionDropped.load();
+    value.postDeathSuccessionsPreserved = gPostDeathSuccessionsPreserved.load();
+    value.postDeathArbitrationDeferrals = gPostDeathArbitrationDeferrals.load();
+    value.postDeathDecisionUncertain = gPostDeathDecisionUncertain.load();
     value.deadTargetRecoveries = gDeadTargetRecoveries.load();
     value.aiPlayerQueryRemaps = gAiPlayerQueryRemaps.load();
     value.aiPlayerSlotRemaps = gAiPlayerSlotRemaps.load();
@@ -5714,6 +6732,11 @@ Counters DiagnosticsSnapshot() noexcept {
     value.lastActionTypeRva = gLastActionTypeRva.load();
     value.lastActionPathHash = gLastActionPathHash.load();
     value.lastActionStatus = gLastActionStatus.load();
+    value.lastExecutionTypeRva = gLastExecutionTypeRva.load();
+    value.lastExecutionState = gLastExecutionState.load();
+    value.lastExecutionFlags = gLastExecutionFlags.load();
+    value.lastRejectedExecutionTypeRva = gLastRejectedExecutionTypeRva.load();
+    value.lastRejectedExecutionState = gLastRejectedExecutionState.load();
     value.lastRoleTaskTypeRva = gLastRoleTaskTypeRva.load();
     value.lastRoleTaskKeyA = gLastRoleTaskKeyA.load();
     value.lastRoleTaskKeyB = gLastRoleTaskKeyB.load();
@@ -5748,6 +6771,10 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"ownerMismatch", Diagnostics::Unsigned(ai.ownerMismatch), true},
          {"poseCaptured", Diagnostics::Unsigned(ai.poseCaptured), true},
          {"poseApplied", Diagnostics::Unsigned(ai.poseApplied), true},
+         {"intentCaptured", Diagnostics::Unsigned(ai.intentCaptured), true},
+         {"intentApplied", Diagnostics::Unsigned(ai.intentApplied), true},
+         {"intentRejected", Diagnostics::Unsigned(ai.intentRejected), true},
+         {"intentRecoveries", Diagnostics::Unsigned(ai.intentRecoveries), true},
          {"poseInterpolated", Diagnostics::Unsigned(gPoseInterpolated.load(std::memory_order_relaxed)), true},
          {"pairedHostCycleWaits", Diagnostics::Unsigned(gPairedHostCycleWaits.load(std::memory_order_relaxed)), true},
          {"outcomeSnapshotsCoalesced", Diagnostics::Unsigned(gOutcomeSnapshotsCoalesced.load(std::memory_order_relaxed)), true},
@@ -5765,6 +6792,15 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"poseRejected", Diagnostics::Unsigned(ai.poseRejected), true},
          {"actionCaptured", Diagnostics::Unsigned(ai.actionCaptured), true},
          {"actionTransitions", Diagnostics::Unsigned(ai.actionTransitions), true},
+         {"executionCaptured", Diagnostics::Unsigned(ai.executionCaptured), true},
+         {"executionTransitions", Diagnostics::Unsigned(ai.executionTransitions), true},
+         {"executionReplayed", Diagnostics::Unsigned(ai.executionReplayed), true},
+         {"executionReplayRejected", Diagnostics::Unsigned(ai.executionReplayRejected), true},
+         {"lastExecutionTypeRva", Diagnostics::Unsigned(ai.lastExecutionTypeRva), true},
+         {"lastExecutionState", Diagnostics::Unsigned(ai.lastExecutionState), true},
+         {"lastExecutionFlags", Diagnostics::Unsigned(ai.lastExecutionFlags), true},
+         {"lastRejectedExecutionTypeRva", Diagnostics::Unsigned(ai.lastRejectedExecutionTypeRva), true},
+         {"lastRejectedExecutionState", Diagnostics::Unsigned(ai.lastRejectedExecutionState), true},
          {"roleTaskCaptured", Diagnostics::Unsigned(ai.roleTaskCaptured), true},
          {"roleTaskTransitions", Diagnostics::Unsigned(ai.roleTaskTransitions), true},
          {"lifecycleCaptured", Diagnostics::Unsigned(ai.lifecycleCaptured), true},
@@ -5778,6 +6814,10 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"placementRejected", Diagnostics::Unsigned(ai.placementRejected), true},
          {"lifecycleRetries", Diagnostics::Unsigned(ai.lifecycleRetries), true},
          {"executionBarriers", Diagnostics::Unsigned(ai.executionBarriers), true},
+         {"impactCaptured", Diagnostics::Unsigned(ai.impactCaptured), true},
+         {"impactQueued", Diagnostics::Unsigned(ai.impactQueued), true},
+         {"impactApplied", Diagnostics::Unsigned(ai.impactApplied), true},
+         {"impactRejected", Diagnostics::Unsigned(ai.impactRejected), true},
          {"withdrawSamples", Diagnostics::Unsigned(ai.withdrawSamples), true},
          {"withdrawTransitions", Diagnostics::Unsigned(ai.withdrawTransitions), true},
          {"withdrawApplied", Diagnostics::Unsigned(ai.withdrawApplied), true},
@@ -5807,6 +6847,13 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"pairedInitializeSucceeded", Diagnostics::Unsigned(ai.pairedInitializeSucceeded), true},
          {"pairedInitializeFailed", Diagnostics::Unsigned(ai.pairedInitializeFailed), true},
          {"pairedCycleReleased", Diagnostics::Unsigned(ai.pairedCycleReleased), true},
+         {"pairedObserverCompletions", Diagnostics::Unsigned(ai.pairedObserverCompletions), true},
+         {"pairedObserverReleaseAttempts", Diagnostics::Unsigned(ai.pairedObserverReleaseAttempts), true},
+         {"pairedObserverReleases", Diagnostics::Unsigned(ai.pairedObserverReleases), true},
+         {"pairedObserverReleaseRejected", Diagnostics::Unsigned(ai.pairedObserverReleaseRejected), true},
+         {"pairedObserverPairReopenSuppressed", Diagnostics::Unsigned(ai.pairedObserverPairReopenSuppressed), true},
+         {"pairedObserverNeutralHolds", Diagnostics::Unsigned(ai.pairedObserverNeutralHolds), true},
+         {"pairedObserverHandoffResumed", Diagnostics::Unsigned(ai.pairedObserverHandoffResumed), true},
          {"pairedVictimTransitions", Diagnostics::Unsigned(ai.pairedVictimTransitions), true},
          {"pairedVictimTransitionRejected", Diagnostics::Unsigned(ai.pairedVictimTransitionRejected), true},
          {"pairedVictimInitializeAborted", Diagnostics::Unsigned(ai.pairedVictimInitializeAborted), true},
@@ -5855,6 +6902,11 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"participantRecordsRejected", Diagnostics::Unsigned(ai.participantRecordsRejected), true},
          {"participantPerceptionSamples", Diagnostics::Unsigned(ai.participantPerceptionSamples), true},
          {"participantPerceptionDropped", Diagnostics::Unsigned(ai.participantPerceptionDropped), true},
+         {"targetSuccessionSamples", Diagnostics::Unsigned(ai.targetSuccessionSamples), true},
+         {"targetSuccessionDropped", Diagnostics::Unsigned(ai.targetSuccessionDropped), true},
+         {"postDeathSuccessionsPreserved", Diagnostics::Unsigned(ai.postDeathSuccessionsPreserved), true},
+         {"postDeathArbitrationDeferrals", Diagnostics::Unsigned(ai.postDeathArbitrationDeferrals), true},
+         {"postDeathDecisionUncertain", Diagnostics::Unsigned(ai.postDeathDecisionUncertain), true},
          {"deadTargetRecoveries", Diagnostics::Unsigned(ai.deadTargetRecoveries), true},
          {"aiPlayerQueryRemaps", Diagnostics::Unsigned(ai.aiPlayerQueryRemaps), true},
          {"aiPlayerSlotRemaps", Diagnostics::Unsigned(ai.aiPlayerSlotRemaps), true},
@@ -5908,7 +6960,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
         if (read == gPresentationProbeWrite.load(std::memory_order_acquire)) break;
         const auto sample = gPresentationProbes[read % kParticipantProbeRing];
         gPresentationProbeRead.store(read + 1U, std::memory_order_release);
-        diagnostics.Log("info", "aisync_presentation", "Exact source/victim/local identities, health and paired result; phase 0=periodic, 1=before admission, 2=after transition, 3=resolved outcome. Terminal health and 4F acquisition do not prove death-flow completion.",
+        diagnostics.Log("info", "aisync_presentation", "Exact source/victim/local identities, health and paired result; phase 0=periodic, 1=before admission, 2=after transition, 3=resolved outcome, 4=remote observer completion, 5=remote observer release, 6=observer handoff resume, 7=remote terminal stage-2 release attempt. Terminal health alone never releases a local victim.",
             {{"sessionCookie", Diagnostics::Unsigned(sample.sessionCookie), true},
              {"nativeGeneration", Diagnostics::Unsigned(sample.nativeGeneration), true},
              {"worldGeneration", Diagnostics::Unsigned(sample.worldGeneration), true},
@@ -5963,6 +7015,8 @@ void LogDiagnostics(Diagnostics& diagnostics) {
              {"visibilityReadable", Diagnostics::Boolean(sample.visibilityReadable), true},
              {"cycleReadable", Diagnostics::Boolean(sample.cycleReadable), true},
              {"ownsPair", Diagnostics::Boolean(sample.ownsPair), true},
+             {"observerReleasedPairRevision", Diagnostics::Unsigned(sample.observerReleasedPairRevision), true},
+             {"observerHandoffNeutral", Diagnostics::Boolean(sample.observerHandoffNeutral), true},
              {"placementPending", Diagnostics::Boolean(sample.placementPending), true},
              {"pairPlacementPending", Diagnostics::Boolean(sample.pairPlacementPending), true},
              {"localX", sample.positionReadable ? std::to_string(sample.local[0]) : "null", true},
@@ -6048,6 +7102,40 @@ void LogDiagnostics(Diagnostics& diagnostics) {
              {"pendingPresent", Diagnostics::Boolean(sample.pendingPresent), true},
              {"pendingPeer", Diagnostics::Unsigned(sample.pendingPeer), true},
              {"pendingLiving", Diagnostics::Boolean(sample.pendingLiving), true},
+             {"targetSignalsReadable", Diagnostics::Boolean(sample.targetSignalsReadable), true},
+             {"haveTargetSignal", Diagnostics::Unsigned(sample.haveTargetSignal), true},
+             {"haveNextTargetSignal", Diagnostics::Unsigned(sample.haveNextTargetSignal), true}});
+    }
+    for (std::size_t i = 0U; i < kParticipantProbeRing; ++i) {
+        const auto read = gTargetSuccessionProbeRead.load(std::memory_order_relaxed);
+        if (read == gTargetSuccessionProbeWrite.load(std::memory_order_acquire)) break;
+        const auto sample = gTargetSuccessionProbes[read % kParticipantProbeRing];
+        gTargetSuccessionProbeRead.store(read + 1U, std::memory_order_release);
+        diagnostics.Log("info", "aisync_target_succession", "Observed post-kill target-selector mutation/recovery boundary; diagnostics only, no target is injected.",
+            {{"sessionCookie", Diagnostics::Unsigned(sample.sessionCookie), true},
+             {"nativeGeneration", Diagnostics::Unsigned(sample.nativeGeneration), true},
+             {"worldGeneration", Diagnostics::Unsigned(sample.worldGeneration), true},
+             {"sampleTick", Diagnostics::Unsigned(sample.tick), true},
+             {"entityA", Diagnostics::Unsigned(sample.entityA), true},
+             {"entityB", Diagnostics::Unsigned(sample.entityB), true},
+             {"birth", Diagnostics::Unsigned(sample.birth), true},
+             {"interactionRevision", Diagnostics::Unsigned(sample.interactionRevision), true},
+             {"pairRevision", Diagnostics::Unsigned(sample.pairRevision), true},
+             {"phase", Diagnostics::Unsigned(sample.phase), true},
+             {"retiredPeer", Diagnostics::Unsigned(sample.retiredPeer), true},
+             {"selectionReadable", Diagnostics::Boolean(sample.selectionReadable), true},
+             {"selectedReadable", Diagnostics::Boolean(sample.selectedReadable), true},
+             {"selectedPresent", Diagnostics::Boolean(sample.selectedPresent), true},
+             {"selectedPeer", Diagnostics::Unsigned(sample.selectedPeer), true},
+             {"selectedBirth", Diagnostics::Unsigned(sample.selectedBirth), true},
+             {"selectedLiving", Diagnostics::Boolean(sample.selectedLiving), true},
+             {"selectedTerminalDead", Diagnostics::Boolean(sample.selectedTerminalDead), true},
+             {"pendingReadable", Diagnostics::Boolean(sample.pendingReadable), true},
+             {"pendingPresent", Diagnostics::Boolean(sample.pendingPresent), true},
+             {"pendingPeer", Diagnostics::Unsigned(sample.pendingPeer), true},
+             {"pendingBirth", Diagnostics::Unsigned(sample.pendingBirth), true},
+             {"pendingLiving", Diagnostics::Boolean(sample.pendingLiving), true},
+             {"pendingTerminalDead", Diagnostics::Boolean(sample.pendingTerminalDead), true},
              {"targetSignalsReadable", Diagnostics::Boolean(sample.targetSignalsReadable), true},
              {"haveTargetSignal", Diagnostics::Unsigned(sample.haveTargetSignal), true},
              {"haveNextTargetSignal", Diagnostics::Unsigned(sample.haveNextTargetSignal), true}});

@@ -143,6 +143,7 @@ public sealed class LobbyHost : IAsyncDisposable
     public event EventHandler<PlayerEquipmentSnapshotPayload>? PlayerEquipmentReceived;
 
     public event EventHandler<PlayerActionEventPayload>? PlayerActionReceived;
+    public event EventHandler<ReadOnlyMemory<byte>>? AISyncImpactReceived;
 
     public event EventHandler<WorldNetworkContext>? WorldContextReceived;
 
@@ -1002,6 +1003,11 @@ public sealed class LobbyHost : IAsyncDisposable
                         .ConfigureAwait(false);
                     break;
 
+                case MessageType.AISyncNetworkImpact:
+                    await HandleAISyncImpactAsync(state, frame.Payload, cancellationToken)
+                        .ConfigureAwait(false);
+                    break;
+
                 case MessageType.WorldContext:
                     await HandleWorldContextAsync(state, frame.Payload, cancellationToken)
                         .ConfigureAwait(false);
@@ -1375,6 +1381,26 @@ public sealed class LobbyHost : IAsyncDisposable
         return state.TryAcceptActionSequence(payload.Sequence);
     }
 
+    private async Task HandleAISyncImpactAsync(
+        ClientState state,
+        ReadOnlyMemory<byte> bytes,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var native = AISyncCodec.DecodeImpactNetwork(bytes, SessionId);
+            if (AISyncCodec.ImpactSourcePeer(native.Span) != state.PeerId
+                || !state.TryAcceptAISyncImpactSequence(AISyncCodec.ImpactSequence(native.Span)))
+                throw new ProtocolException("AISync impact identity or sequence is invalid.");
+            AISyncImpactReceived?.Invoke(this, native);
+        }
+        catch (Exception exception) when (exception is ProtocolException or InvalidOperationException)
+        {
+            await SendErrorAsync(state.Connection, "INVALID_AISYNC_IMPACT",
+                exception.Message, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
     private void ValidatePlayerAction(
         PlayerActionEventPayload payload,
         ulong expectedPeerId)
@@ -1731,6 +1757,7 @@ public sealed class LobbyHost : IAsyncDisposable
         private ulong _lastPositionSequence;
         private ulong _lastEquipmentSequence;
         private ulong _lastActionSequence;
+        private uint _lastAISyncImpactSequence;
         private long _lastSeenTicks = Environment.TickCount64;
 
         public ClientState(
@@ -1783,6 +1810,13 @@ public sealed class LobbyHost : IAsyncDisposable
         {
             if (sequence <= _lastActionSequence) return false;
             _lastActionSequence = sequence;
+            return true;
+        }
+
+        public bool TryAcceptAISyncImpactSequence(uint sequence)
+        {
+            if (sequence == 0 || sequence <= _lastAISyncImpactSequence) return false;
+            _lastAISyncImpactSequence = sequence;
             return true;
         }
 

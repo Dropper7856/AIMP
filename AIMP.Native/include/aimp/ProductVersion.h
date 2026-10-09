@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.180-aisync-backstage-survivor-request";
+    "0.11.4.187-aisync-survivor-observer-continuity";
 
 } // namespace aimp

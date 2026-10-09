@@ -28,6 +28,17 @@ enum StateFlag : std::uint32_t {
     ActionValid = 1U << 2U,
     InteractionValid = 1U << 3U,
     RoleTaskValid = 1U << 4U,
+    // Character execution-cycle identity selected by the Host. This is not a
+    // serialized native object: the wire carries only the retail cycle type
+    // RVA/state plus an authority revision. Clients replay only certified
+    // transition entry points and otherwise fail closed.
+    ExecutionValid = 1U << 5U,
+};
+
+enum ExecutionFlag : std::uint32_t {
+    ExecutionTransition = 1U << 0U,
+    ExecutionCertified = 1U << 1U,
+    ExecutionPaired = 1U << 2U,
 };
 
 enum LifecycleFlag : std::uint32_t {
@@ -75,18 +86,23 @@ struct NativeOutcome final {
     float sourceYaw{}, targetOffset[3]{};
 };
 struct State final {
-    std::uint32_t version{8U};
+    std::uint32_t version{10U};
     std::uint32_t nativeGeneration{}; // informational: generations differ per process
     std::uint64_t sessionCookie{};
     std::uint32_t worldGeneration{};
     std::uint32_t entityA{}, entityB{}, characterClass{}, birth{}, revision{};
-    // Coarse authoritative Character convergence, not animation replication.
-    // Native locomotion turns this intent into the local gait/animation.
+    // Recovery pose is retained only for spawn/lifecycle/catastrophic drift.
+    // Continuous movement is NOT position-followed. velocityX/Z now carry the
+    // Host's resolved world-space locomotion request observed after retail
+    // pathfinding/local steering. CATHODE on the Client owns the physical move,
+    // collision, turning and animation generated from that intention.
     std::uint32_t stateFlags{};
     float position[3]{};
     float yaw{};
     float velocityX{}, velocityZ{};
     std::uint32_t moveType{};
+    float locomotionIntensity{};
+    std::uint32_t locomotionRevision{};
     // Stable action identity/lifecycle metadata for the certified executable:
     // leaf definition vtable RVA plus a hash of the complete active BT path.
     // It is never interpreted as a serialized leaf or animation state.
@@ -102,8 +118,10 @@ struct State final {
     std::int32_t interactionVariant{};
     float interactionTargetPosition[3]{};
     // Role execution is a second decision layer below ATOMIC_PERFORM_ROLE.
-    // The Host exports only the admitted task identity; Clients use revisions
-    // as authority barriers so stale local tasks can never fight PoseSync.
+    // The Host exports the admitted task identity/revision as an authority
+    // epoch. Clients never synthesize native C++ task objects from a vtable;
+    // stale local task/BT execution is quiesced before the Host locomotion
+    // intention for that epoch is replayed.
     std::uint32_t roleTaskRevision{}, roleTaskTypeRva{}, roleTaskKeyA{}, roleTaskKeyB{};
     // Lifecycle transitions cover vent/backstage/frontstage discontinuities.
     // They are not animation events: a revision means the proxy execution
@@ -118,6 +136,22 @@ struct State final {
     // birth + pair revision + target peer. Definition is a retail manager index,
     // never an animation pointer. Clients consume it instead of choosing again.
     NativeOutcome outcome{};
+    // Exact Host Character execution-cycle identity. Appended after the v9
+    // payload so every established field keeps its prior wire offset.
+    std::uint32_t executionRevision{};
+    std::uint32_t executionCycleTypeRva{};
+    std::uint32_t executionCycleState{};
+    std::uint32_t executionFlags{};
+};
+struct ImpactEvent final {
+    std::uint32_t version{1U};
+    std::uint32_t nativeGeneration{}; // informational; differs per process
+    std::uint64_t sessionCookie{};
+    std::uint32_t worldGeneration{};
+    std::uint32_t sequence{};
+    std::uint64_t sourcePeer{};
+    std::uint32_t targetA{}, targetB{}, targetClass{}, targetBirth{};
+    std::uint32_t damage{}, descriptor{}, channel{}, reserved{};
 };
 struct ParticipantBinding final {
     std::uint64_t peer{};
@@ -135,8 +169,10 @@ struct Configuration final {
 };
 #pragma pack(pop)
 static_assert(sizeof(NativeOutcome) == 48U);
-static_assert(offsetof(State, outcome) == 184U);
-static_assert(sizeof(State) == 232U);
+static_assert(offsetof(State, outcome) == 192U);
+static_assert(offsetof(State, executionRevision) == 240U);
+static_assert(sizeof(State) == 256U);
+static_assert(sizeof(ImpactEvent) == 64U);
 static_assert(sizeof(ParticipantBinding) == 16U);
 static_assert(sizeof(Configuration) == 552U);
 
@@ -145,7 +181,9 @@ bool Install(std::uintptr_t moduleBase, HookManager& hooks,
     std::string& error);
 bool Configure(std::span<const std::byte> payload) noexcept;
 bool QueueRemote(std::span<const std::byte> payload) noexcept;
+bool QueueRemoteImpact(std::span<const std::byte> payload) noexcept;
 bool TryPopObserved(State& state) noexcept;
+bool TryPopObservedImpact(ImpactEvent& impact) noexcept;
 void PumpOnEngineThread() noexcept;
 // SpawnCharacter creates the NPC-backed visual representation of a remote
 // player. Reserve its runtime identity before native construction because the
@@ -165,9 +203,12 @@ struct Counters final {
     std::uint64_t managerUpdates{}, admitted{}, identityRejected{}, treeUnavailable{}, ownerMismatch{};
     std::uint64_t remoteQueued{};
     std::uint64_t poseCaptured{}, poseApplied{}, poseRejected{};
+    std::uint64_t intentCaptured{}, intentApplied{}, intentRejected{}, intentRecoveries{};
     std::uint64_t actionCaptured{}, actionTransitions{};
+    std::uint64_t executionCaptured{}, executionTransitions{}, executionReplayed{}, executionReplayRejected{};
     std::uint64_t roleTaskCaptured{}, roleTaskTransitions{};
     std::uint64_t lifecycleCaptured{}, lifecycleApplied{}, lifecycleSnaps{}, executionBarriers{};
+    std::uint64_t impactCaptured{}, impactQueued{}, impactApplied{}, impactRejected{};
     std::uint64_t backstageCaptured{}, backstageTransitions{}, backstageApplied{}, backstageRejected{};
     std::uint64_t placementVerified{}, placementRejected{}, lifecycleRetries{};
     std::uint64_t withdrawSamples{}, withdrawTransitions{}, withdrawApplied{};
@@ -187,6 +228,9 @@ struct Counters final {
     std::uint64_t participantPairRetailMissing{}, participantPairAmbiguous{};
     std::uint64_t lastParticipantPairPeer{};
     std::uint64_t pairedInitializeSucceeded{}, pairedInitializeFailed{}, pairedCycleReleased{};
+    std::uint64_t pairedObserverCompletions{}, pairedObserverReleaseAttempts{}, pairedObserverReleases{};
+    std::uint64_t pairedObserverReleaseRejected{}, pairedObserverPairReopenSuppressed{};
+    std::uint64_t pairedObserverNeutralHolds{}, pairedObserverHandoffResumed{};
     std::uint64_t pairedVictimTransitions{}, pairedVictimTransitionRejected{}, pairedVictimInitializeAborted{};
     std::uint64_t pairedVictimEventsRejected{}, pairedVictimDuplicates{}, pairedVictimBusy{}, pairedVictimNativeDispatches{}, pairedVictimNativeStarted{}, pairedVictimAvailabilityOverrides{};
     std::uint64_t pairedPlayerPreparationRemaps{}, pairedPlayerCategoryRemaps{};
@@ -209,6 +253,8 @@ struct Counters final {
     std::uint64_t participantRecordsRejected{};
     std::uint64_t participantPerceptionSamples{};
     std::uint64_t participantPerceptionDropped{};
+    std::uint64_t targetSuccessionSamples{}, targetSuccessionDropped{};
+    std::uint64_t postDeathSuccessionsPreserved{}, postDeathArbitrationDeferrals{}, postDeathDecisionUncertain{};
     std::uint64_t aiPlayerQueryRemaps{}, aiPlayerSlotRemaps{}, aiPlayerSlotRestoreFailures{};
     std::uint64_t postDeathMeleeSelectionChecks{}, postDeathMeleeSelectionRejects{};
     std::uint64_t postDeathMeleeSelectionWriteFailures{}, lastPostDeathRetiredPeer{};
@@ -218,6 +264,8 @@ struct Counters final {
     std::uint32_t role{}, nativeGeneration{}, worldGeneration{};
     std::uint32_t lastEntityA{}, lastEntityB{}, lastCharacterClass{};
     std::uint32_t lastActionTypeRva{}, lastActionPathHash{}, lastActionStatus{};
+    std::uint32_t lastExecutionTypeRva{}, lastExecutionState{}, lastExecutionFlags{};
+    std::uint32_t lastRejectedExecutionTypeRva{}, lastRejectedExecutionState{};
     std::uint32_t lastRoleTaskTypeRva{}, lastRoleTaskKeyA{}, lastRoleTaskKeyB{};
     std::uint32_t lastLifecycleFlags{}, lastWithdrawState{};
     std::uint32_t lastInteractionTargetA{}, lastInteractionTargetB{}, lastInteractionTargetMode{};

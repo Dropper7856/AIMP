@@ -85,6 +85,34 @@ using SubmitLocomotionFn = void(__thiscall*)(
 using TeleportCharacterFn = void(__thiscall*)(
     void* registryEntry,
     const float* position);
+using ExecutionTransitionFn = void(__thiscall*)(void* cycle);
+
+struct CertifiedExecutionTransition final {
+    std::uint32_t state{};
+    std::uintptr_t typeRva{};
+    std::uintptr_t transitionRva{};
+};
+
+// These are the one-argument retail Character-cycle transitions certified in
+// AI.exe.c around FUN_006577F0..FUN_006584A0. They destroy/replace the current
+// cycle through retail code and therefore preserve CATHODE ownership instead
+// of fabricating a native object from a vtable. Move (38), Idle (01) and paired
+// cycles are owned by their existing dedicated replication paths.
+constexpr std::array<CertifiedExecutionTransition, 6U> kExecutionTransitions{{
+    // These six constructors are self-contained in AI.exe.c: they consume
+    // only ECX=cycle and do not derive hidden state from the caller return
+    // address or explicit stack arguments. Several neighbouring transitions
+    // look parameterless in the decompiler but consume caller context
+    // ("unaff_retaddr"); replaying those from AIMP would synthesize invalid
+    // runtime state, so they remain observable metadata until their complete
+    // portable inputs are certified.
+    {0x37U, 0x00EABE00U, 0x002577F0U},
+    {0x03U, 0x00EABA40U, 0x00257980U},
+    {0x09U, 0x00EAC1C0U, 0x00258190U},
+    {0x10U, 0x00EADC18U, 0x00258080U},
+    {0x5CU, 0x00EACDA8U, 0x00258390U},
+    {0x51U, 0x00EAC608U, 0x00258420U},
+}};
 
 struct MovementSlot final {
     std::atomic<std::uintptr_t> characterAddress{0U};
@@ -167,6 +195,7 @@ struct MovementSlot final {
 };
 
 std::atomic<bool> gInstalled{false};
+std::atomic<NativeAIIntentObserver> gNativeAIIntentObserver{nullptr};
 std::array<MovementSlot, MaximumConcurrentTargets()> gSlots{};
 std::atomic<std::uintptr_t> gLastArmedCharacter{0U};
 std::uintptr_t gModuleBase{};
@@ -1579,6 +1608,46 @@ void __cdecl ApplyAtNpcLocomotionPreTransform(
             runtime_features::Feature::RemoteMovementRuntime)) {
         return;
     }
+
+    // Observe the Host's already-resolved retail steering before any AIMP
+    // override. This hook sits after AI/pathfinding/local-steering populated
+    // +4C/+50/+5C and before FUN_0043CD30 converts that request to a
+    // Character-local vector. The callback is passive and performs no writes.
+    if (cycleAddress != 0U && characterAddress != 0U) {
+        const auto observer = gNativeAIIntentObserver.load(std::memory_order_acquire);
+        if (observer != nullptr) {
+            std::uintptr_t owner{};
+            std::uint8_t observed{};
+            float magnitude{}, worldHeading{}, nativeIntensity{};
+            if (GuardedReadValue(cycleAddress + kNpcLocomotionCycleOwnerOffset, owner) &&
+                owner == characterAddress &&
+                GuardedReadValue(cycleAddress + kNpcLocomotionCycleStateOffset, observed) &&
+                GuardedReadValue(cycleAddress + NativeCycleOffsets().magnitude, magnitude) &&
+                GuardedReadValue(cycleAddress + NativeCycleOffsets().worldHeading, worldHeading) &&
+                GuardedReadValue(cycleAddress + NativeCycleOffsets().intensity, nativeIntensity) &&
+                std::isfinite(magnitude) && std::isfinite(worldHeading) &&
+                std::isfinite(nativeIntensity) && magnitude >= 0.0F && magnitude <= 64.0F) {
+                NativeAIIntent intent{};
+                intent.moving = observed == kNpcLocomotionMoveState &&
+                    magnitude > kMoveRequestEpsilon && nativeIntensity > kMoveRequestEpsilon;
+                if (intent.moving) {
+                    intent.directionX = std::sin(worldHeading) * magnitude;
+                    intent.directionZ = std::cos(worldHeading) * magnitude;
+                    intent.intensity = nativeIntensity;
+                }
+                std::uintptr_t movementAction{};
+                std::uint32_t moveType{};
+                if (GuardedReadValue(characterAddress + kMovementActionObjectOffset, movementAction) &&
+                    movementAction != 0U &&
+                    GuardedReadValue(movementAction + kMovementActionCurrentMoveTypeOffset, moveType) &&
+                    moveType <= 3U) {
+                    intent.moveType = moveType;
+                }
+                observer(characterAddress, intent);
+            }
+        }
+    }
+
     auto* slot = FindSlot(characterAddress);
     if (slot == nullptr || cycleAddress == 0U) return;
     if (RetailOwnsPhysicalCycle(characterAddress)) return;
@@ -2538,6 +2607,10 @@ bool Installed() noexcept {
     return gInstalled.load(std::memory_order_acquire);
 }
 
+void SetNativeAIIntentObserver(const NativeAIIntentObserver observer) noexcept {
+    gNativeAIIntentObserver.store(observer, std::memory_order_release);
+}
+
 void PumpOnEngineThread(const EnginePumpPhase phase) noexcept {
     if (!Installed() || !runtime_features::Enabled(
             runtime_features::Feature::RemoteMovementRuntime)) {
@@ -2602,6 +2675,123 @@ bool ArmWorldDirection(
         false,
         frameCount,
         error);
+}
+
+bool ArmAIIntentReplication(
+    const std::uintptr_t characterAddress,
+    const float directionX,
+    const float directionZ,
+    const float intensity,
+    const std::uint32_t moveType,
+    std::string& error) noexcept {
+    if (!ArmCore(
+        characterAddress, directionX, 0.0F, directionZ, 0.0F, intensity,
+        true, false, 0.0F, 0.0F, 0.0F, false, 0.0F, true, moveType, false,
+        kPersistentReplicationFrames, error))
+        return false;
+    if (auto* slot = FindSlot(characterAddress)) {
+        // Intent ownership deliberately carries no network transform. The
+        // lease only expires the steering request; it never enables hard
+        // positional resync because LoadNetworkTarget remains unavailable.
+        slot->aiReplicationProfile.store(false, std::memory_order_release);
+        slot->initialPlacementPending.store(false, std::memory_order_release);
+        slot->aiDivergenceSinceTickMs.store(0U, std::memory_order_release);
+        slot->leaseExpiresAtTickMs.store(
+            GetTickCount64() + kReplicationLeaseMilliseconds,
+            std::memory_order_release);
+    }
+    return true;
+}
+
+bool HoldAIIntentIdle(
+    const std::uintptr_t characterAddress,
+    const std::uint32_t moveType,
+    std::string& error) noexcept {
+    if (!ArmCore(
+        characterAddress, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
+        true, false, 0.0F, 0.0F, 0.0F, false, 0.0F, true, moveType, false,
+        kPersistentReplicationFrames, error))
+        return false;
+    if (auto* slot = FindSlot(characterAddress)) {
+        slot->aiReplicationProfile.store(false, std::memory_order_release);
+        slot->initialPlacementPending.store(false, std::memory_order_release);
+        slot->aiDivergenceSinceTickMs.store(0U, std::memory_order_release);
+        slot->leaseExpiresAtTickMs.store(
+            GetTickCount64() + kReplicationLeaseMilliseconds,
+            std::memory_order_release);
+    }
+    return true;
+}
+
+AIExecutionReplayResult ReplayAIExecutionTransition(
+    const std::uintptr_t characterAddress,
+    const std::uint32_t cycleTypeRva,
+    const std::uint32_t cycleState,
+    std::string& error) noexcept {
+    if (!Installed() || gModuleBase == 0U || characterAddress == 0U ||
+        cycleTypeRva == 0U || cycleState > 0xFFU) {
+        error = "AI execution replay arguments are invalid";
+        return AIExecutionReplayResult::Failed;
+    }
+
+    // Dedicated paths already own these states. Never compete with the
+    // locomotion or paired-interaction state machines.
+    if (cycleState == kNpcLocomotionIdleState || cycleState == kNpcLocomotionMoveState ||
+        cycleState == 0x42U || cycleState == 0x47U || cycleState == 0x4EU || cycleState == 0x4FU)
+        return AIExecutionReplayResult::NotRequired;
+
+    const CertifiedExecutionTransition* transition = nullptr;
+    for (const auto& candidate : kExecutionTransitions) {
+        if (candidate.state == cycleState && candidate.typeRva == cycleTypeRva) {
+            transition = &candidate;
+            break;
+        }
+    }
+    if (transition == nullptr) return AIExecutionReplayResult::Unsupported;
+
+    std::uintptr_t cycle{};
+    std::uint8_t localState{};
+    if (!ReadNativeCycle(characterAddress, cycle, localState) || cycle == 0U) {
+        error = "Character execution cycle is unavailable";
+        return AIExecutionReplayResult::Failed;
+    }
+    std::uintptr_t localVtable{};
+    if (!GuardedReadValue(cycle, localVtable)) {
+        error = "Character execution-cycle vtable is unreadable";
+        return AIExecutionReplayResult::Failed;
+    }
+    if (localState == cycleState && localVtable == gModuleBase + cycleTypeRva)
+        return AIExecutionReplayResult::Applied;
+    if (RetailOwnsPhysicalCycle(characterAddress)) return AIExecutionReplayResult::NotRequired;
+
+#if defined(_MSC_VER)
+    __try {
+#endif
+        reinterpret_cast<ExecutionTransitionFn>(gModuleBase + transition->transitionRva)(
+            reinterpret_cast<void*>(cycle));
+        std::uintptr_t current{};
+        std::uint8_t currentState{};
+        std::uintptr_t currentVtable{};
+        if (!ReadNativeCycle(characterAddress, current, currentState) || current == 0U ||
+            !GuardedReadValue(current, currentVtable) || currentState != cycleState ||
+            currentVtable != gModuleBase + cycleTypeRva) {
+            error = "Retail execution transition did not reach the authoritative cycle";
+            return AIExecutionReplayResult::Failed;
+        }
+        return AIExecutionReplayResult::Applied;
+#if defined(_MSC_VER)
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        error = "Retail execution transition raised an exception";
+        return AIExecutionReplayResult::Failed;
+    }
+#endif
+}
+
+bool ReleaseAIIntentOwnership(const std::uintptr_t characterAddress) noexcept {
+    auto* slot = FindSlot(characterAddress);
+    if (slot == nullptr) return true;
+    ReleaseSlot(*slot);
+    return true;
 }
 
 bool ArmWorldReplication(
