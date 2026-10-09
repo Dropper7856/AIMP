@@ -15,6 +15,7 @@ internal sealed class AISyncSession : IDisposable
     private readonly SemaphoreSlim _configureGate = new(1, 1);
     private readonly Dictionary<ulong, ReadOnlyMemory<byte>> _pending = new();
     private readonly Queue<ReadOnlyMemory<byte>> _outcomes = new();
+    private readonly Queue<ReadOnlyMemory<byte>> _impacts = new();
     private readonly Dictionary<ulong, (uint Birth, uint Pair, uint Revision)> _lastOutcome = new();
     private readonly Dictionary<ulong, uint> _participants = new();
     private ulong _localPeer;
@@ -30,19 +31,29 @@ internal sealed class AISyncSession : IDisposable
     private int _nativeGeneration;
     private long _epoch;
     private bool _isHost, _bound, _compatible;
-    private bool _active, _sending, _disposed;
+    private bool _active, _sending, _impactSending, _disposed;
     private bool _availabilityWarningReported;
     private long _nativeProduced, _remoteReceived, _networkSent, _nativeSent, _lastTrafficLogTick;
+    private long _impactNativeProduced, _impactRemoteReceived, _impactNetworkSent, _impactNativeSent;
 
     internal AISyncSession(NativeRuntimeController controller, PerformanceIsolationState performanceIsolation)
     {
         _controller = controller; _diagnostics = controller.Diagnostics;
         _performanceIsolation = performanceIsolation;
         _controller.AISyncStateProduced += OnNativeState;
+        _controller.AISyncImpactProduced += OnNativeImpact;
     }
-    internal void BindHost(LobbyHost host) { lock (_gate) _host = host; }
+    internal void BindHost(LobbyHost host)
+    {
+        LobbyHost? previous;
+        lock (_gate) { previous = _host; _host = host; }
+        if (previous is not null && !ReferenceEquals(previous, host)) previous.AISyncImpactReceived -= OnRemoteImpact;
+        host.AISyncImpactReceived -= OnRemoteImpact;
+        host.AISyncImpactReceived += OnRemoteImpact;
+    }
     internal void UnbindHost(LobbyHost host)
     {
+        host.AISyncImpactReceived -= OnRemoteImpact;
         lock (_gate) if (ReferenceEquals(_host, host)) { _host = null; _bound = false; InvalidateLocked(); }
     }
     internal void BindClient(LobbyClient client)
@@ -57,7 +68,7 @@ internal sealed class AISyncSession : IDisposable
     }
     private void InvalidateLocked()
     {
-        _active = false; ++_epoch; _pending.Clear(); _outcomes.Clear(); _lastOutcome.Clear();
+        _active = false; ++_epoch; _pending.Clear(); _outcomes.Clear(); _impacts.Clear(); _lastOutcome.Clear();
     }
 
     internal async Task ConfigureAsync(Guid session, bool isHost, int nativeGeneration,
@@ -223,7 +234,7 @@ internal sealed class AISyncSession : IDisposable
         lock (_gate) active = _active;
         _diagnostics.Log("AISync", $"V2 enabled={(enabled ? 1 : 0)} role={role} active={(active ? 1 : 0)} " +
             $"nativeGeneration={nativeGeneration} worldGeneration={worldGeneration}; " +
-            "Character convergence + Host native paired outcomes; animation/audio and CATHODE world consequences run locally; control=Performance Isolation.");
+            "Host AI intent + certified Character execution replay + Host-native paired/weapon consequences; animation/audio and CATHODE presentation run locally; control=Performance Isolation.");
     }
     private void OnNativeState(object? sender, ReadOnlyMemory<byte> bytes)
     {
@@ -243,6 +254,40 @@ internal sealed class AISyncSession : IDisposable
             ++_remoteReceived;
             QueueLocked(bytes);
         }
+    }
+    private void OnNativeImpact(object? sender, ReadOnlyMemory<byte> bytes)
+    {
+        lock (_gate)
+        {
+            if (!Enabled || !_active || _isHost || _client is null
+                || !AISyncCodec.ImpactBelongsTo(bytes.Span, _session, _worldGeneration)
+                || AISyncCodec.ImpactSourcePeer(bytes.Span) != _localPeer) return;
+            ++_impactNativeProduced;
+            QueueImpactLocked(bytes);
+        }
+    }
+    private void OnRemoteImpact(object? sender, ReadOnlyMemory<byte> bytes)
+    {
+        lock (_gate)
+        {
+            if (!Enabled || !_active || !_isHost || !ReferenceEquals(sender, _host)
+                || !AISyncCodec.ImpactBelongsTo(bytes.Span, _session, _worldGeneration)
+                || AISyncCodec.ImpactSourcePeer(bytes.Span) == _localPeer) return;
+            ++_impactRemoteReceived;
+            QueueImpactLocked(bytes);
+        }
+    }
+    private void QueueImpactLocked(ReadOnlyMemory<byte> bytes)
+    {
+        if (_impacts.Count >= 256)
+        {
+            _diagnostics.Log("AISync", "Client-impact queue exceeded 256 events; newest impact was dropped without changing Host AI state.");
+            return;
+        }
+        _impacts.Enqueue(bytes);
+        if (_impactSending) return;
+        _impactSending = true;
+        _ = Task.Run(PumpImpactsAsync);
     }
     private void QueueLocked(ReadOnlyMemory<byte> bytes)
     {
@@ -323,9 +368,59 @@ internal sealed class AISyncSession : IDisposable
             }
         }
     }
+    private async Task PumpImpactsAsync()
+    {
+        try
+        {
+            while (!_shutdown.IsCancellationRequested)
+            {
+                ReadOnlyMemory<byte> bytes;
+                LobbyHost? host;
+                LobbyClient? client;
+                Guid session;
+                long epoch;
+                bool isHost;
+                lock (_gate)
+                {
+                    if (!Enabled || !_active || _impacts.Count == 0) return;
+                    bytes = _impacts.Dequeue();
+                    host = _host; client = _client; session = _session; epoch = _epoch; isHost = _isHost;
+                }
+                lock (_gate) if (!Enabled || !_active || epoch != _epoch) continue;
+                if (isHost)
+                {
+                    if (host is null) continue;
+                    await _controller.SendAISyncImpactAsync(bytes, _shutdown.Token).ConfigureAwait(false);
+                    lock (_gate) ++_impactNativeSent;
+                }
+                else
+                {
+                    if (client is null) continue;
+                    await client.SendAISyncImpactAsync(AISyncCodec.EncodeImpactNetwork(session, bytes.Span),
+                        _shutdown.Token).ConfigureAwait(false);
+                    lock (_gate) ++_impactNetworkSent;
+                }
+                LogTrafficIfDue();
+            }
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            _diagnostics.Log("AISync", $"Client-impact transport paused: {exception.Message}");
+        }
+        catch (OperationCanceledException) { }
+        finally
+        {
+            lock (_gate)
+            {
+                _impactSending = false;
+                if (Enabled && _active && _impacts.Count != 0 && !_disposed)
+                { _impactSending = true; _ = Task.Run(PumpImpactsAsync); }
+            }
+        }
+    }
     private void LogTrafficIfDue()
     {
-        long produced, received, networkSent, nativeSent;
+        long produced, received, networkSent, nativeSent, impactProduced, impactReceived, impactNetworkSent, impactNativeSent;
         bool isHost;
         lock (_gate)
         {
@@ -334,16 +429,21 @@ internal sealed class AISyncSession : IDisposable
             _lastTrafficLogTick = now;
             produced = _nativeProduced; received = _remoteReceived;
             networkSent = _networkSent; nativeSent = _nativeSent; isHost = _isHost;
+            impactProduced = _impactNativeProduced; impactReceived = _impactRemoteReceived;
+            impactNetworkSent = _impactNetworkSent; impactNativeSent = _impactNativeSent;
         }
         _diagnostics.Log("AISync", $"V2 transport role={(isHost ? "Host" : "Client")} " +
-            $"nativeProduced={produced} remoteReceived={received} networkSent={networkSent} nativeSent={nativeSent}; cumulative, at most every 5s.");
+            $"nativeProduced={produced} remoteReceived={received} networkSent={networkSent} nativeSent={nativeSent} " +
+            $"impactProduced={impactProduced} impactReceived={impactReceived} impactNetworkSent={impactNetworkSent} impactNativeSent={impactNativeSent}; cumulative, at most every 5s.");
     }
     public void Dispose()
     {
         _controller.AISyncStateProduced -= OnNativeState;
+        _controller.AISyncImpactProduced -= OnNativeImpact;
         lock (_gate)
         {
             _disposed = true; InvalidateLocked();
+            if (_host is not null) _host.AISyncImpactReceived -= OnRemoteImpact;
             if (_client is not null) _client.AISyncStateReceived -= OnRemoteState;
         }
         _shutdown.Cancel();

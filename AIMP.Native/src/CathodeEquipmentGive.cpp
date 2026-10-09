@@ -196,6 +196,13 @@ Result StepNative(std::uintptr_t base, std::uintptr_t character, Record& r) {
     if (manager == nullptr) return Result::Pending;
     const auto equipmentManager = Read<std::uintptr_t>(character + 0x1100U);
     if (equipmentManager == 0U) return Result::Pending;
+    // Equipment safety remains local to PlayerSync. Retail GiveToCharacter
+    // later dereferences EquipmentManager+0x1528 and Character+0x64, so do
+    // not dispatch when that relationship is already invalid. AISync does not
+    // participate in this decision and never changes target eligibility here.
+    const auto equipmentOwner = Read<std::uintptr_t>(equipmentManager + 0x1528U);
+    const auto descriptor = Read<std::uintptr_t>(character + 0x64U);
+    if (equipmentOwner != character || descriptor == 0U) return Result::Pending;
 
     // Success is defined by the exact EquipmentInstance returned from the
     // selected public output appearing in the Character's native slot table.

@@ -654,6 +654,14 @@ void LauncherIPC::PublishAISyncTraffic() {
                 localSequence_.fetch_add(1U, std::memory_order_relaxed),
                 std::as_bytes(std::span(&state, 1U)))) break;
     }
+    ai_sync::ImpactEvent impact{};
+    for (std::size_t i = 0U; i < 16U && ai_sync::TryPopObservedImpact(impact); ++i) {
+        if (!sessionConfigured_.load(std::memory_order_acquire) ||
+            !worldSyncAuthorityBound_ || worldSyncAuthorityHost_ || !worldSyncWorldBusActive_) continue;
+        if (!Queue(protocol::MessageType::AISyncImpact, 0U,
+                localSequence_.fetch_add(1U, std::memory_order_relaxed),
+                std::as_bytes(std::span(&impact, 1U)))) break;
+    }
 }
 
 void LauncherIPC::PublishPlayerSyncTraffic() {
@@ -1511,6 +1519,10 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
         if (!sessionConfigured_.load(std::memory_order_acquire) || !worldSyncAuthorityBound_ ||
             worldSyncAuthorityHost_ || !worldSyncWorldBusActive_) return true;
         return !ai_sync::Installed() || ai_sync::QueueRemote(frame.payload);
+    case protocol::MessageType::AISyncImpact:
+        if (!sessionConfigured_.load(std::memory_order_acquire) || !worldSyncAuthorityBound_ ||
+            !worldSyncAuthorityHost_ || !worldSyncWorldBusActive_) return true;
+        return !ai_sync::Installed() || ai_sync::QueueRemoteImpact(frame.payload);
     case protocol::MessageType::WorldSyncLifecycle: {
         if (!sessionConfigured_.load(std::memory_order_acquire) ||
             frame.payload.empty() || frame.payload.size() > 16U * 1024U) {

@@ -54,6 +54,8 @@ internal sealed class NativeRuntimeController : IDisposable
 
     internal event EventHandler<ReadOnlyMemory<byte>>? AISyncStateProduced;
 
+    internal event EventHandler<ReadOnlyMemory<byte>>? AISyncImpactProduced;
+
     internal void RefreshProcessStatus()
     {
         if (Volatile.Read(ref _disposed) != 0 || HasTrackedProcess()) return;
@@ -373,6 +375,9 @@ internal sealed class NativeRuntimeController : IDisposable
     internal Task SendAISyncStateAsync(ReadOnlyMemory<byte> payload, CancellationToken token) =>
         GetCommandSession().SendAISyncAsync(MessageType.AISyncState, payload, token);
 
+    internal Task SendAISyncImpactAsync(ReadOnlyMemory<byte> payload, CancellationToken token) =>
+        GetCommandSession().SendAISyncAsync(MessageType.AISyncImpact, payload, token);
+
     internal Task SendWorldSyncLifecycleAsync(
         WorldSyncLifecyclePayload lifecycle,
         CancellationToken cancellationToken = default)
@@ -571,6 +576,7 @@ internal sealed class NativeRuntimeController : IDisposable
         session.PlayerSyncStateChanged += OnPlayerSyncStateChanged;
         session.PlayerSyncActionProduced += OnPlayerSyncActionProduced;
         session.AISyncStateProduced += OnAISyncStateProduced;
+        session.AISyncImpactProduced += OnAISyncImpactProduced;
         session.ConnectionClosed += OnConnectionClosed;
     }
 
@@ -587,6 +593,7 @@ internal sealed class NativeRuntimeController : IDisposable
         session.PlayerSyncStateChanged -= OnPlayerSyncStateChanged;
         session.PlayerSyncActionProduced -= OnPlayerSyncActionProduced;
         session.AISyncStateProduced -= OnAISyncStateProduced;
+        session.AISyncImpactProduced -= OnAISyncImpactProduced;
         session.ConnectionClosed -= OnConnectionClosed;
     }
 
@@ -600,6 +607,9 @@ internal sealed class NativeRuntimeController : IDisposable
 
     private void OnAISyncStateProduced(object? sender, ReadOnlyMemory<byte> value) =>
         AISyncStateProduced?.Invoke(this, value);
+
+    private void OnAISyncImpactProduced(object? sender, ReadOnlyMemory<byte> value) =>
+        AISyncImpactProduced?.Invoke(this, value);
 
     private void OnPlayerSyncStateChanged(
         object? sender,

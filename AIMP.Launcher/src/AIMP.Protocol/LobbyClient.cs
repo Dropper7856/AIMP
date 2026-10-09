@@ -244,6 +244,17 @@ public sealed class LobbyClient : IAsyncDisposable
             JsonPayload.Serialize(payload), cancellationToken).AsTask();
     }
 
+    public Task SendAISyncImpactAsync(
+        ReadOnlyMemory<byte> bytes,
+        CancellationToken cancellationToken = default)
+    {
+        var native = AISyncCodec.DecodeImpactNetwork(bytes, SessionId);
+        if (AISyncCodec.ImpactSourcePeer(native.Span) != PeerId)
+            throw new InvalidOperationException("The AISync impact source identity is invalid.");
+        return _connection.SendAsync(MessageType.AISyncNetworkImpact,
+            bytes, cancellationToken).AsTask();
+    }
+
     private void ValidateSpawnPositionResponseInput(
         SpawnPositionRequestPayload request,
         PlayerSpawnPositionPayload position)

@@ -64,6 +64,8 @@ internal sealed class DllIpcSession : IAsyncDisposable
 
     internal event EventHandler<ReadOnlyMemory<byte>>? AISyncStateProduced;
 
+    internal event EventHandler<ReadOnlyMemory<byte>>? AISyncImpactProduced;
+
     internal event EventHandler<string>? Log;
 
     internal event EventHandler? ConnectionClosed;
@@ -446,6 +448,10 @@ internal sealed class DllIpcSession : IAsyncDisposable
                 AISyncCodec.ValidateNative(frame.Payload.Span);
                 AISyncStateProduced?.Invoke(this, frame.Payload);
                 return true;
+            case MessageType.AISyncImpact:
+                AISyncCodec.ValidateNativeImpact(frame.Payload.Span);
+                AISyncImpactProduced?.Invoke(this, frame.Payload);
+                return true;
             default: return false;
         }
     }
@@ -616,7 +622,7 @@ internal sealed class DllIpcSession : IAsyncDisposable
     internal Task SendAISyncAsync(MessageType type, ReadOnlyMemory<byte> payload, CancellationToken token)
     {
         EnsureReady();
-        if (type is not (MessageType.AISyncConfigure or MessageType.AISyncState))
+        if (type is not (MessageType.AISyncConfigure or MessageType.AISyncState or MessageType.AISyncImpact))
             throw new ArgumentOutOfRangeException(nameof(type));
         return SendAsync(type, payload, token);
     }

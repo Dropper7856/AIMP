@@ -10,6 +10,20 @@ class HookManager;
 
 namespace character_direct_step_runtime {
 
+// Resolved retail locomotion carrier observed after Host pathfinding/local
+// steering but before ActNPCLocomotionCycle transforms it into Character-local
+// motion. It is an intention, not a pose: no position or animation state is
+// transported. The Client feeds the same world-space request back through the
+// retail locomotion cycle so CATHODE owns turning, collision and animation.
+struct NativeAIIntent final {
+    float directionX{}, directionZ{}, intensity{};
+    std::uint32_t moveType{0xFFFFFFFFU};
+    bool moving{};
+};
+using NativeAIIntentObserver = void(*)(
+    std::uintptr_t characterAddress,
+    const NativeAIIntent& intent) noexcept;
+
 struct RuntimeSnapshot {
     std::uintptr_t characterAddress{};
     std::uint32_t remainingFrames{};
@@ -59,6 +73,50 @@ bool Install(
     std::string& error);
 
 [[nodiscard]] bool Installed() noexcept;
+
+// Passive engine-thread tap used by AISync Host authority. The observer sees
+// the retail-resolved steering request even when no remote-movement slot owns
+// the Character. Passing nullptr detaches it.
+void SetNativeAIIntentObserver(NativeAIIntentObserver observer) noexcept;
+
+// Authoritative NPC intent replay. Unlike ArmWorldReplication these functions
+// carry no network transform and therefore never chase/snap toward a position.
+// A short lease makes a lost Host update settle to retail Idle rather than
+// continuing the last direction forever.
+bool ArmAIIntentReplication(
+    std::uintptr_t characterAddress,
+    float directionX,
+    float directionZ,
+    float intensity,
+    std::uint32_t moveType,
+    std::string& error) noexcept;
+
+bool HoldAIIntentIdle(
+    std::uintptr_t characterAddress,
+    std::uint32_t moveType,
+    std::string& error) noexcept;
+
+enum class AIExecutionReplayResult : std::uint8_t {
+    NotRequired = 0U,
+    Applied = 1U,
+    Unsupported = 2U,
+    Failed = 3U,
+};
+
+// Replays a Host-selected Character execution transition through the same
+// retail transition entry point. Only transitions whose one-argument ABI and
+// destination cycle identity are certified are admitted; unknown states are
+// deliberately left untouched rather than fabricating a native C++ object.
+AIExecutionReplayResult ReplayAIExecutionTransition(
+    std::uintptr_t characterAddress,
+    std::uint32_t cycleTypeRva,
+    std::uint32_t cycleState,
+    std::string& error) noexcept;
+
+// Drops only AIMP's persistent intent slot. Unlike Stop(), this deliberately
+// does not force Idle or submit a zero movement request, so a just-replayed
+// retail transition remains fully owned by CATHODE.
+bool ReleaseAIIntentOwnership(std::uintptr_t characterAddress) noexcept;
 
 // Called from CharacterManagerUpdate on the engine thread. PRE owns normal
 // follower preparation and native transitions. POST is a reconciliation pass
