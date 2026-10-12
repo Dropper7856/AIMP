@@ -6,10 +6,12 @@
 `b45ca4cd2f11404c87b710d52d448b7a`. Il contient Launcher 188, DLL 188,
 IPC connecté, rôle AISync Host et génération monde 1.
 
-`AIMP-Diagnostics-20261012-104252.zip` est l'ancien diagnostic Host du problème
-IPC : Launcher 187, DLL 188 refusée, aucun handshake validé. Ce n'est pas le
-diagnostic du Client de la partie de 11:27. Le Client est confirmé en 188 par
-l'utilisateur ; sa trace de cette partie reste nécessaire.
+`AIMP-Diagnostics-20261012-104252.zip` a été exporté sur le Client, selon
+l'utilisateur. Son contenu couvre l'ancien problème IPC de 10:42 : Launcher 187,
+DLL 188 refusée, aucun handshake validé. L'origine de l'archive avait été
+incorrectement attribuée au Host dans la première analyse. Cette archive ne
+couvre pas la partie de 11:27. Le Client actuel est confirmé en 188 par
+l'utilisateur ; sa trace de la partie de 11:27 reste nécessaire.
 
 ## Ce que prouve le Host
 
