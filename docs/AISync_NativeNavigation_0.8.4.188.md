@@ -137,3 +137,10 @@ Le dossier `dist/aisync-native-execution/Launcher` contient le backend publié,
 l’injecteur x86 et `Native/AIMP.NetZ.dll`. Il ne remplace pas les installations
 existantes. Le frontend Electron n’a pas été modifié. Les modules PlayerSync,
 Equipment, WorldSync et PlayerLifecycle n’ont pas été modifiés.
+
+Après les diagnostics du 12 octobre, un paquet Electron complet est aussi
+disponible dans `dist/aisync-188-desktop` :
+`AI-MP-AISync-188-Portable-x64.exe` et `AI-MP-AISync-188-Setup-x64.exe`.
+Il embarque l’API self-contained 188, la même DLL 188 et l’injecteur x86.
+Utiliser ce paquet sur les deux machines après fermeture du jeu et des anciens
+Launchers. Voir `AISync_188_IPC_Deployment.md` pour la cause du refus IPC.
