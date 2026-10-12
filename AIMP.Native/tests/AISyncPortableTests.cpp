@@ -14,6 +14,17 @@ int main() {
     // successfully replayed execution, pair admission and observer handoff.
     assert(ChooseMovementOwner(false, false, false, false) == MovementOwner::Intent);
     assert(ChooseMovementOwner(false, false, false, true) == MovementOwner::Navigation);
+    // Closing a goal during the old pair cannot release the neutral handoff;
+    // a fresh live Host goal can, even if its resolved steering is unchanged.
+    assert(!NavigationAuthorityAdvanced(0U, 11U, 8U, 10U, 7U));
+    assert(!NavigationAuthorityAdvanced(1U, 10U, 7U, 10U, 7U));
+    assert(NavigationAuthorityAdvanced(1U, 11U, 7U, 10U, 7U));
+    assert(NavigationAuthorityAdvanced(1U, 10U, 8U, 10U, 7U));
+    assert(HostLeftPairedExecution(true, false, false, false));
+    assert(!HostLeftPairedExecution(true, true, false, false));
+    assert(!HostLeftPairedExecution(true, false, false, true));
+    assert(!HostLeftPairedExecution(true, false, true, false));
+    assert(!HostLeftPairedExecution(false, false, false, false));
     assert(FindExecutionTransition(0x00EADB58U, 0x12U) == nullptr);
     assert(ChooseMovementOwner(false, false, false, true) == MovementOwner::Navigation);
     const auto* stop = FindExecutionTransition(0x00EABEC0U, 0x3BU);

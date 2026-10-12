@@ -226,6 +226,7 @@ struct Actor {
     std::uint32_t observerReleasedInteractionRevision{}, observerReleasedActionRevision{};
     std::uint32_t observerReleasedExecutionRevision{}, observerReleasedRoleTaskRevision{};
     std::uint32_t observerReleasedLifecycleRevision{}, observerReleasedLocomotionRevision{};
+    std::uint32_t observerReleasedNavigationRevision{}, observerReleasedNavigationRequestRevision{};
     std::uint64_t observerReleasedTargetPeer{};
     bool observerHandoffNeutral{};
     std::uint32_t remoteBirth{}, remoteRevision{};
@@ -2518,6 +2519,8 @@ void ClearObserverReleaseMemory(Actor& actor) noexcept {
     actor.observerReleasedRoleTaskRevision = 0U;
     actor.observerReleasedLifecycleRevision = 0U;
     actor.observerReleasedLocomotionRevision = 0U;
+    actor.observerReleasedNavigationRevision = 0U;
+    actor.observerReleasedNavigationRequestRevision = 0U;
     actor.observerReleasedTargetPeer = 0U;
     actor.observerHandoffNeutral = false;
 }
@@ -2525,11 +2528,21 @@ void ClearObserverReleaseMemory(Actor& actor) noexcept {
 bool ObserverHandoffHasNewAuthority(const Actor& actor, const State& state) noexcept {
     if (!actor.observerHandoffNeutral) return true;
     if (!ObserverReleasedPairMatches(actor, state)) return true;
+    // A newer compatible Host state can have arrived BEFORE local completion.
+    // Do not record that state as the release baseline and then wait forever
+    // for a second change (e.g. a stationary goal with unchanged steering).
+    if (HostLeftPairedExecution((state.stateFlags & ExecutionValid) != 0U,
+        (state.executionFlags & ExecutionPaired) != 0U,
+        (state.interactionFlags & InteractionCycleActive) != 0U,
+        (state.interactionFlags & InteractionSourceCycleRetained) != 0U)) return true;
     return state.actionRevision > actor.observerReleasedActionRevision ||
         state.executionRevision > actor.observerReleasedExecutionRevision ||
         state.roleTaskRevision > actor.observerReleasedRoleTaskRevision ||
         state.lifecycleRevision > actor.observerReleasedLifecycleRevision ||
         state.locomotionRevision > actor.observerReleasedLocomotionRevision ||
+        NavigationAuthorityAdvanced(state.navigation.flags, state.navigation.revision,
+            state.navigation.requestRevision, actor.observerReleasedNavigationRevision,
+            actor.observerReleasedNavigationRequestRevision) ||
         (state.interactionRevision > actor.observerReleasedInteractionRevision &&
             (state.interactionFlags & (InteractionCycleActive | InteractionSourceCycleRetained)) == 0U);
 }
@@ -4054,6 +4067,8 @@ bool PairedTransitionOwnsCycle(Actor& actor, const ULONGLONG now) noexcept {
         actor.observerReleasedRoleTaskRevision = actor.desired.roleTaskRevision;
         actor.observerReleasedLifecycleRevision = actor.desired.lifecycleRevision;
         actor.observerReleasedLocomotionRevision = actor.desired.locomotionRevision;
+        actor.observerReleasedNavigationRevision = actor.desired.navigation.revision;
+        actor.observerReleasedNavigationRequestRevision = actor.desired.navigation.requestRevision;
         actor.observerReleasedTargetPeer = actor.desired.interactionTargetPeer;
         actor.observerHandoffNeutral = true;
         actor.movementOwner = MovementOwner::Neutral;
