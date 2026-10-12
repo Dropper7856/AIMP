@@ -1,4 +1,5 @@
 #include "aimp/CharacterDirectStepRuntime.h"
+#include "aimp/AISyncExecutionPolicy.h"
 
 #include "aimp/CrashGuard.h"
 #include "aimp/HookManager.h"
@@ -86,33 +87,6 @@ using TeleportCharacterFn = void(__thiscall*)(
     void* registryEntry,
     const float* position);
 using ExecutionTransitionFn = void(__thiscall*)(void* cycle);
-
-struct CertifiedExecutionTransition final {
-    std::uint32_t state{};
-    std::uintptr_t typeRva{};
-    std::uintptr_t transitionRva{};
-};
-
-// These are the one-argument retail Character-cycle transitions certified in
-// AI.exe.c around FUN_006577F0..FUN_006584A0. They destroy/replace the current
-// cycle through retail code and therefore preserve CATHODE ownership instead
-// of fabricating a native object from a vtable. Move (38), Idle (01) and paired
-// cycles are owned by their existing dedicated replication paths.
-constexpr std::array<CertifiedExecutionTransition, 6U> kExecutionTransitions{{
-    // These six constructors are self-contained in AI.exe.c: they consume
-    // only ECX=cycle and do not derive hidden state from the caller return
-    // address or explicit stack arguments. Several neighbouring transitions
-    // look parameterless in the decompiler but consume caller context
-    // ("unaff_retaddr"); replaying those from AIMP would synthesize invalid
-    // runtime state, so they remain observable metadata until their complete
-    // portable inputs are certified.
-    {0x37U, 0x00EABE00U, 0x002577F0U},
-    {0x03U, 0x00EABA40U, 0x00257980U},
-    {0x09U, 0x00EAC1C0U, 0x00258190U},
-    {0x10U, 0x00EADC18U, 0x00258080U},
-    {0x5CU, 0x00EACDA8U, 0x00258390U},
-    {0x51U, 0x00EAC608U, 0x00258420U},
-}};
 
 struct MovementSlot final {
     std::atomic<std::uintptr_t> characterAddress{0U};
@@ -2740,13 +2714,7 @@ AIExecutionReplayResult ReplayAIExecutionTransition(
         cycleState == 0x42U || cycleState == 0x47U || cycleState == 0x4EU || cycleState == 0x4FU)
         return AIExecutionReplayResult::NotRequired;
 
-    const CertifiedExecutionTransition* transition = nullptr;
-    for (const auto& candidate : kExecutionTransitions) {
-        if (candidate.state == cycleState && candidate.typeRva == cycleTypeRva) {
-            transition = &candidate;
-            break;
-        }
-    }
+    const auto* transition = ai_sync::FindExecutionTransition(cycleTypeRva, cycleState);
     if (transition == nullptr) return AIExecutionReplayResult::Unsupported;
 
     std::uintptr_t cycle{};
@@ -2767,8 +2735,12 @@ AIExecutionReplayResult ReplayAIExecutionTransition(
 #if defined(_MSC_VER)
     __try {
 #endif
-        reinterpret_cast<ExecutionTransitionFn>(gModuleBase + transition->transitionRva)(
-            reinterpret_cast<void*>(cycle));
+        if (transition->ignoredStackArgument)
+            reinterpret_cast<void(__thiscall*)(void*, std::uint32_t)>(gModuleBase + transition->entryRva)(
+                reinterpret_cast<void*>(cycle), 0U);
+        else
+            reinterpret_cast<ExecutionTransitionFn>(gModuleBase + transition->entryRva)(
+                reinterpret_cast<void*>(cycle));
         std::uintptr_t current{};
         std::uint8_t currentState{};
         std::uintptr_t currentVtable{};

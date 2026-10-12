@@ -8,8 +8,8 @@ namespace AIMP.Protocol;
 // regenerate presentation locally; resolved paired health/outcomes come from Host.
 public static class AISyncCodec
 {
-    public const uint StateVersion = 10;
-    public const int NativeStateBytes = 256;
+    public const uint StateVersion = 11;
+    public const int NativeStateBytes = 288;
     public const int NativeImpactBytes = 64;
     public const int ConfigurationBytes = 552;
     public const int NetworkStateBytes = 16 + NativeStateBytes;
@@ -45,12 +45,21 @@ public static class AISyncCodec
             || (U32(bytes, 20) == 0 && U32(bytes, 24) == 0) || U32(bytes, 32) == 0
             || U32(bytes, 36) == 0
             || !AllowedCharacterClass(U32(bytes, 28)))
-            throw new ProtocolException("Invalid AISync authority snapshot v10.");
+            throw new ProtocolException("Invalid AISync authority snapshot v11.");
         ValidateAuthorityState(bytes);
     }
 
     private static void ValidateAuthorityState(ReadOnlySpan<byte> bytes)
     {
+        var navigationFlags = U32(bytes, 260);
+        var stoppingDistance = Float(bytes, 276);
+        if ((navigationFlags & ~1U) != 0 || U32(bytes, 280) > 3
+            || !float.IsFinite(stoppingDistance) || stoppingDistance is < -1F or > 1000F
+            || navigationFlags != 0 && (U32(bytes, 256) == 0 || U32(bytes, 284) == 0))
+            throw new ProtocolException("Invalid AISync native navigation goal.");
+        for (var offset = 264; offset <= 272; offset += 4)
+            if (!float.IsFinite(Float(bytes, offset)) || Math.Abs(Float(bytes, offset)) > 100000)
+                throw new ProtocolException("Invalid AISync native navigation coordinates.");
         var flags = U32(bytes, 40);
         var locomotionIntensity = Float(bytes, 72);
         var locomotionRevision = U32(bytes, 76);

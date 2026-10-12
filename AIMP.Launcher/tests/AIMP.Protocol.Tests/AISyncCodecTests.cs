@@ -15,6 +15,7 @@ internal static class AISyncCodecTests
         AssertEx.SequenceEqual(native, decoded.ToArray());
         ValidateRejectedStates(native);
         ValidateExecutionReplayCarrier(session);
+        ValidateNavigationCarrier(session);
         ValidateImpactRoundTrip(session);
         return Task.CompletedTask;
     }
@@ -44,6 +45,39 @@ internal static class AISyncCodecTests
         U32(certifiedWithoutTransition, 252, 2U);
         AssertEx.Throws<AIMP.Protocol.ProtocolException>(
             () => AIMP.Protocol.AISyncCodec.ValidateNative(certifiedWithoutTransition));
+    }
+
+    private static void ValidateNavigationCarrier(Guid session)
+    {
+        var goal = ValidState(session);
+        U32(goal, 256, 9U); U32(goal, 260, 1U);
+        F32(goal, 264, 2F); F32(goal, 268, 3F); F32(goal, 272, -4F);
+        F32(goal, 276, 1F); U32(goal, 280, 2U); U32(goal, 284, 7U);
+        var network = AIMP.Protocol.AISyncCodec.EncodeNetwork(session, goal);
+        AssertEx.Equal(304, network.Length);
+        AssertEx.SequenceEqual(goal, AIMP.Protocol.AISyncCodec.DecodeNetwork(network, session).ToArray());
+        // A moving target can update its goal within the same native request.
+        U32(goal, 256, 10U); F32(goal, 264, 5F);
+        AIMP.Protocol.AISyncCodec.ValidateNative(goal);
+        foreach (var (offset, value) in new (int, uint)[]
+        {
+            (256, 0U), (284, 0U), (260, 2U), (280, 4U)
+        })
+        {
+            var invalid = goal.ToArray(); U32(invalid, offset, value);
+            AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.ValidateNative(invalid));
+        }
+        foreach (var (offset, value) in new (int, float)[]
+        {
+            (264, float.NaN), (268, float.PositiveInfinity), (272, 100001F),
+            (276, -2F), (276, 1001F), (276, float.NaN)
+        })
+        {
+            var invalid = goal.ToArray(); F32(invalid, offset, value);
+            AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.ValidateNative(invalid));
+        }
+        var legacy = goal.AsSpan(0, 256).ToArray(); U32(legacy, 0, 10U);
+        AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.ValidateNative(legacy));
     }
 
     private static void ValidateImpactRoundTrip(Guid session)
