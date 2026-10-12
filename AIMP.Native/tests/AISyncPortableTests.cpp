@@ -13,6 +13,30 @@ int main() {
     // Ownership through a real replication timeline, including rejected and
     // successfully replayed execution, pair admission and observer handoff.
     assert(ChooseMovementOwner(false, false, false, false) == MovementOwner::Intent);
+    // A move-to-goal is interrupted by a Host pair. Binding and victim
+    // preparation may not be available until a later engine frame: motion
+    // must remain reserved even before the local transition is acknowledged.
+    State attack{};
+    attack.stateFlags = InteractionValid;
+    attack.interactionPairRevision = 7U;
+    attack.interactionTransition = 1U;
+    attack.interactionTransitionRevision = 9U;
+    attack.interactionFlags = InteractionCycleActive | InteractionNativeOutcomeRequired;
+    assert(PairAdmissionPending(attack, 0U, 0U)); // waiting for prepared outcome
+    attack.outcome.revision = 1U;
+    attack.outcome.flags = OutcomePrepared;
+    assert(PairAdmissionPending(attack, 7U, 0U)); // pair carrier accepted, transition pending
+    assert(!PairAdmissionPending(attack, 7U, 9U)); // native pair now owns execution
+    attack.interactionFlags = 0U;
+    assert(PairAdmissionPending(attack, 0U, 0U)); // ordered outcome still needs admission
+    attack.outcome = {};
+    assert(!PairAdmissionPending(attack, 0U, 0U)); // stale, inactive pair-only carrier
+    attack.interactionFlags = InteractionCycleActive;
+    attack.interactionTransition = 0U;
+    assert(!PairAdmissionPending(attack, 0U, 0U)); // unresolved initial pair header
+    attack.interactionTransition = 1U;
+    attack.stateFlags = 0U;
+    assert(!PairAdmissionPending(attack, 0U, 0U)); // no interaction authority
     assert(ChooseMovementOwner(false, false, false, true) == MovementOwner::Navigation);
     // Closing a goal during the old pair cannot release the neutral handoff;
     // a fresh live Host goal can, even if its resolved steering is unchanged.

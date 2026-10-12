@@ -205,6 +205,8 @@ struct Actor {
     ULONGLONG lastExecutionAttempt{};
     std::uintptr_t capturedNavigationRequest{};
     std::uint32_t capturedNavigationEpoch{};
+    std::uint32_t rejectedNavigationRevision{}, rejectedNavigationRequestRevision{};
+    ULONGLONG lastNavigationAttempt{};
     MovementOwner movementOwner{MovementOwner::None};
     std::uint32_t interactionActionRevision{}, interactionActionPathHash{};
     std::uint32_t completedPairRevision{}, completedTransitionRevision{}, recoveredInteractionRevision{};
@@ -229,6 +231,7 @@ struct Actor {
     std::uint32_t observerReleasedNavigationRevision{}, observerReleasedNavigationRequestRevision{};
     std::uint64_t observerReleasedTargetPeer{};
     bool observerHandoffNeutral{};
+    ULONGLONG lastObserverFinishAttempt{};
     std::uint32_t remoteBirth{}, remoteRevision{};
     float lastPosition[3]{};
     bool blocked{}, duplicate{}, faulted{}, hasLastPosition{}, interactionOwnsCycle{};
@@ -485,6 +488,8 @@ std::atomic<std::uint64_t> gPairedCycleReleased{};
 std::atomic<std::uint64_t> gPairedObserverCompletions{}, gPairedObserverReleaseAttempts{};
 std::atomic<std::uint64_t> gPairedObserverReleases{}, gPairedObserverReleaseRejected{};
 std::atomic<std::uint64_t> gPairedObserverPairReopenSuppressed{}, gPairedObserverNeutralHolds{};
+std::atomic<std::uint64_t> gPairedObserverFinishRetries{}, gPairedObserverFinishCompleted{};
+std::atomic<std::uint64_t> gNavigationFallbacks{};
 std::atomic<std::uint64_t> gPairedObserverHandoffResumed{};
 std::atomic<std::uint64_t> gPairedVictimTransitions{}, gPairedVictimTransitionRejected{};
 std::atomic<std::uint64_t> gPairedVictimInitializeAborted{};
@@ -1972,6 +1977,11 @@ bool ClearRoleTaskExecutor(Actor& actor) noexcept {
 bool QuiesceProxyExecution(Actor& actor) noexcept {
     if (actor.character == 0U) return false;
     navigation::Cancel(actor.character);
+    actor.replayedExecutionRevision = 0U;
+    actor.completedExecutionRevision = 0U;
+    actor.lastExecutionAttempt = 0U;
+    actor.rejectedNavigationRevision = actor.rejectedNavigationRequestRevision = 0U;
+    actor.lastNavigationAttempt = 0U;
     actor.poseCount = 0U; actor.poseRevision = 0U; actor.poseInterpolating = false;
     static_cast<void>(character_direct_step_runtime::Stop(actor.character));
     const bool tree = actor.tree == 0U || SuspendExistingTree(actor);
@@ -2511,6 +2521,7 @@ bool ObserverReleasedPairMatches(const Actor& actor, const State& state) noexcep
 }
 
 void ClearObserverReleaseMemory(Actor& actor) noexcept {
+    actor.lastObserverFinishAttempt = 0U;
     actor.observerReleasedBirth = 0U;
     actor.observerReleasedPairRevision = 0U;
     actor.observerReleasedInteractionRevision = 0U;
@@ -3679,7 +3690,10 @@ bool Release(Actor& actor) noexcept {
     navigation::Cancel(actor.character);
     actor.movementOwner = MovementOwner::None;
     actor.replayedExecutionRevision = 0U;
+    actor.completedExecutionRevision = 0U;
     actor.lastExecutionAttempt = 0U;
+    actor.rejectedNavigationRevision = actor.rejectedNavigationRequestRevision = 0U;
+    actor.lastNavigationAttempt = 0U;
     actor.poseCount = 0U; actor.poseRevision = 0U; actor.poseInterpolating = false;
     if (actor.character != 0U && Client()) {
         static_cast<void>(character_direct_step_runtime::Stop(actor.character));
@@ -3842,6 +3856,16 @@ bool ApplyAuthoritativeInteraction(Actor& actor, const ULONGLONG now) noexcept {
         gPairedObserverPairReopenSuppressed.fetch_add(1U, std::memory_order_relaxed);
         return true;
     }
+    if (PairAdmissionPending(state, actor.completedPairRevision, actor.completedTransitionRevision)) {
+        // Binding, native preparation and physical placement can span frames.
+        // Retire locomotion BEFORE any of those gates, then reserve the pair;
+        // no new path/stop transition may replace its source while waiting.
+        navigation::Cancel(actor.character);
+        actor.replayedExecutionRevision = 0U;
+        actor.completedExecutionRevision = 0U;
+        actor.movementOwner = MovementOwner::Paired;
+        static_cast<void>(character_direct_step_runtime::Stop(actor.character));
+    }
     if (actor.pairPlacementPending && !PairPlacementMatchesState(actor, state))
         ClearPairPlacement(actor);
     if (actor.pairPlacementPending && now - actor.pairPlacementSince > kPairPlacementReadyTimeout) {
@@ -3980,6 +4004,33 @@ bool ApplyAuthoritativeInteraction(Actor& actor, const ULONGLONG now) noexcept {
     gInteractionApplied.fetch_add(1U, std::memory_order_relaxed);
     return true;
 }
+void RetryObserverSourceFinish(Actor& actor, const ULONGLONG now) noexcept {
+    // Called only after ReadRemoteObserverVictimState proves that this exact
+    // local victim graph ended. FUN_00655A60 calls FUN_006559A0 once; the latter
+    // can decline while the source animation controller is not ready. Retry
+    // that same native finish boundary rather than inventing a death marker
+    // or destroying a still-running source on HP=0.
+    std::uintptr_t cycle{}, owner{}, table{};
+    std::uint8_t state{}, finished{};
+    const auto original = reinterpret_cast<void(__thiscall*)(void*)>(
+        gSourceGraphFinishOriginal.load(std::memory_order_acquire));
+    if (original == nullptr ||
+        (actor.lastObserverFinishAttempt != 0U && now - actor.lastObserverFinishAttempt < kRefreshPeriod) ||
+        !Read(actor.character + 0x36CU, cycle) || cycle == 0U ||
+        !Read(cycle + 4U, owner) || owner != actor.character ||
+        !Read(cycle, table) || table != gBase + 0x00EAE5D0U ||
+        !Read(cycle + 0x1AU, state) || state != 0x4EU ||
+        !Read(cycle + 0xE6U, finished) || finished != 0U) return;
+    actor.lastObserverFinishAttempt = now;
+    gPairedObserverFinishRetries.fetch_add(1U, std::memory_order_relaxed);
+    __try {
+        original(reinterpret_cast<void*>(cycle));
+        if (Read(cycle + 0xE6U, finished) && finished != 0U)
+            gPairedObserverFinishCompleted.fetch_add(1U, std::memory_order_relaxed);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        gFaults.fetch_add(1U, std::memory_order_relaxed);
+    }
+}
 bool PairedTransitionOwnsCycle(Actor& actor, const ULONGLONG now) noexcept {
     // Do not reuse the source layout while a retail worker admits its victim.
     if (PairSourceBusy(actor.character)) return true;
@@ -4011,6 +4062,7 @@ bool PairedTransitionOwnsCycle(Actor& actor, const ULONGLONG now) noexcept {
             !LocalClientVictim(target) && TerminalDeadCharacter(target)) {
             const auto victimState = ReadRemoteObserverVictimState(actor, target, binding);
             if (victimState == RemoteObserverVictimState::Complete) {
+                RetryObserverSourceFinish(actor, now);
                 std::uintptr_t cycle{};
                 std::uint8_t nativeState{};
                 bool localActive{};
@@ -4596,6 +4648,11 @@ bool ApplyAuthoritativeExecution(Actor& actor, const ULONGLONG now) noexcept {
 bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
     const auto& state = actor.desired;
     if (PairSourceBusy(actor.character)) { actor.movementOwner = MovementOwner::Paired; return true; }
+    if (!ObserverReleasedPairMatches(actor, state) &&
+        PairAdmissionPending(state, actor.completedPairRevision, actor.completedTransitionRevision)) {
+        actor.movementOwner = MovementOwner::Paired;
+        return true;
+    }
     if (actor.observerHandoffNeutral) {
         if (ObserverHandoffHasNewAuthority(actor, state)) {
             // Resume motion/execution, but retain the released-pair identity until
@@ -4638,14 +4695,28 @@ bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
         return true;
     }
     if (actor.movementOwner == MovementOwner::Navigation) {
-        std::string navigationError;
-        if (!navigation::Apply(actor.character, state.navigation, actor.lastReceive + kMotionLease, navigationError))
-            return false;
-        actor.intentDivergenceSince = 0U;
-        actor.completedRevision = state.revision;
-        actor.lastProxyRefresh = now;
-        gIntentApplied.fetch_add(1U, std::memory_order_relaxed);
-        return true;
+        const bool rejected = actor.rejectedNavigationRevision == state.navigation.revision &&
+            actor.rejectedNavigationRequestRevision == state.navigation.requestRevision;
+        if (!rejected && (actor.lastNavigationAttempt == 0U ||
+                now - actor.lastNavigationAttempt >= kRefreshPeriod)) {
+            std::string navigationError;
+            if (navigation::Apply(actor.character, state.navigation,
+                    actor.lastReceive + kMotionLease, navigationError)) {
+                actor.lastNavigationAttempt = 0U;
+                actor.intentDivergenceSince = 0U;
+                actor.completedRevision = state.revision;
+                actor.lastProxyRefresh = now;
+                gIntentApplied.fetch_add(1U, std::memory_order_relaxed);
+                return true;
+            }
+            actor.rejectedNavigationRevision = state.navigation.revision;
+            actor.rejectedNavigationRequestRevision = state.navigation.requestRevision;
+            actor.lastNavigationAttempt = now;
+            gNavigationFallbacks.fetch_add(1U, std::memory_order_relaxed);
+        }
+        // Failure/interruption belongs to the local path request, not to the
+        // actor or its paired authority. Restore the existing steering path.
+        actor.movementOwner = MovementOwner::Intent;
     }
     navigation::Cancel(actor.character);
     // Unrecognized move requests retain the bounded steering carrier. Unknown
@@ -5522,7 +5593,8 @@ std::uint8_t __fastcall NavigationSubmitDetour(void* request, void*) noexcept {
         actor->capturedNavigationRequest = address;
         ++actor->capturedNavigationEpoch;
         if (actor->capturedNavigationEpoch == 0U) actor->capturedNavigationEpoch = 1U;
-        actor->lastSend = 0U;
+        // Keep the normal publication cadence for movement requests. Pair and
+        // outcome transitions have their own immediate publication paths.
     }
     return accepted;
 }
@@ -6902,6 +6974,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"failed", Diagnostics::Unsigned(nav.failed), true},
          {"cancelled", Diagnostics::Unsigned(nav.cancelled), true},
          {"expired", Diagnostics::Unsigned(nav.expired), true},
+         {"intentFallbacks", Diagnostics::Unsigned(gNavigationFallbacks.load()), true},
          {"pairedGraphDropped", Diagnostics::Unsigned(gPairedGraphDropped.load()), true}});
     for (;;) {
         PairedGraphProbe sample{};
@@ -7024,6 +7097,8 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"pairedInitializeFailed", Diagnostics::Unsigned(ai.pairedInitializeFailed), true},
          {"pairedCycleReleased", Diagnostics::Unsigned(ai.pairedCycleReleased), true},
          {"pairedObserverCompletions", Diagnostics::Unsigned(ai.pairedObserverCompletions), true},
+         {"pairedObserverFinishRetries", Diagnostics::Unsigned(gPairedObserverFinishRetries.load()), true},
+         {"pairedObserverFinishCompleted", Diagnostics::Unsigned(gPairedObserverFinishCompleted.load()), true},
          {"pairedObserverReleaseAttempts", Diagnostics::Unsigned(ai.pairedObserverReleaseAttempts), true},
          {"pairedObserverReleases", Diagnostics::Unsigned(ai.pairedObserverReleases), true},
          {"pairedObserverReleaseRejected", Diagnostics::Unsigned(ai.pairedObserverReleaseRejected), true},
