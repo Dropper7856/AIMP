@@ -6914,7 +6914,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
             {{"sampleTick", Diagnostics::Unsigned(sample.tick), true},
              {"role", Diagnostics::Unsigned(sample.role), true},
              {"worldGeneration", Diagnostics::Unsigned(sample.generation), true},
-             {"event", Diagnostics::Unsigned(sample.event), true},
+             {"nativeEventId", Diagnostics::Unsigned(sample.event), true},
              {"side", Diagnostics::Unsigned(sample.side), true},
              {"phase", Diagnostics::Unsigned(sample.phase), true},
              {"sourceA", Diagnostics::Unsigned(sample.sourceA), true},
