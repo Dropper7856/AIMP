@@ -17,6 +17,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
 set(AIMP_CORE_SOURCES
     src/AISync.cpp
+    src/AISyncNavigation.cpp
     src/BuildProfile.cpp
     src/CapabilityMatrix.cpp
     src/CaptureCatalog.cpp
@@ -113,6 +114,12 @@ set_target_properties(AIMP.NetZ PROPERTIES
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(AIMP.AISyncTests tests/AISyncPortableTests.cpp)
+    set_target_properties(AIMP.AISyncTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    target_include_directories(AIMP.AISyncTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_options(AIMP.AISyncTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    add_test(NAME AISyncOwnershipAndNavigation COMMAND AIMP.AISyncTests)
     add_executable(AIMP.WorldActionTests EXCLUDE_FROM_ALL
         tests/WorldActionPortableTests.cpp
         src/WorldInteractionAdapterCodec.cpp)

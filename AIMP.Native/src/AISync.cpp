@@ -1,4 +1,6 @@
 #include "aimp/AISync.h"
+#include "aimp/AISyncExecutionPolicy.h"
+#include "aimp/AISyncNavigation.h"
 #include "aimp/BuildProfile.h"
 #include "aimp/CharacterDirectStepRuntime.h"
 #include "aimp/CrashGuard.h"
@@ -29,7 +31,7 @@ constexpr ULONGLONG kManagerDormancyPeriod = 500ULL;
 constexpr ULONGLONG kDeadTargetGracePeriod = 1500ULL;
 constexpr ULONGLONG kPostDeathArbitrationGracePeriod = 2000ULL;
 constexpr ULONGLONG kPostDeathRecentSenseHold = 2000ULL;
-constexpr ULONGLONG kRemoteObserverStage2ReleaseGrace = 350ULL;
+constexpr ULONGLONG kMotionLease = 600ULL;
 constexpr std::uint32_t kStateFlags = PoseValid | Moving | ActionValid | InteractionValid | RoleTaskValid |
     ExecutionValid;
 constexpr std::uint32_t kExecutionFlags = ExecutionTransition | ExecutionCertified | ExecutionPaired;
@@ -199,6 +201,11 @@ struct Actor {
     std::uint32_t completedRevision{}, completedInteractionRevision{};
     std::uint32_t completedActionRevision{}, completedRoleTaskRevision{}, completedLifecycleRevision{};
     std::uint32_t completedExecutionRevision{};
+    std::uint32_t replayedExecutionRevision{};
+    ULONGLONG lastExecutionAttempt{};
+    std::uintptr_t capturedNavigationRequest{};
+    std::uint32_t capturedNavigationEpoch{};
+    MovementOwner movementOwner{MovementOwner::None};
     std::uint32_t interactionActionRevision{}, interactionActionPathHash{};
     std::uint32_t completedPairRevision{}, completedTransitionRevision{}, recoveredInteractionRevision{};
     std::uint32_t resolvedPairRevision{}, localPairFlagsLow{}, localPairFlagsHigh{};
@@ -220,11 +227,6 @@ struct Actor {
     std::uint32_t observerReleasedExecutionRevision{}, observerReleasedRoleTaskRevision{};
     std::uint32_t observerReleasedLifecycleRevision{}, observerReleasedLocomotionRevision{};
     std::uint64_t observerReleasedTargetPeer{};
-    // Remote-observer-only watchdog for the terminal kind=1 stage-2 hold.
-    // It never applies to the local victim and carries no pointer across frames.
-    ULONGLONG observerStage2Since{};
-    std::uint32_t observerStage2PairRevision{};
-    std::uint64_t observerStage2TargetPeer{};
     bool observerHandoffNeutral{};
     std::uint32_t remoteBirth{}, remoteRevision{};
     float lastPosition[3]{};
@@ -246,6 +248,8 @@ struct PresentationProbe final {
     std::uint32_t nativeGeneration{}, worldGeneration{}, role{}, phase{};
     std::uint32_t entityA{}, entityB{}, birth{}, revision{}, pairRevision{}, lifecycleFlags{}, interactionFlags{};
     std::uint32_t observerReleasedPairRevision{};
+    NavigationGoalState navigation{};
+    std::uint32_t movementOwner{};
     std::uint32_t cycleType{}, stage{0xFFFFFFFFU}, withdrawState{0xFFFFFFFFU};
     float local[3]{}, authority[3]{}, victim[3]{}, authorityVictim[3]{};
     std::uint8_t cycleState{}, hidden{}, enabled{};
@@ -506,6 +510,22 @@ std::atomic<std::uint64_t> gPostDeathDecisionResets{}, gPostDeathDecisionResetRe
 std::atomic<std::uint64_t> gInteractionBindingsResolved{}, gInteractionBindingRejected{};
 std::atomic<std::uint32_t> gLastHostAttachment{}, gLastLocalAttachment{}, gLastTransitionVariant{};
 std::atomic<std::uint32_t> gActiveNativeGeneration{}, gActiveWorldGeneration{};
+// Worker-safe value-only callback trace. Never read Actor or gCurrent here.
+struct PairedGraphProbe final {
+    std::uint64_t tick{}, peer{};
+    std::uint32_t role{}, generation{}, event{}, side{}, phase{}, pairRevision{}, birth{};
+    std::uint32_t sourceA{}, sourceB{}, victimA{}, victimB{}, sourceStage{0xFFFFFFFFU};
+    std::uint8_t sourceState{}, victimState{}, sourceFinished{}, victimEnded{}, victimAcquired{};
+    bool readable{};
+};
+std::array<PairedGraphProbe, kParticipantProbeRing> gPairedGraphProbes{};
+std::mutex gPairedGraphMutex;
+std::uint32_t gPairedGraphWrite{}, gPairedGraphRead{};
+std::atomic<std::uint64_t> gPairedGraphDropped{};
+void* gSourceGraphEventTrampoline{}, *gVictimGraphEventTrampoline{}, *gSourceGraphFinishTrampoline{};
+std::atomic<void*> gSourceGraphEventOriginal{}, gVictimGraphEventOriginal{}, gSourceGraphFinishOriginal{};
+void* gNavigationSubmitTrampoline{};
+std::atomic<void*> gNavigationSubmitOriginal{};
 std::atomic<std::uint32_t> gLastEntityA{}, gLastEntityB{}, gLastCharacterClass{};
 std::atomic<std::uint32_t> gLastActionTypeRva{}, gLastActionPathHash{}, gLastActionStatus{};
 std::atomic<std::uint32_t> gLastExecutionTypeRva{}, gLastExecutionState{}, gLastExecutionFlags{};
@@ -568,7 +588,8 @@ bool AICharacterClass(const std::uint32_t type) noexcept {
     }
 }
 bool Valid(const State& s) noexcept {
-    if (s.version != 10U || s.nativeGeneration == 0U || s.sessionCookie == 0U ||
+    if (!navigation::ValidGoal(s.navigation)) return false;
+    if (s.version != 11U || s.nativeGeneration == 0U || s.sessionCookie == 0U ||
         s.worldGeneration == 0U || (s.entityA == 0U && s.entityB == 0U) ||
         s.birth == 0U || s.revision == 0U || !AICharacterClass(s.characterClass) ||
         (s.stateFlags & ~kStateFlags) != 0U || s.moveType > 3U ||
@@ -1949,6 +1970,7 @@ bool ClearRoleTaskExecutor(Actor& actor) noexcept {
 
 bool QuiesceProxyExecution(Actor& actor) noexcept {
     if (actor.character == 0U) return false;
+    navigation::Cancel(actor.character);
     actor.poseCount = 0U; actor.poseRevision = 0U; actor.poseInterpolating = false;
     static_cast<void>(character_direct_step_runtime::Stop(actor.character));
     const bool tree = actor.tree == 0U || SuspendExistingTree(actor);
@@ -2118,15 +2140,7 @@ void CaptureActiveAction(Actor& actor) noexcept {
 
 bool CertifiedExecutionCycle(const std::uint32_t typeRva,
     const std::uint32_t state) noexcept {
-    switch (state) {
-    case 0x37U: return typeRva == 0x00EABE00U;
-    case 0x03U: return typeRva == 0x00EABA40U;
-    case 0x09U: return typeRva == 0x00EAC1C0U;
-    case 0x10U: return typeRva == 0x00EADC18U;
-    case 0x5CU: return typeRva == 0x00EACDA8U;
-    case 0x51U: return typeRva == 0x00EAC608U;
-    default: return false;
-    }
+    return FindExecutionTransition(typeRva, state) != nullptr;
 }
 
 void CaptureExecutionCycle(Actor& actor) noexcept {
@@ -2488,72 +2502,6 @@ RemoteObserverVictimState ReadRemoteObserverVictimState(const Actor& actor,
     return RemoteObserverVictimState::Active;
 }
 
-bool RemoteObserverTerminalStage2ReleaseReady(Actor& actor, const ULONGLONG now) noexcept {
-    auto reset = [&]() noexcept {
-        actor.observerStage2Since = 0U;
-        actor.observerStage2PairRevision = 0U;
-        actor.observerStage2TargetPeer = 0U;
-    };
-    if (gRole.load(std::memory_order_acquire) != Role::Client ||
-        !actor.interactionOwnsCycle || actor.desired.interactionPairRevision == 0U ||
-        actor.desired.interactionTargetPeer == 0U || actor.desired.outcome.revision == 0U ||
-        actor.desired.outcome.kind != 1U) {
-        reset();
-        return false;
-    }
-    const auto fatalFlags = OutcomeVictimAdmitted | OutcomeNativeDeath | OutcomeTerminal;
-    if ((actor.desired.outcome.flags & fatalFlags) != fatalFlags) {
-        reset();
-        return false;
-    }
-    const auto target = ParticipantForPeer(actor.desired.interactionTargetPeer);
-    if (target == 0U || LocalClientVictim(target) || !RegisteredPlayerRepresentation(target) ||
-        !TerminalDeadCharacter(target)) {
-        reset();
-        return false;
-    }
-    OutcomeBinding binding{};
-    if (!LoadOutcome(actor.character, target, binding) || !binding.claimed ||
-        binding.state.birth != actor.desired.birth ||
-        binding.state.interactionPairRevision != actor.desired.interactionPairRevision ||
-        binding.state.interactionTargetPeer != actor.desired.interactionTargetPeer ||
-        !PairIdentityLive(binding.victim)) {
-        reset();
-        return false;
-    }
-    // The victim graph must be the exact admitted remote 4F and must still be
-    // running. This is not a generic HP==0 shortcut; local-player death remains
-    // strict and an unreadable graph is never treated as safe completion.
-    if (ReadRemoteObserverVictimState(actor, target, binding) != RemoteObserverVictimState::Active) {
-        reset();
-        return false;
-    }
-    std::uintptr_t sourceCycle{}, victimCycle{}, linkedSource{}, linkedCycle{};
-    std::uint8_t sourceState{}, acquired{}, ended{}, interactive{};
-    std::uint32_t stage{};
-    if (!Read(actor.character + 0x36CU, sourceCycle) || sourceCycle == 0U ||
-        !Read(sourceCycle + 0x1AU, sourceState) || sourceState != 0x4EU ||
-        !Read(sourceCycle + 0xE0U, stage) || stage != 2U ||
-        !Read(target + 0x36CU, victimCycle) || victimCycle == 0U ||
-        !Read(victimCycle + 0xD9U, acquired) || acquired == 0U ||
-        !Read(victimCycle + 0xD8U, ended) || ended != 0U ||
-        !Read(victimCycle + 0xDAU, interactive) || interactive != 0U ||
-        !Read(victimCycle + 0x68U, linkedSource) || linkedSource != actor.character ||
-        !Read(victimCycle + 0xB0U, linkedCycle) || linkedCycle != sourceCycle) {
-        reset();
-        return false;
-    }
-    if (actor.observerStage2PairRevision != actor.desired.interactionPairRevision ||
-        actor.observerStage2TargetPeer != actor.desired.interactionTargetPeer ||
-        actor.observerStage2Since == 0U) {
-        actor.observerStage2PairRevision = actor.desired.interactionPairRevision;
-        actor.observerStage2TargetPeer = actor.desired.interactionTargetPeer;
-        actor.observerStage2Since = now;
-        return false;
-    }
-    return now - actor.observerStage2Since >= kRemoteObserverStage2ReleaseGrace;
-}
-
 bool ObserverReleasedPairMatches(const Actor& actor, const State& state) noexcept {
     return actor.observerReleasedBirth != 0U &&
         actor.observerReleasedBirth == state.birth &&
@@ -2571,9 +2519,6 @@ void ClearObserverReleaseMemory(Actor& actor) noexcept {
     actor.observerReleasedLifecycleRevision = 0U;
     actor.observerReleasedLocomotionRevision = 0U;
     actor.observerReleasedTargetPeer = 0U;
-    actor.observerStage2Since = 0U;
-    actor.observerStage2PairRevision = 0U;
-    actor.observerStage2TargetPeer = 0U;
     actor.observerHandoffNeutral = false;
 }
 
@@ -3321,6 +3266,74 @@ __declspec(naked) void PairedVictimAvailabilityShim() {
         ret
     }
 }
+void TracePairedGraph(const std::uintptr_t source, const std::uintptr_t victim,
+    const std::uint32_t event, const std::uint32_t side, const std::uint32_t phase) noexcept {
+    PairIdentity identity{};
+    if (PublishedPairSource(source, identity) == kActors || !PairIdentityLive(identity)) return;
+    PairedGraphProbe sample{};
+    sample.tick = GetTickCount64(); sample.event = event; sample.side = side; sample.phase = phase;
+    sample.role = static_cast<std::uint32_t>(gRole.load(std::memory_order_acquire));
+    sample.generation = gActiveWorldGeneration.load(std::memory_order_acquire);
+    sample.sourceA = identity.entityA; sample.sourceB = identity.entityB;
+    std::uint32_t victimType{};
+    static_cast<void>(CharacterIdentity(victim, sample.victimA, sample.victimB, victimType));
+    OutcomeBinding binding{};
+    if (LoadOutcome(source, victim, binding)) {
+        sample.peer = binding.state.interactionTargetPeer;
+        sample.pairRevision = binding.state.interactionPairRevision; sample.birth = binding.state.birth;
+    }
+    std::uintptr_t sourceCycle{}, victimCycle{}, owner{};
+    sample.readable = Read(source + 0x36CU, sourceCycle) && sourceCycle != 0U &&
+        Read(sourceCycle + 4U, owner) && owner == source &&
+        Read(sourceCycle + 0x1AU, sample.sourceState);
+    if (sample.readable && sample.sourceState == 0x4EU) {
+        sample.readable = Read(sourceCycle + 0xE0U, sample.sourceStage) &&
+            Read(sourceCycle + 0xE6U, sample.sourceFinished);
+    }
+    if (victim != 0U && Read(victim + 0x36CU, victimCycle) && victimCycle != 0U &&
+        Read(victimCycle + 4U, owner) && owner == victim &&
+        Read(victimCycle + 0x1AU, sample.victimState) && sample.victimState == 0x4FU) {
+        sample.readable = sample.readable && Read(victimCycle + 0xD8U, sample.victimEnded) &&
+            Read(victimCycle + 0xD9U, sample.victimAcquired);
+    }
+    std::unique_lock lock(gPairedGraphMutex, std::try_to_lock);
+    if (!lock.owns_lock() || gPairedGraphWrite - gPairedGraphRead >= kParticipantProbeRing) {
+        gPairedGraphDropped.fetch_add(1U, std::memory_order_relaxed); return;
+    }
+    gPairedGraphProbes[gPairedGraphWrite++ % kParticipantProbeRing] = sample;
+}
+void __fastcall SourceGraphEventDetour(void* context, void*, const std::uint32_t event) noexcept {
+    using Event = void(__thiscall*)(void*, std::uint32_t);
+    const auto original = reinterpret_cast<Event>(gSourceGraphEventOriginal.load(std::memory_order_acquire));
+    if (original == nullptr) return;
+    std::uintptr_t source{}, victim{};
+    const auto cycle = reinterpret_cast<std::uintptr_t>(context);
+    if (Read(cycle + 4U, source) && Read(cycle + 0x44U, victim))
+        TracePairedGraph(source, victim, event, 1U, 0U);
+    original(context, event);
+    TracePairedGraph(source, victim, event, 1U, 1U);
+}
+void __fastcall VictimGraphEventDetour(void* context, void*, const std::uint32_t event) noexcept {
+    using Event = void(__thiscall*)(void*, std::uint32_t);
+    const auto original = reinterpret_cast<Event>(gVictimGraphEventOriginal.load(std::memory_order_acquire));
+    if (original == nullptr) return;
+    std::uintptr_t source{}, victim{};
+    const auto cycle = reinterpret_cast<std::uintptr_t>(context);
+    if (Read(cycle + 4U, victim) && Read(cycle + 0x68U, source))
+        TracePairedGraph(source, victim, event, 2U, 0U);
+    original(context, event);
+    TracePairedGraph(source, victim, event, 2U, 1U);
+}
+void __fastcall SourceGraphFinishDetour(void* context, void*) noexcept {
+    const auto original = reinterpret_cast<void(__thiscall*)(void*)>(gSourceGraphFinishOriginal.load(std::memory_order_acquire));
+    if (original == nullptr) return;
+    std::uintptr_t source{}, victim{};
+    const auto cycle = reinterpret_cast<std::uintptr_t>(context);
+    if (Read(cycle + 4U, source) && Read(cycle + 0x44U, victim))
+        TracePairedGraph(source, victim, 0U, 3U, 0U);
+    original(context);
+    TracePairedGraph(source, victim, 0U, 3U, 1U);
+}
 void SamplePresentation(Actor& actor, const ULONGLONG now, const std::uint32_t phase = 0U) noexcept {
     if (!EngineThread() || !Stable() || actor.character == 0U || actor.duplicate) return;
     if (phase == 0U && now - actor.lastPresentationProbe < kParticipantProbePeriod) return;
@@ -3338,6 +3351,8 @@ void SamplePresentation(Actor& actor, const ULONGLONG now, const std::uint32_t p
     sample.interactionFlags = state.interactionFlags;
     sample.lifecycleFlags = state.lifecycleFlags; sample.ownsPair = actor.interactionOwnsCycle;
     sample.observerReleasedPairRevision = actor.observerReleasedPairRevision;
+    sample.navigation = state.navigation;
+    sample.movementOwner = static_cast<std::uint32_t>(actor.movementOwner);
     sample.observerHandoffNeutral = actor.observerHandoffNeutral;
     sample.placementPending = actor.placementPending;
     sample.pairPlacementPending = actor.pairPlacementPending;
@@ -3648,6 +3663,10 @@ bool CharacterReady(const Actor& actor) noexcept {
 }
 bool Release(Actor& actor) noexcept {
     if (PairSourceBusy(actor.character)) return true;
+    navigation::Cancel(actor.character);
+    actor.movementOwner = MovementOwner::None;
+    actor.replayedExecutionRevision = 0U;
+    actor.lastExecutionAttempt = 0U;
     actor.poseCount = 0U; actor.poseRevision = 0U; actor.poseInterpolating = false;
     if (actor.character != 0U && Client()) {
         static_cast<void>(character_direct_step_runtime::Stop(actor.character));
@@ -3868,6 +3887,8 @@ bool ApplyAuthoritativeInteraction(Actor& actor, const ULONGLONG now) noexcept {
         (static_cast<std::uint64_t>(actor.localPairFlagsHigh) << 32U);
     __try {
         if (actor.completedPairRevision != state.interactionPairRevision) {
+            navigation::Cancel(actor.character);
+            actor.movementOwner = MovementOwner::Paired;
             // The latest-state mailbox can skip the old pair's inactive frame
             // when Host immediately attacks another player. Retire our prior
             // native pair before admitting the replacement source/target pair.
@@ -3955,8 +3976,6 @@ bool PairedTransitionOwnsCycle(Actor& actor, const ULONGLONG now) noexcept {
     if (actor.completedPairRevision != actor.desired.interactionPairRevision) return false;
 
     bool remoteObserverFatalComplete{};
-    const bool remoteObserverTerminalStage2Release =
-        RemoteObserverTerminalStage2ReleaseReady(actor, now);
     const auto target = ParticipantForPeer(actor.desired.interactionTargetPeer);
     if (actor.desired.outcome.revision != 0U) {
         OutcomeBinding binding{};
@@ -3991,10 +4010,10 @@ bool PairedTransitionOwnsCycle(Actor& actor, const ULONGLONG now) noexcept {
             }
         }
     }
-    if (!remoteObserverTerminalStage2Release && ClientNativeVictimOwnsPair(actor.character)) return true;
+    if (ClientNativeVictimOwnsPair(actor.character)) return true;
     const bool withdrawn = ProxyWithdrawn(actor.desired);
     if (!withdrawn && (actor.desired.interactionFlags & InteractionSourceCycleRetained) != 0U &&
-        !remoteObserverFatalComplete && !remoteObserverTerminalStage2Release) {
+        !remoteObserverFatalComplete) {
         // While the local victim graph still matters, keep the attacker through
         // the Host's real 4E outro. A completed remote observer graph is allowed
         // to release so the next authoritative execution can take over.
@@ -4007,14 +4026,13 @@ bool PairedTransitionOwnsCycle(Actor& actor, const ULONGLONG now) noexcept {
     std::uintptr_t cycle{};
     std::uint8_t state{};
     bool localActive{};
-    if (!remoteObserverTerminalStage2Release && !withdrawn &&
+    if (!withdrawn &&
         (actor.desired.interactionFlags & InteractionCycleActive) != 0U &&
         (!ReadPairedCycleActivity(actor.character, cycle, state, localActive) || localActive)) return true;
 
-    const bool observerRelease = remoteObserverFatalComplete || remoteObserverTerminalStage2Release;
+    const bool observerRelease = remoteObserverFatalComplete;
     if (observerRelease) {
         gPairedObserverReleaseAttempts.fetch_add(1U, std::memory_order_relaxed);
-        if (remoteObserverTerminalStage2Release) SamplePresentation(actor, now, 7U);
     }
     if (!character_direct_step_runtime::FinishReplicatedInteraction(actor.character)) {
         if (observerRelease)
@@ -4038,6 +4056,7 @@ bool PairedTransitionOwnsCycle(Actor& actor, const ULONGLONG now) noexcept {
         actor.observerReleasedLocomotionRevision = actor.desired.locomotionRevision;
         actor.observerReleasedTargetPeer = actor.desired.interactionTargetPeer;
         actor.observerHandoffNeutral = true;
+        actor.movementOwner = MovementOwner::Neutral;
         gPairedObserverReleases.fetch_add(1U, std::memory_order_relaxed);
         SamplePresentation(actor, now, 5U);
     }
@@ -4474,11 +4493,12 @@ void RememberPresentationPose(Actor& actor, const State& state, const ULONGLONG 
 }
 bool RecoverCatastrophicIntentDivergence(Actor& actor, const State& state,
     const ULONGLONG now) noexcept {
-    const bool hostTransitionOwnsMotion = (state.stateFlags & ExecutionValid) != 0U &&
-        (state.executionFlags & ExecutionTransition) != 0U;
+    const bool hostTransitionOwnsMotion = actor.replayedExecutionRevision != 0U &&
+        actor.replayedExecutionRevision == state.executionRevision;
     if ((state.stateFlags & PoseValid) == 0U || ProxyWithdrawn(state) ||
         (state.lifecycleFlags & (LifecycleSpatialDiscontinuity | LifecycleTraversalAction)) != 0U ||
-        PairSourceBusy(actor.character) || actor.interactionOwnsCycle || hostTransitionOwnsMotion) {
+        PairSourceBusy(actor.character) || actor.interactionOwnsCycle || hostTransitionOwnsMotion ||
+        state.navigation.flags != 0U) {
         actor.intentDivergenceSince = 0U;
         return true;
     }
@@ -4517,51 +4537,50 @@ bool RecoverCatastrophicIntentDivergence(Actor& actor, const State& state,
     return true;
 }
 
-bool ApplyAuthoritativeExecution(Actor& actor) noexcept {
+bool ApplyAuthoritativeExecution(Actor& actor, const ULONGLONG now) noexcept {
     const auto& state = actor.desired;
     if ((state.stateFlags & ExecutionValid) == 0U || state.executionRevision == 0U ||
-        state.executionRevision == actor.completedExecutionRevision) return true;
-
-    // Move/Idle and paired graphs already have stronger dedicated carriers.
-    if ((state.executionFlags & ExecutionPaired) != 0U ||
-        state.executionCycleState == 0x01U || state.executionCycleState == 0x38U) {
+        (state.executionFlags & ExecutionTransition) == 0U) {
+        actor.replayedExecutionRevision = 0U;
         actor.completedExecutionRevision = state.executionRevision;
         return true;
     }
-    if ((state.executionFlags & ExecutionTransition) == 0U) {
+    if (state.executionRevision == actor.completedExecutionRevision) return true;
+    actor.replayedExecutionRevision = 0U;
+    // Unknown metadata is acknowledged once, but does not acquire movement.
+    if (FindExecutionTransition(state.executionCycleTypeRva, state.executionCycleState) == nullptr) {
         actor.completedExecutionRevision = state.executionRevision;
+        gExecutionReplayRejected.fetch_add(1U, std::memory_order_relaxed);
+        gLastRejectedExecutionTypeRva.store(state.executionCycleTypeRva, std::memory_order_relaxed);
+        gLastRejectedExecutionState.store(state.executionCycleState, std::memory_order_relaxed);
         return true;
     }
-
+    if (actor.lastExecutionAttempt != 0U && now - actor.lastExecutionAttempt < kRefreshPeriod) return true;
+    actor.lastExecutionAttempt = now;
+    navigation::Cancel(actor.character);
     std::string error;
     const auto result = character_direct_step_runtime::ReplayAIExecutionTransition(
         actor.character, state.executionCycleTypeRva, state.executionCycleState, error);
     if (result == character_direct_step_runtime::AIExecutionReplayResult::Applied) {
         static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
         actor.completedExecutionRevision = state.executionRevision;
+        actor.replayedExecutionRevision = state.executionRevision;
         actor.intentDivergenceSince = 0U;
+        actor.lastExecutionAttempt = 0U;
         gExecutionReplayed.fetch_add(1U, std::memory_order_relaxed);
-        return true;
+    } else {
+        // A failed replay remains pending and can be retried; it cannot create
+        // the ownership vacuum of the old reject-and-complete path.
+        gExecutionReplayRejected.fetch_add(1U, std::memory_order_relaxed);
+        gLastRejectedExecutionTypeRva.store(state.executionCycleTypeRva, std::memory_order_relaxed);
+        gLastRejectedExecutionState.store(state.executionCycleState, std::memory_order_relaxed);
     }
-    if (result == character_direct_step_runtime::AIExecutionReplayResult::NotRequired) {
-        actor.completedExecutionRevision = state.executionRevision;
-        return true;
-    }
-
-    // Unknown transitions are metadata-only. Drop AIMP's steering lease so it
-    // cannot overwrite the retail Character cycle, but never fabricate state
-    // or fault the whole actor. Certified failures remain visible in counters.
-    static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
-    actor.completedExecutionRevision = state.executionRevision;
-    gExecutionReplayRejected.fetch_add(1U, std::memory_order_relaxed);
-    gLastRejectedExecutionTypeRva.store(state.executionCycleTypeRva, std::memory_order_relaxed);
-    gLastRejectedExecutionState.store(state.executionCycleState, std::memory_order_relaxed);
     return true;
 }
 
 bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
     const auto& state = actor.desired;
-    if (PairSourceBusy(actor.character)) return true;
+    if (PairSourceBusy(actor.character)) { actor.movementOwner = MovementOwner::Paired; return true; }
     if (actor.observerHandoffNeutral) {
         if (ObserverHandoffHasNewAuthority(actor, state)) {
             // Resume motion/execution, but retain the released-pair identity until
@@ -4575,6 +4594,7 @@ bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
             // retail Idle. Do not overwrite it with stale steering from the
             // released kill snapshot while Host is still finishing its outro.
             actor.completedRevision = state.revision;
+            actor.movementOwner = MovementOwner::Neutral;
             actor.lastProxyRefresh = now;
             gPairedObserverNeutralHolds.fetch_add(1U, std::memory_order_relaxed);
             return true;
@@ -4585,25 +4605,36 @@ bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
         return true;
     }
     if (actor.lastProxyRefresh == now) return true;
+    if (now - actor.lastReceive >= kMotionLease) {
+        navigation::Cancel(actor.character);
+        actor.movementOwner = MovementOwner::Neutral;
+        std::string idleError;
+        return character_direct_step_runtime::HoldAIIntentIdle(actor.character, state.moveType, idleError);
+    }
     if (!RecoverCatastrophicIntentDivergence(actor, state, now)) return false;
-    if (!ApplyAuthoritativeExecution(actor)) return false;
+    if (!ApplyAuthoritativeExecution(actor, now)) return false;
 
-    // A Host-owned retail transition (for example 37 after a paired kill)
-    // owns motion until Host returns to Move/Idle. Do not immediately stomp it
-    // with HoldAIIntentIdle merely because the Move intent tap is inactive.
-    if ((state.stateFlags & ExecutionValid) != 0U &&
-        (state.executionFlags & ExecutionTransition) != 0U) {
+    const bool executionApplied = actor.replayedExecutionRevision != 0U &&
+        actor.replayedExecutionRevision == state.executionRevision;
+    actor.movementOwner = ChooseMovementOwner(false, false, executionApplied, state.navigation.flags == 1U);
+    if (actor.movementOwner == MovementOwner::Execution) {
+        actor.completedRevision = state.revision;
+        actor.lastProxyRefresh = now;
+        return true;
+    }
+    if (actor.movementOwner == MovementOwner::Navigation) {
+        std::string navigationError;
+        if (!navigation::Apply(actor.character, state.navigation, actor.lastReceive + kMotionLease, navigationError))
+            return false;
+        actor.intentDivergenceSince = 0U;
         actor.completedRevision = state.revision;
         actor.lastProxyRefresh = now;
         gIntentApplied.fetch_add(1U, std::memory_order_relaxed);
         return true;
     }
-
-    // Host BT/RoleTask revisions define the authoritative decision epoch.
-    // Native C++ BT/task objects themselves are never serialized or fabricated
-    // on the Client. Their resolved locomotion output is replayed through the
-    // same retail Move/Idle boundary, while interactions continue to use their
-    // certified native carriers.
+    navigation::Cancel(actor.character);
+    // Unrecognized move requests retain the bounded steering carrier. Unknown
+    // execution metadata does not suppress it and never runs a local brain.
     std::string error;
     const bool moving = (state.stateFlags & Moving) != 0U;
     const bool applied = moving
@@ -4625,6 +4656,7 @@ bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
 
 bool SameState(const State& a, const State& b) noexcept {
     if (std::memcmp(&a.outcome, &b.outcome, sizeof(a.outcome)) != 0) return false;
+    if (std::memcmp(&a.navigation, &b.navigation, sizeof(NavigationGoalState)) != 0) return false;
     if (a.stateFlags != b.stateFlags || a.moveType != b.moveType ||
         a.locomotionRevision != b.locomotionRevision ||
         std::abs(a.locomotionIntensity - b.locomotionIntensity) > 0.002F ||
@@ -4669,6 +4701,26 @@ bool SameState(const State& a, const State& b) noexcept {
     return std::abs(a.velocityX - b.velocityX) <= 0.02F &&
         std::abs(a.velocityZ - b.velocityZ) <= 0.02F;
 }
+void CaptureNavigationGoal(Actor& actor) noexcept {
+    navigation::Sample sample{};
+    if (!ProxyWithdrawn(actor.desired)) sample = navigation::Capture(actor.character);
+    if (actor.interactionOwnsCycle ||
+        (actor.desired.executionFlags & ExecutionPaired) != 0U ||
+        (actor.desired.lifecycleFlags & LifecycleTraversalAction) != 0U) sample = {};
+    const auto previous = actor.desired.navigation;
+    if (sample.request != actor.capturedNavigationRequest) {
+        actor.capturedNavigationRequest = sample.request;
+        ++actor.capturedNavigationEpoch;
+        if (actor.capturedNavigationEpoch == 0U) actor.capturedNavigationEpoch = 1U;
+    }
+    sample.goal.requestRevision = actor.capturedNavigationEpoch;
+    sample.goal.revision = previous.revision;
+    if (std::memcmp(&sample.goal, &previous, sizeof(NavigationGoalState)) != 0) {
+        ++sample.goal.revision;
+        if (sample.goal.revision == 0U) sample.goal.revision = 1U;
+    }
+    actor.desired.navigation = sample.goal;
+}
 void Publish(Actor& actor) noexcept {
     if (PairSourceBusy(actor.character)) return;
     CaptureOutcome(actor);
@@ -4699,6 +4751,7 @@ void Publish(Actor& actor) noexcept {
     CapturePose(actor, now);
     CaptureActiveAction(actor);
     CaptureRoleTask(actor);
+    CaptureNavigationGoal(actor);
     SamplePresentation(actor, now, newOutcome ? 3U : 0U);
     const bool changed = !SameState(actor.desired, actor.previous);
     if (!changed && now - actor.lastSend < kRefreshPeriod) return;
@@ -4772,6 +4825,12 @@ void PublishDormantHostActor(Actor& actor, const ULONGLONG now,
         CapturePose(actor, now);
     }
     actor.desired.stateFlags &= ~Moving;
+    if (actor.desired.navigation.flags != 0U) {
+        actor.desired.navigation.flags = 0U;
+        ++actor.desired.navigation.revision;
+        if (actor.desired.navigation.revision == 0U) actor.desired.navigation.revision = 1U;
+        actor.capturedNavigationRequest = 0U;
+    }
     actor.desired.velocityX = 0.0F;
     actor.desired.velocityZ = 0.0F;
     SamplePresentation(actor, now);
@@ -5146,8 +5205,7 @@ void __fastcall UpdateDetour(void* manager, void*, std::uint32_t previousTime, f
         SamplePresentation(*actor, now);
         // Both first-person and observer victim graphs must keep their actual
         // attacker until native fatal completion. Housekeeping still ran above.
-        if (ClientNativeVictimOwnsPair(actor->character) &&
-            !(actor->interactionOwnsCycle && RemoteObserverTerminalStage2ReleaseReady(*actor, now))) return;
+        if (ClientNativeVictimOwnsPair(actor->character)) return;
         if (gRole.load(std::memory_order_acquire) == Role::Client && Stable() &&
             !actor->faulted && now - actor->lastReceive <= kTimeout &&
             actor->interactionOwnsCycle && PairedTransitionOwnsCycle(*actor, now)) return;
@@ -5174,6 +5232,7 @@ void __fastcall UpdateDetour(void* manager, void*, std::uint32_t previousTime, f
             actor->placementPending = true;
             static_cast<void>(Release(*actor));
         } else if (withdrawn) {
+            navigation::Cancel(actor->character);
             ClearPairPlacement(*actor);
             // Host is backstage/withdrawn/dormant. Keep the follower quiesced
             // until the Host's explicit live frontstage state returns.
@@ -5428,6 +5487,29 @@ void __fastcall PairedTransitionBDetour(void* manager, void*,
     if (gRole.load(std::memory_order_acquire) == Role::Host && EngineThread() && Stable())
         CapturePairedTransition(reinterpret_cast<std::uintptr_t>(manager), target,
             variant, 2U, firstFlag, secondFlag);
+}
+std::uint8_t __fastcall NavigationSubmitDetour(void* request, void*) noexcept {
+    const auto original = reinterpret_cast<std::uint8_t(__thiscall*)(void*)>(
+        gNavigationSubmitOriginal.load(std::memory_order_acquire));
+    if (original == nullptr) return 0U;
+    const auto accepted = original(request);
+    if (accepted == 0U || gRole.load(std::memory_order_acquire) != Role::Host ||
+        !EngineThread() || !Stable()) return accepted;
+    const auto address = reinterpret_cast<std::uintptr_t>(request);
+    std::uintptr_t type{}, scheduler{}, character{};
+    if (!Read(address, type) || type != gBase + 0x00EB1A70U ||
+        !Read(address + 0x14U, scheduler) || !Read(scheduler, character) ||
+        scheduler != character + 0x2CD0U) return accepted;
+    if (auto* actor = Find(character); actor != nullptr && !actor->duplicate && !actor->faulted) {
+        // An allocator can reuse the SAME request address and goal between two
+        // network samples. Native admission, rather than pointer equality,
+        // creates the portable request epoch so completed Clients resume it.
+        actor->capturedNavigationRequest = address;
+        ++actor->capturedNavigationEpoch;
+        if (actor->capturedNavigationEpoch == 0U) actor->capturedNavigationEpoch = 1U;
+        actor->lastSend = 0U;
+    }
+    return accepted;
 }
 bool Hook(HookManager& hooks, const char* name, std::uintptr_t rva, void* detour,
     std::initializer_list<unsigned int> prefix, void** trampoline,
@@ -5793,6 +5875,35 @@ bool HookParticipantPairedIdentity(HookManager& hooks, std::string& error) {
     return hooks.InstallCallRedirect(animated, error);
 }
 
+bool HookPairedGraphTrace(HookManager& hooks, std::string& error) {
+    if (!MatchRetailBytes(0x00264AC8U, {0xC2,0x04,0x00}) ||
+        !MatchRetailBytes(0x00265A25U, {0xC2,0x04,0x00}) ||
+        !MatchRetailBytes(0x00255A5BU, {0xC3})) {
+        error = "AISync paired graph callback ABI mismatch";
+        return false;
+    }
+    // 00664A10: PUSH ESI; PUSH EDI; PUSH string (PE HIGHLOW). Complete
+    // prefix with its loaded ASLR operand. Both event handlers have RET 4.
+    HookRequest source;
+    source.name = "aisync_paired_source_graph_events";
+    source.target = reinterpret_cast<void*>(gBase + 0x00264A10U);
+    source.detour = reinterpret_cast<void*>(&SourceGraphEventDetour);
+    source.patchLength = 7U;
+    source.expected.bytes = {0x56,0x57,0x68,0,0,0,0};
+    const auto operand = static_cast<std::uint32_t>(gBase + 0x00EAE984U);
+    std::memcpy(source.expected.bytes.data() + 3U, &operand, sizeof(operand));
+    source.expected.mask = "xxxxxxx";
+    source.relocationSafePrefix = true;
+    source.trampolineOut = &gSourceGraphEventTrampoline;
+    source.publishedTrampolineOut = &gSourceGraphEventOriginal;
+    return hooks.Install(source, error) &&
+        Hook(hooks, "aisync_paired_victim_graph_events", 0x002658E0U,
+            reinterpret_cast<void*>(&VictimGraphEventDetour), {0x83,0xEC,0x1C,0x56,0x57},
+            &gVictimGraphEventTrampoline, &gVictimGraphEventOriginal, error) &&
+        Hook(hooks, "aisync_paired_source_native_finish", 0x002559A0U,
+            reinterpret_cast<void*>(&SourceGraphFinishDetour), {0x83,0xEC,0x10,0x56,0x8B,0xF1},
+            &gSourceGraphFinishTrampoline, &gSourceGraphFinishOriginal, error);
+}
 bool HookPairedVictimGuards(HookManager& hooks, std::string& error) {
     // Both the ABI and unsafe source-animation load are independently checked
     // against the certified executable before installing these two guards.
@@ -5944,7 +6055,8 @@ bool Install(const std::uintptr_t base, HookManager& hooks, LevelGenerationTrack
         return false;
     }
     gBase = base; gGenerations = &generations; gDispatcher = &dispatcher;
-    if (!ValidateRoleTaskCleanupAbi(error) || !ValidateCharacterLifecycleAbi(error)) return false;
+    if (!ValidateRoleTaskCleanupAbi(error) || !ValidateCharacterLifecycleAbi(error) ||
+        !navigation::Initialize(base, error)) return false;
     gBranchExit = reinterpret_cast<void*>(base + 0x003344D4U);
     const auto first = hooks.InstalledCount();
     // Complete instructions; no relative CALL/Jcc in a prefix. The PUSH
@@ -5955,6 +6067,10 @@ bool Install(const std::uintptr_t base, HookManager& hooks, LevelGenerationTrack
         HookParticipantSenseSignals(hooks, error) &&
         HookParticipantPairedIdentity(hooks, error) &&
         HookPairedVictimGuards(hooks, error) &&
+        HookPairedGraphTrace(hooks, error) &&
+        Hook(hooks, "aisync_native_navigation_submission", 0x00283CE0U,
+            reinterpret_cast<void*>(&NavigationSubmitDetour), {0x64,0xA1,0,0,0,0,0x6A,0xFF},
+            &gNavigationSubmitTrampoline, &gNavigationSubmitOriginal, error) &&
         HookParticipantEligibility(hooks, error) &&
         HookPostDeathMeleeSelection(hooks, error) &&
         HookPairedPlayerClassification(hooks, error) &&
@@ -6202,6 +6318,9 @@ void PumpHostImpacts() noexcept {
 
 void PumpOnEngineThread() noexcept {
     if (!Installed() || !EngineThread()) return;
+    // Generation cleanup must precede dereferencing any navigation owner.
+    if (gGeneration != gGenerations->CurrentGeneration()) navigation::Reset(false);
+    navigation::Pump(GetTickCount64());
     // Own native path-query references independently of Characters. Maintain
     // them before taking the IPC mailbox mutex; cleanup can invoke native code.
     PumpHostNavigationContext();
@@ -6313,8 +6432,7 @@ void PumpOnEngineThread() noexcept {
         // Retain this latest snapshot until the worker admission has returned;
         // birth/withdraw/task cleanup must not reconstruct its source cycle.
         if (PairSourceBusy(actor.character)) continue;
-        if (value.birth == actor.remoteBirth && ClientNativeVictimOwnsPair(actor.character) &&
-            !(actor.interactionOwnsCycle && RemoteObserverTerminalStage2ReleaseReady(actor, now))) {
+        if (value.birth == actor.remoteBirth && ClientNativeVictimOwnsPair(actor.character)) {
             // Retain the latest Host snapshot until this exact fatal victim
             // finishes, including an observer's remote human representation.
             // No task/lifecycle cleanup may reuse the paired source meanwhile.
@@ -6405,6 +6523,8 @@ void PumpOnEngineThread() noexcept {
             actor.completedTransitionRevision = 0U;
             actor.resolvedPairRevision = 0U;
             actor.completedExecutionRevision = 0U;
+        actor.replayedExecutionRevision = 0U;
+        actor.lastExecutionAttempt = 0U;
         }
 
         // BT and RoleTask remain Host-authoritative decision epochs. Clients do
@@ -6504,12 +6624,14 @@ void ObservePlayerRepresentation(const std::uintptr_t c) noexcept {
     if (!EngineThread()) return;
     if (auto* actor = Find(c); actor != nullptr) {
         // Never stop CharacterDirectStep here: this slot is owned by PlayerSync.
+        navigation::Cancel(c);
         *actor = {};
         gProvisionalPlayerActorsRetired.fetch_add(1U, std::memory_order_relaxed);
     }
 }
 void ForgetCharacter(const std::uintptr_t c) noexcept {
     InvalidatePairCharacter(c);
+    if (EngineThread()) navigation::Cancel(c);
     const bool playerRepresentation = RegisteredPlayerRepresentation(c);
     std::uint32_t runtimeId{};
     const bool hasRuntimeId = playerRepresentation && Read(c + 0x50U, runtimeId);
@@ -6756,6 +6878,45 @@ Counters DiagnosticsSnapshot() noexcept {
     return value;
 }
 void LogDiagnostics(Diagnostics& diagnostics) {
+    const auto nav = navigation::Snapshot();
+    diagnostics.Log("info", "aisync_navigation", "Host resolved goals executed by local retail navigation; v11 wire.",
+        {{"captured", Diagnostics::Unsigned(nav.captured), true},
+         {"submitted", Diagnostics::Unsigned(nav.submitted), true},
+         {"updated", Diagnostics::Unsigned(nav.updated), true},
+         {"completed", Diagnostics::Unsigned(nav.completed), true},
+         {"failed", Diagnostics::Unsigned(nav.failed), true},
+         {"cancelled", Diagnostics::Unsigned(nav.cancelled), true},
+         {"expired", Diagnostics::Unsigned(nav.expired), true},
+         {"pairedGraphDropped", Diagnostics::Unsigned(gPairedGraphDropped.load()), true}});
+    for (;;) {
+        PairedGraphProbe sample{};
+        {
+            std::unique_lock lock(gPairedGraphMutex, std::try_to_lock);
+            if (!lock.owns_lock() || gPairedGraphRead == gPairedGraphWrite) break;
+            sample = gPairedGraphProbes[gPairedGraphRead++ % kParticipantProbeRing];
+        }
+        diagnostics.Log("info", "aisync_paired_graph", "Retail callback trace: side 1=source event, 2=victim event, 3=source finish; phase 0=entry, 1=return. Observation only.",
+            {{"sampleTick", Diagnostics::Unsigned(sample.tick), true},
+             {"role", Diagnostics::Unsigned(sample.role), true},
+             {"worldGeneration", Diagnostics::Unsigned(sample.generation), true},
+             {"event", Diagnostics::Unsigned(sample.event), true},
+             {"side", Diagnostics::Unsigned(sample.side), true},
+             {"phase", Diagnostics::Unsigned(sample.phase), true},
+             {"sourceA", Diagnostics::Unsigned(sample.sourceA), true},
+             {"sourceB", Diagnostics::Unsigned(sample.sourceB), true},
+             {"victimA", Diagnostics::Unsigned(sample.victimA), true},
+             {"victimB", Diagnostics::Unsigned(sample.victimB), true},
+             {"peer", Diagnostics::Unsigned(sample.peer), true},
+             {"birth", Diagnostics::Unsigned(sample.birth), true},
+             {"pairRevision", Diagnostics::Unsigned(sample.pairRevision), true},
+             {"sourceState", Diagnostics::Unsigned(sample.sourceState), true},
+             {"victimState", Diagnostics::Unsigned(sample.victimState), true},
+             {"sourceStage", Diagnostics::Unsigned(sample.sourceStage), true},
+             {"sourceFinished", Diagnostics::Unsigned(sample.sourceFinished), true},
+             {"victimEnded", Diagnostics::Unsigned(sample.victimEnded), true},
+             {"victimAcquired", Diagnostics::Unsigned(sample.victimAcquired), true},
+             {"readable", Diagnostics::Boolean(sample.readable), true}});
+    }
     const auto ai = DiagnosticsSnapshot();
     diagnostics.Log("info", "aisync_v2_snapshot", "AISync V2 high-level Character authority counters; animation/audio and downstream CATHODE consequences remain retail-local.",
         {{"installed", Diagnostics::Boolean(Installed()), true},
@@ -6960,7 +7121,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
         if (read == gPresentationProbeWrite.load(std::memory_order_acquire)) break;
         const auto sample = gPresentationProbes[read % kParticipantProbeRing];
         gPresentationProbeRead.store(read + 1U, std::memory_order_release);
-        diagnostics.Log("info", "aisync_presentation", "Exact source/victim/local identities, health and paired result; phase 0=periodic, 1=before admission, 2=after transition, 3=resolved outcome, 4=remote observer completion, 5=remote observer release, 6=observer handoff resume, 7=remote terminal stage-2 release attempt. Terminal health alone never releases a local victim.",
+        diagnostics.Log("info", "aisync_presentation", "Exact source/victim/local identities, health and paired result; phase 0=periodic, 1=before admission, 2=after transition, 3=resolved outcome, 4=remote observer completion, 5=remote observer release, 6=observer handoff resume. Terminal health alone never completes a paired graph.",
             {{"sessionCookie", Diagnostics::Unsigned(sample.sessionCookie), true},
              {"nativeGeneration", Diagnostics::Unsigned(sample.nativeGeneration), true},
              {"worldGeneration", Diagnostics::Unsigned(sample.worldGeneration), true},
@@ -6974,6 +7135,13 @@ void LogDiagnostics(Diagnostics& diagnostics) {
              {"birth", Diagnostics::Unsigned(sample.birth), true},
              {"revision", Diagnostics::Unsigned(sample.revision), true},
              {"pairRevision", Diagnostics::Unsigned(sample.pairRevision), true},
+             {"movementOwner", Diagnostics::Unsigned(sample.movementOwner), true},
+             {"navigationRevision", Diagnostics::Unsigned(sample.navigation.revision), true},
+             {"navigationRequestRevision", Diagnostics::Unsigned(sample.navigation.requestRevision), true},
+             {"navigationFlags", Diagnostics::Unsigned(sample.navigation.flags), true},
+             {"navigationGoalX", std::to_string(sample.navigation.position[0]), true},
+             {"navigationGoalY", std::to_string(sample.navigation.position[1]), true},
+             {"navigationGoalZ", std::to_string(sample.navigation.position[2]), true},
              {"peer", Diagnostics::Unsigned(sample.peer), true},
              {"victimCharacter", Diagnostics::Pointer(reinterpret_cast<const void*>(sample.victimCharacter))},
              {"victimRuntimeId", Diagnostics::Unsigned(sample.victimRuntimeId), true},

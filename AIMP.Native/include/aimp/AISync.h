@@ -85,14 +85,20 @@ struct NativeOutcome final {
     std::uint32_t hpBefore{}, hpPrepared{}, hpReaction{}, healthReaction{};
     float sourceYaw{}, targetOffset[3]{};
 };
+struct NavigationGoalState final {
+    std::uint32_t revision{}, flags{}; // bit 0: live native Move-to-point
+    float position[3]{}, stoppingDistance{};
+    std::uint32_t moveType{}, requestRevision{};
+};
 struct State final {
-    std::uint32_t version{10U};
+    std::uint32_t version{11U};
     std::uint32_t nativeGeneration{}; // informational: generations differ per process
     std::uint64_t sessionCookie{};
     std::uint32_t worldGeneration{};
     std::uint32_t entityA{}, entityB{}, characterClass{}, birth{}, revision{};
     // Recovery pose is retained only for spawn/lifecycle/catastrophic drift.
-    // Continuous movement is NOT position-followed. velocityX/Z now carry the
+    // Continuous movement is NOT position-followed. The v11 navigation goal
+    // below is preferred for certified Move-to-point requests. velocityX/Z carry the
     // Host's resolved world-space locomotion request observed after retail
     // pathfinding/local steering. CATHODE on the Client owns the physical move,
     // collision, turning and animation generated from that intention.
@@ -142,6 +148,9 @@ struct State final {
     std::uint32_t executionCycleTypeRva{};
     std::uint32_t executionCycleState{};
     std::uint32_t executionFlags{};
+    // Resolved Host goal, above pathfinding/steering. The Client builds a
+    // local retail request; no corridor, ObjectRef, BT or transform is copied.
+    NavigationGoalState navigation{};
 };
 struct ImpactEvent final {
     std::uint32_t version{1U};
@@ -171,7 +180,9 @@ struct Configuration final {
 static_assert(sizeof(NativeOutcome) == 48U);
 static_assert(offsetof(State, outcome) == 192U);
 static_assert(offsetof(State, executionRevision) == 240U);
-static_assert(sizeof(State) == 256U);
+static_assert(sizeof(NavigationGoalState) == 32U);
+static_assert(offsetof(State, navigation) == 256U);
+static_assert(sizeof(State) == 288U);
 static_assert(sizeof(ImpactEvent) == 64U);
 static_assert(sizeof(ParticipantBinding) == 16U);
 static_assert(sizeof(Configuration) == 552U);
