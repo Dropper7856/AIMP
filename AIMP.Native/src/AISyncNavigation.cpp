@@ -22,7 +22,7 @@ struct Lease final {
     std::uintptr_t character{};
     std::uint32_t runtimeId{}, revision{}, requestRevision{};
     std::uint64_t expires{};
-    bool finished{};
+    bool finished{}, failed{};
 };
 std::array<Lease, 32U> gLeases{};
 std::uintptr_t gBase{};
@@ -128,7 +128,7 @@ bool Apply(const std::uintptr_t character, const NavigationGoalState& goal,
     if (lease != nullptr && lease->requestRevision == goal.requestRevision &&
         (!lease->finished || lease->revision == goal.revision)) {
         lease->expires = expiresAt;
-        if (lease->finished) return true; // never reopen a completed same-goal request
+        if (lease->finished) return !lease->failed; // failure cannot own movement
         std::uint32_t status{};
         if (!Live(*lease) || !Read(lease->ref.object + 0xCU, status)) return false;
         if (status == 3U && lease->revision == goal.revision) {
@@ -139,9 +139,10 @@ bool Apply(const std::uintptr_t character, const NavigationGoalState& goal,
         if (status == 4U || status == 5U || status == 6U) {
             error = "Retail AISync navigation request failed or was interrupted";
             lease->finished = true;
+            lease->failed = true;
             lease->revision = goal.revision;
             gFailed.fetch_add(1U, std::memory_order_relaxed);
-            return true; // wait for a NEW goal; never recreate a failed path each frame
+            return false; // caller resumes Host steering, without releasing the actor
         }
         if (status == 3U) {
             lease->finished = true;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "aimp/AISync.h"
 #include <array>
 #include <cstdint>
 
@@ -34,6 +35,16 @@ constexpr const ExecutionTransitionEntry* FindExecutionTransition(
 enum class MovementOwner : std::uint8_t {
     None, Intent, Navigation, Execution, Paired, Neutral
 };
+
+constexpr bool PairAdmissionPending(const State& state,
+    const std::uint32_t completedPair, const std::uint32_t completedTransition) noexcept {
+    return (state.stateFlags & InteractionValid) != 0U &&
+        state.interactionPairRevision != 0U && state.interactionTransition != 0U &&
+        (state.interactionPairRevision != completedPair ||
+            state.interactionTransitionRevision != completedTransition) &&
+        ((state.interactionFlags & (InteractionCycleActive | InteractionSourceCycleRetained)) != 0U ||
+            state.outcome.revision != 0U);
+}
 
 constexpr bool NavigationAuthorityAdvanced(const std::uint32_t flags,
     const std::uint32_t revision, const std::uint32_t requestRevision,
