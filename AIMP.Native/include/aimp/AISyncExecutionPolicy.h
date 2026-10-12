@@ -35,6 +35,17 @@ enum class MovementOwner : std::uint8_t {
     None, Intent, Navigation, Execution, Paired, Neutral
 };
 
+constexpr bool NavigationAuthorityAdvanced(const std::uint32_t flags,
+    const std::uint32_t revision, const std::uint32_t requestRevision,
+    const std::uint32_t releasedRevision, const std::uint32_t releasedRequestRevision) noexcept {
+    return flags == 1U && (revision > releasedRevision || requestRevision > releasedRequestRevision);
+}
+
+constexpr bool HostLeftPairedExecution(const bool executionValid, const bool executionPaired,
+    const bool interactionActive, const bool sourceRetained) noexcept {
+    return executionValid && !executionPaired && !interactionActive && !sourceRetained;
+}
+
 // Metadata gives no local ownership until replay succeeds for this revision.
 constexpr MovementOwner ChooseMovementOwner(const bool paired, const bool neutral,
     const bool executionApplied, const bool navigationAvailable) noexcept {

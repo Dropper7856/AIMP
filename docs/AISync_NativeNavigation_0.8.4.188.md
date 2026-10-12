@@ -44,6 +44,11 @@ aucun cycle effectivement rejoué ne les possède.
 Le watchdog v187 « victime morte + paire encore active + 350 ms → release »
 est supprimé. La libération observateur fondée sur la vraie fin locale du graphe
 victime reste présente. Les HP ne prouvent pas cette fin.
+Le handoff neutre peut reprendre sur un nouvel objectif Host actif, même lorsque
+sa direction finale de steering reste identique. La fermeture de l’ancien
+objectif ne suffit pas à libérer ce handoff et l’ancienne paire reste mémorisée.
+Une autorité dont l’exécution et les flags ont déjà quitté la paire peut aussi
+reprendre immédiatement lorsqu’elle est arrivée avant la fin locale du graphe.
 
 ## Preuves statiques
 
@@ -91,6 +96,8 @@ side 1=source (`00664A10`), 2=victime (`006658E0`), 3=finish source (`006559A0`)
 Il expose l’événement, les identités, la paire et les flags natifs de progression.
 Les workers ne lisent pas les Actors ; la file est bornée et non bloquante.
 Ce flux est une observation, pas une autorisation de replay d’un marker.
+Une absence d’événement ne constitue une preuve que si `pairedGraphDropped`
+n’augmente pas pendant la fenêtre comparée.
 
 Scénarios nécessaires :
 
