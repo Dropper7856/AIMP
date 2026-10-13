@@ -40,6 +40,7 @@ internal static class LauncherTests
         var candidates = NativeDllResolver.BuildCandidates(launcher, root);
         AssertCandidateOrder(candidates, launcher, alpha, zeta);
         AssertResolutionPriority(launcher, alpha);
+        AssertRecentReleaseBuild(launcher, alpha, zeta);
         return Task.CompletedTask;
     }
 
@@ -595,6 +596,28 @@ internal static class LauncherTests
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         File.WriteAllBytes(path, new byte[] { 1 });
+    }
+
+    private static void AssertRecentReleaseBuild(string launcher, string alpha, string zeta)
+    {
+        var older = Path.Combine(alpha, "bin", "Release", "AIMP.NetZ.dll");
+        var newer = Path.Combine(zeta, "bin", "Release", "AIMP.NetZ.dll");
+        var debug = Path.Combine(alpha, "bin", "Debug", "AIMP.NetZ.dll");
+        var local = Path.Combine(launcher, "AIMP.NetZ.dll");
+        CreateFile(newer); CreateFile(debug);
+        File.WriteAllBytes(newer, new byte[] { 2 });
+        var time = new DateTime(2026, 10, 13, 12, 0, 0, DateTimeKind.Utc);
+        File.SetLastWriteTimeUtc(older, time.AddDays(-1));
+        File.SetLastWriteTimeUtc(newer, time);
+        File.SetLastWriteTimeUtc(debug, time.AddDays(1));
+        AssertEx.Equal(newer, NativeDllResolver.Resolve(launcher));
+        // Release still precedes a newer Debug, and matching local bytes win.
+        File.Copy(newer, local, overwrite: true);
+        AssertEx.Equal(local, NativeDllResolver.Resolve(launcher));
+        // Equal timestamps retain deterministic alphabetical fallback.
+        File.WriteAllBytes(local, new byte[] { 3 });
+        File.SetLastWriteTimeUtc(older, time);
+        AssertEx.Equal(older, NativeDllResolver.Resolve(launcher));
     }
 
     private static NativeRuntimeSnapshot DiagnosticSnapshot() => new(
