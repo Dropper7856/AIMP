@@ -134,6 +134,8 @@ internal static class NativeDllResolver
         };
         // Packaged files win when they match the repository build; native
         // Release builds precede Debug builds as the stale-copy fallback.
+        // Within each configuration, prefer the most recently written DLL:
+        // an older alphabetically first build must not shadow a fresh build.
         AddBuildCandidates(values, repositoryRoot, "Release");
         AddBuildCandidates(values, repositoryRoot, "Debug");
         return values.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
@@ -178,11 +180,14 @@ internal static class NativeDllResolver
         string repositoryRoot,
         string configuration)
     {
-        foreach (var directory in EnumerateNativeBuilds(repositoryRoot))
+        var paths = EnumerateNativeBuilds(repositoryRoot).SelectMany(directory => new[]
         {
-            values.Add(Path.Combine(directory, "bin", configuration, DllName));
-            values.Add(Path.Combine(directory, configuration, DllName));
-        }
+            Path.Combine(directory, "bin", configuration, DllName),
+            Path.Combine(directory, configuration, DllName)
+        });
+        foreach (var path in paths.OrderByDescending(File.GetLastWriteTimeUtc)
+                     .ThenBy(value => value, StringComparer.OrdinalIgnoreCase))
+            values.Add(path);
     }
 
     private static IEnumerable<string> EnumerateNativeBuilds(string repositoryRoot)
