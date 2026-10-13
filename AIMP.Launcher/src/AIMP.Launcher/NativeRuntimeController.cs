@@ -320,7 +320,8 @@ internal sealed class NativeRuntimeController : IDisposable
         var session = GetCommandSession();
         var request = CreateCommandRequest(command, arguments);
         TaskCompletionSource<GameCommandResultPayload>? execution = null;
-        if (waitForExecution)
+        var manifestLoad = command == GameCommandNames.WorldManifestLoad;
+        if (waitForExecution || manifestLoad)
         {
             execution = new(TaskCreationOptions.RunContinuationsAsynchronously);
             _commandExecutionWaiters.TryAdd(request.RequestId, execution);
@@ -332,7 +333,14 @@ internal sealed class NativeRuntimeController : IDisposable
             var result = await AwaitCommandAsync(session, request, cancellationToken)
                 .ConfigureAwait(false);
             if (execution is not null && IsQueuedResult(result))
+            {
+                // A queued acknowledgement is not proof that the manifest and
+                // capture hooks are ready. Activation requires the final result.
+                if (manifestLoad)
+                    return await AwaitManifestExecutionAsync(execution, request,
+                        cancellationToken).ConfigureAwait(false);
                 return await execution.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
             return result;
         }
         finally
@@ -411,6 +419,31 @@ internal sealed class NativeRuntimeController : IDisposable
         return session.SendWorldIntentAbandonedAsync(intent, cancellationToken);
     }
 
+    private async Task<GameCommandResultPayload> AwaitManifestExecutionAsync(
+        TaskCompletionSource<GameCommandResultPayload> execution,
+        GameCommandExecutePayload request,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await execution.Task.WaitAsync(CommandResponseTimeout(request.Command),
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            FailSubmittedCommand(request.RequestId, exception);
+            throw;
+        }
+    }
+
+    private static TimeSpan CommandResponseTimeout(string command) =>
+        // Loading the runtime index also arms CATHODE hooks on the engine thread.
+        // Captured runs take 18.7 to 23 seconds; the regular 20-second budget races
+        // their successful completion and leaves the world bus permanently closed.
+        command == GameCommandNames.WorldManifestLoad
+            ? TimeSpan.FromSeconds(120)
+            : TimeSpan.FromSeconds(20);
+
     private async Task<GameCommandResultPayload> AwaitCommandAsync(
         DllIpcSession session,
         GameCommandExecutePayload request,
@@ -419,7 +452,7 @@ internal sealed class NativeRuntimeController : IDisposable
         try
         {
             var result = await session.ExecuteGameCommandAsync(request,
-                TimeSpan.FromSeconds(20), cancellationToken).ConfigureAwait(false);
+                CommandResponseTimeout(request.Command), cancellationToken).ConfigureAwait(false);
             CompleteCommandResponse(result);
             return result;
         }

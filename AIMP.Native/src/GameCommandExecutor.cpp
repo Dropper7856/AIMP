@@ -1851,6 +1851,7 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteWorldManifestLoad(
         return result;
     }
     std::string error;
+    const auto loadStarted = GetTickCount64();
     if (!worldRegistry_->LoadManifestRuntimeIndex(
             std::filesystem::path(command.manifestPath),
             static_cast<std::uint32_t>(generations_->CurrentGeneration()),
@@ -1859,11 +1860,13 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteWorldManifestLoad(
         result.message = error;
         return result;
     }
+    const auto indexLoaded = GetTickCount64();
     const auto diagnostics = worldRegistry_->DiagnosticsSnapshot();
     result.executed = diagnostics.manifestLoaded;
     std::string captureError;
     const bool captureArmed = result.executed &&
         world_interactions::ArmCapture(captureError);
+    const auto captureFinished = GetTickCount64();
     if (result.executed && !captureArmed) {
         result.executed = false;
         result.statusCode = "WORLD_CAPTURE_ARM_FAILED";
@@ -1878,6 +1881,7 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteWorldManifestLoad(
     std::string doorSemanticProbeError;
     const bool doorSemanticProbeArmed = result.executed &&
         world_animated::ArmDoorSemanticInputProbe(doorSemanticProbeError);
+    const auto probesFinished = GetTickCount64();
     result.statusCode = result.executed
         ? "WORLD_MANIFEST_LOADED"
         : "WORLD_MANIFEST_REJECTED";
@@ -1889,6 +1893,9 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteWorldManifestLoad(
             std::to_string(doorTransitionCaptureArmed ? 1U : 0U) +
         " doorTransitionCapturePolicy=disabled-regression-hotfix" +
         " doorSemanticProbeArmed=" + std::to_string(doorSemanticProbeArmed ? 1U : 0U) +
+        " runtimeIndexLoadMs=" + std::to_string(indexLoaded - loadStarted) +
+        " genericCaptureArmMs=" + std::to_string(captureFinished - indexLoaded) +
+        " doorSemanticProbeArmMs=" + std::to_string(probesFinished - captureFinished) +
         (doorSemanticProbeError.empty() ? std::string{} :
             " doorSemanticProbeError=" + doorSemanticProbeError) +
         ". No runtime entity scan was performed.";

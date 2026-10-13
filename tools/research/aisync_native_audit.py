@@ -6,6 +6,7 @@ Usage: python tools/research/aisync_native_audit.py [AI.exe]
 from pathlib import Path
 import hashlib
 import json
+import re
 import struct
 import sys
 
@@ -73,6 +74,20 @@ checks = [
     ("Second retail move producer same gait/reset contract", 0x284041, "89 83 94 01 00 00 C7 83 90 01 00 00 00 00 00 00"),
 ]
 failures = []
+# Audit the literals that actually gate installation, not only the independent
+# RE evidence above. A duplicated byte in a live guard previously escaped this
+# audit because its separately transcribed evidence was correct.
+source = Path(__file__).resolve().parents[2] / "AIMP.Native" / "src" / "AISync.cpp"
+runtime_guards = re.findall(
+    r"MatchRetailBytes\(\s*(0x[0-9a-fA-F]+)U?\s*,\s*\{([^}]+)\}\s*\)",
+    source.read_text(encoding="utf-8-sig"),
+)
+if not runtime_guards:
+    raise ValueError("No runtime AISync certification guards were found")
+for rva_text, literals in runtime_guards:
+    expected = bytes(int(value.strip().rstrip("Uu"), 0)
+                     for value in literals.split(",") if value.strip())
+    checks.append(("Runtime AISync guard", int(rva_text, 16), expected.hex()))
 for name, rva, hex_bytes in checks:
     expected = bytes.fromhex(hex_bytes)
     actual = at(rva, len(expected))
@@ -84,5 +99,6 @@ for rva, target in [(0xEAE5D4, 0x264A10), (0xEAE694, 0x2658E0)]:
         failures.append({"vtableRva": hex(rva), "actual": hex(actual)})
 print(json.dumps({"binary": str(path), "sha256": hashlib.sha256(data).hexdigest(),
                   "checks": len(checks) + 2, "failures": failures,
+                  "runtimeGuards": len(runtime_guards),
                   "validation": "static only; Host/Client runtime acceptance remains required"}, indent=2))
 sys.exit(bool(failures))
