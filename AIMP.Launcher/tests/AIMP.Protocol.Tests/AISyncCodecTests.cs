@@ -16,6 +16,7 @@ internal static class AISyncCodecTests
         ValidateRejectedStates(native);
         ValidateExecutionReplayCarrier(session);
         ValidateNavigationCarrier(session);
+        ValidateNpcFamilies(session);
         ValidateImpactRoundTrip(session);
         return Task.CompletedTask;
     }
@@ -104,12 +105,34 @@ internal static class AISyncCodecTests
 
         var network = AIMP.Protocol.AISyncCodec.EncodeImpactNetwork(session, impact);
         var decoded = AIMP.Protocol.AISyncCodec.DecodeImpactNetwork(network, session);
+        foreach (var family in new uint[] { 2, 7 })
+        {
+            var androidImpact = impact.ToArray(); U32(androidImpact, 40, family);
+            var androidNetwork = AIMP.Protocol.AISyncCodec.EncodeImpactNetwork(session, androidImpact);
+            AssertEx.SequenceEqual(androidImpact,
+                AIMP.Protocol.AISyncCodec.DecodeImpactNetwork(androidNetwork, session).ToArray());
+        }
         AssertEx.SequenceEqual(impact, decoded.ToArray());
 
         var badDamage = impact.ToArray();
         U32(badDamage, 48, 0U);
         AssertEx.Throws<AIMP.Protocol.ProtocolException>(
             () => AIMP.Protocol.AISyncCodec.ValidateNativeImpact(badDamage));
+    }
+
+    private static void ValidateNpcFamilies(Guid session)
+    {
+        foreach (var family in new uint[] { 1, 2, 3, 4, 6, 7, 9 })
+        {
+            var state = ValidState(session); U32(state, 28, family);
+            var network = AIMP.Protocol.AISyncCodec.EncodeNetwork(session, state);
+            AssertEx.SequenceEqual(state, AIMP.Protocol.AISyncCodec.DecodeNetwork(network, session).ToArray());
+        }
+        foreach (var family in new uint[] { 0, 5, 8, 10, uint.MaxValue })
+        {
+            var state = ValidState(session); U32(state, 28, family);
+            AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.ValidateNative(state));
+        }
     }
 
     private static void ValidateRejectedStates(byte[] valid)
@@ -141,7 +164,7 @@ internal static class AISyncCodecTests
             () => AIMP.Protocol.AISyncCodec.ValidateNative(interactionWithoutIdentity));
 
         var playerFamily = valid.ToArray();
-        U32(playerFamily, 28, 2U);
+        U32(playerFamily, 28, 0U);
         AssertEx.Throws<AIMP.Protocol.ProtocolException>(
             () => AIMP.Protocol.AISyncCodec.ValidateNative(playerFamily));
 

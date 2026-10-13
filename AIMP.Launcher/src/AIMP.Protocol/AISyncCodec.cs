@@ -256,7 +256,7 @@ public static class AISyncCodec
         return bytes;
     }
 
-    private static bool AllowedCharacterClass(uint value) => value is 1 or 3 or 4 or 6 or 9;
+    private static bool AllowedCharacterClass(uint value) => value is 1 or 2 or 3 or 4 or 6 or 7 or 9;
 
     private static uint U32(ReadOnlySpan<byte> bytes, int offset) =>
         BinaryPrimitives.ReadUInt32LittleEndian(bytes[offset..]);

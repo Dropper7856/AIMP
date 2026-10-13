@@ -158,8 +158,9 @@ bool Apply(const std::uintptr_t character, const NavigationGoalState& goal,
                 // The native setter queues one target while a path is active.
                 // Retry on the next engine tick if its pending slot was busy.
                 std::uint8_t pending{};
-                if (Read(request + 0xB8U, pending) && (pending & 0x40U) != 0U &&
-                    std::memcmp(reinterpret_cast<const void*>(request + 0x34U), goal.position, 12U) == 0) {
+                if (Read(request + 0xB8U, pending) &&
+                    std::memcmp(reinterpret_cast<const void*>(request +
+                        ((pending & 0x40U) != 0U ? 0x34U : 0x1CU)), goal.position, 12U) == 0) {
                     lease->revision = goal.revision;
                     gUpdated.fetch_add(1U, std::memory_order_relaxed);
                 }

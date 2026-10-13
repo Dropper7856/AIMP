@@ -10,6 +10,15 @@
 
 int main() {
     using namespace aimp::ai_sync;
+    for (const auto type : {1U, 2U, 3U, 4U, 6U, 7U, 9U}) assert(AICharacterClass(type));
+    for (const auto type : {0U, 5U, 8U, 10U, 0xFFFFFFFFU}) assert(!AICharacterClass(type));
+    // A native stop completes locally before a same-revision Host heartbeat.
+    // Its old acknowledgment must not keep navigation/steering suspended.
+    assert(ExecutionCycleOwnsMovement(0x00EABEC0U, 0x3BU, 0x00EABEC0U, 0x3BU, 0U));
+    assert(!ExecutionCycleOwnsMovement(0x00EABEC0U, 0x3BU, 0x00EABEC0U, 0x3BU, 2U));
+    assert(!ExecutionCycleOwnsMovement(0x00EABEC0U, 0x3BU, 0x00EABEC0U, 0x3BU, 4U));
+    assert(!ExecutionCycleOwnsMovement(0x00EABEC0U, 0x3BU, 0x00EABC00U, 1U, 0U));
+    assert(!ExecutionCycleOwnsMovement(0U, 0U, 0U, 0U, 0U));
     // Ownership through a real replication timeline, including rejected and
     // successfully replayed execution, pair admission and observer handoff.
     assert(ChooseMovementOwner(false, false, false, false) == MovementOwner::Intent);

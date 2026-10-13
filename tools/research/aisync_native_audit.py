@@ -1,4 +1,4 @@
-"""Reproduce the AISync v188 machine-code boundary checks without running AI.exe.
+"""Reproduce the AISync machine-code boundary checks without running AI.exe.
 
 This verifies bytes/ABI/layout evidence, not runtime navigation or animation.
 Usage: python tools/research/aisync_native_audit.py [AI.exe]
@@ -57,6 +57,14 @@ checks = [
     ("Paired source finish complete prefix", 0x2559A0, "83 EC 10 56 8B F1"),
     ("Native finish sets source+E6", 0x255A21, "C6 86 E6 00 00 00 01"),
     ("Native victim finish sets victim+D8", 0x255A69, "C6 86 D8 00 00 00 01"),
+    ("Victim graph finish complete hook prefix", 0x255A60, "56 8B F1 8B 8E B0 00 00 00"),
+    ("Victim graph finish plain RET", 0x255B24, "C3"),
+    ("Victim graph finish calls source finish", 0x255A7A, "E8 21 FF FF FF"),
+    ("Stop constructor immediately requests completion", 0x2612CF, "80 CA 02 88 56 08"),
+    ("Paired update victim classification/ESI/EAX", 0x263E4A,
+     "8B 46 44 85 C0 74 58 8B 80 1C 03 00 00 85 C0 74 06 80 78 48 00 75 48"),
+    ("Paired update NPC-only controller guard", 0x263E71, "83 79 74 03"),
+    ("Paired update retail player stage dispatcher", 0x263EA9, "8B 86 E0 00 00 00"),
 ]
 failures = []
 for name, rva, hex_bytes in checks:
