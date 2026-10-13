@@ -65,6 +65,12 @@ checks = [
      "8B 46 44 85 C0 74 58 8B 80 1C 03 00 00 85 C0 74 06 80 78 48 00 75 48"),
     ("Paired update NPC-only controller guard", 0x263E71, "83 79 74 03"),
     ("Paired update retail player stage dispatcher", 0x263EA9, "8B 86 E0 00 00 00"),
+    ("Prepared source native transition ECX=this/call producer", 0x2638D0, "56 8B F1 E8 98 ED FF FF"),
+    ("Prepared source native stage 2 and plain RET", 0x2638EA, "C7 86 E0 00 00 00 02 00 00 00 5E C3"),
+    ("Prepared source alternate phase guard", 0x263900, "56 8B F1 8B 86 18 01 00 00 24 07 3C 01"),
+    ("Prepared source alternate native producer/stage 5/RET", 0x26390F, "E8 5C ED FF FF C7 86 E0 00 00 00 05 00 00 00 5E C3"),
+    ("Retail move producer gait/reset outside request", 0x284C28, "89 B8 94 01 00 00 C7 80 90 01 00 00 00 00 00 00"),
+    ("Second retail move producer same gait/reset contract", 0x284041, "89 83 94 01 00 00 C7 83 90 01 00 00 00 00 00 00"),
 ]
 failures = []
 for name, rva, hex_bytes in checks:

@@ -52,6 +52,24 @@ constexpr bool ExecutionCycleOwnsMovement(const std::uint32_t expectedType,
         expectedState == currentState && (flags & 6U) == 0U;
 }
 
+constexpr std::uint32_t PairedPreparationEntry(const std::uint32_t stage) noexcept {
+    // Native 4E execution transitions: both run the existing victim producer.
+    // No stage/marker is fabricated and no local animation definition is chosen.
+    return stage <= 1U ? 0x002638D0U : stage == 4U ? 0x00263900U : 0U;
+}
+
+constexpr bool UnclaimedPairLost(const bool busy, const bool sourcePresent,
+    const bool victimPresent, const bool claimed) noexcept {
+    return !busy && !sourcePresent && !victimPresent && !claimed;
+}
+
+constexpr bool HostSuspendsNavigation(const State& state) noexcept {
+    // A live goal may remain queued while retail explicitly stops its physical
+    // cycle. Finishing that local stop is not permission to resume the goal.
+    return (state.stateFlags & ExecutionValid) != 0U && (state.stateFlags & Moving) == 0U &&
+        state.executionCycleTypeRva == 0x00EABEC0U && state.executionCycleState == 0x3BU;
+}
+
 constexpr bool PairAdmissionPending(const State& state,
     const std::uint32_t completedPair, const std::uint32_t completedTransition) noexcept {
     return (state.stateFlags & InteractionValid) != 0U &&

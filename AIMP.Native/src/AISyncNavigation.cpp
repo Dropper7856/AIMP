@@ -28,6 +28,7 @@ std::array<Lease, 32U> gLeases{};
 std::uintptr_t gBase{};
 std::atomic<std::uint64_t> gCaptured{}, gSubmitted{}, gUpdated{}, gCompleted{};
 std::atomic<std::uint64_t> gFailed{}, gCancelled{}, gExpired{};
+std::atomic<std::uint64_t> gGaitApplied{};
 template<typename T> bool Read(const std::uintptr_t address, T& value) noexcept {
     __try { value = *reinterpret_cast<const T*>(address); return true; }
     __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
@@ -80,7 +81,9 @@ bool Initialize(const std::uintptr_t base, std::string& error) {
         !Match(kUpdateGoal, {0x83,0x79,0x68,0x03}) ||
         !Match(kReleaseRef, {0x56,0x8B,0x71,0x04}) ||
         !Match(0x00262661U, {0xC2,0x04,0x00}) ||
-        !Match(0x002612B1U, {0xC6,0x46,0x1A,0x3B})) {
+        !Match(0x002612B1U, {0xC6,0x46,0x1A,0x3B}) ||
+        !Match(0x00284C28U, {0x89,0xB8,0x94,0x01,0x00,0x00,0xC7,0x80,0x90,0x01,0x00,0x00,0x00,0x00,0x00,0x00}) ||
+        !Match(0x00284041U, {0x89,0x83,0x94,0x01,0x00,0x00,0xC7,0x83,0x90,0x01,0x00,0x00,0x00,0x00,0x00,0x00})) {
         error = "AISync native navigation ABI mismatch";
         gBase = 0U;
         return false;
@@ -207,6 +210,22 @@ bool Apply(const std::uintptr_t character, const NavigationGoalState& goal,
         return false;
     }
 }
+bool ApplyGait(const std::uintptr_t character, const std::uint32_t moveType) noexcept {
+    std::uintptr_t movement{};
+    std::uint32_t requested{};
+    if (moveType > 3U || !Read(character + 0x42A8U, movement) || movement == 0U ||
+        !Read(movement + 0x194U, requested) || requested > 3U) return false;
+    if (requested == moveType) return true;
+    __try {
+        // FUN_00684900 / 00683E80 author +194 and reset +190 outside the
+        // request itself. Client BT/action suppression removes those writers.
+        // Effective gait, physical velocity and route remain engine-owned.
+        *reinterpret_cast<std::uint32_t*>(movement + 0x194U) = moveType;
+        *reinterpret_cast<std::uint32_t*>(movement + 0x190U) = 0U;
+        gGaitApplied.fetch_add(1U, std::memory_order_relaxed);
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
 void Cancel(const std::uintptr_t character) noexcept {
     if (auto* lease = Find(character)) Release(*lease, true);
 }
@@ -225,6 +244,6 @@ void Pump(const std::uint64_t now) noexcept {
 }
 Counters Snapshot() noexcept {
     return {gCaptured.load(), gSubmitted.load(), gUpdated.load(), gCompleted.load(),
-        gFailed.load(), gCancelled.load(), gExpired.load()};
+        gFailed.load(), gCancelled.load(), gExpired.load(), gGaitApplied.load()};
 }
 } // namespace aimp::ai_sync::navigation
