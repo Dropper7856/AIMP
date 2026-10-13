@@ -1279,6 +1279,39 @@ void LauncherIPC::Disconnect(const std::string_view reason) noexcept {
     }
 }
 
+bool LauncherIPC::HandleAISyncFrame(const protocol::Frame& frame) {
+    if (!sessionConfigured_.load(std::memory_order_acquire)) return false;
+    bool accepted{};
+    if (!ai_sync::Installed()) {
+        accepted = false;
+    } else if (frame.type == protocol::MessageType::AISyncConfigure) {
+        accepted = ai_sync::Configure(frame.payload);
+    } else if (!worldSyncAuthorityBound_ || !worldSyncWorldBusActive_) {
+        return true; // A stale application packet cannot bind gameplay authority.
+    } else if (frame.type == protocol::MessageType::AISyncState) {
+        if (worldSyncAuthorityHost_) return true;
+        accepted = ai_sync::QueueRemote(frame.payload);
+    } else {
+        if (!worldSyncAuthorityHost_) return true;
+        accepted = ai_sync::QueueRemoteImpact(frame.payload);
+    }
+    if (!accepted) {
+        // A decoded AISync frame can fail validation or bounded admission.
+        // Neither is a broken pipe/header: keep other modules and diagnostics
+        // connected. Invalid data never reaches native gameplay execution.
+        ++aiSyncRejectedFrames_;
+        if (aiSyncRejectedFrames_ <= 4U || aiSyncRejectedFrames_ % 128U == 0U)
+            diagnostics_->Log("warning", "aisync_ipc_payload_rejected",
+                "AISync payload refused without closing the shared IPC; inspect validation and queue counters.",
+                {{"messageType", Diagnostics::Unsigned(static_cast<std::uint16_t>(frame.type)), true},
+                 {"sequence", Diagnostics::Unsigned(frame.sequence), true},
+                 {"payloadBytes", Diagnostics::Unsigned(frame.payload.size()), true},
+                 {"rejectedFrames", Diagnostics::Unsigned(aiSyncRejectedFrames_), true},
+                 {"aisyncInstalled", Diagnostics::Boolean(ai_sync::Installed()), true}});
+    }
+    return true;
+}
+
 bool LauncherIPC::ReceiveAvailable() {
     constexpr std::size_t kMaximumReceiveBatch = 32U;
     for (std::size_t batch = 0U; batch < kMaximumReceiveBatch; ++batch) {
@@ -1507,22 +1540,10 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
         netzReadySent_.store(queued, std::memory_order_release);
         return queued;
     }
-    case protocol::MessageType::AISyncConfigure: {
-        if (!sessionConfigured_.load(std::memory_order_acquire)) return false;
-        if (!ai_sync::Installed()) {
-            diagnostics_->Log("warning", "aisync_v2_unavailable", "AISync hooks are unavailable; restart the game with the patched DLL and inspect aisync_v2_install.");
-            return frame.payload.size() == sizeof(ai_sync::Configuration);
-        }
-        return ai_sync::Configure(frame.payload);
-    }
+    case protocol::MessageType::AISyncConfigure:
     case protocol::MessageType::AISyncState:
-        if (!sessionConfigured_.load(std::memory_order_acquire) || !worldSyncAuthorityBound_ ||
-            worldSyncAuthorityHost_ || !worldSyncWorldBusActive_) return true;
-        return !ai_sync::Installed() || ai_sync::QueueRemote(frame.payload);
     case protocol::MessageType::AISyncImpact:
-        if (!sessionConfigured_.load(std::memory_order_acquire) || !worldSyncAuthorityBound_ ||
-            !worldSyncAuthorityHost_ || !worldSyncWorldBusActive_) return true;
-        return !ai_sync::Installed() || ai_sync::QueueRemoteImpact(frame.payload);
+        return HandleAISyncFrame(frame);
     case protocol::MessageType::WorldSyncLifecycle: {
         if (!sessionConfigured_.load(std::memory_order_acquire) ||
             frame.payload.empty() || frame.payload.size() > 16U * 1024U) {

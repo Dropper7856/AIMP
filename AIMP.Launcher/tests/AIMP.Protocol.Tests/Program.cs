@@ -19,6 +19,7 @@ internal static class Program
         new("Local player position tools", LauncherTests.LocalPlayerPositionToolsAsync),
         new("Launcher integration tools", LauncherTests.LauncherIntegrationToolsAsync),
         new("Generic native IPC", IpcTests.GenericHandshakeAndQueuedCommandAsync),
+        new("AISync rejection preserves IPC", IpcTests.AISyncRejectionPreservesConnectionAsync),
         new("Launcher body length", ArchitectureTests.LauncherBodiesAreShortAsync)
     };
 

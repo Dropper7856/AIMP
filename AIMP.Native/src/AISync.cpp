@@ -454,6 +454,8 @@ thread_local std::uintptr_t gRecordEligibilityOwner{}, gRecordEligibilityTarget{
 thread_local std::uintptr_t gAiPlayerRealLocal{};
 thread_local std::uint32_t gAiPlayerContextDepth{};
 std::atomic<std::uint64_t> gObserved{}, gApplied{}, gDropped{}, gRefused{}, gSuspended{}, gFaults{};
+std::atomic<std::uint64_t> gInvalidOutgoing{};
+std::atomic<std::uint32_t> gLastInvalidOutgoingFlags{}, gLastInvalidOutgoingEntityA{}, gLastInvalidOutgoingEntityB{};
 std::atomic<std::uint64_t> gMissing{};
 std::atomic<std::uint64_t> gManagerUpdates{}, gAdmitted{}, gIdentityRejected{}, gTreeUnavailable{}, gOwnerMismatch{};
 std::atomic<std::uint64_t> gRemoteQueued{};
@@ -605,7 +607,8 @@ bool Valid(const State& s) noexcept {
         !std::isfinite(s.locomotionIntensity) || s.locomotionIntensity < 0.0F ||
         s.locomotionIntensity > 64.0F)
         return false;
-    if ((s.stateFlags & Moving) != 0U && s.locomotionRevision == 0U) return false;
+    if ((s.stateFlags & Moving) != 0U &&
+        (s.locomotionRevision == 0U || (s.stateFlags & PoseValid) == 0U)) return false;
     if ((s.interactionFlags & InteractionSourceCycleRetained) != 0U &&
         ((s.stateFlags & InteractionValid) == 0U || s.interactionTransition == 0U ||
          (s.interactionFlags & InteractionPairValid) == 0U)) return false;
@@ -4950,6 +4953,14 @@ void CaptureNavigationGoal(Actor& actor) noexcept {
     }
     actor.desired.navigation = sample.goal;
 }
+bool ValidateOutgoing(const State& state) noexcept {
+    if (Valid(state)) return true;
+    gInvalidOutgoing.fetch_add(1U, std::memory_order_relaxed);
+    gLastInvalidOutgoingFlags.store(state.stateFlags, std::memory_order_relaxed);
+    gLastInvalidOutgoingEntityA.store(state.entityA, std::memory_order_relaxed);
+    gLastInvalidOutgoingEntityB.store(state.entityB, std::memory_order_relaxed);
+    return false;
+}
 void Publish(Actor& actor) noexcept {
     if (PairSourceBusy(actor.character)) return;
     CaptureOutcome(actor);
@@ -4998,6 +5009,9 @@ void Publish(Actor& actor) noexcept {
             ~(LifecycleWithdrawn | LifecycleWithdrawState2 | LifecycleHostDormant | LifecycleCharacterBackstage);
         state.stateFlags |= PoseValid;
     }
+    // Native reads can fail during lifecycle changes. Validate the complete
+    // carrier before publishing/acknowledging it, just as the Launcher does.
+    if (!ValidateOutgoing(state)) return;
     auto& writeCursor = newOutcome ? gOutcomeWrite : gWrite;
     auto& readCursor = newOutcome ? gOutcomeRead : gRead;
     auto& queue = newOutcome ? gOutgoingOutcomes : gOutgoing;
@@ -5067,6 +5081,7 @@ void PublishDormantHostActor(Actor& actor, const ULONGLONG now,
     const auto changed = !SameState(actor.desired, actor.previous);
     auto state = actor.desired;
     if (changed) ++state.revision;
+    if (!ValidateOutgoing(state)) return;
     const auto write = gWrite.load(std::memory_order_relaxed);
     if (write - gRead.load(std::memory_order_acquire) >= kRing) {
         gDropped.fetch_add(1U, std::memory_order_relaxed);
@@ -7294,6 +7309,10 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"nativeOutcomeCaptured", Diagnostics::Unsigned(gOutcomeCaptured.load()), true},
          {"nativeOutcomeApplied", Diagnostics::Unsigned(gOutcomeApplied.load()), true},
          {"nativeOutcomeRejected", Diagnostics::Unsigned(gOutcomeRejected.load()), true},
+         {"invalidOutgoing", Diagnostics::Unsigned(gInvalidOutgoing.load()), true},
+         {"lastInvalidOutgoingFlags", Diagnostics::Unsigned(gLastInvalidOutgoingFlags.load()), true},
+         {"lastInvalidOutgoingEntityA", Diagnostics::Unsigned(gLastInvalidOutgoingEntityA.load()), true},
+         {"lastInvalidOutgoingEntityB", Diagnostics::Unsigned(gLastInvalidOutgoingEntityB.load()), true},
          {"nativeOutcomeDuplicates", Diagnostics::Unsigned(gOutcomeDuplicates.load()), true},
          {"pairedVictimAvailabilityOverrides", Diagnostics::Unsigned(ai.pairedVictimAvailabilityOverrides), true},
          {"pairedPlayerPreparationRemaps", Diagnostics::Unsigned(ai.pairedPlayerPreparationRemaps), true},

@@ -174,7 +174,7 @@ internal static class AISyncCodecTests
             () => AIMP.Protocol.AISyncCodec.ValidateNative(oldVersion));
     }
 
-    private static byte[] ValidState(Guid session)
+    internal static byte[] ValidState(Guid session)
     {
         var bytes = new byte[AIMP.Protocol.AISyncCodec.NativeStateBytes];
         U32(bytes, 0, AIMP.Protocol.AISyncCodec.StateVersion);

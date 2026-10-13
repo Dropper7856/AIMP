@@ -445,15 +445,35 @@ internal sealed class DllIpcSession : IAsyncDisposable
             case MessageType.PlayerSyncState: HandlePlayerSyncState(frame); return true;
             case MessageType.PlayerSyncAction: HandlePlayerSyncAction(frame); return true;
             case MessageType.AISyncState:
-                AISyncCodec.ValidateNative(frame.Payload.Span);
-                AISyncStateProduced?.Invoke(this, frame.Payload);
+                HandleAISyncState(frame);
                 return true;
             case MessageType.AISyncImpact:
-                AISyncCodec.ValidateNativeImpact(frame.Payload.Span);
-                AISyncImpactProduced?.Invoke(this, frame.Payload);
+                HandleAISyncImpact(frame);
                 return true;
             default: return false;
         }
+    }
+
+    private void HandleAISyncState(AimpFrame frame)
+    {
+        try { AISyncCodec.ValidateNative(frame.Payload.Span); }
+        catch (ProtocolException exception)
+        {
+            Log?.Invoke(this, $"Rejected AISYNC_STATE sequence={frame.Sequence} bytes={frame.Payload.Length} without closing IPC: {exception.Message}");
+            return;
+        }
+        AISyncStateProduced?.Invoke(this, frame.Payload);
+    }
+
+    private void HandleAISyncImpact(AimpFrame frame)
+    {
+        try { AISyncCodec.ValidateNativeImpact(frame.Payload.Span); }
+        catch (ProtocolException exception)
+        {
+            Log?.Invoke(this, $"Rejected AISYNC_IMPACT sequence={frame.Sequence} bytes={frame.Payload.Length} without closing IPC: {exception.Message}");
+            return;
+        }
+        AISyncImpactProduced?.Invoke(this, frame.Payload);
     }
 
     private bool TryHandleResponseFrame(AimpFrame frame)
