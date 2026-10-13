@@ -72,6 +72,10 @@ checks = [
     ("Prepared source alternate native producer/stage 5/RET", 0x26390F, "E8 5C ED FF FF C7 86 E0 00 00 00 05 00 00 00 5E C3"),
     ("Retail move producer gait/reset outside request", 0x284C28, "89 B8 94 01 00 00 C7 80 90 01 00 00 00 00 00 00"),
     ("Second retail move producer same gait/reset contract", 0x284041, "89 83 94 01 00 00 C7 83 90 01 00 00 00 00 00 00"),
+    ("Scheduler transition early RET 4", 0x287412, "C2 04 00"),
+    ("Scheduler transition final RET 4", 0x287687, "C2 04 00"),
+    ("Scheduler idle callback plain RET", 0x287A19, "C3"),
+    ("Paired graph player E5 branch", 0x264AA9, "80 BE E5 00 00 00 00 74 14"),
 ]
 failures = []
 # Audit the literals that actually gate installation, not only the independent
@@ -88,6 +92,15 @@ for rva_text, literals in runtime_guards:
     expected = bytes(int(value.strip().rstrip("Uu"), 0)
                      for value in literals.split(",") if value.strip())
     checks.append(("Runtime AISync guard", int(rva_text, 16), expected.hex()))
+hook_prefixes = re.findall(
+    r'Hook\(hooks,\s*"([^"]+)",\s*(0x[0-9a-fA-F]+)U?\s*,\s*'
+    r'reinterpret_cast<void\*>\(\s*&\w+\s*\)\s*,\s*\{([^}]+)\}',
+    source.read_text(encoding="utf-8-sig"),
+)
+for name, rva_text, literals in hook_prefixes:
+    expected = bytes(int(value.strip().rstrip("Uu"), 0)
+                     for value in literals.split(",") if value.strip())
+    checks.append(("Runtime hook prefix: " + name, int(rva_text, 16), expected.hex()))
 for name, rva, hex_bytes in checks:
     expected = bytes.fromhex(hex_bytes)
     actual = at(rva, len(expected))
@@ -100,5 +113,6 @@ for rva, target in [(0xEAE5D4, 0x264A10), (0xEAE694, 0x2658E0)]:
 print(json.dumps({"binary": str(path), "sha256": hashlib.sha256(data).hexdigest(),
                   "checks": len(checks) + 2, "failures": failures,
                   "runtimeGuards": len(runtime_guards),
+                  "hookPrefixes": len(hook_prefixes),
                   "validation": "static only; Host/Client runtime acceptance remains required"}, indent=2))
 sys.exit(bool(failures))

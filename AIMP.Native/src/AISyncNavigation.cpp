@@ -22,7 +22,7 @@ struct Lease final {
     std::uintptr_t character{};
     std::uint32_t runtimeId{}, revision{}, requestRevision{};
     std::uint64_t expires{};
-    bool finished{}, failed{};
+    bool finished{}, failed{}, convergence{};
 };
 std::array<Lease, 32U> gLeases{};
 std::uintptr_t gBase{};
@@ -120,10 +120,29 @@ Sample Capture(const std::uintptr_t character) noexcept {
     gCaptured.fetch_add(1U, std::memory_order_relaxed);
     return sample;
 }
+HeadObservation InspectHead(const std::uintptr_t character) noexcept {
+    HeadObservation result{};
+    std::uintptr_t owner{}, sentinel{}, node{}, request{}, table{};
+    const auto scheduler = character + kScheduler;
+    if (!Read(scheduler, owner) || owner != character ||
+        !Read(scheduler + 8U, result.count) || result.count > 64U) return result;
+    if (result.count == 0U) { result.readable = true; return result; }
+    if (!Read(scheduler + 4U, sentinel) || sentinel == 0U ||
+        !Read(sentinel, node) || node == sentinel || !Read(node + 8U, request) || request == 0U ||
+        !Read(request, table) || table < gBase ||
+        !Read(request + 0x10U, result.kind) || !Read(request + 0xCU, result.status)) return result;
+    result.typeRva = static_cast<std::uint32_t>(table - gBase);
+    result.readable = true;
+    return result;
+}
 bool Apply(const std::uintptr_t character, const NavigationGoalState& goal,
-    const std::uint64_t expiresAt, std::string& error) noexcept {
+    const std::uint64_t expiresAt, std::string& error, const bool convergence) noexcept {
     if (gBase == 0U || goal.flags != 1U || !ValidGoal(goal)) return false;
     auto* lease = Find(character);
+    if (lease != nullptr && lease->convergence != convergence) {
+        Release(*lease, true);
+        lease = nullptr;
+    }
     if (lease != nullptr && !Live(*lease)) {
         Release(*lease, false);
         lease = nullptr;
@@ -149,7 +168,7 @@ bool Apply(const std::uintptr_t character, const NavigationGoalState& goal,
         }
         if (status == 3U) {
             lease->finished = true;
-            return Apply(character, goal, expiresAt, error);
+            return Apply(character, goal, expiresAt, error, convergence);
         }
         if (lease->revision != goal.revision) {
             __try {
@@ -179,6 +198,7 @@ bool Apply(const std::uintptr_t character, const NavigationGoalState& goal,
         if (!Read(character + kScheduler, schedulerOwner) || schedulerOwner != character ||
             !Read(character + 0x50U, lease->runtimeId)) return false;
         lease->character = character; lease->revision = goal.revision; lease->expires = expiresAt;
+        lease->convergence = convergence;
         lease->requestRevision = goal.requestRevision;
         reinterpret_cast<Ref*(__thiscall*)(void*, Ref*)>(gBase + kCreate)(
             reinterpret_cast<void*>(character + kScheduler), &lease->ref);
