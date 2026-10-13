@@ -233,6 +233,7 @@ struct Actor {
     std::uint64_t observerReleasedTargetPeer{};
     bool observerHandoffNeutral{};
     ULONGLONG lastObserverFinishAttempt{};
+    std::uint32_t admissionRetryBirth{}, admissionRetryPair{}, admissionRetries{};
     std::uint32_t remoteBirth{}, remoteRevision{};
     float lastPosition[3]{};
     bool blocked{}, duplicate{}, faulted{}, hasLastPosition{}, interactionOwnsCycle{};
@@ -257,7 +258,9 @@ struct PresentationProbe final {
     std::uint32_t movementOwner{};
     std::uint32_t cycleType{}, stage{0xFFFFFFFFU}, withdrawState{0xFFFFFFFFU};
     float local[3]{}, authority[3]{}, victim[3]{}, authorityVictim[3]{};
-    std::uint8_t cycleState{}, hidden{}, enabled{};
+    std::uint8_t cycleState{}, cycleFlags{}, hidden{}, enabled{};
+    std::uint32_t authorityMoveType{}, requestedMoveType{0xFFFFFFFFU}, effectiveMoveType{0xFFFFFFFFU};
+    float authorityIntensity{};
     std::uint16_t victimHp{};
     std::uint32_t victimHealthState{};
     bool victimHealthReadable{};
@@ -539,6 +542,7 @@ void* gVictimGraphFinishTrampoline{};
 std::atomic<void*> gSourceGraphEventOriginal{}, gVictimGraphEventOriginal{}, gSourceGraphFinishOriginal{};
 std::atomic<void*> gVictimGraphFinishOriginal{};
 std::atomic<std::uint64_t> gPairedLocalVictimFinishes{};
+std::atomic<std::uint64_t> gPairedPreparedReplays{}, gPairedAdmissionRetries{}, gPairedAdmissionAbandoned{};
 void* gNavigationSubmitTrampoline{};
 std::atomic<void*> gNavigationSubmitOriginal{};
 std::atomic<std::uint32_t> gLastEntityA{}, gLastEntityB{}, gLastCharacterClass{};
@@ -3505,6 +3509,12 @@ void SamplePresentation(Actor& actor, const ULONGLONG now, const std::uint32_t p
     sample.observerReleasedPairRevision = actor.observerReleasedPairRevision;
     sample.navigation = state.navigation;
     sample.movementOwner = static_cast<std::uint32_t>(actor.movementOwner);
+    sample.authorityMoveType = state.moveType; sample.authorityIntensity = state.locomotionIntensity;
+    std::uintptr_t movement{};
+    if (Read(actor.character + 0x42A8U, movement) && movement != 0U) {
+        static_cast<void>(Read(movement + 0x194U, sample.requestedMoveType));
+        static_cast<void>(Read(movement + 0x198U, sample.effectiveMoveType));
+    }
     sample.observerHandoffNeutral = actor.observerHandoffNeutral;
     sample.placementPending = actor.placementPending;
     sample.pairPlacementPending = actor.pairPlacementPending;
@@ -3522,6 +3532,7 @@ void SamplePresentation(Actor& actor, const ULONGLONG now, const std::uint32_t p
         Read(cycle + 0x1AU, sample.cycleState) && Read(cycle, table) && table >= gBase;
     if (sample.cycleReadable) {
         sample.cycleType = static_cast<std::uint32_t>(table - gBase);
+        static_cast<void>(Read(cycle + 8U, sample.cycleFlags));
         if (sample.cycleState == 0x4EU && table == gBase + 0x00EAE5D0U)
             static_cast<void>(Read(cycle + 0xE0U, sample.stage));
     }
@@ -3961,6 +3972,106 @@ bool PlaceReplicatedPairSource(Actor& actor, const std::uintptr_t target, const 
     gPairedSourcePlacements.fetch_add(1U, std::memory_order_relaxed);
     return true;
 }
+void RememberReleasedPair(Actor& actor) noexcept {
+    const auto& state = actor.desired;
+    actor.observerReleasedBirth = state.birth;
+    actor.observerReleasedPairRevision = state.interactionPairRevision;
+    actor.observerReleasedInteractionRevision = state.interactionRevision;
+    actor.observerReleasedActionRevision = state.actionRevision;
+    actor.observerReleasedExecutionRevision = state.executionRevision;
+    actor.observerReleasedRoleTaskRevision = state.roleTaskRevision;
+    actor.observerReleasedLifecycleRevision = state.lifecycleRevision;
+    actor.observerReleasedLocomotionRevision = state.locomotionRevision;
+    actor.observerReleasedNavigationRevision = state.navigation.revision;
+    actor.observerReleasedNavigationRequestRevision = state.navigation.requestRevision;
+    actor.observerReleasedTargetPeer = state.interactionTargetPeer;
+    actor.observerHandoffNeutral = true;
+    actor.movementOwner = MovementOwner::Neutral;
+}
+
+void AdvanceAuthoritativePairPreparation(Actor& actor, const ULONGLONG now) noexcept {
+    const auto& state = actor.desired;
+    const auto target = ParticipantForPeer(state.interactionTargetPeer);
+    OutcomeBinding binding{};
+    std::uintptr_t cycle{}, table{}, owner{}, victim{};
+    std::uint32_t victimBirth{}, stage{};
+    std::uint8_t nativeState{}, flags{}, prepared{};
+    if (gRole.load(std::memory_order_acquire) != Role::Client || !Stable() ||
+        actor.completedPairRevision != state.interactionPairRevision ||
+        actor.completedTransitionRevision != state.interactionTransitionRevision ||
+        PairSourceBusy(actor.character) || !LoadOutcome(actor.character, target, binding) || binding.claimed ||
+        binding.state.birth != state.birth || binding.state.interactionPairRevision != state.interactionPairRevision ||
+        binding.state.interactionTargetPeer != state.interactionTargetPeer ||
+        (binding.state.outcome.flags & (OutcomePrepared | OutcomeVictimAdmitted)) !=
+            (OutcomePrepared | OutcomeVictimAdmitted) ||
+        !PairIdentityLive(binding.source) || !PairIdentityLive(binding.victim) ||
+        !Read(actor.character + 0x36CU, cycle) || cycle == 0U || !Read(cycle, table) ||
+        table != gBase + 0x00EAE5D0U || !Read(cycle + 4U, owner) || owner != actor.character ||
+        !Read(cycle + 0x1AU, nativeState) || nativeState != 0x4EU ||
+        !Read(cycle + 8U, flags) || (flags & 6U) != 0U ||
+        !Read(cycle + 0x44U, victim) || victim != target ||
+        !Read(cycle + 0x48U, victimBirth) || victimBirth != binding.victim.runtimeId ||
+        !Read(cycle + 0xE7U, prepared) || prepared != 0U || !Read(cycle + 0xE0U, stage)) return;
+    const auto entry = PairedPreparationEntry(stage);
+    if (entry == 0U) return;
+    __try {
+        // Host already ran preparation and admitted this exact victim. Replay
+        // its native execution transition, not an NPC alignment decision on
+        // the Client. It invokes the existing authoritative definition/health
+        // producer and the original native victim message, once via ClaimOutcome.
+        reinterpret_cast<void(__thiscall*)(void*)>(gBase + entry)(reinterpret_cast<void*>(cycle));
+        if (LoadOutcome(actor.character, target, binding) && binding.claimed) {
+            gPairedPreparedReplays.fetch_add(1U, std::memory_order_relaxed);
+            SamplePresentation(actor, now, 7U);
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) { gFaults.fetch_add(1U, std::memory_order_relaxed); }
+}
+
+bool RecoverLostPairAdmission(Actor& actor, const ULONGLONG now) noexcept {
+    if (!actor.interactionOwnsCycle || actor.desired.outcome.revision == 0U ||
+        actor.completedPairRevision != actor.desired.interactionPairRevision ||
+        PairSourceBusy(actor.character)) return false;
+    const auto target = ParticipantForPeer(actor.desired.interactionTargetPeer);
+    OutcomeBinding binding{};
+    std::uintptr_t sourceCycle{}, sourceTable{}, sourceOwner{}, victimCycle{}, victimTable{}, victimOwner{};
+    std::uint8_t sourceState{}, sourceFlags{}, victimState{};
+    // Failed reads are uncertainty, not proof of a lost graph. A typed victim
+    // 4F remains protected even if it finished/was linked before the source.
+    if (!LoadOutcome(actor.character, target, binding) || !PairIdentityLive(binding.source) ||
+        !PairIdentityLive(binding.victim) || binding.state.birth != actor.desired.birth ||
+        binding.state.interactionPairRevision != actor.desired.interactionPairRevision ||
+        !Read(actor.character + 0x36CU, sourceCycle) || sourceCycle == 0U ||
+        !Read(sourceCycle, sourceTable) || !Read(sourceCycle + 4U, sourceOwner) || sourceOwner != actor.character ||
+        !Read(sourceCycle + 0x1AU, sourceState) || !Read(sourceCycle + 8U, sourceFlags) ||
+        !Read(target + 0x36CU, victimCycle) || victimCycle == 0U || !Read(victimCycle, victimTable) ||
+        !Read(victimCycle + 4U, victimOwner) || victimOwner != target ||
+        !Read(victimCycle + 0x1AU, victimState)) return false;
+    const bool sourcePresent = sourceState == 0x4EU && sourceTable == gBase + 0x00EAE5D0U && (sourceFlags & 6U) == 0U;
+    const bool victimPresent = victimState == 0x4FU && victimTable == gBase + 0x00EAE690U;
+    if (sourcePresent || victimPresent) return false;
+    actor.interactionOwnsCycle = false;
+    actor.lastProxyRefresh = 0U;
+    ClearPairPlacement(actor);
+    if (actor.admissionRetryBirth != actor.desired.birth || actor.admissionRetryPair != actor.desired.interactionPairRevision) {
+        actor.admissionRetryBirth = actor.desired.birth;
+        actor.admissionRetryPair = actor.desired.interactionPairRevision;
+        actor.admissionRetries = 0U;
+    }
+    if (UnclaimedPairLost(false, sourcePresent, victimPresent, binding.claimed) && actor.admissionRetries < 2U) {
+        ++actor.admissionRetries;
+        actor.completedInteractionRevision = actor.completedPairRevision = actor.completedTransitionRevision = 0U;
+        actor.lastInteractionAttempt = now; // existing 250ms admission backoff
+        gPairedAdmissionRetries.fetch_add(1U, std::memory_order_relaxed);
+    } else {
+        // No current source/victim graph remains. Retire the failed lease
+        // without fabricating a death, graph finish, or replaying consumed damage.
+        RememberReleasedPair(actor);
+        gPairedAdmissionAbandoned.fetch_add(1U, std::memory_order_relaxed);
+    }
+    SamplePresentation(actor, now, 8U);
+    return true;
+}
+
 bool ApplyAuthoritativeInteraction(Actor& actor, const ULONGLONG now) noexcept {
     if (PairSourceBusy(actor.character)) return true;
     const auto& state = actor.desired;
@@ -4128,6 +4239,7 @@ bool ApplyAuthoritativeInteraction(Actor& actor, const ULONGLONG now) noexcept {
         return false;
     }
     actor.completedInteractionRevision = state.interactionRevision;
+    AdvanceAuthoritativePairPreparation(actor, now);
     SamplePresentation(actor, now, 2U);
     gInteractionApplied.fetch_add(1U, std::memory_order_relaxed);
     return true;
@@ -4162,10 +4274,12 @@ void RetryObserverSourceFinish(Actor& actor, const ULONGLONG now) noexcept {
 bool PairedTransitionOwnsCycle(Actor& actor, const ULONGLONG now) noexcept {
     // Do not reuse the source layout while a retail worker admits its victim.
     if (PairSourceBusy(actor.character)) return true;
+    if (RecoverLostPairAdmission(actor, now)) return false;
     if (!actor.interactionOwnsCycle) return false;
     // A replacement event is admitted below after the old local victim lease
     // has ended. Its new Host cycle cannot extend ownership of our old pair.
     if (actor.completedPairRevision != actor.desired.interactionPairRevision) return false;
+    AdvanceAuthoritativePairPreparation(actor, now);
 
     bool remoteObserverFatalComplete{};
     const auto target = ParticipantForPeer(actor.desired.interactionTargetPeer);
@@ -4239,19 +4353,7 @@ bool PairedTransitionOwnsCycle(Actor& actor, const ULONGLONG now) noexcept {
         // update metadata without reacquiring the old local 4E. Until a newer
         // decision epoch arrives, stay in the retail Idle reached above instead
         // of replaying a locomotion request captured before/during the kill.
-        actor.observerReleasedBirth = actor.desired.birth;
-        actor.observerReleasedPairRevision = actor.desired.interactionPairRevision;
-        actor.observerReleasedInteractionRevision = actor.desired.interactionRevision;
-        actor.observerReleasedActionRevision = actor.desired.actionRevision;
-        actor.observerReleasedExecutionRevision = actor.desired.executionRevision;
-        actor.observerReleasedRoleTaskRevision = actor.desired.roleTaskRevision;
-        actor.observerReleasedLifecycleRevision = actor.desired.lifecycleRevision;
-        actor.observerReleasedLocomotionRevision = actor.desired.locomotionRevision;
-        actor.observerReleasedNavigationRevision = actor.desired.navigation.revision;
-        actor.observerReleasedNavigationRequestRevision = actor.desired.navigation.requestRevision;
-        actor.observerReleasedTargetPeer = actor.desired.interactionTargetPeer;
-        actor.observerHandoffNeutral = true;
-        actor.movementOwner = MovementOwner::Neutral;
+        RememberReleasedPair(actor);
         gPairedObserverReleases.fetch_add(1U, std::memory_order_relaxed);
         SamplePresentation(actor, now, 5U);
     }
@@ -4829,10 +4931,21 @@ bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
         return character_direct_step_runtime::HoldAIIntentIdle(actor.character, state.moveType, idleError);
     }
     if (!RecoverCatastrophicIntentDivergence(actor, state, now)) return false;
+    if (HostSuspendsNavigation(state)) navigation::Cancel(actor.character);
     if (!ApplyAuthoritativeExecution(actor, now)) return false;
 
     const bool executionApplied = actor.replayedExecutionRevision != 0U &&
         actor.replayedExecutionRevision == state.executionRevision;
+    if (HostSuspendsNavigation(state) && !executionApplied) {
+        // Keep the Host stop decision after the LOCAL 3B ends. Do not allow
+        // a still-published path goal to immediately undo that decision.
+        actor.movementOwner = MovementOwner::Neutral;
+        std::string idleError;
+        if (!character_direct_step_runtime::HoldAIIntentIdle(actor.character, state.moveType, idleError)) return false;
+        actor.completedRevision = state.revision;
+        actor.lastProxyRefresh = now;
+        return true;
+    }
     actor.movementOwner = ChooseMovementOwner(false, false, executionApplied, state.navigation.flags == 1U);
     if (actor.movementOwner == MovementOwner::Execution) {
         actor.completedRevision = state.revision;
@@ -4846,7 +4959,8 @@ bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
         if (actor.lastNavigationAttempt == 0U || now - actor.lastNavigationAttempt >= backoff) {
             std::string navigationError;
             if (navigation::Apply(actor.character, state.navigation,
-                    actor.lastReceive + kMotionLease, navigationError)) {
+                    actor.lastReceive + kMotionLease, navigationError) &&
+                navigation::ApplyGait(actor.character, state.moveType)) {
                 actor.lastNavigationAttempt = 0U;
                 actor.rejectedNavigationRevision = actor.rejectedNavigationRequestRevision = 0U;
                 actor.intentDivergenceSince = 0U;
@@ -5937,7 +6051,11 @@ bool HookPairedPlayerClassification(HookManager& hooks, std::string& error) {
             {0x8B,0x46,0x44,0x85,0xC0,0x74,0x58,0x8B,0x80,0x1C,0x03,0x00,0x00,
              0x85,0xC0,0x74,0x06,0x80,0x78,0x48,0x00,0x75,0x48}) ||
         !MatchRetailBytes(0x00263E71U, {0x83,0x79,0x74,0x03}) ||
-        !MatchRetailBytes(0x00263EA9U, {0x8B,0x86,0xE0,0x00,0x00,0x00})) {
+        !MatchRetailBytes(0x00263EA9U, {0x8B,0x86,0xE0,0x00,0x00,0x00}) ||
+        !MatchRetailBytes(0x002638D0U, {0x56,0x8B,0xF1,0xE8,0x98,0xED,0xFF,0xFF}) ||
+        !MatchRetailBytes(0x002638EAU, {0xC7,0x86,0xE0,0x00,0x00,0x00,0x02,0x00,0x00,0x00,0x5E,0xC3}) ||
+        !MatchRetailBytes(0x00263900U, {0x56,0x8B,0xF1,0x8B,0x86,0x18,0x01,0x00,0x00,0x00,0x24,0x07,0x3C,0x01}) ||
+        !MatchRetailBytes(0x0026390FU, {0xE8,0x5C,0xED,0xFF,0xFF,0xC7,0x86,0xE0,0x00,0x00,0x00,0x05,0x00,0x00,0x00,0x5E,0xC3})) {
         error = "aisync paired player classification: certified victim/register/branch/stack bytes mismatch";
         return false;
     }
@@ -6662,9 +6780,11 @@ void PumpOnEngineThread() noexcept {
             continue;
         }
         auto& actor = *found;
+        static_cast<void>(RecoverLostPairAdmission(actor, now));
         // A later event cannot replace a pair whose irreversible native result
         // has not yet been admitted (placement/binding may need another frame).
-        if (actor.remoteBirth == value.birth && actor.desired.outcome.revision != 0U) {
+        if (actor.remoteBirth == value.birth && actor.desired.outcome.revision != 0U &&
+            !ObserverReleasedPairMatches(actor, actor.desired)) {
             OutcomeBinding binding{};
             if (!LoadOutcome(actor.character, ParticipantForPeer(actor.desired.interactionTargetPeer), binding) ||
                 !binding.claimed) {
@@ -7165,6 +7285,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"failed", Diagnostics::Unsigned(nav.failed), true},
          {"cancelled", Diagnostics::Unsigned(nav.cancelled), true},
          {"expired", Diagnostics::Unsigned(nav.expired), true},
+         {"gaitApplied", Diagnostics::Unsigned(nav.gaitApplied), true},
          {"intentFallbacks", Diagnostics::Unsigned(gNavigationFallbacks.load()), true},
          {"pairedGraphDropped", Diagnostics::Unsigned(gPairedGraphDropped.load()), true}});
     for (;;) {
@@ -7291,6 +7412,9 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"pairedObserverFinishRetries", Diagnostics::Unsigned(gPairedObserverFinishRetries.load()), true},
          {"pairedObserverFinishCompleted", Diagnostics::Unsigned(gPairedObserverFinishCompleted.load()), true},
          {"pairedLocalVictimFinishes", Diagnostics::Unsigned(gPairedLocalVictimFinishes.load()), true},
+         {"pairedPreparedReplays", Diagnostics::Unsigned(gPairedPreparedReplays.load()), true},
+         {"pairedAdmissionRetries", Diagnostics::Unsigned(gPairedAdmissionRetries.load()), true},
+         {"pairedAdmissionAbandoned", Diagnostics::Unsigned(gPairedAdmissionAbandoned.load()), true},
          {"pairedRuntimePlayerRemaps", Diagnostics::Unsigned(gPairedRuntimePlayerRemaps.load()), true},
          {"pairedObserverReleaseAttempts", Diagnostics::Unsigned(ai.pairedObserverReleaseAttempts), true},
          {"pairedObserverReleases", Diagnostics::Unsigned(ai.pairedObserverReleases), true},
@@ -7408,7 +7532,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
         if (read == gPresentationProbeWrite.load(std::memory_order_acquire)) break;
         const auto sample = gPresentationProbes[read % kParticipantProbeRing];
         gPresentationProbeRead.store(read + 1U, std::memory_order_release);
-        diagnostics.Log("info", "aisync_presentation", "Exact source/victim/local identities, health and paired result; phase 0=periodic, 1=before admission, 2=after transition, 3=resolved outcome, 4=remote observer completion, 5=remote observer release, 6=observer handoff resume. Terminal health alone never completes a paired graph.",
+        diagnostics.Log("info", "aisync_presentation", "Exact source/victim/local identities, health and paired result; phase 0=periodic, 1=before admission, 2=after transition, 3=resolved outcome, 4=remote observer completion, 5=remote observer release, 6=observer handoff resume, 7=authoritative native preparation, 8=lost admission recovery. Terminal health alone never completes a paired graph.",
             {{"sessionCookie", Diagnostics::Unsigned(sample.sessionCookie), true},
              {"nativeGeneration", Diagnostics::Unsigned(sample.nativeGeneration), true},
              {"worldGeneration", Diagnostics::Unsigned(sample.worldGeneration), true},
@@ -7423,6 +7547,10 @@ void LogDiagnostics(Diagnostics& diagnostics) {
              {"revision", Diagnostics::Unsigned(sample.revision), true},
              {"pairRevision", Diagnostics::Unsigned(sample.pairRevision), true},
              {"movementOwner", Diagnostics::Unsigned(sample.movementOwner), true},
+             {"authorityMoveType", Diagnostics::Unsigned(sample.authorityMoveType), true},
+             {"authorityIntensity", std::to_string(sample.authorityIntensity), true},
+             {"requestedMoveType", Diagnostics::Unsigned(sample.requestedMoveType), true},
+             {"effectiveMoveType", Diagnostics::Unsigned(sample.effectiveMoveType), true},
              {"navigationRevision", Diagnostics::Unsigned(sample.navigation.revision), true},
              {"navigationRequestRevision", Diagnostics::Unsigned(sample.navigation.requestRevision), true},
              {"navigationFlags", Diagnostics::Unsigned(sample.navigation.flags), true},
@@ -7458,6 +7586,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
              {"interactionFlags", Diagnostics::Unsigned(sample.interactionFlags), true},
              {"cycleType", Diagnostics::Unsigned(sample.cycleType), true},
              {"cycleState", Diagnostics::Unsigned(sample.cycleState), true},
+             {"cycleFlags", Diagnostics::Unsigned(sample.cycleFlags), true},
              {"stage", Diagnostics::Unsigned(sample.stage), true},
              {"withdrawState", Diagnostics::Unsigned(sample.withdrawState), true},
              {"hidden", Diagnostics::Unsigned(sample.hidden), true},

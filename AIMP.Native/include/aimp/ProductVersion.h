@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.191-aisync-ipc-isolation";
+    "0.11.4.192-aisync-native-pair-preparation";
 
 } // namespace aimp

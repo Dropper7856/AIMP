@@ -19,6 +19,27 @@ int main() {
     assert(!ExecutionCycleOwnsMovement(0x00EABEC0U, 0x3BU, 0x00EABEC0U, 0x3BU, 4U));
     assert(!ExecutionCycleOwnsMovement(0x00EABEC0U, 0x3BU, 0x00EABC00U, 1U, 0U));
     assert(!ExecutionCycleOwnsMovement(0U, 0U, 0U, 0U, 0U));
+    assert(PairedPreparationEntry(0U) == 0x002638D0U);
+    assert(PairedPreparationEntry(1U) == 0x002638D0U);
+    assert(PairedPreparationEntry(4U) == 0x00263900U);
+    for (const auto stage : {2U, 3U, 5U, 6U, 0xFFFFFFFFU}) assert(PairedPreparationEntry(stage) == 0U);
+    // The reported Client timeline: 4E disappears before a 4F is acquired.
+    assert(UnclaimedPairLost(false, false, false, false));
+    assert(!UnclaimedPairLost(true, false, false, false)); // native worker owns admission
+    assert(!UnclaimedPairLost(false, true, false, false)); // source still preparing
+    assert(!UnclaimedPairLost(false, false, true, false)); // genuine victim graph
+    assert(!UnclaimedPairLost(false, false, false, true)); // irreversible result consumed
+    State stopped{};
+    stopped.stateFlags = ExecutionValid;
+    stopped.executionCycleTypeRva = 0x00EABEC0U;
+    stopped.executionCycleState = 0x3BU;
+    stopped.navigation.flags = 1U;
+    assert(HostSuspendsNavigation(stopped)); // pending goal cannot undo Host stop
+    stopped.executionCycleState = 0x38U;
+    assert(!HostSuspendsNavigation(stopped)); // same goal resumes on new execution
+    stopped.executionCycleState = 0x3BU;
+    stopped.stateFlags |= Moving;
+    assert(!HostSuspendsNavigation(stopped));
     // Ownership through a real replication timeline, including rejected and
     // successfully replayed execution, pair admission and observer handoff.
     assert(ChooseMovementOwner(false, false, false, false) == MovementOwner::Intent);

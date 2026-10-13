@@ -13,6 +13,7 @@ struct Sample final {
 };
 struct Counters final {
     std::uint64_t captured{}, submitted{}, updated{}, completed{}, failed{}, cancelled{}, expired{};
+    std::uint64_t gaitApplied{};
 };
 
 // Engine-thread only. References are owned independently of Character lifetime.
@@ -20,6 +21,9 @@ bool Initialize(std::uintptr_t base, std::string& error);
 Sample Capture(std::uintptr_t character) noexcept;
 bool Apply(std::uintptr_t character, const NavigationGoalState& goal,
     std::uint64_t expiresAt, std::string& error) noexcept;
+// Retail movement producers author this separately from their Move request.
+// Keep local pathfinding/steering; replicate only the Host-selected gait.
+bool ApplyGait(std::uintptr_t character, std::uint32_t moveType) noexcept;
 void Cancel(std::uintptr_t character) noexcept;
 void Reset(bool cancelNative) noexcept;
 void Pump(std::uint64_t now) noexcept;
