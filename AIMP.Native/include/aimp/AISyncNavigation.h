@@ -15,12 +15,17 @@ struct Counters final {
     std::uint64_t captured{}, submitted{}, updated{}, completed{}, failed{}, cancelled{}, expired{};
     std::uint64_t gaitApplied{};
 };
+struct HeadObservation final {
+    std::uint32_t count{}, typeRva{}, kind{0xFFFFFFFFU}, status{0xFFFFFFFFU};
+    bool readable{};
+};
 
 // Engine-thread only. References are owned independently of Character lifetime.
 bool Initialize(std::uintptr_t base, std::string& error);
 Sample Capture(std::uintptr_t character) noexcept;
+HeadObservation InspectHead(std::uintptr_t character) noexcept;
 bool Apply(std::uintptr_t character, const NavigationGoalState& goal,
-    std::uint64_t expiresAt, std::string& error) noexcept;
+    std::uint64_t expiresAt, std::string& error, bool convergence = false) noexcept;
 // Retail movement producers author this separately from their Move request.
 // Keep local pathfinding/steering; replicate only the Host-selected gait.
 bool ApplyGait(std::uintptr_t character, std::uint32_t moveType) noexcept;

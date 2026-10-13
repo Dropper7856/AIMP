@@ -170,6 +170,7 @@ struct MovementSlot final {
 
 std::atomic<bool> gInstalled{false};
 std::atomic<NativeAIIntentObserver> gNativeAIIntentObserver{nullptr};
+std::atomic<NativeAITransitionGuard> gNativeAITransitionGuard{nullptr};
 std::array<MovementSlot, MaximumConcurrentTargets()> gSlots{};
 std::atomic<std::uintptr_t> gLastArmedCharacter{0U};
 std::uintptr_t gModuleBase{};
@@ -1495,16 +1496,19 @@ void __fastcall EnterIdleCycleDetour(
     const auto original = reinterpret_cast<EnterIdleCycleFn>(
         gEnterIdleCycleTrampoline);
     if (original == nullptr || cycle == nullptr) return;
-    if (!runtime_features::Enabled(
-            runtime_features::Feature::RemoteMovementRuntime)) {
-        original(cycle);
-        return;
-    }
     const auto cycleAddress = reinterpret_cast<std::uintptr_t>(cycle);
     std::uintptr_t owner = 0U;
     if (!GuardedReadValue(
             cycleAddress + kNpcLocomotionCycleOwnerOffset, owner) ||
         owner == 0U) {
+        original(cycle);
+        return;
+    }
+    // Pair admission releases the locomotion slot. Its native graph still has
+    // a separate owner: an idle scheduler must not destroy it on its next tick.
+    const auto guard = gNativeAITransitionGuard.load(std::memory_order_acquire);
+    if (guard != nullptr && guard(owner, cycleAddress, kNpcLocomotionIdleState)) return;
+    if (!runtime_features::Enabled(runtime_features::Feature::RemoteMovementRuntime)) {
         original(cycle);
         return;
     }
@@ -2583,6 +2587,9 @@ bool Installed() noexcept {
 
 void SetNativeAIIntentObserver(const NativeAIIntentObserver observer) noexcept {
     gNativeAIIntentObserver.store(observer, std::memory_order_release);
+}
+void SetNativeAITransitionGuard(const NativeAITransitionGuard guard) noexcept {
+    gNativeAITransitionGuard.store(guard, std::memory_order_release);
 }
 
 void PumpOnEngineThread(const EnginePumpPhase phase) noexcept {

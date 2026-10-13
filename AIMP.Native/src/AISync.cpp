@@ -234,6 +234,9 @@ struct Actor {
     bool observerHandoffNeutral{};
     ULONGLONG lastObserverFinishAttempt{};
     std::uint32_t admissionRetryBirth{}, admissionRetryPair{}, admissionRetries{};
+    NavigationGoalState convergenceGoal{};
+    ULONGLONG convergenceDivergenceSince{};
+    bool convergenceActive{};
     std::uint32_t remoteBirth{}, remoteRevision{};
     float lastPosition[3]{};
     bool blocked{}, duplicate{}, faulted{}, hasLastPosition{}, interactionOwnsCycle{};
@@ -259,6 +262,8 @@ struct PresentationProbe final {
     std::uint32_t cycleType{}, stage{0xFFFFFFFFU}, withdrawState{0xFFFFFFFFU};
     float local[3]{}, authority[3]{}, victim[3]{}, authorityVictim[3]{};
     std::uint8_t cycleState{}, cycleFlags{}, hidden{}, enabled{};
+    bool sourceGraphPresent{};
+    navigation::HeadObservation navigationHead{};
     std::uint32_t authorityMoveType{}, requestedMoveType{0xFFFFFFFFU}, effectiveMoveType{0xFFFFFFFFU};
     float authorityIntensity{};
     std::uint16_t victimHp{};
@@ -381,6 +386,17 @@ void* gOutcomePreparationContinue{}, *gOutcomePreparationAbort{};
 void* gPlayerCategoryTrampoline{}, *gPlayerCategoryContinue{};
 void* gPlayerRuntimeTrampoline{}, *gPlayerRuntimeContinue{};
 std::atomic<void*> gPlayerRuntimePublished{};
+void* gPlayerGraphTrampoline{}, *gPlayerGraphContinue{};
+std::atomic<void*> gPlayerGraphPublished{};
+void* gPairedStopTrampoline{};
+std::atomic<void*> gPairedStopOriginal{};
+std::atomic<std::uint64_t> gPairedIdleBlocked{}, gPairedStopBlocked{};
+void* gSchedulerIdleTrampoline{}, *gSchedulerTransitionTrampoline{};
+std::atomic<void*> gSchedulerIdleOriginal{}, gSchedulerTransitionOriginal{};
+thread_local std::uintptr_t gSchedulerTransitionOwner{};
+thread_local std::uint32_t gSchedulerTransitionRva{};
+std::atomic<std::uint32_t> gLastPairedBlockedSchedulerRva{};
+std::atomic<std::uint64_t> gNavigationConvergenceApplied{}, gNavigationConvergenceFailed{};
 std::atomic<std::uint64_t> gPairedRuntimePlayerRemaps{};
 std::atomic<void*> gPlayerPreparationPublished{}, gPlayerCategoryPublished{};
 void* gVictimUpdateTrampoline{};
@@ -2011,6 +2027,7 @@ bool ClearRoleTaskExecutor(Actor& actor) noexcept {
 bool QuiesceProxyExecution(Actor& actor) noexcept {
     if (actor.character == 0U) return false;
     navigation::Cancel(actor.character);
+    actor.convergenceActive = false; actor.convergenceDivergenceSince = 0U;
     actor.replayedExecutionRevision = 0U;
     actor.completedExecutionRevision = 0U;
     actor.lastExecutionAttempt = 0U;
@@ -2509,6 +2526,79 @@ bool ClientNativeVictimOwnsPair(const std::uintptr_t source) noexcept {
         (interactive == 0U || TerminalDeadCharacter(target));
 }
 
+bool RetainAuthoritativeSourceGraph(const std::uintptr_t source,
+    const std::uintptr_t cycle, const std::uint32_t requestedState) noexcept {
+    if (source != gSchedulerTransitionOwner || gRole.load(std::memory_order_acquire) != Role::Client ||
+        !PairGenerationStable()) return false;
+    PairIdentity sourceIdentity{}, victimIdentity{};
+    std::uintptr_t current{}, owner{}, table{}, victim{}, victimCycle{}, linked{}, linkedSource{}, graph{};
+    std::uint32_t victimBirth{}, sourceBirth{}, stage{};
+    std::uint8_t state{}, flags{}, prepared{}, finished{}, acquired{}, ended{};
+    // E7 + the acquired 4F link is the native handshake consumed only after
+    // ClaimOutcome on a Client. No mutex or health heuristic in this callback.
+    if (PublishedPairSource(source, sourceIdentity) == kActors || !PairIdentityLive(sourceIdentity) ||
+        !Read(source + 0x36CU, current) || current != cycle || !Read(cycle + 4U, owner) || owner != source ||
+        !Read(cycle, table) || table != gBase + 0x00EAE5D0U ||
+        !Read(cycle + 0x1AU, state) || state != 0x4EU ||
+        !Read(cycle + 8U, flags) || (flags & 4U) != 0U ||
+        !Read(cycle + 0x14U, graph) || graph == 0U ||
+        !Read(cycle + 0xE7U, prepared) || prepared == 0U ||
+        !Read(cycle + 0xE6U, finished) || finished != 0U ||
+        !Read(cycle + 0xE0U, stage) || stage >= 6U ||
+        !Read(cycle + 0x44U, victim) || !PublishedPairParticipant(victim, victimIdentity) ||
+        !PairIdentityLive(victimIdentity) || !Read(cycle + 0x48U, victimBirth) ||
+        victimBirth != victimIdentity.runtimeId ||
+        !Read(victim + 0x36CU, victimCycle) || victimCycle == 0U ||
+        !Read(victimCycle, table) || table != gBase + 0x00EAE690U ||
+        !Read(victimCycle + 4U, owner) || owner != victim ||
+        !Read(victimCycle + 0x1AU, state) || state != 0x4FU ||
+        !Read(victimCycle + 0x68U, linkedSource) || linkedSource != source ||
+        !Read(victimCycle + 0x6CU, sourceBirth) || sourceBirth != sourceIdentity.runtimeId ||
+        !Read(victimCycle + 0xB0U, linked) || linked != cycle ||
+        !Read(victimCycle + 0xD9U, acquired) || acquired == 0U ||
+        !Read(victimCycle + 0xD8U, ended) || ended != 0U) return false;
+    // The low flags can retain a completion request through a native outro.
+    // E6/D8/stage6 and an actual failure are execution proof; HP is not.
+    (requestedState == 0x3BU ? gPairedStopBlocked : gPairedIdleBlocked)
+        .fetch_add(1U, std::memory_order_relaxed);
+    gLastPairedBlockedSchedulerRva.store(gSchedulerTransitionRva, std::memory_order_relaxed);
+    return true;
+}
+void __fastcall SchedulerIdleDetour(void* scheduler, void*) noexcept {
+    const auto original = reinterpret_cast<void(__thiscall*)(void*)>(
+        gSchedulerIdleOriginal.load(std::memory_order_acquire));
+    if (original == nullptr) return;
+    const auto previousOwner = gSchedulerTransitionOwner;
+    const auto previousRva = gSchedulerTransitionRva;
+    gSchedulerTransitionOwner = 0U;
+    static_cast<void>(Read(reinterpret_cast<std::uintptr_t>(scheduler), gSchedulerTransitionOwner));
+    gSchedulerTransitionRva = 0x00287690U;
+    __try { original(scheduler); }
+    __finally { gSchedulerTransitionOwner = previousOwner; gSchedulerTransitionRva = previousRva; }
+}
+std::uint32_t __fastcall SchedulerTransitionDetour(void* scheduler, void*, const std::uint32_t previousMode) noexcept {
+    const auto original = reinterpret_cast<std::uint32_t(__thiscall*)(void*, std::uint32_t)>(
+        gSchedulerTransitionOriginal.load(std::memory_order_acquire));
+    if (original == nullptr) return 0U;
+    const auto previousOwner = gSchedulerTransitionOwner;
+    const auto previousRva = gSchedulerTransitionRva;
+    std::uint32_t result{};
+    gSchedulerTransitionOwner = 0U;
+    static_cast<void>(Read(reinterpret_cast<std::uintptr_t>(scheduler), gSchedulerTransitionOwner));
+    gSchedulerTransitionRva = 0x00287190U;
+    __try { result = original(scheduler, previousMode); }
+    __finally { gSchedulerTransitionOwner = previousOwner; gSchedulerTransitionRva = previousRva; }
+    return result;
+}
+void __fastcall PairedStopDetour(void* context, void*, const std::uint32_t argument) noexcept {
+    const auto original = reinterpret_cast<void(__thiscall*)(void*, std::uint32_t)>(
+        gPairedStopOriginal.load(std::memory_order_acquire));
+    std::uintptr_t source{};
+    if (original == nullptr || (Read(reinterpret_cast<std::uintptr_t>(context) + 4U, source) &&
+        RetainAuthoritativeSourceGraph(source, reinterpret_cast<std::uintptr_t>(context), 0x3BU))) return;
+    original(context, argument); // one opaque stack word; retail RET 4
+}
+
 enum class RemoteObserverVictimState : std::uint8_t {
     Unknown = 0U,
     Active = 1U,
@@ -2783,7 +2873,8 @@ std::uintptr_t __cdecl PlayerPreparationBoundary(const std::uintptr_t victim,
 int __cdecl PlayerRuntimeBoundary(const std::uintptr_t cycle, const std::uintptr_t victim) noexcept {
     const auto role = gRole.load(std::memory_order_acquire);
     if ((role != Role::Host && role != Role::Client) || !PairGenerationStable() ||
-        !RegisteredPlayerRepresentation(victim)) return 0;
+        (!RegisteredPlayerRepresentation(victim) &&
+            !(role == Role::Client && LocalClientVictim(victim)))) return 0;
     PairIdentity sourceIdentity{}, victimIdentity{};
     std::uintptr_t source{}, current{}, owner{}, target{}, table{};
     std::uint8_t state{};
@@ -2829,6 +2920,36 @@ __declspec(naked) void PlayerRuntimeShim() {
         popad
         popfd
         jmp dword ptr [gPlayerRuntimeContinue]
+    }
+}
+// The graph End_Action callback repeats the same player/controller query.
+// Preserve its preceding native lifetime check and its following E5 choice.
+__declspec(naked) void PlayerGraphShim() {
+    __asm {
+        pushfd
+        pushad
+        mov edi, esp
+        sub esp, 210h
+        and esp, 0FFFFFFF0h
+        fxsave [esp]
+        cld
+        push dword ptr [esi + 44h]
+        push esi
+        call PlayerRuntimeBoundary
+        add esp, 8
+        test eax, eax
+        jnz participant
+        fxrstor [esp]
+        mov esp, edi
+        popad
+        popfd
+        jmp dword ptr [gPlayerGraphTrampoline]
+    participant:
+        fxrstor [esp]
+        mov esp, edi
+        popad
+        popfd
+        jmp dword ptr [gPlayerGraphContinue]
     }
 }
 int __cdecl PlayerCategoryBoundary(const std::uintptr_t victim) noexcept {
@@ -3508,6 +3629,7 @@ void SamplePresentation(Actor& actor, const ULONGLONG now, const std::uint32_t p
     sample.lifecycleFlags = state.lifecycleFlags; sample.ownsPair = actor.interactionOwnsCycle;
     sample.observerReleasedPairRevision = actor.observerReleasedPairRevision;
     sample.navigation = state.navigation;
+    sample.navigationHead = navigation::InspectHead(actor.character);
     sample.movementOwner = static_cast<std::uint32_t>(actor.movementOwner);
     sample.authorityMoveType = state.moveType; sample.authorityIntensity = state.locomotionIntensity;
     std::uintptr_t movement{};
@@ -3533,8 +3655,11 @@ void SamplePresentation(Actor& actor, const ULONGLONG now, const std::uint32_t p
     if (sample.cycleReadable) {
         sample.cycleType = static_cast<std::uint32_t>(table - gBase);
         static_cast<void>(Read(cycle + 8U, sample.cycleFlags));
-        if (sample.cycleState == 0x4EU && table == gBase + 0x00EAE5D0U)
+        if (sample.cycleState == 0x4EU && table == gBase + 0x00EAE5D0U) {
             static_cast<void>(Read(cycle + 0xE0U, sample.stage));
+            std::uintptr_t graph{};
+            sample.sourceGraphPresent = Read(cycle + 0x14U, graph) && graph != 0U;
+        }
     }
     std::uintptr_t withdraw{};
     static_cast<void>(ResolveAlienWithdrawContext(actor.character, withdraw, sample.withdrawState));
@@ -3827,6 +3952,7 @@ bool CharacterReady(const Actor& actor) noexcept {
 bool Release(Actor& actor) noexcept {
     if (PairSourceBusy(actor.character)) return true;
     navigation::Cancel(actor.character);
+    actor.convergenceActive = false; actor.convergenceDivergenceSince = 0U;
     actor.movementOwner = MovementOwner::None;
     actor.replayedExecutionRevision = 0U;
     actor.completedExecutionRevision = 0U;
@@ -4100,6 +4226,7 @@ bool ApplyAuthoritativeInteraction(Actor& actor, const ULONGLONG now) noexcept {
         // Retire locomotion BEFORE any of those gates, then reserve the pair;
         // no new path/stop transition may replace its source while waiting.
         navigation::Cancel(actor.character);
+        actor.convergenceActive = false; actor.convergenceDivergenceSince = 0U;
         actor.replayedExecutionRevision = 0U;
         actor.completedExecutionRevision = 0U;
         actor.movementOwner = MovementOwner::Paired;
@@ -4164,6 +4291,7 @@ bool ApplyAuthoritativeInteraction(Actor& actor, const ULONGLONG now) noexcept {
     __try {
         if (actor.completedPairRevision != state.interactionPairRevision) {
             navigation::Cancel(actor.character);
+            actor.convergenceActive = false; actor.convergenceDivergenceSince = 0U;
             actor.movementOwner = MovementOwner::Paired;
             // The latest-state mailbox can skip the old pair's inactive frame
             // when Host immediately attacks another player. Retire our prior
@@ -4787,6 +4915,13 @@ void RememberPresentationPose(Actor& actor, const State& state, const ULONGLONG 
     sample.yaw = state.yaw; sample.velocityX = state.velocityX; sample.velocityZ = state.velocityZ;
     actor.poseRevision = state.revision;
 }
+bool NativeMoveConvergenceEligible(const State& state) noexcept {
+    const auto required = PoseValid | Moving | ExecutionValid;
+    return (state.stateFlags & required) == required && state.navigation.flags == 0U &&
+        state.executionCycleState == 0x38U && state.executionCycleTypeRva == 0x00EABF80U &&
+        state.locomotionIntensity > 0.0F && !ProxyWithdrawn(state) &&
+        (state.lifecycleFlags & (LifecycleSpatialDiscontinuity | LifecycleTraversalAction)) == 0U;
+}
 bool RecoverCatastrophicIntentDivergence(Actor& actor, const State& state,
     const ULONGLONG now) noexcept {
     const bool hostTransitionOwnsMotion = actor.replayedExecutionRevision != 0U &&
@@ -4798,6 +4933,7 @@ bool RecoverCatastrophicIntentDivergence(Actor& actor, const State& state,
     if ((state.stateFlags & PoseValid) == 0U || ProxyWithdrawn(state) ||
         (state.lifecycleFlags & (LifecycleSpatialDiscontinuity | LifecycleTraversalAction)) != 0U ||
         PairSourceBusy(actor.character) || actor.interactionOwnsCycle || hostTransitionOwnsMotion ||
+        actor.convergenceActive || NativeMoveConvergenceEligible(state) ||
         navigationPendingOrOwned) {
         actor.intentDivergenceSince = 0U;
         return true;
@@ -4892,6 +5028,51 @@ bool ApplyAuthoritativeExecution(Actor& actor, const ULONGLONG now) noexcept {
     return true;
 }
 
+bool ApplyNativeNavigationConvergence(Actor& actor, const ULONGLONG now) noexcept {
+    const auto& state = actor.desired;
+    const bool eligible = NativeMoveConvergenceEligible(state) && !actor.interactionOwnsCycle;
+    float x{}, z{};
+    const bool readable = Read(actor.character + kPositionOffset, x) &&
+        Read(actor.character + kPositionOffset + 8U, z) && FiniteCoordinate(x) && FiniteCoordinate(z);
+    const auto distance = readable ? std::hypot(state.position[0] - x, state.position[2] - z) : 0.0F;
+    if (!eligible || !readable || distance < (actor.convergenceActive ? 0.65F : 1.5F)) {
+        if (actor.convergenceActive) navigation::Cancel(actor.character);
+        actor.convergenceActive = false; actor.convergenceDivergenceSince = 0U;
+        return false;
+    }
+    if (!actor.convergenceActive) {
+        if (actor.convergenceDivergenceSince == 0U) actor.convergenceDivergenceSince = now;
+        if (now - actor.convergenceDivergenceSince < 250ULL) return false;
+    }
+    auto& goal = actor.convergenceGoal;
+    float targetDistance{};
+    for (std::size_t i = 0U; i < 3U; ++i) {
+        const auto delta = goal.position[i] - state.position[i];
+        targetDistance += delta * delta;
+    }
+    if (!actor.convergenceActive || targetDistance >= 0.0625F) {
+        for (std::size_t i = 0U; i < 3U; ++i) goal.position[i] = state.position[i];
+        ++goal.revision; if (goal.revision == 0U) goal.revision = 1U;
+    }
+    goal.flags = 1U; goal.requestRevision = 1U; goal.stoppingDistance = 0.25F; goal.moveType = 0U;
+    std::string error;
+    // Temporary local path correction for a demonstrated Host Move. The
+    // authoritative pose is a reachable route anchor, never a transform write.
+    // A real Host goal always wins; paired/root-motion/unknown cycles are excluded.
+    if (navigation::Apply(actor.character, goal, actor.lastReceive + kMotionLease, error, true) &&
+        navigation::ApplyGait(actor.character, state.moveType)) {
+        actor.convergenceActive = true;
+        actor.movementOwner = MovementOwner::Navigation;
+        actor.completedRevision = state.revision; actor.lastProxyRefresh = now;
+        gNavigationConvergenceApplied.fetch_add(1U, std::memory_order_relaxed);
+        return true;
+    }
+    navigation::Cancel(actor.character);
+    actor.convergenceActive = false; actor.convergenceDivergenceSince = now;
+    gNavigationConvergenceFailed.fetch_add(1U, std::memory_order_relaxed);
+    return false;
+}
+
 bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
     const auto& state = actor.desired;
     if (PairSourceBusy(actor.character)) { actor.movementOwner = MovementOwner::Paired; return true; }
@@ -4926,9 +5107,14 @@ bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
     if (actor.lastProxyRefresh == now) return true;
     if (now - actor.lastReceive >= kMotionLease) {
         navigation::Cancel(actor.character);
+        actor.convergenceActive = false; actor.convergenceDivergenceSince = 0U;
         actor.movementOwner = MovementOwner::Neutral;
         std::string idleError;
         return character_direct_step_runtime::HoldAIIntentIdle(actor.character, state.moveType, idleError);
+    }
+    if (actor.convergenceActive && !NativeMoveConvergenceEligible(state)) {
+        navigation::Cancel(actor.character);
+        actor.convergenceActive = false; actor.convergenceDivergenceSince = 0U;
     }
     if (!RecoverCatastrophicIntentDivergence(actor, state, now)) return false;
     if (HostSuspendsNavigation(state)) navigation::Cancel(actor.character);
@@ -4953,6 +5139,7 @@ bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
         return true;
     }
     if (actor.movementOwner == MovementOwner::Navigation) {
+        actor.convergenceActive = false; actor.convergenceDivergenceSince = 0U;
         const bool rejected = actor.rejectedNavigationRevision == state.navigation.revision &&
             actor.rejectedNavigationRequestRevision == state.navigation.requestRevision;
         const auto backoff = rejected ? kRejectedNavigationRetry : kRefreshPeriod;
@@ -4978,6 +5165,7 @@ bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
         // actor or its paired authority. Restore the existing steering path.
         actor.movementOwner = MovementOwner::Intent;
     }
+    if (ApplyNativeNavigationConvergence(actor, now)) return true;
     navigation::Cancel(actor.character);
     // Unrecognized move requests retain the bounded steering carrier. Unknown
     // execution metadata does not suppress it and never runs a local brain.
@@ -5048,6 +5236,11 @@ bool SameState(const State& a, const State& b) noexcept {
         std::abs(a.velocityZ - b.velocityZ) <= 0.02F;
 }
 void CaptureNavigationGoal(Actor& actor) noexcept {
+    std::uintptr_t movement{};
+    std::uint32_t requested{};
+    if (Read(actor.character + 0x42A8U, movement) && movement != 0U &&
+        Read(movement + 0x194U, requested) && requested <= 3U)
+        actor.desired.moveType = requested;
     navigation::Sample sample{};
     if (!ProxyWithdrawn(actor.desired)) sample = navigation::Capture(actor.character);
     if (actor.interactionOwnsCycle ||
@@ -6055,13 +6248,16 @@ bool HookPairedPlayerClassification(HookManager& hooks, std::string& error) {
         !MatchRetailBytes(0x002638D0U, {0x56,0x8B,0xF1,0xE8,0x98,0xED,0xFF,0xFF}) ||
         !MatchRetailBytes(0x002638EAU, {0xC7,0x86,0xE0,0x00,0x00,0x00,0x02,0x00,0x00,0x00,0x5E,0xC3}) ||
         !MatchRetailBytes(0x00263900U, {0x56,0x8B,0xF1,0x8B,0x86,0x18,0x01,0x00,0x00,0x24,0x07,0x3C,0x01}) ||
-        !MatchRetailBytes(0x0026390FU, {0xE8,0x5C,0xED,0xFF,0xFF,0xC7,0x86,0xE0,0x00,0x00,0x00,0x05,0x00,0x00,0x00,0x5E,0xC3})) {
+        !MatchRetailBytes(0x0026390FU, {0xE8,0x5C,0xED,0xFF,0xFF,0xC7,0x86,0xE0,0x00,0x00,0x00,0x05,0x00,0x00,0x00,0x5E,0xC3}) ||
+        !MatchRetailBytes(0x00264A96U, {0x8B,0x46,0x44,0x8B,0x80,0x1C,0x03,0x00,0x00,0x85,0xC0,0x74,0x0F,
+            0x80,0x78,0x48,0x00,0x74,0x09,0x80,0xBE,0xE5,0x00,0x00,0x00,0x00,0x74,0x14})) {
         error = "aisync paired player classification: certified victim/register/branch/stack bytes mismatch";
         return false;
     }
     gPlayerPreparationContinue = reinterpret_cast<void*>(gBase + 0x0026270EU);
     gPlayerCategoryContinue = reinterpret_cast<void*>(gBase + 0x002E3A5DU);
     gPlayerRuntimeContinue = reinterpret_cast<void*>(gBase + 0x00263EA9U);
+    gPlayerGraphContinue = reinterpret_cast<void*>(gBase + 0x00264AA9U);
     gOutcomePreparationContinue = reinterpret_cast<void*>(gBase + 0x00262837U);
     gOutcomePreparationAbort = reinterpret_cast<void*>(gBase + 0x002626CCU);
     return Hook(hooks, "aisync_paired_player_preparation", 0x002626F7U,
@@ -6072,7 +6268,10 @@ bool HookPairedPlayerClassification(HookManager& hooks, std::string& error) {
         &gPlayerCategoryTrampoline, &gPlayerCategoryPublished, error) &&
         Hook(hooks, "aisync_paired_player_runtime", 0x00263E51U,
         reinterpret_cast<void*>(&PlayerRuntimeShim), {0x8B,0x80,0x1C,0x03,0x00,0x00},
-        &gPlayerRuntimeTrampoline, &gPlayerRuntimePublished, error);
+        &gPlayerRuntimeTrampoline, &gPlayerRuntimePublished, error) &&
+        Hook(hooks, "aisync_paired_player_graph", 0x00264A96U,
+        reinterpret_cast<void*>(&PlayerGraphShim), {0x8B,0x46,0x44,0x8B,0x80,0x1C,0x03,0x00,0x00},
+        &gPlayerGraphTrampoline, &gPlayerGraphPublished, error);
 }
 
 bool HookNativeOutcomes(HookManager& hooks, std::string& error) {
@@ -6449,6 +6648,15 @@ bool Install(const std::uintptr_t base, HookManager& hooks, LevelGenerationTrack
         HookParticipantPairedIdentity(hooks, error) &&
         HookPairedVictimGuards(hooks, error) &&
         HookPairedGraphTrace(hooks, error) &&
+        Hook(hooks, "aisync_paired_scheduler_idle_scope", 0x00287690U,
+            reinterpret_cast<void*>(&SchedulerIdleDetour), {0x6A,0xFF,0x68,0x33,0x72,0x12,0x01},
+            &gSchedulerIdleTrampoline, &gSchedulerIdleOriginal, error, 0x00D27233U) &&
+        Hook(hooks, "aisync_paired_scheduler_transition_scope", 0x00287190U,
+            reinterpret_cast<void*>(&SchedulerTransitionDetour), {0x55,0x8B,0xEC,0x83,0xE4,0xF8},
+            &gSchedulerTransitionTrampoline, &gSchedulerTransitionOriginal, error) &&
+        Hook(hooks, "aisync_paired_stop_ownership", 0x002625E0U,
+            reinterpret_cast<void*>(&PairedStopDetour), {0x6A,0xFF,0x68,0xC1,0x3F,0x12,0x01},
+            &gPairedStopTrampoline, &gPairedStopOriginal, error, 0x00D23FC1U) &&
         Hook(hooks, "aisync_native_navigation_submission", 0x00283CE0U,
             reinterpret_cast<void*>(&NavigationSubmitDetour), {0x64,0xA1,0,0,0,0,0x6A,0xFF},
             &gNavigationSubmitTrampoline, &gNavigationSubmitOriginal, error) &&
@@ -6507,6 +6715,7 @@ bool Install(const std::uintptr_t base, HookManager& hooks, LevelGenerationTrack
         return false;
     }
     character_direct_step_runtime::SetNativeAIIntentObserver(&ObserveNativeAIIntent);
+    character_direct_step_runtime::SetNativeAITransitionGuard(&RetainAuthoritativeSourceGraph);
     gInstalled.store(true, std::memory_order_release);
     return true;
 }
@@ -7413,6 +7622,11 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"pairedObserverFinishCompleted", Diagnostics::Unsigned(gPairedObserverFinishCompleted.load()), true},
          {"pairedLocalVictimFinishes", Diagnostics::Unsigned(gPairedLocalVictimFinishes.load()), true},
          {"pairedPreparedReplays", Diagnostics::Unsigned(gPairedPreparedReplays.load()), true},
+         {"pairedIdleBlocked", Diagnostics::Unsigned(gPairedIdleBlocked.load()), true},
+         {"pairedStopBlocked", Diagnostics::Unsigned(gPairedStopBlocked.load()), true},
+         {"lastPairedBlockedSchedulerRva", Diagnostics::Unsigned(gLastPairedBlockedSchedulerRva.load()), true},
+         {"navigationConvergenceApplied", Diagnostics::Unsigned(gNavigationConvergenceApplied.load()), true},
+         {"navigationConvergenceFailed", Diagnostics::Unsigned(gNavigationConvergenceFailed.load()), true},
          {"pairedAdmissionRetries", Diagnostics::Unsigned(gPairedAdmissionRetries.load()), true},
          {"pairedAdmissionAbandoned", Diagnostics::Unsigned(gPairedAdmissionAbandoned.load()), true},
          {"pairedRuntimePlayerRemaps", Diagnostics::Unsigned(gPairedRuntimePlayerRemaps.load()), true},
@@ -7587,6 +7801,12 @@ void LogDiagnostics(Diagnostics& diagnostics) {
              {"cycleType", Diagnostics::Unsigned(sample.cycleType), true},
              {"cycleState", Diagnostics::Unsigned(sample.cycleState), true},
              {"cycleFlags", Diagnostics::Unsigned(sample.cycleFlags), true},
+             {"sourceGraphPresent", Diagnostics::Boolean(sample.sourceGraphPresent), true},
+             {"navigationHeadReadable", Diagnostics::Boolean(sample.navigationHead.readable), true},
+             {"navigationHeadCount", Diagnostics::Unsigned(sample.navigationHead.count), true},
+             {"navigationHeadTypeRva", Diagnostics::Unsigned(sample.navigationHead.typeRva), true},
+             {"navigationHeadKind", Diagnostics::Unsigned(sample.navigationHead.kind), true},
+             {"navigationHeadStatus", Diagnostics::Unsigned(sample.navigationHead.status), true},
              {"stage", Diagnostics::Unsigned(sample.stage), true},
              {"withdrawState", Diagnostics::Unsigned(sample.withdrawState), true},
              {"hidden", Diagnostics::Unsigned(sample.hidden), true},

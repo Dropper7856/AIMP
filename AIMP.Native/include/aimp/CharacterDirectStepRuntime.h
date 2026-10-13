@@ -23,6 +23,8 @@ struct NativeAIIntent final {
 using NativeAIIntentObserver = void(*)(
     std::uintptr_t characterAddress,
     const NativeAIIntent& intent) noexcept;
+using NativeAITransitionGuard = bool(*)(std::uintptr_t characterAddress,
+    std::uintptr_t cycleAddress, std::uint32_t requestedState) noexcept;
 
 struct RuntimeSnapshot {
     std::uintptr_t characterAddress{};
@@ -78,6 +80,9 @@ bool Install(
 // the retail-resolved steering request even when no remote-movement slot owns
 // the Character. Passing nullptr detaches it.
 void SetNativeAIIntentObserver(NativeAIIntentObserver observer) noexcept;
+// AISync can retain an acquired paired source independently of locomotion slots.
+// The callback must use published lifetime identities, never engine-owned Actor data.
+void SetNativeAITransitionGuard(NativeAITransitionGuard guard) noexcept;
 
 // Authoritative NPC intent replay. Unlike ArmWorldReplication these functions
 // carry no network transform and therefore never chase/snap toward a position.
