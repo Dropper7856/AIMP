@@ -36,6 +36,22 @@ enum class MovementOwner : std::uint8_t {
     None, Intent, Navigation, Execution, Paired, Neutral
 };
 
+constexpr bool AICharacterClass(const std::uint32_t type) noexcept {
+    // Native template enum: 0 is PLAYER, 2/7 are ANDROID/ANDROID_HEAVY.
+    // Fail closed for unadmitted families. The class describes appearance,
+    // not network identity; PlayerSync participant ownership is checked
+    // independently before NPC admission.
+    return type == 1U || type == 2U || type == 3U || type == 4U ||
+        type == 6U || type == 7U || type == 9U;
+}
+
+constexpr bool ExecutionCycleOwnsMovement(const std::uint32_t expectedType,
+    const std::uint32_t expectedState, const std::uint32_t currentType,
+    const std::uint32_t currentState, const std::uint8_t flags) noexcept {
+    return expectedType != 0U && expectedType == currentType &&
+        expectedState == currentState && (flags & 6U) == 0U;
+}
+
 constexpr bool PairAdmissionPending(const State& state,
     const std::uint32_t completedPair, const std::uint32_t completedTransition) noexcept {
     return (state.stateFlags & InteractionValid) != 0U &&

@@ -32,6 +32,7 @@ constexpr ULONGLONG kDeadTargetGracePeriod = 1500ULL;
 constexpr ULONGLONG kPostDeathArbitrationGracePeriod = 2000ULL;
 constexpr ULONGLONG kPostDeathRecentSenseHold = 2000ULL;
 constexpr ULONGLONG kMotionLease = 600ULL;
+constexpr ULONGLONG kRejectedNavigationRetry = 1000ULL;
 constexpr std::uint32_t kStateFlags = PoseValid | Moving | ActionValid | InteractionValid | RoleTaskValid |
     ExecutionValid;
 constexpr std::uint32_t kExecutionFlags = ExecutionTransition | ExecutionCertified | ExecutionPaired;
@@ -297,7 +298,7 @@ struct OutcomeBinding final {
     PairIdentity source{}, victim{};
     State state{};
     std::uint8_t serial{};
-    bool claimed{}, lateFinishClaimed{};
+    bool claimed{}, lateFinishClaimed{}, localVictimEnded{};
 };
 std::array<OutcomeBinding, kActors> gOutcomes{};
 std::mutex gOutcomeMutex;
@@ -375,6 +376,9 @@ void* gPairedVictimPrepareTrampoline{};
 void* gPlayerPreparationTrampoline{}, *gPlayerPreparationContinue{};
 void* gOutcomePreparationContinue{}, *gOutcomePreparationAbort{};
 void* gPlayerCategoryTrampoline{}, *gPlayerCategoryContinue{};
+void* gPlayerRuntimeTrampoline{}, *gPlayerRuntimeContinue{};
+std::atomic<void*> gPlayerRuntimePublished{};
+std::atomic<std::uint64_t> gPairedRuntimePlayerRemaps{};
 std::atomic<void*> gPlayerPreparationPublished{}, gPlayerCategoryPublished{};
 void* gVictimUpdateTrampoline{};
 std::atomic<void*> gVictimUpdateOriginal{};
@@ -529,7 +533,10 @@ std::mutex gPairedGraphMutex;
 std::uint32_t gPairedGraphWrite{}, gPairedGraphRead{};
 std::atomic<std::uint64_t> gPairedGraphDropped{};
 void* gSourceGraphEventTrampoline{}, *gVictimGraphEventTrampoline{}, *gSourceGraphFinishTrampoline{};
+void* gVictimGraphFinishTrampoline{};
 std::atomic<void*> gSourceGraphEventOriginal{}, gVictimGraphEventOriginal{}, gSourceGraphFinishOriginal{};
+std::atomic<void*> gVictimGraphFinishOriginal{};
+std::atomic<std::uint64_t> gPairedLocalVictimFinishes{};
 void* gNavigationSubmitTrampoline{};
 std::atomic<void*> gNavigationSubmitOriginal{};
 std::atomic<std::uint32_t> gLastEntityA{}, gLastEntityB{}, gLastCharacterClass{};
@@ -575,24 +582,6 @@ bool FiniteCoordinate(const float value) noexcept {
     return std::isfinite(value) && std::abs(value) <= 100000.0F;
 }
 bool CertifiedExecutionCycle(std::uint32_t typeRva, std::uint32_t state) noexcept;
-// Certified retail NPC Character families currently admitted by AISync. Keep
-// this authority boundary fail-closed. The native Character class enum is an
-// appearance/runtime family, not a network participant identity: class 0 is
-// PLAYER, while 2/7 are ANDROID/ANDROID_HEAVY. Participant ownership is
-// resolved separately from the real local player pointer and PlayerSync's
-// generation-bound remote Character registry.
-bool AICharacterClass(const std::uint32_t type) noexcept {
-    switch (type) {
-    case 1U:
-    case 3U:
-    case 4U:
-    case 6U:
-    case 9U:
-        return true;
-    default:
-        return false;
-    }
-}
 bool Valid(const State& s) noexcept {
     if (!navigation::ValidGoal(s.navigation)) return false;
     if (s.version != 11U || s.nativeGeneration == 0U || s.sessionCookie == 0U ||
@@ -833,6 +822,28 @@ std::uint64_t PeerForParticipant(const std::uintptr_t character) noexcept {
 std::uintptr_t LivingAiParticipant(const std::uintptr_t owner,
     std::uint64_t& peer) noexcept {
     peer = 0U;
+    // Prefer the participant already chosen (or promoted next) by retail.
+    // The singular-player compatibility context must not drift to a nearer
+    // participant while the native selector is pursuing someone else.
+    std::uintptr_t selection{}, manager{}, managerOwner{};
+    if (owner != 0U && Read(owner + 0x34A8U, selection) && selection != 0U &&
+        Read(selection + 4U, manager) && manager != 0U &&
+        Read(manager + 0x128U, managerOwner) && managerOwner == owner) {
+        for (const auto offset : {0x10U, 0x14U}) {
+            std::uintptr_t record{}, recordOwner{}, target{};
+            std::uint32_t recordedBirth{}, currentBirth{};
+            if (!Read(selection + offset, record) || record == 0U ||
+                !Read(record + 8U, recordOwner) || recordOwner != owner ||
+                !Read(record + 0x42CU, target) || target == owner ||
+                !Read(record + 0x430U, recordedBirth) ||
+                !Read(target + 0x50U, currentBirth) || recordedBirth != currentBirth ||
+                !LivingCharacter(target)) continue;
+            const auto selectedPeer = PeerForParticipant(target);
+            if (selectedPeer == 0U) continue;
+            peer = selectedPeer;
+            return target;
+        }
+    }
     std::uintptr_t selected{};
     bool selectedHasDistance{};
     float bestDistance{};
@@ -1439,6 +1450,9 @@ bool PublishOutcomeBinding(Actor& actor, const std::uintptr_t victim) noexcept {
     // Consumption belongs to the network attack, not to a disposable proxy
     // address. Rebinding the same peer cannot replay its damage or late finish.
     if (!same) binding = {};
+    else if (binding.victim.character != victimIdentity.character ||
+        binding.victim.runtimeId != victimIdentity.runtimeId)
+        binding.localVictimEnded = false;
     binding.source = sourceIdentity; binding.victim = victimIdentity;
     // Host workers own the result; refreshing the pair header must not erase it.
     const auto result = binding.state.outcome;
@@ -1447,12 +1461,13 @@ bool PublishOutcomeBinding(Actor& actor, const std::uintptr_t victim) noexcept {
     return true;
 }
 bool LoadOutcome(const std::uintptr_t source, const std::uintptr_t victim,
-    OutcomeBinding& value) noexcept {
+    OutcomeBinding& value, const bool wait = false) noexcept {
     PairIdentity identity{};
     const auto slot = PublishedPairSource(source, identity);
     if (slot == kActors) return false;
-    std::unique_lock lock(gOutcomeMutex, std::try_to_lock);
-    if (!lock.owns_lock()) return false;
+    std::unique_lock lock(gOutcomeMutex, std::defer_lock);
+    if (wait) lock.lock();
+    else if (!lock.try_lock()) return false;
     value = gOutcomes[slot];
     return value.source.character == source && value.source.runtimeId == identity.runtimeId &&
         value.source.epoch == identity.epoch && value.victim.character == victim &&
@@ -1668,22 +1683,34 @@ std::uint8_t __fastcall RecordInvalidDetour(void* context, void*) noexcept {
     // Lifetime and hostility checks still run in the original validator.
     return invalid;
 }
+bool RecordMatches(std::uintptr_t record, std::uintptr_t owner, std::uintptr_t target) noexcept;
 bool AdmitParticipantCandidate(const std::uintptr_t senses, const std::uintptr_t target) noexcept {
     // Mirror the ordinary Character candidate admission. The retail helper
     // owns allocation, insertion, Character lifetime and reference counting.
     // Its forced-perception flag (+493) is removed for a newly admitted record;
     // normal sight/hearing/occlusion still decide whether this human is sensed.
     __try {
+        const auto owner = *reinterpret_cast<const std::uintptr_t*>(senses + 0x8CU);
+        bool staleRecord{};
         auto node = *reinterpret_cast<const std::uintptr_t*>(senses + 0xCU);
         for (std::size_t i = 0U; node != 0U && i < 1024U; ++i) {
             const auto record = *reinterpret_cast<const std::uintptr_t*>(node);
             if (*reinterpret_cast<const std::uintptr_t*>(record + 0x42CU) == target) {
+                if (!RecordMatches(record, owner, target)) {
+                    staleRecord = true;
+                    node = *reinterpret_cast<const std::uintptr_t*>(node + 8U);
+                    continue;
+                }
                 *reinterpret_cast<std::uint8_t*>(record + 0x490U) = 1U;
                 return true;
             }
             node = *reinterpret_cast<const std::uintptr_t*>(node + 8U);
         }
         if (node != 0U) return false;
+        // Ensure looks up only the address. Do not reactivate its stale record
+        // after Character address reuse; let retail lifetime validation retire
+        // it and ordinary candidate admission create the new incarnation.
+        if (staleRecord) return false;
         std::uintptr_t record{};
         using Ensure = std::uintptr_t*(__thiscall*)(void*, std::uintptr_t*, std::uintptr_t);
         reinterpret_cast<Ensure>(gBase + 0x0032AE00U)(
@@ -2302,7 +2329,9 @@ void ObserveNativeAIIntent(const std::uintptr_t character,
     if (changed) {
         ++actor->desired.locomotionRevision;
         if (actor->desired.locomotionRevision == 0U) actor->desired.locomotionRevision = 1U;
-        actor->lastSend = 0U;
+        // Direction/intensity are sampled every engine frame but published at
+        // kSendPeriod. Pair/outcome/execution boundaries remain urgent; ordinary
+        // steering changes must not turn every native tick into an IPC send.
     }
     gIntentCaptured.fetch_add(1U, std::memory_order_relaxed);
 }
@@ -2488,6 +2517,9 @@ RemoteObserverVictimState ReadRemoteObserverVictimState(const Actor& actor,
         binding.state.interactionTargetPeer != actor.desired.interactionTargetPeer ||
         !PairIdentityLive(binding.victim)) return RemoteObserverVictimState::Unknown;
 
+    // The native finish notification can replace the 4F before this manager
+    // samples it. Retain the exact local proof, never infer it from Host HP.
+    if (binding.localVictimEnded) return RemoteObserverVictimState::Complete;
     std::uintptr_t sourceCycle{}, victimCycle{}, owner{}, table{}, linkedSource{}, linkedCycle{}, current{};
     std::uint32_t cachedBirth{};
     std::uint8_t sourceState{}, victimState{}, acquired{}, ended{}, flags{}, interactive{};
@@ -2740,6 +2772,57 @@ std::uintptr_t __cdecl PlayerPreparationBoundary(const std::uintptr_t victim,
     gNativeVictimSubmission->playerPreparation = true;
     gPairedPlayerPreparationRemaps.fetch_add(1U, std::memory_order_relaxed);
     return 1;
+}
+int __cdecl PlayerRuntimeBoundary(const std::uintptr_t cycle, const std::uintptr_t victim) noexcept {
+    const auto role = gRole.load(std::memory_order_acquire);
+    if ((role != Role::Host && role != Role::Client) || !PairGenerationStable() ||
+        !RegisteredPlayerRepresentation(victim)) return 0;
+    PairIdentity sourceIdentity{}, victimIdentity{};
+    std::uintptr_t source{}, current{}, owner{}, target{}, table{};
+    std::uint8_t state{};
+    std::uint32_t targetBirth{};
+    // Exact published human participation, not a template-class/player-slot
+    // guess. The ordinary source update already checked victim lifetime.
+    if (!Read(cycle + 4U, source) || PublishedPairSource(source, sourceIdentity) == kActors ||
+        !PublishedPairParticipant(victim, victimIdentity) || !PairIdentityLive(sourceIdentity) ||
+        !PairIdentityLive(victimIdentity) || !Read(source + 0x36CU, current) || current != cycle ||
+        !Read(cycle + 4U, owner) || owner != source || !Read(cycle, table) ||
+        table != gBase + 0x00EAE5D0U || !Read(cycle + 0x1AU, state) || state != 0x4EU ||
+        !Read(cycle + 0x44U, target) || target != victim ||
+        !Read(cycle + 0x48U, targetBirth) || targetBirth != victimIdentity.runtimeId) return 0;
+    gPairedRuntimePlayerRemaps.fetch_add(1U, std::memory_order_relaxed);
+    return 1;
+}
+// 00663E51: ESI=source 4E, EAX=victim. Preserve all GPRs, flags and
+// x87/MMX/XMM/MXCSR. Human proxies take the same +E0 stage dispatcher as the
+// real retail player, bypassing only the NPC-victim/controller-state guard.
+__declspec(naked) void PlayerRuntimeShim() {
+    __asm {
+        pushfd
+        pushad
+        mov edi, esp
+        sub esp, 210h
+        and esp, 0FFFFFFF0h
+        fxsave [esp]
+        cld
+        push dword ptr [edi + 1Ch]
+        push dword ptr [edi + 4]
+        call PlayerRuntimeBoundary
+        add esp, 8
+        test eax, eax
+        jnz participant
+        fxrstor [esp]
+        mov esp, edi
+        popad
+        popfd
+        jmp dword ptr [gPlayerRuntimeTrampoline]
+    participant:
+        fxrstor [esp]
+        mov esp, edi
+        popad
+        popfd
+        jmp dword ptr [gPlayerRuntimeContinue]
+    }
 }
 int __cdecl PlayerCategoryBoundary(const std::uintptr_t victim) noexcept {
     const auto* submission = gNativeVictimSubmission;
@@ -3357,6 +3440,48 @@ void __fastcall SourceGraphFinishDetour(void* context, void*) noexcept {
         TracePairedGraph(source, victim, 0U, 3U, 0U);
     original(context);
     TracePairedGraph(source, victim, 0U, 3U, 1U);
+}
+void __fastcall VictimGraphFinishDetour(void* context, void*) noexcept {
+    const auto original = reinterpret_cast<void(__thiscall*)(void*)>(
+        gVictimGraphFinishOriginal.load(std::memory_order_acquire));
+    if (original == nullptr) return;
+    const auto cycle = reinterpret_cast<std::uintptr_t>(context);
+    std::uintptr_t victim{}, source{}, current{}, linked{}, table{}, owner{};
+    std::uint8_t acquired{}, interactive{}, serial{};
+    std::uint32_t sourceBirth{};
+    OutcomeBinding observed{};
+    // Capture while this exact victim cycle is still alive: the native finish
+    // may synchronously replace it. No Actor or engine-owned table is used by
+    // this animation-worker callback.
+    const bool observe = gRole.load(std::memory_order_acquire) == Role::Client &&
+        Read(cycle + 4U, victim) && Read(cycle + 0x68U, source) &&
+        LoadOutcome(source, victim, observed, true) && observed.claimed &&
+        !LocalClientVictim(victim) && Read(victim + 0x36CU, current) && current == cycle &&
+        Read(cycle, table) && table == gBase + 0x00EAE690U &&
+        Read(cycle + 0xD9U, acquired) && acquired != 0U &&
+        Read(cycle + 0xDAU, interactive) && interactive == 0U &&
+        Read(cycle + 0x6CU, sourceBirth) && sourceBirth == observed.source.runtimeId &&
+        Read(cycle + 0xB0U, linked) && linked != 0U &&
+        Read(source + 0x36CU, current) && current == linked &&
+        Read(linked + 4U, owner) && owner == source &&
+        Read(linked + 0x19U, serial) && serial == observed.serial;
+    original(context); // FUN_00655A60 sets victim+D8 and calls source finish.
+    if (!observe || !PairIdentityLive(observed.source) || !PairIdentityLive(observed.victim)) return;
+    PairIdentity identity{};
+    const auto slot = PublishedPairSource(source, identity);
+    if (slot == kActors) return;
+    std::lock_guard lock(gOutcomeMutex);
+    auto& binding = gOutcomes[slot];
+    if (binding.source.character == observed.source.character &&
+        binding.source.runtimeId == observed.source.runtimeId && binding.source.epoch == observed.source.epoch &&
+        binding.victim.character == observed.victim.character && binding.victim.runtimeId == observed.victim.runtimeId &&
+        binding.state.birth == observed.state.birth &&
+        binding.state.interactionPairRevision == observed.state.interactionPairRevision &&
+        binding.state.interactionTargetPeer == observed.state.interactionTargetPeer && binding.serial == serial &&
+        !binding.localVictimEnded) {
+        binding.localVictimEnded = true;
+        gPairedLocalVictimFinishes.fetch_add(1U, std::memory_order_relaxed);
+    }
 }
 void SamplePresentation(Actor& actor, const ULONGLONG now, const std::uint32_t phase = 0U) noexcept {
     if (!EngineThread() || !Stable() || actor.character == 0U || actor.duplicate) return;
@@ -4051,13 +4176,13 @@ bool PairedTransitionOwnsCycle(Actor& actor, const ULONGLONG now) noexcept {
         if (fatalKind0 && !binding.lateFinishClaimed) return true;
 
         // kind=0 has its certified late control/finish block and therefore keeps
-        // the existing lateFinishClaimed contract. kind=1 follows a different
-        // native path: for a remote observer, completion is proven by the exact
-        // local 4F graph ending plus terminal authoritative consequences.
+        // the existing lateFinishClaimed contract. Other fatal kinds require
+        // the exact local 4F graph ending plus terminal authoritative
+        // consequences before a remote observer can release the source.
         if (fatalKind0) {
             remoteObserverFatalComplete = binding.lateFinishClaimed && target != 0U &&
                 !LocalClientVictim(target) && TerminalDeadCharacter(target);
-        } else if (binding.state.outcome.kind == 1U &&
+        } else if (binding.state.outcome.kind != 0U &&
             (binding.state.outcome.flags & fatalFlags) == fatalFlags && target != 0U &&
             !LocalClientVictim(target) && TerminalDeadCharacter(target)) {
             const auto victimState = ReadRemoteObserverVictimState(actor, target, binding);
@@ -4469,7 +4594,6 @@ void RecoverDeadParticipantTarget(Actor& actor, const ULONGLONG now) noexcept {
 // root selection, before promotion/execution; failure 8 is propagated by
 // FUN_00726190 to the parent, which owns fallback and target switching.
 // This does not edit target records/signals or call SetPending/Commit.
-bool RecordMatches(std::uintptr_t record, std::uintptr_t owner, std::uintptr_t target) noexcept;
 bool RetiredMeleeSelection(void* node, const std::uintptr_t owner,
     const std::uintptr_t execution, const std::uintptr_t tree, std::uint64_t& peer) noexcept {
     peer = 0U;
@@ -4562,10 +4686,14 @@ bool RecoverCatastrophicIntentDivergence(Actor& actor, const State& state,
     const ULONGLONG now) noexcept {
     const bool hostTransitionOwnsMotion = actor.replayedExecutionRevision != 0U &&
         actor.replayedExecutionRevision == state.executionRevision;
+    const bool navigationRejected = actor.rejectedNavigationRevision == state.navigation.revision &&
+        actor.rejectedNavigationRequestRevision == state.navigation.requestRevision;
+    const bool navigationPendingOrOwned = state.navigation.flags != 0U &&
+        (!navigationRejected || actor.movementOwner == MovementOwner::Navigation);
     if ((state.stateFlags & PoseValid) == 0U || ProxyWithdrawn(state) ||
         (state.lifecycleFlags & (LifecycleSpatialDiscontinuity | LifecycleTraversalAction)) != 0U ||
         PairSourceBusy(actor.character) || actor.interactionOwnsCycle || hostTransitionOwnsMotion ||
-        state.navigation.flags != 0U) {
+        navigationPendingOrOwned) {
         actor.intentDivergenceSince = 0U;
         return true;
     }
@@ -4612,7 +4740,21 @@ bool ApplyAuthoritativeExecution(Actor& actor, const ULONGLONG now) noexcept {
         actor.completedExecutionRevision = state.executionRevision;
         return true;
     }
-    if (state.executionRevision == actor.completedExecutionRevision) return true;
+    if (state.executionRevision == actor.completedExecutionRevision) {
+        // Acknowledging a transition is not an indefinite execution lease.
+        // The local native cycle may finish before the next Host snapshot.
+        std::uintptr_t cycle{}, owner{}, table{};
+        std::uint8_t nativeState{}, flags{};
+        if (actor.replayedExecutionRevision != 0U &&
+            (!Read(actor.character + 0x36CU, cycle) || cycle == 0U ||
+             !Read(cycle + 4U, owner) || owner != actor.character ||
+             !Read(cycle, table) || table < gBase ||
+             !Read(cycle + 0x1AU, nativeState) || !Read(cycle + 8U, flags) ||
+             !ExecutionCycleOwnsMovement(state.executionCycleTypeRva, state.executionCycleState,
+                 static_cast<std::uint32_t>(table - gBase), nativeState, flags)))
+            actor.replayedExecutionRevision = 0U;
+        return true; // never replay an already completed Host transition
+    }
     actor.replayedExecutionRevision = 0U;
     // Unknown metadata is acknowledged once, but does not acquire movement.
     if (FindExecutionTransition(state.executionCycleTypeRva, state.executionCycleState) == nullptr) {
@@ -4697,12 +4839,13 @@ bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
     if (actor.movementOwner == MovementOwner::Navigation) {
         const bool rejected = actor.rejectedNavigationRevision == state.navigation.revision &&
             actor.rejectedNavigationRequestRevision == state.navigation.requestRevision;
-        if (!rejected && (actor.lastNavigationAttempt == 0U ||
-                now - actor.lastNavigationAttempt >= kRefreshPeriod)) {
+        const auto backoff = rejected ? kRejectedNavigationRetry : kRefreshPeriod;
+        if (actor.lastNavigationAttempt == 0U || now - actor.lastNavigationAttempt >= backoff) {
             std::string navigationError;
             if (navigation::Apply(actor.character, state.navigation,
                     actor.lastReceive + kMotionLease, navigationError)) {
                 actor.lastNavigationAttempt = 0U;
+                actor.rejectedNavigationRevision = actor.rejectedNavigationRequestRevision = 0U;
                 actor.intentDivergenceSince = 0U;
                 actor.completedRevision = state.revision;
                 actor.lastProxyRefresh = now;
@@ -4946,6 +5089,9 @@ void PumpHostAuthority() noexcept {
         if (actor.character == 0U || actor.duplicate || actor.faulted) continue;
         if (actor.lastManagerUpdate != 0U &&
             now - actor.lastManagerUpdate <= kManagerDormancyPeriod) continue;
+        // Dormant publication already uses this cadence. Avoid a complete
+        // Character-registry scan on frames where no heartbeat can be emitted.
+        if (now - actor.lastSend < kRefreshPeriod) continue;
 
         // Resolve through stable retail identity rather than trusting a stale
         // Character pointer. This also detects the rare case where a backstage
@@ -5771,12 +5917,18 @@ bool HookPairedPlayerClassification(HookManager& hooks, std::string& error) {
             {0x50,0x51,0x52,0x8B,0xCB,0xE8,0x41,0x23,0xFF,0xFF}) ||
         !MatchRetailBytes(0x002E3B06U,
             {0x5F,0x5E,0xB0,0x01,0x5B,0x8B,0xE5,0x5D,0xC2,0x14,0x00}) ||
-        !MatchRetailBytes(0x002D5E25U, {0x5F,0x5B,0x5E,0x5D,0xC2,0x0C,0x00})) {
+        !MatchRetailBytes(0x002D5E25U, {0x5F,0x5B,0x5E,0x5D,0xC2,0x0C,0x00}) ||
+        !MatchRetailBytes(0x00263E4AU,
+            {0x8B,0x46,0x44,0x85,0xC0,0x74,0x58,0x8B,0x80,0x1C,0x03,0x00,0x00,
+             0x85,0xC0,0x74,0x06,0x80,0x78,0x48,0x00,0x75,0x48}) ||
+        !MatchRetailBytes(0x00263E71U, {0x83,0x79,0x74,0x03}) ||
+        !MatchRetailBytes(0x00263EA9U, {0x8B,0x86,0xE0,0x00,0x00,0x00})) {
         error = "aisync paired player classification: certified victim/register/branch/stack bytes mismatch";
         return false;
     }
     gPlayerPreparationContinue = reinterpret_cast<void*>(gBase + 0x0026270EU);
     gPlayerCategoryContinue = reinterpret_cast<void*>(gBase + 0x002E3A5DU);
+    gPlayerRuntimeContinue = reinterpret_cast<void*>(gBase + 0x00263EA9U);
     gOutcomePreparationContinue = reinterpret_cast<void*>(gBase + 0x00262837U);
     gOutcomePreparationAbort = reinterpret_cast<void*>(gBase + 0x002626CCU);
     return Hook(hooks, "aisync_paired_player_preparation", 0x002626F7U,
@@ -5784,7 +5936,10 @@ bool HookPairedPlayerClassification(HookManager& hooks, std::string& error) {
         &gPlayerPreparationTrampoline, &gPlayerPreparationPublished, error) &&
         Hook(hooks, "aisync_paired_player_category", 0x002E3A4DU,
         reinterpret_cast<void*>(&PlayerCategoryShim), {0x8B,0x86,0x1C,0x03,0x00,0x00},
-        &gPlayerCategoryTrampoline, &gPlayerCategoryPublished, error);
+        &gPlayerCategoryTrampoline, &gPlayerCategoryPublished, error) &&
+        Hook(hooks, "aisync_paired_player_runtime", 0x00263E51U,
+        reinterpret_cast<void*>(&PlayerRuntimeShim), {0x8B,0x80,0x1C,0x03,0x00,0x00},
+        &gPlayerRuntimeTrampoline, &gPlayerRuntimePublished, error);
 }
 
 bool HookNativeOutcomes(HookManager& hooks, std::string& error) {
@@ -5965,7 +6120,9 @@ bool HookParticipantPairedIdentity(HookManager& hooks, std::string& error) {
 bool HookPairedGraphTrace(HookManager& hooks, std::string& error) {
     if (!MatchRetailBytes(0x00264AC8U, {0xC2,0x04,0x00}) ||
         !MatchRetailBytes(0x00265A25U, {0xC2,0x04,0x00}) ||
-        !MatchRetailBytes(0x00255A5BU, {0xC3})) {
+        !MatchRetailBytes(0x00255A5BU, {0xC3}) ||
+        !MatchRetailBytes(0x00255A69U, {0xC6,0x86,0xD8,0x00,0x00,0x00,0x01}) ||
+        !MatchRetailBytes(0x00255B24U, {0xC3})) {
         error = "AISync paired graph callback ABI mismatch";
         return false;
     }
@@ -5989,7 +6146,11 @@ bool HookPairedGraphTrace(HookManager& hooks, std::string& error) {
             &gVictimGraphEventTrampoline, &gVictimGraphEventOriginal, error) &&
         Hook(hooks, "aisync_paired_source_native_finish", 0x002559A0U,
             reinterpret_cast<void*>(&SourceGraphFinishDetour), {0x83,0xEC,0x10,0x56,0x8B,0xF1},
-            &gSourceGraphFinishTrampoline, &gSourceGraphFinishOriginal, error);
+            &gSourceGraphFinishTrampoline, &gSourceGraphFinishOriginal, error) &&
+        Hook(hooks, "aisync_paired_victim_graph_finish", 0x00255A60U,
+            reinterpret_cast<void*>(&VictimGraphFinishDetour),
+            {0x56,0x8B,0xF1,0x8B,0x8E,0xB0,0x00,0x00,0x00},
+            &gVictimGraphFinishTrampoline, &gVictimGraphFinishOriginal, error);
 }
 bool HookPairedVictimGuards(HookManager& hooks, std::string& error) {
     // Both the ABI and unsafe source-animation load are independently checked
@@ -6523,6 +6684,21 @@ void PumpOnEngineThread() noexcept {
             // Retain the latest Host snapshot until this exact fatal victim
             // finishes, including an observer's remote human representation.
             // No task/lifecycle cleanup may reuse the paired source meanwhile.
+            // Presentation deferral must not also starve progress for THIS
+            // authoritative outcome. Keep world/pose/task epochs deferred,
+            // while callbacks can observe newer Host finish/health evidence.
+            const auto refreshOutcome = [&](const State& progress) noexcept {
+                if (progress.birth != actor.desired.birth ||
+                    progress.interactionPairRevision != actor.desired.interactionPairRevision ||
+                    progress.interactionTargetPeer != actor.desired.interactionTargetPeer ||
+                    progress.outcome.revision <= actor.desired.outcome.revision) return;
+                const auto previousOutcome = actor.desired.outcome;
+                actor.desired.outcome = progress.outcome;
+                if (!PublishOutcomeBinding(actor, ParticipantForPeer(actor.desired.interactionTargetPeer)))
+                    actor.desired.outcome = previousOutcome; // retry a contended publication next tick
+            };
+            refreshOutcome(value);
+            refreshOutcome(gIncoming[i]);
             actor.lastReceive = now;
             gPairedVictimSnapshotsDeferred.fetch_add(1U, std::memory_order_relaxed);
             if (!LocalClientVictim(ParticipantForPeer(actor.desired.interactionTargetPeer)))
@@ -6610,8 +6786,8 @@ void PumpOnEngineThread() noexcept {
             actor.completedTransitionRevision = 0U;
             actor.resolvedPairRevision = 0U;
             actor.completedExecutionRevision = 0U;
-        actor.replayedExecutionRevision = 0U;
-        actor.lastExecutionAttempt = 0U;
+            actor.replayedExecutionRevision = 0U;
+            actor.lastExecutionAttempt = 0U;
         }
 
         // BT and RoleTask remain Host-authoritative decision epochs. Clients do
@@ -7099,6 +7275,8 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"pairedObserverCompletions", Diagnostics::Unsigned(ai.pairedObserverCompletions), true},
          {"pairedObserverFinishRetries", Diagnostics::Unsigned(gPairedObserverFinishRetries.load()), true},
          {"pairedObserverFinishCompleted", Diagnostics::Unsigned(gPairedObserverFinishCompleted.load()), true},
+         {"pairedLocalVictimFinishes", Diagnostics::Unsigned(gPairedLocalVictimFinishes.load()), true},
+         {"pairedRuntimePlayerRemaps", Diagnostics::Unsigned(gPairedRuntimePlayerRemaps.load()), true},
          {"pairedObserverReleaseAttempts", Diagnostics::Unsigned(ai.pairedObserverReleaseAttempts), true},
          {"pairedObserverReleases", Diagnostics::Unsigned(ai.pairedObserverReleases), true},
          {"pairedObserverReleaseRejected", Diagnostics::Unsigned(ai.pairedObserverReleaseRejected), true},
