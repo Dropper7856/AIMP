@@ -130,6 +130,7 @@ private:
     void PublishWorldReplicationTraffic();
     void PublishPlayerSyncTraffic();
     void PublishAISyncTraffic();
+    bool HandleAISyncFrame(const protocol::Frame& frame);
     bool TryConnect();
     void Disconnect(std::string_view reason) noexcept;
     bool ReceiveAvailable();
@@ -163,6 +164,7 @@ private:
     std::wstring pipeName_;
     std::array<std::uint8_t, 32> executableHash_{};
     std::uint32_t processId_{};
+    std::uint64_t aiSyncRejectedFrames_{}; // IPC-worker only, retained across reconnects.
     bool buildValidated_{};
     std::string profileId_;
     std::string resolutionMode_;

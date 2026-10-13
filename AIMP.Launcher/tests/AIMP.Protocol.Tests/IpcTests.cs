@@ -1,4 +1,6 @@
 using AIMP.Launcher;
+using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.IO.Pipes;
 using System.Security.Cryptography;
 
@@ -45,6 +47,71 @@ internal static class IpcTests
         ProtocolConstants.PipeName(Environment.ProcessId),
         PipeDirection.InOut,
         PipeOptions.Asynchronous);
+
+    internal static async Task AISyncRejectionPreservesConnectionAsync()
+    {
+        using var temporary = new TemporaryDirectory();
+        var executablePath = temporary.Combine("AI.exe");
+        var executableBytes = new byte[] { 0x4D, 0x5A, 0x01, 0x02, 0x03 };
+        await File.WriteAllBytesAsync(executablePath, executableBytes).ConfigureAwait(false);
+        var identity = Guid.NewGuid();
+        var serverFrames = new List<MessageType>();
+        await using var session = new DllIpcSession(Environment.ProcessId);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var logs = new ConcurrentQueue<string>();
+        var states = 0; var impacts = 0; var closed = 0;
+        session.Log += (_, message) => logs.Enqueue(message);
+        session.AISyncStateProduced += (_, _) => Interlocked.Increment(ref states);
+        session.AISyncImpactProduced += (_, _) => Interlocked.Increment(ref impacts);
+        session.ConnectionClosed += (_, _) => Interlocked.Increment(ref closed);
+        var handshake = session.AcceptAndHandshakeAsync(
+            executablePath, identity, TimeSpan.FromSeconds(5), timeout.Token);
+        using var client = CreateClient();
+        await client.ConnectAsync(timeout.Token).ConfigureAwait(false);
+        await SendHandshakeAsync(client, executableBytes, identity, serverFrames, timeout.Token).ConfigureAwait(false);
+        await handshake.ConfigureAwait(false);
+
+        // Bad application payloads arrive in valid frames. None may reach an
+        // AISync subscriber or prevent subsequent gameplay/diagnostic requests.
+        await WriteRawAsync(client, MessageType.AISyncState, new byte[1], 10, timeout.Token).ConfigureAwait(false);
+        var missingPose = AISyncCodecTests.ValidState(identity);
+        BinaryPrimitives.WriteUInt32LittleEndian(missingPose.AsSpan(40), 2U);
+        await WriteRawAsync(client, MessageType.AISyncState, missingPose, 11, timeout.Token).ConfigureAwait(false);
+        await WriteRawAsync(client, MessageType.AISyncImpact,
+            new byte[AISyncCodec.NativeImpactBytes], 12, timeout.Token).ConfigureAwait(false);
+        await WriteRawAsync(client, MessageType.AISyncState,
+            AISyncCodecTests.ValidState(identity), 13, timeout.Token).ConfigureAwait(false);
+        await WriteRawAsync(client, MessageType.AISyncImpact,
+            ValidImpact(identity), 14, timeout.Token).ConfigureAwait(false);
+
+        // The response is ordered after these frames, so it also serves as a
+        // processing barrier without sleeps or polling the read-loop thread.
+        await QueryCapabilitiesAsync(session, client, identity, serverFrames, timeout.Token).ConfigureAwait(false);
+        await ExecuteQueuedCommandAsync(session, client, identity, serverFrames, timeout.Token).ConfigureAwait(false);
+        AssertEx.True(session.IsReady);
+        AssertEx.Equal(0, Volatile.Read(ref closed));
+        AssertEx.Equal(1, Volatile.Read(ref states));
+        AssertEx.Equal(1, Volatile.Read(ref impacts));
+        AssertEx.Equal(2, logs.Count(message => message.StartsWith("Rejected AISYNC_STATE", StringComparison.Ordinal)));
+        AssertEx.Equal(1, logs.Count(message => message.StartsWith("Rejected AISYNC_IMPACT", StringComparison.Ordinal)));
+    }
+
+    private static byte[] ValidImpact(Guid identity)
+    {
+        var bytes = new byte[AISyncCodec.NativeImpactBytes];
+        foreach (var (offset, value) in new (int, uint)[]
+        {
+            (0, 1), (4, 1), (16, 7), (20, 1), (32, 11),
+            (40, 2), (44, 1), (48, 25), (56, 1)
+        }) BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(offset), value);
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(8), AISyncCodec.SessionCookie(identity));
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(24), 1234UL);
+        return bytes;
+    }
+
+    private static ValueTask WriteRawAsync(Stream stream, MessageType type,
+        ReadOnlyMemory<byte> payload, ulong sequence, CancellationToken token) =>
+        FrameCodec.WriteAsync(stream, new AimpFrame(type, 0, sequence, payload), token);
 
     private static async Task SendHandshakeAsync(
         Stream client,

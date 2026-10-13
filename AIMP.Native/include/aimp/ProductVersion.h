@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.190-aisync-rea-retail-execution";
+    "0.11.4.191-aisync-ipc-isolation";
 
 } // namespace aimp
