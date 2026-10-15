@@ -76,8 +76,20 @@ checks = [
     ("Scheduler transition final RET 4", 0x287687, "C2 04 00"),
     ("Scheduler idle callback plain RET", 0x287A19, "C3"),
     ("Paired graph player E5 branch", 0x264AA9, "80 BE E5 00 00 00 00 74 14"),
+    ("Idle class dispatch can bypass shared Idle hook", 0x25FCB6,
+     "8B 41 64 8B 40 04 83 F8 02 74 19 83 F8 07 74 14 83 F8 03 74 0F 83 F8 04 74 0A 83 F8 06 74 05 83 F8 09 75 62"),
+    ("Alternate Idle has same native class dispatch", 0x25FD92,
+     "8B 41 64 8B 40 04 83 F8 02 74 19 83 F8 07 74 14 83 F8 03 74 0F 83 F8 04 74 0A 83 F8 06 74 05 83 F8 09 75 5B"),
+    ("Idle dispatch destroys previous cycle before constructor", 0x25FCF7, "8B 06 8B 10 6A 01 8B CE FF D2"),
+    ("Alternate Idle dispatch also destroys previous cycle", 0x25FDD3, "8B 06 8B 10 6A 01 8B CE FF D2"),
+    ("Interactive victim Start_Death failure before D8 finish", 0x2659AD, "80 BE DA 00 00 00 00 74 17 80 4E 08 06"),
+    ("Cancel clears scheduler retention flag regardless of status", 0x283DCB, "83 7E 0C 00 C6 46 18 00"),
+    ("Terminal scheduler list retains requests with +18 set", 0x283478, "80 7E 18 00 74 3F"),
 ]
 failures = []
+target_sha256 = hashlib.sha256(data).hexdigest()
+if target_sha256 != "00d6bb846ac5a78916baf363eb148aa255a23bf216a271cfd23a0ece3c368364":
+    failures.append({"name": "Certified AI.exe identity", "actual": target_sha256})
 # Audit the literals that actually gate installation, not only the independent
 # RE evidence above. A duplicated byte in a live guard previously escaped this
 # audit because its separately transcribed evidence was correct.
@@ -110,8 +122,26 @@ for rva, target in [(0xEAE5D4, 0x264A10), (0xEAE694, 0x2658E0)]:
     actual = struct.unpack("<I", at(rva, 4))[0]
     if actual != image_base + target:
         failures.append({"vtableRva": hex(rva), "actual": hex(actual)})
-print(json.dumps({"binary": str(path), "sha256": hashlib.sha256(data).hexdigest(),
-                  "checks": len(checks) + 2, "failures": failures,
+# The new whole-instruction trampolines copy a PUSH absolute SEH handler.
+# Confirm these operands are actually PE HIGHLOW relocations, so their loaded
+# values remain valid when the game is rebased.
+reloc_rva, reloc_size = struct.unpack_from("<II", data, pe + 24 + 96 + 5 * 8)
+relocations = set()
+cursor = 0
+while cursor < reloc_size:
+    page, block_size = struct.unpack("<II", at(reloc_rva + cursor, 8))
+    if block_size < 8 or block_size % 2 or cursor + block_size > reloc_size:
+        raise ValueError("Invalid PE base relocation block")
+    for entry in struct.unpack("<" + "H" * ((block_size - 8) // 2),
+                               at(reloc_rva + cursor + 8, block_size - 8)):
+        if entry >> 12 == 3:
+            relocations.add(page + (entry & 0xFFF))
+    cursor += block_size
+for rva in (0x25FC83, 0x25FD63):
+    if rva not in relocations:
+        failures.append({"name": "Paired Idle SEH HIGHLOW operand", "rva": hex(rva)})
+print(json.dumps({"binary": str(path), "sha256": target_sha256,
+                  "checks": len(checks) + 5, "failures": failures,
                   "runtimeGuards": len(runtime_guards),
                   "hookPrefixes": len(hook_prefixes),
                   "validation": "static only; Host/Client runtime acceptance remains required"}, indent=2))

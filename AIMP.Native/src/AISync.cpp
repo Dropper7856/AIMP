@@ -390,6 +390,8 @@ void* gPlayerGraphTrampoline{}, *gPlayerGraphContinue{};
 std::atomic<void*> gPlayerGraphPublished{};
 void* gPairedStopTrampoline{};
 std::atomic<void*> gPairedStopOriginal{};
+void* gPairedIdleTrampoline{}, *gPairedAlternateIdleTrampoline{};
+std::atomic<void*> gPairedIdleOriginal{}, gPairedAlternateIdleOriginal{};
 std::atomic<std::uint64_t> gPairedIdleBlocked{}, gPairedStopBlocked{};
 void* gSchedulerIdleTrampoline{}, *gSchedulerTransitionTrampoline{};
 std::atomic<void*> gSchedulerIdleOriginal{}, gSchedulerTransitionOriginal{};
@@ -2533,7 +2535,7 @@ bool RetainAuthoritativeSourceGraph(const std::uintptr_t source,
     PairIdentity sourceIdentity{}, victimIdentity{};
     std::uintptr_t current{}, owner{}, table{}, victim{}, victimCycle{}, linked{}, linkedSource{}, graph{};
     std::uint32_t victimBirth{}, sourceBirth{}, stage{};
-    std::uint8_t state{}, flags{}, prepared{}, finished{}, acquired{}, ended{};
+    std::uint8_t state{}, flags{}, victimFlags{}, prepared{}, finished{}, acquired{}, ended{};
     // E7 + the acquired 4F link is the native handshake consumed only after
     // ClaimOutcome on a Client. No mutex or health heuristic in this callback.
     if (PublishedPairSource(source, sourceIdentity) == kActors || !PairIdentityLive(sourceIdentity) ||
@@ -2552,6 +2554,7 @@ bool RetainAuthoritativeSourceGraph(const std::uintptr_t source,
         !Read(victimCycle, table) || table != gBase + 0x00EAE690U ||
         !Read(victimCycle + 4U, owner) || owner != victim ||
         !Read(victimCycle + 0x1AU, state) || state != 0x4FU ||
+        !Read(victimCycle + 8U, victimFlags) || (victimFlags & 4U) != 0U ||
         !Read(victimCycle + 0x68U, linkedSource) || linkedSource != source ||
         !Read(victimCycle + 0x6CU, sourceBirth) || sourceBirth != sourceIdentity.runtimeId ||
         !Read(victimCycle + 0xB0U, linked) || linked != cycle ||
@@ -2597,6 +2600,26 @@ void __fastcall PairedStopDetour(void* context, void*, const std::uint32_t argum
     if (original == nullptr || (Read(reinterpret_cast<std::uintptr_t>(context) + 4U, source) &&
         RetainAuthoritativeSourceGraph(source, reinterpret_cast<std::uintptr_t>(context), 0x3BU))) return;
     original(context, argument); // one opaque stack word; retail RET 4
+}
+
+// These class-dispatching entries can destroy a humanoid/Android cycle before
+// reaching the shared Idle hook. Guard the same scheduler-owned transition at
+// their entry, before any destructor, with each retail stack ABI unchanged.
+void __fastcall PairedIdleDetour(void* context, void*, const std::uint32_t argument) noexcept {
+    const auto original = reinterpret_cast<void(__thiscall*)(void*, std::uint32_t)>(
+        gPairedIdleOriginal.load(std::memory_order_acquire));
+    std::uintptr_t source{};
+    if (original == nullptr || (Read(reinterpret_cast<std::uintptr_t>(context) + 4U, source) &&
+        RetainAuthoritativeSourceGraph(source, reinterpret_cast<std::uintptr_t>(context), 1U))) return;
+    original(context, argument);
+}
+void __fastcall PairedAlternateIdleDetour(void* context, void*) noexcept {
+    const auto original = reinterpret_cast<void(__thiscall*)(void*)>(
+        gPairedAlternateIdleOriginal.load(std::memory_order_acquire));
+    std::uintptr_t source{};
+    if (original == nullptr || (Read(reinterpret_cast<std::uintptr_t>(context) + 4U, source) &&
+        RetainAuthoritativeSourceGraph(source, reinterpret_cast<std::uintptr_t>(context), 2U))) return;
+    original(context);
 }
 
 enum class RemoteObserverVictimState : std::uint8_t {
@@ -5926,17 +5949,25 @@ bool PublishClientImpact(const std::uintptr_t victim, int* hit,
     }
     if (damage <= 0 || damage > 0xFFFF) return false;
 
-    std::uint32_t entityA{}, entityB{}, type{}, birth{}, descriptor{};
+    std::uint32_t entityA{}, entityB{}, type{}, runtimeId{}, descriptor{};
     if (!CharacterIdentity(victim, entityA, entityB, type) || !AICharacterClass(type) ||
-        !Read(victim + 0x50U, birth) || birth == 0U ||
+        !Read(victim + 0x50U, runtimeId) ||
         !Read(reinterpret_cast<std::uintptr_t>(hit) + 0x18U, descriptor)) return false;
+    const auto* actor = Find(victim); // EngineThread is required above.
+    if (actor == nullptr || actor->duplicate || actor->faulted ||
+        actor->entityA != entityA || actor->entityB != entityB || actor->characterClass != type ||
+        actor->desired.sessionCookie != gCurrent.sessionCookie ||
+        actor->desired.worldGeneration != gCurrent.worldGeneration ||
+        !ImpactTargetLifetimeMatches(actor->remoteBirth, actor->desired.birth,
+            runtimeId, actor->runtimeId)) return false;
 
     ImpactEvent event{};
     event.nativeGeneration = gCurrent.nativeGeneration;
     event.sessionCookie = gCurrent.sessionCookie;
     event.worldGeneration = gCurrent.worldGeneration;
     event.sourcePeer = gCurrent.localPeer;
-    event.targetA = entityA; event.targetB = entityB; event.targetClass = type; event.targetBirth = birth;
+    event.targetA = entityA; event.targetB = entityB; event.targetClass = type;
+    event.targetBirth = actor->remoteBirth;
     event.damage = static_cast<std::uint32_t>(damage);
     event.descriptor = descriptor;
     event.channel = channel;
@@ -6449,6 +6480,20 @@ bool HookParticipantPairedIdentity(HookManager& hooks, std::string& error) {
     return hooks.InstallCallRedirect(animated, error);
 }
 
+bool ValidatePairedSchedulerAbi(std::string& error) {
+    // ECX is the current cycle in both class-dispatching Idle entries. They
+    // differ in stack arity, including their early/fallback return paths.
+    if (!MatchRetailBytes(0x0025FC98U, {0x56,0x8B,0xF1,0x8B,0x4E,0x04}) ||
+        !MatchRetailBytes(0x0025FD39U, {0xC2,0x04,0x00}) ||
+        !MatchRetailBytes(0x0025FD52U, {0xC2,0x04,0x00}) ||
+        !MatchRetailBytes(0x0025FD78U, {0x56,0x8B,0xF1,0x8B,0x4E,0x04}) ||
+        !MatchRetailBytes(0x0025FE10U, {0xC3}) ||
+        !MatchRetailBytes(0x0025FE27U, {0xC3})) {
+        error = "AISync paired scheduler Idle dispatch ABI mismatch";
+        return false;
+    }
+    return true;
+}
 bool HookPairedGraphTrace(HookManager& hooks, std::string& error) {
     if (!MatchRetailBytes(0x00264AC8U, {0xC2,0x04,0x00}) ||
         !MatchRetailBytes(0x00265A25U, {0xC2,0x04,0x00}) ||
@@ -6636,7 +6681,7 @@ bool Install(const std::uintptr_t base, HookManager& hooks, LevelGenerationTrack
     }
     gBase = base; gGenerations = &generations; gDispatcher = &dispatcher;
     if (!ValidateRoleTaskCleanupAbi(error) || !ValidateCharacterLifecycleAbi(error) ||
-        !navigation::Initialize(base, error)) return false;
+        !ValidatePairedSchedulerAbi(error) || !navigation::Initialize(base, error)) return false;
     gBranchExit = reinterpret_cast<void*>(base + 0x003344D4U);
     const auto first = hooks.InstalledCount();
     // Complete instructions; no relative CALL/Jcc in a prefix. The PUSH
@@ -6657,6 +6702,12 @@ bool Install(const std::uintptr_t base, HookManager& hooks, LevelGenerationTrack
         Hook(hooks, "aisync_paired_stop_ownership", 0x002625E0U,
             reinterpret_cast<void*>(&PairedStopDetour), {0x6A,0xFF,0x68,0xC1,0x3F,0x12,0x01},
             &gPairedStopTrampoline, &gPairedStopOriginal, error, 0x00D23FC1U) &&
+        Hook(hooks, "aisync_paired_idle_ownership", 0x0025FC80U,
+            reinterpret_cast<void*>(&PairedIdleDetour), {0x6A,0xFF,0x68,0xC1,0x3F,0x12,0x01},
+            &gPairedIdleTrampoline, &gPairedIdleOriginal, error, 0x00D23FC1U) &&
+        Hook(hooks, "aisync_paired_alternate_idle_ownership", 0x0025FD60U,
+            reinterpret_cast<void*>(&PairedAlternateIdleDetour), {0x6A,0xFF,0x68,0xC1,0x3F,0x12,0x01},
+            &gPairedAlternateIdleTrampoline, &gPairedAlternateIdleOriginal, error, 0x00D23FC1U) &&
         Hook(hooks, "aisync_native_navigation_submission", 0x00283CE0U,
             reinterpret_cast<void*>(&NavigationSubmitDetour), {0x64,0xA1,0,0,0,0,0x6A,0xFF},
             &gNavigationSubmitTrampoline, &gNavigationSubmitOriginal, error) &&
@@ -6758,7 +6809,7 @@ bool Configure(const std::span<const std::byte> payload) noexcept {
 }
 
 bool ValidImpactEvent(const ImpactEvent& value) noexcept {
-    return value.version == 1U && value.nativeGeneration != 0U && value.sessionCookie != 0U &&
+    return value.version == 2U && value.nativeGeneration != 0U && value.sessionCookie != 0U &&
         value.worldGeneration != 0U && value.sequence != 0U && value.sourcePeer != 0U &&
         (value.targetA != 0U || value.targetB != 0U) && AICharacterClass(value.targetClass) &&
         value.targetBirth != 0U && value.damage != 0U && value.damage <= 0xFFFFU &&
@@ -6884,11 +6935,18 @@ void PumpHostImpacts() noexcept {
         }
         const auto source = ParticipantForPeer(impact.sourcePeer);
         const auto target = FindCharacterByIdentity(impact.targetA, impact.targetB);
-        std::uint32_t entityA{}, entityB{}, type{}, birth{};
+        const auto* actor = Find(target);
+        std::uint32_t entityA{}, entityB{}, type{}, runtimeId{};
         if (source == 0U || !RegisteredPlayerRepresentation(source) || target == 0U ||
+            actor == nullptr || actor->duplicate || actor->faulted ||
+            actor->desired.sessionCookie != gCurrent.sessionCookie ||
+            actor->desired.worldGeneration != gCurrent.worldGeneration ||
             !CharacterIdentity(target, entityA, entityB, type) || entityA != impact.targetA ||
-            entityB != impact.targetB || type != impact.targetClass || !Read(target + 0x50U, birth) ||
-            birth != impact.targetBirth || TerminalDeadCharacter(target)) {
+            entityB != impact.targetB || type != impact.targetClass ||
+            actor->entityA != entityA || actor->entityB != entityB || actor->characterClass != type ||
+            !Read(target + 0x50U, runtimeId) ||
+            !ImpactTargetLifetimeMatches(impact.targetBirth, actor->birth, runtimeId, actor->runtimeId) ||
+            TerminalDeadCharacter(target)) {
             gImpactRejected.fetch_add(1U, std::memory_order_relaxed);
             continue;
         }
@@ -6901,7 +6959,7 @@ void PumpHostImpacts() noexcept {
             gImpactRejected.fetch_add(1U, std::memory_order_relaxed);
             continue;
         }
-        if (auto* actor = Find(target); actor != nullptr) actor->lastSend = 0U;
+        if (auto* updated = Find(target); updated != nullptr) updated->lastSend = 0U;
         gImpactApplied.fetch_add(1U, std::memory_order_relaxed);
     }
 }

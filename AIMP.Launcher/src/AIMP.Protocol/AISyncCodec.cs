@@ -9,6 +9,7 @@ namespace AIMP.Protocol;
 public static class AISyncCodec
 {
     public const uint StateVersion = 11;
+    public const uint ImpactVersion = 2;
     public const int NativeStateBytes = 288;
     public const int NativeImpactBytes = 64;
     public const int ConfigurationBytes = 552;
@@ -183,7 +184,7 @@ public static class AISyncCodec
 
     public static void ValidateNativeImpact(ReadOnlySpan<byte> bytes)
     {
-        if (bytes.Length != NativeImpactBytes || U32(bytes, 0) != 1 || U32(bytes, 4) == 0
+        if (bytes.Length != NativeImpactBytes || U32(bytes, 0) != ImpactVersion || U32(bytes, 4) == 0
             || BinaryPrimitives.ReadUInt64LittleEndian(bytes[8..]) == 0 || U32(bytes, 16) == 0
             || U32(bytes, 20) == 0 || BinaryPrimitives.ReadUInt64LittleEndian(bytes[24..]) == 0
             || (U32(bytes, 32) == 0 && U32(bytes, 36) == 0) || !AllowedCharacterClass(U32(bytes, 40))

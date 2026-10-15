@@ -81,8 +81,12 @@ internal static class IpcTests
             new byte[AISyncCodec.NativeImpactBytes], 12, timeout.Token).ConfigureAwait(false);
         await WriteRawAsync(client, MessageType.AISyncState,
             AISyncCodecTests.ValidState(identity), 13, timeout.Token).ConfigureAwait(false);
+        var legacyImpact = ValidImpact(identity);
+        BinaryPrimitives.WriteUInt32LittleEndian(legacyImpact, 1U);
         await WriteRawAsync(client, MessageType.AISyncImpact,
-            ValidImpact(identity), 14, timeout.Token).ConfigureAwait(false);
+            legacyImpact, 14, timeout.Token).ConfigureAwait(false);
+        await WriteRawAsync(client, MessageType.AISyncImpact,
+            ValidImpact(identity), 15, timeout.Token).ConfigureAwait(false);
 
         // The response is ordered after these frames, so it also serves as a
         // processing barrier without sleeps or polling the read-loop thread.
@@ -93,7 +97,7 @@ internal static class IpcTests
         AssertEx.Equal(1, Volatile.Read(ref states));
         AssertEx.Equal(1, Volatile.Read(ref impacts));
         AssertEx.Equal(2, logs.Count(message => message.StartsWith("Rejected AISYNC_STATE", StringComparison.Ordinal)));
-        AssertEx.Equal(1, logs.Count(message => message.StartsWith("Rejected AISYNC_IMPACT", StringComparison.Ordinal)));
+        AssertEx.Equal(2, logs.Count(message => message.StartsWith("Rejected AISYNC_IMPACT", StringComparison.Ordinal)));
     }
 
     private static byte[] ValidImpact(Guid identity)
@@ -101,7 +105,7 @@ internal static class IpcTests
         var bytes = new byte[AISyncCodec.NativeImpactBytes];
         foreach (var (offset, value) in new (int, uint)[]
         {
-            (0, 1), (4, 1), (16, 7), (20, 1), (32, 11),
+            (0, AISyncCodec.ImpactVersion), (4, 1), (16, 7), (20, 1), (32, 11),
             (40, 2), (44, 1), (48, 25), (56, 1)
         }) BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(offset), value);
         BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(8), AISyncCodec.SessionCookie(identity));

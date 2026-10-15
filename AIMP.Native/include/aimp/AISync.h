@@ -153,7 +153,8 @@ struct State final {
     NavigationGoalState navigation{};
 };
 struct ImpactEvent final {
-    std::uint32_t version{1U};
+    // v2 targetBirth is the Host's portable AISync incarnation, never +50.
+    std::uint32_t version{2U};
     std::uint32_t nativeGeneration{}; // informational; differs per process
     std::uint64_t sessionCookie{};
     std::uint32_t worldGeneration{};
