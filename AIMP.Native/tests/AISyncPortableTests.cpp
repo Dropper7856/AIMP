@@ -12,6 +12,16 @@ int main() {
     using namespace aimp::ai_sync;
     for (const auto type : {1U, 2U, 3U, 4U, 6U, 7U, 9U}) assert(AICharacterClass(type));
     for (const auto type : {0U, 5U, 8U, 10U, 0xFFFFFFFFU}) assert(!AICharacterClass(type));
+    // The same NPC has different local lifetime tokens on Host and Client.
+    // A hit carries the Host-issued incarnation, and each side checks only
+    // its own local token. Reallocation and delayed hits must fail closed.
+    const std::uint32_t hostRuntime = 3U, clientRuntime = 91U, hostBirth = 7U;
+    assert(ImpactTargetLifetimeMatches(hostBirth, hostBirth, clientRuntime, clientRuntime));
+    assert(ImpactTargetLifetimeMatches(hostBirth, hostBirth, hostRuntime, hostRuntime));
+    assert(!ImpactTargetLifetimeMatches(clientRuntime, hostBirth, hostRuntime, hostRuntime));
+    assert(!ImpactTargetLifetimeMatches(6U, hostBirth, hostRuntime, hostRuntime));
+    assert(!ImpactTargetLifetimeMatches(hostBirth, hostBirth, 92U, clientRuntime));
+    assert(!ImpactTargetLifetimeMatches(0U, 0U, clientRuntime, clientRuntime));
     // A native stop completes locally before a same-revision Host heartbeat.
     // Its old acknowledgment must not keep navigation/steering suspended.
     assert(ExecutionCycleOwnsMovement(0x00EABEC0U, 0x3BU, 0x00EABEC0U, 0x3BU, 0U));
@@ -104,5 +114,6 @@ int main() {
     assert(navigation::ValidGoal(goal)); // no active native request
     static_assert(sizeof(State) == 288U && offsetof(State, navigation) == 256U);
     static_assert(offsetof(State, outcome) == 192U && offsetof(State, executionRevision) == 240U);
+    static_assert(sizeof(ImpactEvent) == 64U && ImpactEvent{}.version == 2U);
     std::cout << "AISync ownership, navigation admission and v11 wire layout passed\n";
 }

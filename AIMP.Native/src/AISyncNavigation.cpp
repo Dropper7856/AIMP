@@ -50,7 +50,10 @@ bool Live(const Lease& lease) noexcept {
 }
 void Release(Lease& lease, const bool cancel) noexcept {
     __try {
-        if (lease.ref.object != 0U && cancel && Live(lease) && !lease.finished) {
+        // A terminal request still has a scheduler reference while +18 is set.
+        // Retail Cancel clears that bit and removes both active and terminal
+        // entries. Releasing only our Ref leaks completed goals in the scheduler.
+        if (lease.ref.object != 0U && cancel && Live(lease)) {
             reinterpret_cast<void(__thiscall*)(void*)>(gBase + kCancel)(
                 reinterpret_cast<void*>(lease.ref.object));
             gCancelled.fetch_add(1U, std::memory_order_relaxed);

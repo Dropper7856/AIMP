@@ -84,7 +84,7 @@ internal static class AISyncCodecTests
     private static void ValidateImpactRoundTrip(Guid session)
     {
         var impact = new byte[AIMP.Protocol.AISyncCodec.NativeImpactBytes];
-        U32(impact, 0, 1U);
+        U32(impact, 0, AIMP.Protocol.AISyncCodec.ImpactVersion);
         U32(impact, 4, 9U);
         BinaryPrimitives.WriteUInt64LittleEndian(impact.AsSpan(8),
             AIMP.Protocol.AISyncCodec.SessionCookie(session));
@@ -113,6 +113,13 @@ internal static class AISyncCodecTests
                 AIMP.Protocol.AISyncCodec.DecodeImpactNetwork(androidNetwork, session).ToArray());
         }
         AssertEx.SequenceEqual(impact, decoded.ToArray());
+
+        // v1 sent a process-local runtime ID at offset 44. Its bytes cannot
+        // silently be interpreted as an authoritative NPC incarnation.
+        var legacyImpact = impact.ToArray();
+        U32(legacyImpact, 0, 1U);
+        AssertEx.Throws<AIMP.Protocol.ProtocolException>(
+            () => AIMP.Protocol.AISyncCodec.ValidateNativeImpact(legacyImpact));
 
         var badDamage = impact.ToArray();
         U32(badDamage, 48, 0U);

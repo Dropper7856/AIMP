@@ -45,6 +45,16 @@ constexpr bool AICharacterClass(const std::uint32_t type) noexcept {
         type == 6U || type == 7U || type == 9U;
 }
 
+// The authority incarnation crosses the network. The runtime token only
+// validates the admitted Character within this process; never compare it with
+// another machine's token, even when they happen to have the same value.
+constexpr bool ImpactTargetLifetimeMatches(const std::uint32_t receivedBirth,
+    const std::uint32_t authoritativeBirth, const std::uint32_t currentRuntimeId,
+    const std::uint32_t admittedRuntimeId) noexcept {
+    return receivedBirth != 0U && receivedBirth == authoritativeBirth &&
+        admittedRuntimeId != 0U && currentRuntimeId == admittedRuntimeId;
+}
+
 constexpr bool ExecutionCycleOwnsMovement(const std::uint32_t expectedType,
     const std::uint32_t expectedState, const std::uint32_t currentType,
     const std::uint32_t currentState, const std::uint8_t flags) noexcept {
