@@ -17,6 +17,9 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
 set(AIMP_CORE_SOURCES
     src/AISync.cpp
+    src/AISyncHealth.cpp
+    src/AISyncAnimation.cpp
+    src/AISyncCombat.cpp
     src/AISyncNavigation.cpp
     src/BuildProfile.cpp
     src/CapabilityMatrix.cpp

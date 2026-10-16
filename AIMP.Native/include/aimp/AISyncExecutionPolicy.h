@@ -33,7 +33,7 @@ constexpr const ExecutionTransitionEntry* FindExecutionTransition(
 }
 
 enum class MovementOwner : std::uint8_t {
-    None, Intent, Navigation, Execution, Paired, Neutral
+    None, Intent, Navigation, Execution, Paired, Neutral, Consequence
 };
 
 constexpr bool AICharacterClass(const std::uint32_t type) noexcept {
@@ -77,6 +77,7 @@ constexpr bool HostSuspendsNavigation(const State& state) noexcept {
     // A live goal may remain queued while retail explicitly stops its physical
     // cycle. Finishing that local stop is not permission to resume the goal.
     return (state.stateFlags & ExecutionValid) != 0U && (state.stateFlags & Moving) == 0U &&
+        state.navigation.kind != 4U && state.navigation.kind != 7U &&
         state.executionCycleTypeRva == 0x00EABEC0U && state.executionCycleState == 0x3BU;
 }
 
@@ -93,7 +94,7 @@ constexpr bool PairAdmissionPending(const State& state,
 constexpr bool NavigationAuthorityAdvanced(const std::uint32_t flags,
     const std::uint32_t revision, const std::uint32_t requestRevision,
     const std::uint32_t releasedRevision, const std::uint32_t releasedRequestRevision) noexcept {
-    return flags == 1U && (revision > releasedRevision || requestRevision > releasedRequestRevision);
+    return (flags & 1U) != 0U && (revision > releasedRevision || requestRevision > releasedRequestRevision);
 }
 
 constexpr bool HostLeftPairedExecution(const bool executionValid, const bool executionPaired,

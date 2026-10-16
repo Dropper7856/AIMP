@@ -113,6 +113,34 @@ for name, rva_text, literals in hook_prefixes:
     expected = bytes(int(value.strip().rstrip("Uu"), 0)
                      for value in literals.split(",") if value.strip())
     checks.append(("Runtime hook prefix: " + name, int(rva_text, 16), expected.hex()))
+# Include each AISync module's actual guards and installed prefixes. Named RVA
+# constants are resolved from the same source instead of transcribing copies.
+module_guard_counts = {}
+for module in ("AISyncNavigation.cpp", "AISyncHealth.cpp", "AISyncAnimation.cpp", "AISyncCombat.cpp"):
+    module_path = source.parent / module
+    if not module_path.exists():
+        continue
+    code = module_path.read_text(encoding="utf-8-sig")
+    constants = {name: int(value, 16) for name, value in re.findall(
+        r"\b(k\w+)\s*=\s*(0x[0-9a-fA-F]+)U?", code)}
+    count = 0
+    for name, extra, literals in re.findall(r"\bMatch\(\s*(0x[0-9a-fA-F]+U?|k\w+)(?:\s*\+\s*(0x[0-9a-fA-F]+U?))?\s*,\s*\{([^}]+)\}", code):
+        rva = int(name.rstrip("Uu"), 16) if name.startswith("0x") else constants.get(name)
+        if rva is None:
+            raise ValueError(f"Unresolved certification RVA {module}: {name}")
+        rva += int(extra.rstrip("Uu"), 16) if extra else 0
+        expected = bytes(int(value.strip().rstrip("Uu"), 0)
+                         for value in literals.split(",") if value.strip())
+        checks.append((f"{module} runtime guard", rva, expected.hex()))
+        count += 1
+    for name, rva_text, literals in re.findall(
+            r'Hook\(hooks,\s*"([^"]+)",\s*(0x[0-9a-fA-F]+)U?\s*,\s*'
+            r'reinterpret_cast<void\*>\(\s*&\w+\s*\)\s*,\s*\{([^}]+)\}', code):
+        expected = bytes(int(value.strip().rstrip("Uu"), 0)
+                         for value in literals.split(",") if value.strip())
+        checks.append(("Runtime module hook: " + name, int(rva_text, 16), expected.hex()))
+        count += 1
+    module_guard_counts[module] = count
 for name, rva, hex_bytes in checks:
     expected = bytes.fromhex(hex_bytes)
     actual = at(rva, len(expected))
@@ -143,6 +171,6 @@ for rva in (0x25FC83, 0x25FD63):
 print(json.dumps({"binary": str(path), "sha256": target_sha256,
                   "checks": len(checks) + 5, "failures": failures,
                   "runtimeGuards": len(runtime_guards),
-                  "hookPrefixes": len(hook_prefixes),
+                  "hookPrefixes": len(hook_prefixes), "moduleGuards": module_guard_counts,
                   "validation": "static only; Host/Client runtime acceptance remains required"}, indent=2))
 sys.exit(bool(failures))

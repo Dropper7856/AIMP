@@ -8,21 +8,27 @@ namespace AIMP.Protocol;
 // regenerate presentation locally; resolved paired health/outcomes come from Host.
 public static class AISyncCodec
 {
-    public const uint StateVersion = 11;
+    public const uint StateVersion = 12;
     public const uint ImpactVersion = 2;
-    public const int NativeStateBytes = 288;
+    public const int NativeStateBytes = 640;
     public const int NativeImpactBytes = 64;
     public const int ConfigurationBytes = 552;
     public const int NetworkStateBytes = 16 + NativeStateBytes;
     public const int NetworkImpactBytes = 16 + NativeImpactBytes;
-    public const int MaximumActors = 32;
+    public const int MaximumActors = 256;
+    public const int MaximumParticipants = 32;
     private const uint PoseValid = 1U << 0;
     private const uint Moving = 1U << 1;
     private const uint ActionValid = 1U << 2;
     private const uint InteractionValid = 1U << 3;
     private const uint RoleTaskValid = 1U << 4;
     private const uint ExecutionValid = 1U << 5;
-    private const uint KnownStateFlags = PoseValid | Moving | ActionValid | InteractionValid | RoleTaskValid | ExecutionValid;
+    public const uint ConsequenceEvent = 1U << 6;
+    public const uint ParticipantConsequenceEvent = 1U << 7;
+    public const uint ShotEvent = 1U << 8;
+    public const uint NavigationEvent = 1U << 9;
+    private const uint KnownStateFlags = PoseValid | Moving | ActionValid | InteractionValid | RoleTaskValid | ExecutionValid
+        | ConsequenceEvent | ParticipantConsequenceEvent | ShotEvent | NavigationEvent;
     private const uint ExecutionTransition = 1U << 0;
     private const uint ExecutionCertified = 1U << 1;
     private const uint ExecutionPaired = 1U << 2;
@@ -46,22 +52,26 @@ public static class AISyncCodec
             || (U32(bytes, 20) == 0 && U32(bytes, 24) == 0) || U32(bytes, 32) == 0
             || U32(bytes, 36) == 0
             || !AllowedCharacterClass(U32(bytes, 28)))
-            throw new ProtocolException("Invalid AISync authority snapshot v11.");
+            throw new ProtocolException("Invalid AISync authority snapshot v12.");
         ValidateAuthorityState(bytes);
     }
 
     private static void ValidateAuthorityState(ReadOnlySpan<byte> bytes)
     {
-        var navigationFlags = U32(bytes, 260);
-        var stoppingDistance = Float(bytes, 276);
-        if ((navigationFlags & ~1U) != 0 || U32(bytes, 280) > 3
-            || !float.IsFinite(stoppingDistance) || stoppingDistance is < -1F or > 1000F
-            || navigationFlags != 0 && (U32(bytes, 256) == 0 || U32(bytes, 284) == 0))
-            throw new ProtocolException("Invalid AISync native navigation goal.");
-        for (var offset = 264; offset <= 272; offset += 4)
-            if (!float.IsFinite(Float(bytes, offset)) || Math.Abs(Float(bytes, offset)) > 100000)
-                throw new ProtocolException("Invalid AISync native navigation coordinates.");
+        ValidateNavigation(bytes);
+        ValidateConsequences(bytes);
+        ValidateScripted(bytes);
+        ValidateCombat(bytes);
+        var participantPeer = BinaryPrimitives.ReadUInt64LittleEndian(bytes[472..]);
+        if (!ValidDamage(bytes, 480) || (participantPeer != 0) != (U32(bytes, 484) != 0)
+            || (U32(bytes, 40) & ParticipantConsequenceEvent) != 0 && participantPeer == 0)
+            throw new ProtocolException("Invalid AISync participant consequence.");
         var flags = U32(bytes, 40);
+        if ((flags & NavigationEvent) != 0 && (U32(bytes, 260) == 0 || U32(bytes, 288) is not (4 or 7)))
+            throw new ProtocolException("Invalid AISync ordered navigation event.");
+        if (U32(bytes, 636) != 0 && (U32(bytes, 320) == 0
+            || BinaryPrimitives.ReadUInt64LittleEndian(bytes[332..]) != 0 || U32(bytes, 352) == 0))
+            throw new ProtocolException("Invalid AISync paired health provenance.");
         var locomotionIntensity = Float(bytes, 72);
         var locomotionRevision = U32(bytes, 76);
         if ((flags & ~KnownStateFlags) != 0 || U32(bytes, 68) > 3
@@ -90,6 +100,10 @@ public static class AISyncCodec
                 || U32(bytes, 184) == 0 || (interactionFlags & InteractionPairValid) == 0
                 || ((interactionFlags & 2U) != 0) != (targetPeer != 0)))
             throw new ProtocolException("Invalid AISync interaction identity.");
+        if ((flags & InteractionValid) != 0 && ((interactionFlags & 2U) != 0
+                ? U32(bytes, 544) != 0 || U32(bytes, 548) != 0
+                : U32(bytes, 544) == 0 || !AllowedCharacterClass(U32(bytes, 548))))
+            throw new ProtocolException("Invalid AISync NPC victim incarnation.");
         if ((flags & InteractionValid) == 0 && U32(bytes, 116) != 0)
             throw new ProtocolException("AISync transition requires an interaction event.");
         if ((interactionFlags & 32U) != 0 && ((flags & InteractionValid) == 0
@@ -116,7 +130,8 @@ public static class AISyncCodec
             || (outcomeRevision == 0) != (outcomeFlags == 0)
             || (outcomeFlags & 32U) != 0 && (outcomeFlags & 2U) == 0
             || ((outcomeFlags & 16U) != 0) != (outcomeRevision != 0 && hpReaction == 0 && healthReaction == 4)
-            || outcomeRevision != 0 && ((flags & InteractionValid) == 0 || targetPeer == 0
+            || outcomeRevision != 0 && ((flags & InteractionValid) == 0
+                || targetPeer == 0 && (U32(bytes, 544) == 0 || !AllowedCharacterClass(U32(bytes, 548)))
                 || U32(bytes, 116) == 0 || (interactionFlags & 16U) == 0
                 || (outcomeFlags & 1U) == 0 || hpBefore == 0 || hpPrepared > hpBefore))
             throw new ProtocolException("Invalid AISync native attack outcome.");
@@ -132,6 +147,161 @@ public static class AISyncCodec
             || (executionFlags & ExecutionCertified) != 0 && (executionFlags & ExecutionTransition) == 0
             || (flags & ExecutionValid) != 0 && (executionRevision == 0 || executionType == 0))
             throw new ProtocolException("Invalid AISync execution-cycle authority.");
+    }
+
+    private static void ValidateNavigation(ReadOnlySpan<byte> bytes)
+    {
+        var flags = U32(bytes, 260);
+        var kind = U32(bytes, 288);
+        var stop = Float(bytes, 276);
+        var heading = Float(bytes, 292);
+        var tolerance = Float(bytes, 296);
+        var distance = Float(bytes, 300);
+        if ((flags & ~3U) != 0 || U32(bytes, 280) > 3 || !float.IsFinite(stop) || stop is < -1F or > 1000F
+            || !float.IsFinite(heading) || Math.Abs(heading) > 6.4F
+            || !float.IsFinite(tolerance) || tolerance is < 0F or > 6.4F
+            || !float.IsFinite(distance) || distance is < 0F or > 100000F
+            || flags != 0 && (U32(bytes, 256) == 0 || U32(bytes, 284) == 0))
+            throw new ProtocolException("Invalid AISync native navigation parameters.");
+        foreach (var offset in new[] { 264, 268, 272, 304, 308, 312 })
+            if (!float.IsFinite(Float(bytes, offset)) || Math.Abs(Float(bytes, offset)) > 100000F)
+                throw new ProtocolException("Invalid AISync native navigation coordinates.");
+        var positionZero = ZeroFloats(bytes, 264, 3);
+        var originZero = ZeroFloats(bytes, 304, 3);
+        var valid = flags == 0
+            ? kind == 0 && U32(bytes, 280) == 0 && stop == 0 && heading == 0 && tolerance == 0
+                && distance == 0 && positionZero && originZero
+            : kind switch
+            {
+                1 => flags == 1 && heading == 0 && tolerance == 0 && distance == 0 && originZero,
+                4 => (flags & 1) != 0 && stop == 0 && distance == 0 && originZero
+                    && ((flags & 2) != 0 ? heading == 0 : positionZero),
+                7 => flags == 1 && U32(bytes, 280) <= 2 && stop == 0 && heading == 0 && tolerance == 0
+                    && distance == 0 && positionZero && originZero,
+                9 => (flags & 1) != 0 && ((flags & 2) != 0 || positionZero),
+                _ => false
+            };
+        if (!valid) throw new ProtocolException("Invalid AISync native navigation request kind.");
+    }
+
+    private static bool ZeroFloats(ReadOnlySpan<byte> bytes, int offset, int count)
+    {
+        for (var index = 0; index < count; ++index)
+            if (Float(bytes, offset + index * 4) != 0) return false;
+        return true;
+    }
+
+    private static void ValidateScripted(ReadOnlySpan<byte> bytes)
+    {
+        if (U32(bytes, 420) == 0)
+        {
+            for (var offset = 424; offset < 472; offset += 4)
+                if (U32(bytes, offset) != 0) throw new ProtocolException("Inactive AISync scripted animation has parameters.");
+            return;
+        }
+        if (U32(bytes, 420) != 1 || U32(bytes, 424) == 0 || U32(bytes, 428) == 0
+            || (U32(bytes, 468) & ~0x0302BE7FU) != 0 || (U32(bytes, 40) & ExecutionValid) == 0
+            || U32(bytes, 244) != 0x00EADB58U || U32(bytes, 248) != 0x12U
+            || I32(bytes, 432) is < -1 or > 1000000 || I32(bytes, 436) is < -1 or > 1000000
+            || I32(bytes, 440) is < -1 or > 65535
+            || !BoundedFloat(bytes, 444, 0F, 64F) || !BoundedFloat(bytes, 448, 0F, 60F)
+            || !BoundedFloat(bytes, 456, -1F, 1000000F) || !BoundedFloat(bytes, 460, 0F, 60F)
+            || !BoundedFloat(bytes, 464, 0F, 64F))
+            throw new ProtocolException("Invalid AISync native scripted animation parameters.");
+    }
+
+    private static bool BoundedFloat(ReadOnlySpan<byte> bytes, int offset, float minimum, float maximum)
+    {
+        var value = Float(bytes, offset);
+        return float.IsFinite(value) && value >= minimum && value <= maximum;
+    }
+
+    private static bool ValidCombatState(ReadOnlySpan<byte> bytes, int offset)
+    {
+        var flags = U32(bytes, offset + 4);
+        if ((flags & ~7U) != 0 || U32(bytes, offset + 8) > 10 || U32(bytes, offset + 12) > 0xFFFF
+            || U32(bytes, offset + 32) > 7 || !BoundedFloat(bytes, offset + 28, 0F, 3.141593F)) return false;
+        for (var index = 16; index <= 24; index += 4)
+            if (!BoundedFloat(bytes, offset + index, -100000F, 100000F)) return false;
+        if (flags == 0)
+        {
+            for (var index = 4; index < 36; index += 4)
+                if (U32(bytes, offset + index) != 0) return false;
+            return true;
+        }
+        return (flags & 1) != 0 && U32(bytes, offset) != 0
+            && ((flags & 4) != 0 || ZeroFloats(bytes, offset + 16, 3) && Float(bytes, offset + 28) == 0)
+            && ((flags & 2) == 0 || (flags & 4) != 0);
+    }
+
+    private static void ValidateCombat(ReadOnlySpan<byte> bytes)
+    {
+        if (!ValidCombatState(bytes, 552) || !ValidCombatState(bytes, 596))
+            throw new ProtocolException("Invalid AISync combat presentation state.");
+        var shotFlags = U32(bytes, 592);
+        if (shotFlags == 0)
+        {
+            if (U32(bytes, 588) != 0 || U32(bytes, 596) != 0 || U32(bytes, 600) != 0 || U32(bytes, 632) != 0)
+                throw new ProtocolException("Inactive AISync shot event has a payload.");
+        }
+        else if (shotFlags != 1 || U32(bytes, 588) == 0 || (U32(bytes, 600) & 5U) != 5U
+            || U32(bytes, 632) is 0 or > 0xFFFF)
+            throw new ProtocolException("Invalid AISync authoritative shot.");
+        if ((U32(bytes, 40) & ShotEvent) != 0 && shotFlags == 0)
+            throw new ProtocolException("AISync live shot is missing its event.");
+    }
+
+    private static bool ValidHealth(ReadOnlySpan<byte> bytes, int offset)
+    {
+        var revision = U32(bytes, offset);
+        var flags = U32(bytes, offset + 4);
+        var hp = U32(bytes, offset + 8);
+        var phase = U32(bytes, offset + 12);
+        return flags == 0 ? revision == 0 && hp == 0 && phase == 0
+            : flags == 1 && revision != 0 && hp <= 0xFFFF && phase <= 4 && ((hp == 0) == (phase == 4));
+    }
+
+    private static bool ValidDamage(ReadOnlySpan<byte> bytes, int offset)
+    {
+        if (U32(bytes, offset + 4) == 0)
+        {
+            for (var index = 0; index < 64; index += 4)
+                if (U32(bytes, offset + index) != 0) return false;
+            return true;
+        }
+        var hp = U32(bytes, offset + 40);
+        var phase = U32(bytes, offset + 44);
+        if (U32(bytes, offset + 4) == 3)
+            for (var index = 8; index <= 36; index += 4)
+                if (U32(bytes, offset + index) != 0) return false;
+        return (U32(bytes, offset + 4) is 1 or 3) && U32(bytes, offset) != 0
+            && U32(bytes, offset + 8) <= 0xFFFF && U32(bytes, offset + 16) <= 255
+            && U32(bytes, offset + 20) <= 255 && U32(bytes, offset + 24) <= 255
+            && U32(bytes, offset + 28) <= 255 && U32(bytes, offset + 32) <= 255 && U32(bytes, offset + 36) <= 255
+            && hp <= 0xFFFF && phase <= 4 && ((hp == 0) == (phase == 4))
+            && U32(bytes, offset + 52) == 1 && ValidHealth(bytes, offset + 48);
+    }
+
+    private static void ValidateConsequences(ReadOnlySpan<byte> bytes)
+    {
+        var causePeer = BinaryPrimitives.ReadUInt64LittleEndian(bytes[332..]);
+        var npcCause = U32(bytes, 340) != 0 || U32(bytes, 344) != 0;
+        var eventFlags = U32(bytes, 360);
+        if (!ValidHealth(bytes, 316) || !ValidDamage(bytes, 356)
+            || causePeer != 0 && (npcCause || U32(bytes, 348) != 0 || U32(bytes, 352) != 0)
+            || npcCause != (U32(bytes, 352) != 0)
+            || (npcCause ? !AllowedCharacterClass(U32(bytes, 348)) : U32(bytes, 348) != 0)
+            || (causePeer != 0 || npcCause) && U32(bytes, 320) == 0
+            || (U32(bytes, 40) & ConsequenceEvent) != 0 && eventFlags == 0)
+            throw new ProtocolException("Invalid AISync health authority or cause.");
+        if (eventFlags == 0)
+        {
+            for (var offset = 356; offset < 420; offset += 4)
+                if (U32(bytes, offset) != 0) throw new ProtocolException("Inactive AISync damage event has a payload.");
+            return;
+        }
+        if (U32(bytes, 320) == 0 || U32(bytes, 404) > U32(bytes, 316))
+            throw new ProtocolException("Invalid AISync native damage event.");
     }
 
     private static void ValidatePose(ReadOnlySpan<byte> bytes)
@@ -156,9 +326,24 @@ public static class AISyncCodec
     public static ulong ActorKey(ReadOnlySpan<byte> bytes) =>
         ((ulong)U32(bytes, 20) << 32) | U32(bytes, 24);
 
+    public static (uint Birth, uint Revision) ActorRevision(ReadOnlySpan<byte> bytes) =>
+        (U32(bytes, 32), U32(bytes, 36));
+
     // Irreversible native results cannot be merged like motion snapshots.
     public static (uint Birth, uint Pair, uint Revision) OutcomeKey(ReadOnlySpan<byte> bytes) =>
         (U32(bytes, 32), U32(bytes, 184), U32(bytes, 192));
+
+    public static (uint Birth, uint Revision) DamageKey(ReadOnlySpan<byte> bytes) =>
+        (U32(bytes, 32), (U32(bytes, 40) & ConsequenceEvent) != 0 ? U32(bytes, 356) : 0);
+
+    public static (uint Birth, uint Revision) ParticipantDamageKey(ReadOnlySpan<byte> bytes) =>
+        (U32(bytes, 32), (U32(bytes, 40) & ParticipantConsequenceEvent) != 0 ? U32(bytes, 480) : 0);
+
+    public static (uint Birth, uint Revision) ShotKey(ReadOnlySpan<byte> bytes) =>
+        (U32(bytes, 32), (U32(bytes, 40) & ShotEvent) != 0 ? U32(bytes, 588) : 0);
+
+    public static (uint Birth, uint Revision) NavigationKey(ReadOnlySpan<byte> bytes) =>
+        (U32(bytes, 32), (U32(bytes, 40) & NavigationEvent) != 0 ? U32(bytes, 256) : 0);
 
     public static byte[] EncodeNetwork(Guid session, ReadOnlySpan<byte> native)
     {
@@ -233,7 +418,7 @@ public static class AISyncCodec
         if (role != 0 && (session == Guid.Empty || localPeer == 0 ||
             (role != 3 && (nativeGeneration == 0 || worldGeneration == 0))))
             throw new ProtocolException("AISync configuration needs a live generation.");
-        if (participants.Count > MaximumActors)
+        if (participants.Count > MaximumParticipants)
             throw new ProtocolException("Too many AISync participant bindings.");
         var bytes = new byte[ConfigurationBytes];
         BinaryPrimitives.WriteUInt32LittleEndian(bytes, 2);

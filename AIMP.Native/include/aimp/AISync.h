@@ -4,6 +4,9 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include "aimp/AISyncHealth.h"
+#include "aimp/AISyncAnimation.h"
+#include "aimp/AISyncCombat.h"
 
 namespace aimp {
 class HookManager;
@@ -33,6 +36,12 @@ enum StateFlag : std::uint32_t {
     // RVA/state plus an authority revision. Clients replay only certified
     // transition entry points and otherwise fail closed.
     ExecutionValid = 1U << 5U,
+    // This snapshot carries a live ordered damage event. Ordinary heartbeats
+    // retain its identity as history but must never replay its reaction.
+    ConsequenceEvent = 1U << 6U,
+    ParticipantConsequenceEvent = 1U << 7U,
+    ShotEvent = 1U << 8U,
+    NavigationEvent = 1U << 9U,
 };
 
 enum ExecutionFlag : std::uint32_t {
@@ -86,19 +95,31 @@ struct NativeOutcome final {
     float sourceYaw{}, targetOffset[3]{};
 };
 struct NavigationGoalState final {
-    std::uint32_t revision{}, flags{}; // bit 0: live native Move-to-point
+    std::uint32_t revision{}, flags{}; // bit 0: live request; bit 1: proven directed endpoint
     float position[3]{}, stoppingDistance{};
+    // Request parameter: point mode, turn style bits, or stance enum. Physical
+    // gait remains State.moveType (Movement+194), independently of this union.
     std::uint32_t moveType{}, requestRevision{};
+    std::uint32_t kind{}; // 1: point; 9: heading/distance
+    float heading{}, turnTolerance{}, distance{}, origin[3]{};
+};
+struct ConsequenceSource final {
+    std::uint64_t peer{};
+    std::uint32_t entityA{}, entityB{}, characterClass{}, birth{};
+};
+struct ParticipantConsequence final {
+    std::uint64_t targetPeer{};
+    health::DamageEvent damage{};
 };
 struct State final {
-    std::uint32_t version{11U};
+    std::uint32_t version{12U};
     std::uint32_t nativeGeneration{}; // informational: generations differ per process
     std::uint64_t sessionCookie{};
     std::uint32_t worldGeneration{};
     std::uint32_t entityA{}, entityB{}, characterClass{}, birth{}, revision{};
     // Recovery pose is retained only for spawn/lifecycle/catastrophic drift.
-    // Continuous movement is NOT position-followed. The v11 navigation goal
-    // below is preferred for certified Move-to-point requests. velocityX/Z carry the
+    // Continuous movement is NOT position-followed. The typed navigation goal
+    // below is preferred for certified native requests. velocityX/Z carry the
     // Host's resolved world-space locomotion request observed after retail
     // pathfinding/local steering. CATHODE on the Client owns the physical move,
     // collision, turning and animation generated from that intention.
@@ -139,7 +160,7 @@ struct State final {
     std::int32_t interactionTransitionVariant{};
     std::uint32_t interactionPairRevision{}, interactionTransitionRevision{};
     // Result of the admitted 4E/4F native preparation, keyed by this source
-    // birth + pair revision + target peer. Definition is a retail manager index,
+    // birth + pair revision + target peer/NPC birth. Definition is a retail manager index,
     // never an animation pointer. Clients consume it instead of choosing again.
     NativeOutcome outcome{};
     // Exact Host Character execution-cycle identity. Appended after the v9
@@ -151,6 +172,19 @@ struct State final {
     // Resolved Host goal, above pathfinding/steering. The Client builds a
     // local retail request; no corridor, ObjectRef, BT or transform is copied.
     NavigationGoalState navigation{};
+    // Absolute health repairs late joins; ordered native damage events regenerate
+    // reactions. Their cause is a peer or NPC authority birth, never a pointer.
+    health::State health{};
+    ConsequenceSource healthSource{};
+    health::DamageEvent damage{};
+    animation::ScriptedState scripted{};
+    ParticipantConsequence participantConsequence{};
+    std::uint32_t interactionTargetBirth{}, interactionTargetClass{};
+    combat::State combat{};
+    combat::ShotEvent shot{};
+    // Exact native HP-write provenance. A victim snapshot waits for this pair's
+    // consumed outcome; it cannot kill the victim before native admission.
+    std::uint32_t healthPairRevision{};
 };
 struct ImpactEvent final {
     // v2 targetBirth is the Host's portable AISync incarnation, never +50.
@@ -181,9 +215,19 @@ struct Configuration final {
 static_assert(sizeof(NativeOutcome) == 48U);
 static_assert(offsetof(State, outcome) == 192U);
 static_assert(offsetof(State, executionRevision) == 240U);
-static_assert(sizeof(NavigationGoalState) == 32U);
+static_assert(sizeof(NavigationGoalState) == 60U);
 static_assert(offsetof(State, navigation) == 256U);
-static_assert(sizeof(State) == 288U);
+static_assert(sizeof(ConsequenceSource) == 24U);
+static_assert(offsetof(State, health) == 316U);
+static_assert(offsetof(State, healthSource) == 332U);
+static_assert(offsetof(State, damage) == 356U);
+static_assert(offsetof(State, scripted) == 420U);
+static_assert(sizeof(ParticipantConsequence) == 72U);
+static_assert(offsetof(State, participantConsequence) == 472U);
+static_assert(offsetof(State, interactionTargetBirth) == 544U);
+static_assert(offsetof(State, combat) == 552U && offsetof(State, shot) == 588U);
+static_assert(offsetof(State, healthPairRevision) == 636U);
+static_assert(sizeof(State) == 640U);
 static_assert(sizeof(ImpactEvent) == 64U);
 static_assert(sizeof(ParticipantBinding) == 16U);
 static_assert(sizeof(Configuration) == 552U);
