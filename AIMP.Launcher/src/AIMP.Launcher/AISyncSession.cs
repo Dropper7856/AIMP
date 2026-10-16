@@ -3,7 +3,7 @@ using AIMP.Protocol;
 namespace AIMP.Launcher;
 
 // One serialized sender per direction; one latest motion snapshot per actor
-// and a bounded, ordered queue for irreversible native paired results.
+// and a bounded, ordered queue for native results, shots and short requests.
 // Socket/pipe backpressure never creates an unbounded Task or packet queue.
 internal sealed class AISyncSession : IDisposable
 {
@@ -16,7 +16,7 @@ internal sealed class AISyncSession : IDisposable
     private readonly Dictionary<ulong, ReadOnlyMemory<byte>> _pending = new();
     private readonly Queue<ReadOnlyMemory<byte>> _outcomes = new();
     private readonly Queue<ReadOnlyMemory<byte>> _impacts = new();
-    private readonly Dictionary<ulong, (uint Birth, uint Pair, uint Revision)> _lastOutcome = new();
+    private readonly AISyncEventHistory _eventHistory = new();
     private readonly Dictionary<ulong, uint> _participants = new();
     private ulong _localPeer;
     private byte[]? _lastConfiguration;
@@ -68,7 +68,7 @@ internal sealed class AISyncSession : IDisposable
     }
     private void InvalidateLocked()
     {
-        _active = false; ++_epoch; _pending.Clear(); _outcomes.Clear(); _impacts.Clear(); _lastOutcome.Clear();
+        _active = false; ++_epoch; _pending.Clear(); _outcomes.Clear(); _impacts.Clear(); _eventHistory.Clear();
     }
 
     internal async Task ConfigureAsync(Guid session, bool isHost, int nativeGeneration,
@@ -103,7 +103,7 @@ internal sealed class AISyncSession : IDisposable
             else
             {
                 if (_participants.TryGetValue(peer, out var old) && old == character) return;
-                if (!_participants.ContainsKey(peer) && _participants.Count >= AISyncCodec.MaximumActors) return;
+                if (!_participants.ContainsKey(peer) && _participants.Count >= AISyncCodec.MaximumParticipants) return;
                 _participants[peer] = character;
             }
             ++_participantRevision;
@@ -293,28 +293,32 @@ internal sealed class AISyncSession : IDisposable
     {
         var key = AISyncCodec.ActorKey(bytes.Span);
         if (!_pending.ContainsKey(key) && _pending.Count >= AISyncCodec.MaximumActors) return;
-        var outcome = AISyncCodec.OutcomeKey(bytes.Span);
-        if (outcome.Revision != 0 && (!_lastOutcome.TryGetValue(key, out var previous)
-            || outcome.Birth > previous.Birth || outcome.Birth == previous.Birth
-                && (outcome.Pair > previous.Pair || outcome.Pair == previous.Pair && outcome.Revision > previous.Revision)))
-        {
-            if (_outcomes.Count >= 256)
-            {
-                InvalidateLocked();
-                _diagnostics.Log("AISync", "Native outcome queue exceeded 256 events; authority transport paused. No independent attack result is authorized.");
-                return;
-            }
-            _outcomes.Enqueue(bytes);
-            if (!_lastOutcome.ContainsKey(key) && _lastOutcome.Count >= AISyncCodec.MaximumActors)
-                _lastOutcome.Remove(_lastOutcome.Keys.First());
-            _lastOutcome[key] = outcome;
-        }
-        _pending[key] = bytes;
+        if (_eventHistory.Observe(bytes.Span) && !QueueEventLocked(bytes)) return;
+        RememberLatestLocked(key, bytes);
         if (_sending) return;
         _sending = true;
-        // Do not execute a synchronous continuation/native event under _gate.
+        // Never execute a synchronous continuation/native event under _gate.
         _ = Task.Run(PumpAsync);
     }
+    private bool QueueEventLocked(ReadOnlyMemory<byte> bytes)
+    {
+        if (_outcomes.Count >= 1024)
+        {
+            InvalidateLocked();
+            _diagnostics.Log("AISync", "Native consequence queue exceeded 1024 events; authority transport paused.");
+            return false;
+        }
+        _outcomes.Enqueue(bytes);
+        return true;
+    }
+    private void RememberLatestLocked(ulong key, ReadOnlyMemory<byte> bytes)
+    {
+        var revision = AISyncCodec.ActorRevision(bytes.Span);
+        if (!_pending.TryGetValue(key, out var pending)
+            || AISyncCodec.ActorRevision(pending.Span).CompareTo(revision) <= 0)
+            _pending[key] = bytes;
+    }
+
     private async Task PumpAsync()
     {
         try

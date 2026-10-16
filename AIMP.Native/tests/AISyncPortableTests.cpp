@@ -44,12 +44,22 @@ int main() {
     stopped.executionCycleTypeRva = 0x00EABEC0U;
     stopped.executionCycleState = 0x3BU;
     stopped.navigation.flags = 1U;
+    stopped.navigation.kind = navigation::kPointRequest;
     assert(HostSuspendsNavigation(stopped)); // pending goal cannot undo Host stop
     stopped.executionCycleState = 0x38U;
     assert(!HostSuspendsNavigation(stopped)); // same goal resumes on new execution
     stopped.executionCycleState = 0x3BU;
     stopped.stateFlags |= Moving;
     assert(!HostSuspendsNavigation(stopped));
+    // A physical locomotion stop is not a cancellation of a separately
+    // admitted turn/posture decision. These requests own their retail cycles.
+    stopped.stateFlags &= ~Moving;
+    stopped.navigation.kind = navigation::kTurnRequest;
+    assert(!HostSuspendsNavigation(stopped));
+    stopped.navigation.kind = navigation::kStanceRequest;
+    assert(!HostSuspendsNavigation(stopped));
+    stopped.navigation.kind = navigation::kDirectedRequest;
+    assert(HostSuspendsNavigation(stopped));
     // Ownership through a real replication timeline, including rejected and
     // successfully replayed execution, pair admission and observer handoff.
     assert(ChooseMovementOwner(false, false, false, false) == MovementOwner::Intent);
@@ -84,6 +94,7 @@ int main() {
     assert(!NavigationAuthorityAdvanced(1U, 10U, 7U, 10U, 7U));
     assert(NavigationAuthorityAdvanced(1U, 11U, 7U, 10U, 7U));
     assert(NavigationAuthorityAdvanced(1U, 10U, 8U, 10U, 7U));
+    assert(NavigationAuthorityAdvanced(3U, 11U, 7U, 10U, 7U));
     assert(HostLeftPairedExecution(true, false, false, false));
     assert(!HostLeftPairedExecution(true, true, false, false));
     assert(!HostLeftPairedExecution(true, false, false, true));
@@ -99,7 +110,10 @@ int main() {
     assert(ChooseMovementOwner(false, true, true, true) == MovementOwner::Neutral);
     assert(ChooseMovementOwner(false, false, false, true) == MovementOwner::Navigation);
     NavigationGoalState goal{9U, 1U, {2.0F, 3.0F, -4.0F}, 1.0F, 2U, 7U};
+    goal.kind = navigation::kPointRequest;
     assert(navigation::ValidGoal(goal));
+    assert(navigation::HasWorldEndpoint(goal));
+    assert(navigation::LocalRequestKind(goal) == navigation::kPointRequest);
     auto invalid = goal; invalid.revision = 0U; assert(!navigation::ValidGoal(invalid));
     invalid = goal; invalid.requestRevision = 0U; assert(!navigation::ValidGoal(invalid));
     invalid = goal; invalid.flags = 2U; assert(!navigation::ValidGoal(invalid));
@@ -110,10 +124,113 @@ int main() {
     invalid = goal; invalid.position[1] = std::numeric_limits<float>::infinity();
     assert(!navigation::ValidGoal(invalid));
     invalid = goal; invalid.position[0] = 100001.0F; assert(!navigation::ValidGoal(invalid));
-    goal.flags = 0U; goal.revision = goal.requestRevision = 0U;
-    assert(navigation::ValidGoal(goal)); // no active native request
-    static_assert(sizeof(State) == 288U && offsetof(State, navigation) == 256U);
+    // Closing a request clears its payload. A stale endpoint under flags=0
+    // must not be reinterpreted as a new native command after an IPC stall.
+    invalid = goal; invalid.flags = 0U;
+    assert(!navigation::ValidGoal(invalid));
+    NavigationGoalState inactive{};
+    inactive.revision = 12U; inactive.requestRevision = 8U;
+    assert(navigation::ValidGoal(inactive));
+    assert(!navigation::HasWorldEndpoint(inactive));
+    NavigationGoalState directed{};
+    directed.revision = 17U; directed.requestRevision = 9U;
+    directed.flags = navigation::kLiveGoal; directed.kind = navigation::kDirectedRequest;
+    directed.heading = 0.4F; directed.turnTolerance = 1.5707964F;
+    directed.distance = 6.0F; directed.origin[0] = 12.0F; directed.origin[2] = -8.0F;
+    assert(navigation::ValidGoal(directed));
+    assert(!navigation::HasWorldEndpoint(directed));
+    assert(navigation::LocalRequestKind(directed) == navigation::kDirectedRequest);
+    // Host-derived heading/distance is not a portable XYZ vector. A world
+    // endpoint exists only after the upstream producer supplied all 3 axes.
+    invalid = directed; invalid.position[0] = 1.0F;
+    assert(!navigation::ValidGoal(invalid));
+    directed.flags |= navigation::kWorldEndpoint;
+    directed.position[0] = 25.0F; directed.position[1] = 4.0F; directed.position[2] = -11.0F;
+    directed.stoppingDistance = 0.1F; directed.moveType = 2U;
+    assert(navigation::ValidGoal(directed));
+    assert(navigation::HasWorldEndpoint(directed));
+    assert(navigation::LocalRequestKind(directed) == navigation::kPointRequest);
+    invalid = directed; invalid.origin[2] = std::numeric_limits<float>::quiet_NaN();
+    assert(!navigation::ValidGoal(invalid));
+    invalid = directed; invalid.flags = navigation::kWorldEndpoint;
+    assert(!navigation::ValidGoal(invalid));
+    invalid = directed; invalid.distance = -1.0F;
+    assert(!navigation::ValidGoal(invalid));
+    NavigationGoalState turn{};
+    turn.revision = 1U; turn.requestRevision = 4U;
+    turn.flags = navigation::kLiveGoal; turn.kind = navigation::kTurnRequest;
+    turn.heading = 2.0F; turn.turnTolerance = 0.3F;
+    // Native +34 style and +38 aim flag are two value bits, independent of gait.
+    turn.moveType = 3U;
+    assert(navigation::ValidGoal(turn));
+    assert(navigation::LocalRequestKind(turn) == navigation::kTurnRequest);
+    turn.flags |= navigation::kWorldEndpoint; turn.heading = 0.0F;
+    turn.position[0] = -3.0F; turn.position[2] = 7.0F;
+    assert(navigation::ValidGoal(turn));
+    assert(navigation::HasWorldEndpoint(turn));
+    // A look-at-point must never become a move-to-point simply because it has XYZ.
+    assert(navigation::LocalRequestKind(turn) == navigation::kTurnRequest);
+    invalid = turn; invalid.heading = 1.0F;
+    assert(!navigation::ValidGoal(invalid));
+    invalid = turn; invalid.turnTolerance = std::numeric_limits<float>::infinity();
+    assert(!navigation::ValidGoal(invalid));
+    NavigationGoalState stance{};
+    stance.revision = 1U; stance.requestRevision = 5U;
+    stance.flags = navigation::kLiveGoal; stance.kind = navigation::kStanceRequest;
+    for (const auto posture : {0U, 1U, 2U}) {
+        stance.moveType = posture;
+        assert(navigation::ValidGoal(stance));
+        assert(navigation::LocalRequestKind(stance) == navigation::kStanceRequest);
+    }
+    invalid = stance; invalid.moveType = 3U;
+    assert(!navigation::ValidGoal(invalid));
+    invalid = stance; invalid.flags |= navigation::kWorldEndpoint;
+    assert(!navigation::ValidGoal(invalid));
+    invalid = stance; invalid.distance = 1.0F;
+    assert(!navigation::ValidGoal(invalid));
+    invalid = goal; invalid.kind = 2U; // native path-handle layout is not a point request
+    assert(!navigation::ValidGoal(invalid));
+    // A completed posture is not re-created by a metadata-only revision.
+    auto repeated = stance; repeated.revision += 1U;
+    assert(navigation::SameNativeCommand(stance, repeated));
+    auto endpoint = goal; endpoint.kind = 9U; endpoint.flags = 3U;
+    repeated = endpoint; repeated.heading = 1.0F; repeated.origin[0] = 2.0F;
+    assert(navigation::SameNativeCommand(endpoint, repeated));
+    repeated.position[0] += 1.0F;
+    assert(!navigation::SameNativeCommand(endpoint, repeated));
+    endpoint.flags = 1U; endpoint.position[0] = endpoint.position[1] = endpoint.position[2] = 0.0F;
+    repeated = endpoint; repeated.origin[0] = 2.0F;
+    assert(!navigation::SameNativeCommand(endpoint, repeated));
+    health::State alive{1U, health::Present, 100U, 1U};
+    assert(health::Valid(alive) && !health::Terminal(alive));
+    auto dead = alive; dead.hp = 0U; dead.healthState = 4U;
+    assert(health::Valid(dead) && health::Terminal(dead));
+    auto invalidHealth = dead; invalidHealth.healthState = 1U;
+    assert(!health::Valid(invalidHealth));
+    invalidHealth = alive; invalidHealth.hp = 65536U;
+    assert(!health::Valid(invalidHealth));
+    health::DamageEvent hit{};
+    hit.revision = 1U; hit.flags = health::Present; hit.damage = 100U;
+    hit.hpBefore = 100U; hit.healthStateBefore = 1U; hit.result = dead;
+    assert(health::Valid(hit));
+    hit.flags |= health::CommitOnly; assert(!health::Valid(hit));
+    hit.damage = 0U; assert(health::Valid(hit));
+    hit.flags = 0U; assert(!health::Valid(hit)); // inactive records cannot hide a hit
+    combat::State aim{};
+    combat::State holstered{4U}; assert(combat::Valid(holstered));
+    combat::ShotEvent inactiveShot{}; inactiveShot.state = holstered;
+    assert(!combat::Valid(inactiveShot));
+    aim.revision = 1U; aim.flags = combat::Present | combat::AimPoint | combat::Aiming;
+    aim.slot = 1U; aim.descriptor = 2U; aim.aim[0] = 4.0F;
+    combat::ShotEvent shot{1U, 1U, aim, 6U};
+    assert(combat::Valid(aim) && combat::Valid(shot));
+    shot.ammoBefore = 0U; assert(!combat::Valid(shot));
+    aim.flags = combat::Present | combat::Aiming; assert(!combat::Valid(aim));
+    static_assert(navigation::kNavigationCapacity >= 256U);
+    static_assert(sizeof(NavigationGoalState) == 60U && offsetof(State, navigation) == 256U);
+    static_assert(sizeof(State) == 640U && State{}.version == 12U);
     static_assert(offsetof(State, outcome) == 192U && offsetof(State, executionRevision) == 240U);
     static_assert(sizeof(ImpactEvent) == 64U && ImpactEvent{}.version == 2U);
-    std::cout << "AISync ownership, navigation admission and v11 wire layout passed\n";
+    static_assert(offsetof(State, health) == 316U && offsetof(State, damage) == 356U);
+    std::cout << "AISync ownership, typed navigation, health/combat and v12 wire layout passed\n";
 }
