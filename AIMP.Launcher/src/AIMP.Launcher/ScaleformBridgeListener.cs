@@ -170,8 +170,18 @@ internal sealed class ScaleformBridgeListener : IDisposable
         AddConnection(channel);
         var peerClosed = false;
         try { peerClosed = await ProcessMessagesAsync(stream, channel, first, connectionId, token).ConfigureAwait(false); }
+        catch (IOException exception) when (!token.IsCancellationRequested
+            && exception.InnerException is SocketException { SocketErrorCode: SocketError.ConnectionReset })
+        {
+            // GFx may reset its TCP connection when Socket.close is called.
+            // This is peer termination, unlike a local replacement/disposal.
+            peerClosed = true;
+            LogClientFailure(channel, exception);
+        }
         finally
         {
+            lock (_commandGate)
+                if (command && !ReferenceEquals(_commandClient, client)) peerClosed = false;
             DisconnectClient(channel, client, command);
             ConnectionClosed?.Invoke(this, new ScaleformBridgeConnectionClosed(channel, connectionId, peerClosed));
         }

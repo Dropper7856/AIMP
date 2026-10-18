@@ -81,6 +81,18 @@ constexpr bool HostSuspendsNavigation(const State& state) noexcept {
         state.executionCycleTypeRva == 0x00EABEC0U && state.executionCycleState == 0x3BU;
 }
 
+constexpr bool HostPausesPointNavigation(const State& state) noexcept {
+    // A live destination is not permission to keep moving while the Host's
+    // ordinary Move executor is waiting/stopped. Turn/stance and root-motion
+    // cycles must retain their own native ownership instead.
+    const bool point = state.navigation.kind == 1U ||
+        (state.navigation.kind == 9U && (state.navigation.flags & 2U) != 0U);
+    return (state.navigation.flags & 1U) != 0U && point &&
+        (state.stateFlags & ExecutionValid) != 0U &&
+        state.executionCycleTypeRva == 0x00EABF80U && state.executionCycleState == 0x38U &&
+        ((state.stateFlags & Moving) == 0U || state.locomotionIntensity <= 0.0F);
+}
+
 constexpr bool PairAdmissionPending(const State& state,
     const std::uint32_t completedPair, const std::uint32_t completedTransition) noexcept {
     return (state.stateFlags & InteractionValid) != 0U &&

@@ -137,6 +137,12 @@ package
 
       private var aimp_returning:Boolean = false;
 
+      private var aimp_round_return_pending:Boolean = false;
+
+      private var aimp_round_return_ack_deadline:int = 0;
+
+      private var aimp_bridge_close_pending:Boolean = false;
+
       private var aimp_bridge_init_pending:Boolean = false;
 
       private var aimp_bridge_connect_pending:Boolean = false;
@@ -555,6 +561,8 @@ package
          this.aimp_hide_round_end();
          this.aimp_close_bridge();
          this.aimp_returning = false;
+         this.aimp_round_return_pending = false;
+         this.aimp_bridge_close_pending = false;
       }
 
       private function aimp_close_bridge() : void
@@ -646,6 +654,15 @@ package
          {
             return;
          }
+         // Close only after the Launcher's matching response was consumed on
+         // the previous frame. flush()+close() can discard the last write in GFx.
+         if(this.aimp_bridge_close_pending)
+         {
+            this.aimp_returning = true;
+            removeEventListener(Event.ENTER_FRAME,this.aimp_on_bridge_frame);
+            this.aimp_close_bridge();
+            return;
+         }
          if(this.aimp_bridge_init_pending)
          {
             this.aimp_bridge_init_pending = false;
@@ -693,14 +710,20 @@ package
             if(remaining == 0)
             {
                this.aimp_round_end_active = false;
-               this.aimp_returning = true;
+               this.aimp_round_return_pending = true;
+               this.aimp_round_return_ack_deadline = getTimer() + 10000;
                if(!this.aimp_send_bridge_message("ROUND_RETURN_READY|source=pickup_overlay|phase=gameplay" + this.aimp_round_return_fields))
                {
                   this.aimp_round_end_count_text.text = "Unable to return to lobby. Use Disconnect in Pause.";
                }
-               removeEventListener(Event.ENTER_FRAME,this.aimp_on_bridge_frame);
-               this.aimp_close_bridge();
             }
+         }
+         if(this.aimp_round_return_pending && !this.aimp_bridge_close_pending && getTimer() >= this.aimp_round_return_ack_deadline)
+         {
+            this.aimp_round_end_count_text.text = "Unable to return to lobby. Use Disconnect in Pause.";
+            this.aimp_returning = true;
+            removeEventListener(Event.ENTER_FRAME,this.aimp_on_bridge_frame);
+            this.aimp_close_bridge();
          }
       }
       
@@ -714,6 +737,21 @@ package
          param1 = param1.split("\r").join("");
          if(param1.length == 0)
          {
+            return;
+         }
+         if(this.aimp_round_return_pending)
+         {
+            if(param1.indexOf("ROUND_RETURN_CLOSE|") == 0 &&
+               this.aimp_get_bridge_value(param1,"returnToken") == this.aimp_get_bridge_value(this.aimp_round_return_fields,"returnToken") &&
+               this.aimp_get_bridge_value(param1,"sessionId") == this.aimp_get_bridge_value(this.aimp_round_return_fields,"sessionId") &&
+               this.aimp_get_bridge_value(param1,"generation") == this.aimp_get_bridge_value(this.aimp_round_return_fields,"generation"))
+            {
+               this.aimp_bridge_close_pending = true;
+            }
+            else if(param1.indexOf("CATHODE_COMMAND|") == 0)
+            {
+               this.aimp_send_bridge_message("CATHODE_COMMAND_ACK|source=pickup_overlay|phase=gameplay|result=round_ended|requestId=" + this.aimp_encode_bridge_value(this.aimp_get_bridge_value(param1,"requestId")));
+            }
             return;
          }
          if(param1.indexOf("CATHODE_COMMAND") == 0)
