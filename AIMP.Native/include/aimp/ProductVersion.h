@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.197-aisync-hook-installation";
+    "0.11.4.198-aisync-backstage-route";
 
 } // namespace aimp

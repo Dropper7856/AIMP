@@ -479,9 +479,14 @@ struct ParticipantNavigation final {
     std::uintptr_t character{};
     std::uint32_t runtimeId{}, nativeGeneration{}, worldGeneration{};
     ULONGLONG lastUpdate{};
+    float goal[3]{};
+    bool goalApplied{};
     bool initialized{}, faulted{};
 };
 std::array<ParticipantNavigation, kParticipants> gParticipantNavigation{};
+float gObjectiveNavigationGoal[3]{};
+bool gObjectiveNavigationGoalKnown{};
+std::atomic<std::uint64_t> gBackstageGoalsObjective{}, gBackstageGoalsOwner{}, gBackstageGoalsDegenerate{};
 bool gNavigationHostActive{};
 std::uint64_t gNavigationSession{};
 std::uint64_t gNavigationGeneration{};
@@ -1024,11 +1029,28 @@ void PumpHostNavigationContext() noexcept {
         gNavigationSession = gCurrent.sessionCookie;
         gNavigationWorld = gCurrent.worldGeneration;
         gNavigationMaintenance = 0U;
+        gObjectiveNavigationGoalKnown = false;
     }
     if (!host || !Stable()) return;
     const auto now = GetTickCount64();
     if (!changed && now - gNavigationMaintenance < kRefreshPeriod) return;
     gNavigationMaintenance = now;
+    // Retail's ambush sweep walks THE_PLAYER's own route cache toward the
+    // current objective. Read the real local player's objective, never the
+    // temporary AI slot, and keep the last enabled goal once death suspends
+    // that player's manager. It is shared world context, not an AI target.
+    std::uintptr_t path{};
+    std::uint8_t enabled{};
+    float objective[3]{};
+    const auto player = LocalPlayer();
+    if (player != 0U && Read(player + 0x3500U, path) && path != 0U &&
+        Read(path + 0x455U, enabled) && enabled != 0U &&
+        Read(path + 0xCU, objective[0]) && Read(path + 0x10U, objective[1]) &&
+        Read(path + 0x14U, objective[2]) && FiniteCoordinate(objective[0]) &&
+        FiniteCoordinate(objective[1]) && FiniteCoordinate(objective[2])) {
+        std::memcpy(gObjectiveNavigationGoal, objective, sizeof(objective));
+        gObjectiveNavigationGoalKnown = true;
+    }
     for (auto& navigation : gParticipantNavigation) {
         if (!navigation.initialized || navigation.faulted) continue;
         std::uint32_t birth{};
@@ -1063,28 +1085,56 @@ std::uint32_t __cdecl BackstageParticipantEligibility(
     gBackstageEligibilityOverrides.fetch_add(1U, std::memory_order_relaxed);
     return 1U;
 }
-bool UpdateParticipantNavigation(ParticipantNavigation& navigation, const ULONGLONG now) noexcept {
+bool ReadCharacterPosition(const std::uintptr_t character, float (&position)[3]) noexcept {
+    return character != 0U && Read(character + 0x70U, position[0]) &&
+        Read(character + 0x74U, position[1]) && Read(character + 0x78U, position[2]) &&
+        FiniteCoordinate(position[0]) && FiniteCoordinate(position[1]) && FiniteCoordinate(position[2]);
+}
+float SquaredDistance(const float (&a)[3], const float (&b)[3]) noexcept {
+    const auto dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+    return dx * dx + dy * dy + dz * dz;
+}
+bool UpdateParticipantNavigation(ParticipantNavigation& navigation, const std::uintptr_t owner,
+    const ULONGLONG now) noexcept {
     if (navigation.faulted) return false;
     if (navigation.sessionCookie != gNavigationSession ||
         navigation.nativeGeneration != gNavigationGeneration || navigation.worldGeneration != gNavigationWorld ||
         (navigation.lastUpdate != 0U && now - navigation.lastUpdate < kSendPeriod)) return true;
 
-    // The retail game only ever needed a route toward THE_PLAYER. In AIMP the
-    // Host's real player can be terminal-dead while the backstage sweep is
-    // evaluating a living PlayerRepresentation. Using the dead Host's old
-    // Character+3500 objective leaves this synthetic cache enabled but with no
-    // destination. Give each participant cache the position of the exact
-    // participant for which retail requested navigation instead. This does NOT
-    // choose an AI target: the native sweep still owns candidate selection,
-    // eligibility and route consumption.
+    // 0040AF70 walks this cache's route (+50, count +450 must exceed one)
+    // from the participant toward a destination and picks emergence vents
+    // along it. Retail's destination is THE_PLAYER's objective. A goal equal
+    // to the participant's own position yields a one-node route: the sweep
+    // then never selects a vent and the Alien stays backstage forever once
+    // the Host is dead. Prefer the shared objective; when it is unknown or
+    // already reached, route toward the sweeping Alien so the native sweep
+    // still has a real path to scan. Neither choice selects an AI target:
+    // candidate selection, eligibility and vent choice remain native.
+    constexpr float kMinimumRouteLength = 4.0F;
+    constexpr float kGoalRefreshDistance = 3.0F;
     const auto target = navigation.character;
     std::uint32_t birth{};
-    float goal[3]{};
+    float start[3]{}, goal[3]{}, alien[3]{};
     if (target == 0U || ParticipantForPeer(navigation.peer) != target || !LivingCharacter(target) ||
         !Read(target + 0x50U, birth) || birth != navigation.runtimeId ||
-        !Read(target + 0x70U, goal[0]) || !Read(target + 0x74U, goal[1]) ||
-        !Read(target + 0x78U, goal[2]) || !FiniteCoordinate(goal[0]) ||
-        !FiniteCoordinate(goal[1]) || !FiniteCoordinate(goal[2])) return false;
+        !ReadCharacterPosition(target, start)) return false;
+    constexpr float kMinimumSquared = kMinimumRouteLength * kMinimumRouteLength;
+    if (gObjectiveNavigationGoalKnown &&
+        SquaredDistance(gObjectiveNavigationGoal, start) >= kMinimumSquared) {
+        std::memcpy(goal, gObjectiveNavigationGoal, sizeof(goal));
+        gBackstageGoalsObjective.fetch_add(1U, std::memory_order_relaxed);
+    } else if (ReadCharacterPosition(owner, alien) && SquaredDistance(alien, start) >= kMinimumSquared) {
+        std::memcpy(goal, alien, sizeof(goal));
+        gBackstageGoalsOwner.fetch_add(1U, std::memory_order_relaxed);
+    } else {
+        std::memcpy(goal, start, sizeof(goal));
+        gBackstageGoalsDegenerate.fetch_add(1U, std::memory_order_relaxed);
+    }
+    // A moving goal on a new polygon forces a native repath. Keep the applied
+    // goal until it drifts meaningfully so pending queries can complete.
+    if (navigation.goalApplied &&
+        SquaredDistance(navigation.goal, goal) < kGoalRefreshDistance * kGoalRefreshDistance)
+        std::memcpy(goal, navigation.goal, sizeof(goal));
 
     __try {
         // 006C5D70: ECX=route cache, goal pointer on stack, RET 4.
@@ -1097,6 +1147,8 @@ bool UpdateParticipantNavigation(ParticipantNavigation& navigation, const ULONGL
         gBackstageNavigationRejected.fetch_add(1U, std::memory_order_relaxed);
         return false;
     }
+    std::memcpy(navigation.goal, goal, sizeof(goal));
+    navigation.goalApplied = true;
     navigation.lastUpdate = now;
     gBackstageNavigationUpdates.fetch_add(1U, std::memory_order_relaxed);
     return true;
@@ -1138,7 +1190,7 @@ std::uintptr_t __cdecl BackstageParticipantNavigation(
         if (!Write(address + 8U, target) || !Write(address + 0x44U, 0xFFFFFFFFU)) return 0U;
         found->initialized = true;
     }
-    if (!UpdateParticipantNavigation(*found, GetTickCount64())) return 0U;
+    if (!UpdateParticipantNavigation(*found, HostBackstageOwner(sweep), GetTickCount64())) return 0U;
     gBackstageNavigationPlans.fetch_add(1U, std::memory_order_relaxed);
     // Used only as native EDI in 0040BBF0. Never installed at Character+3500,
     // never borrowed from the dead Host, and never transmitted over the wire.
@@ -8397,6 +8449,9 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"backstageSurvivorRearmRestricted", Diagnostics::Unsigned(gBackstageSurvivorRearmRestricted.load(std::memory_order_relaxed)), true},
          {"backstageSurvivorRearmFailures", Diagnostics::Unsigned(gBackstageSurvivorRearmFailures.load(std::memory_order_relaxed)), true},
          {"lastBackstageSurvivorPeer", Diagnostics::Unsigned(gLastBackstageSurvivorPeer.load(std::memory_order_relaxed)), true},
+         {"backstageGoalsObjective", Diagnostics::Unsigned(gBackstageGoalsObjective.load(std::memory_order_relaxed)), true},
+         {"backstageGoalsOwner", Diagnostics::Unsigned(gBackstageGoalsOwner.load(std::memory_order_relaxed)), true},
+         {"backstageGoalsDegenerate", Diagnostics::Unsigned(gBackstageGoalsDegenerate.load(std::memory_order_relaxed)), true},
          {"poseRejected", Diagnostics::Unsigned(ai.poseRejected), true},
          {"actionCaptured", Diagnostics::Unsigned(ai.actionCaptured), true},
          {"actionTransitions", Diagnostics::Unsigned(ai.actionTransitions), true},
