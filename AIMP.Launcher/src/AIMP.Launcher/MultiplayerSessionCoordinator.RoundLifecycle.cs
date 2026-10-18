@@ -15,6 +15,16 @@ internal sealed partial class MultiplayerSessionCoordinator
     private int _deathReportedGeneration;
     private int _roundEndingGeneration;
     private string? _frontendLobbyReturnRole;
+    private RoundReturnFence? _roundReturnFence;
+
+    private sealed class RoundReturnFence(RoundEndedPayload round)
+    {
+        internal RoundEndedPayload Round { get; } = round;
+        internal Guid Token { get; } = Guid.NewGuid();
+        internal Guid ConnectionId { get; set; }
+        internal TaskCompletionSource<bool> Closed { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
 
     private void OnNativePlayerLifecycleStateChanged(
         object? sender,
@@ -67,47 +77,111 @@ internal sealed partial class MultiplayerSessionCoordinator
 
     private async Task HandleRoundEndedAsync(RoundEndedPayload value)
     {
-        if (!BeginRoundEnd(value)) return;
+        var fence = BeginRoundEnd(value);
+        if (fence is null) return;
         _diagnostics.Log("PlayerLifecycle",
-            $"Round {value.LevelGeneration} ended ({value.Reason}); returning to lobby in " +
-            $"{value.ReturnDelayMilliseconds} ms.");
-        await ShowRoundEndAsync(value).ConfigureAwait(false);
-        try { await Task.Delay(value.ReturnDelayMilliseconds, _lifetime.Token).ConfigureAwait(false); }
-        catch (OperationCanceledException) { return; }
-        await ReturnToLobbyAsync(value).ConfigureAwait(false);
+            $"Round {value.LevelGeneration} ended ({value.Reason}); minimum lobby return delay " +
+            $"{value.ReturnDelayMilliseconds} ms, followed by HUD readiness/closure.");
+        try
+        {
+            if (!await ShowRoundEndAsync(fence).ConfigureAwait(false))
+            {
+                fence.Closed.TrySetResult(false);
+                _diagnostics.Log("PlayerLifecycle", "Round return deferred: gameplay HUD is not connected.");
+                return;
+            }
+            await Task.Delay(value.ReturnDelayMilliseconds, _lifetime.Token).ConfigureAwait(false);
+            // The delay alone cannot establish that the old movie has stopped
+            // its callbacks. Wait for READY and closure of that exact socket.
+            if (!await fence.Closed.Task.WaitAsync(TimeSpan.FromSeconds(10), _lifetime.Token).ConfigureAwait(false)) return;
+            await ReturnToLobbyAsync(fence).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { }
+        catch (TimeoutException)
+        {
+            fence.Closed.TrySetResult(false);
+            _diagnostics.Log("PlayerLifecycle",
+                $"Round {value.LevelGeneration} return deferred: HUD readiness/connection closure timed out. " +
+                "No native frontend request was issued; Disconnect remains available in Pause.");
+        }
+        catch (Exception exception) when (exception is IOException or ObjectDisposedException)
+        {
+            fence.Closed.TrySetResult(false);
+            _diagnostics.Log("PlayerLifecycle", $"Round return failed: {exception.Message}");
+        }
     }
 
-    private bool BeginRoundEnd(RoundEndedPayload value)
+    private RoundReturnFence? BeginRoundEnd(RoundEndedPayload value)
     {
         lock (_stateGate)
         {
             if (_start is null || _start.SessionId != value.SessionId || _start.LevelGeneration != value.LevelGeneration
-                || _roundEndingGeneration == value.LevelGeneration) return false;
+                || _roundEndingGeneration == value.LevelGeneration) return null;
             _roundEndingGeneration = value.LevelGeneration;
-            return true;
+            _roundReturnFence = new RoundReturnFence(value);
+            return _roundReturnFence;
         }
     }
 
-    private Task ShowRoundEndAsync(RoundEndedPayload value)
+    private Task<bool> ShowRoundEndAsync(RoundReturnFence fence)
     {
+        var value = fence.Round;
         var seconds = (value.ReturnDelayMilliseconds + 999) / 1000;
         return _bridge.SendAsync("ROUND_END", new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["title"] = RoundEndTitle,
             ["message"] = RoundEndMessage,
             ["seconds"] = seconds.ToString(CultureInfo.InvariantCulture),
-            ["generation"] = value.LevelGeneration.ToString(CultureInfo.InvariantCulture)
-        });
+            ["generation"] = value.LevelGeneration.ToString(CultureInfo.InvariantCulture),
+            ["sessionId"] = value.SessionId.ToString("D"),
+            ["returnToken"] = fence.Token.ToString("D")
+        }, _lifetime.Token);
     }
 
-    private async Task ReturnToLobbyAsync(RoundEndedPayload value)
+    private void AcceptRoundReturnReady(ScaleformBridgeEvent value)
+    {
+        var message = value.Message;
+        if (value.Channel != "command" || value.ConnectionId == Guid.Empty
+            || message.Get("source") != "pickup_overlay" || message.Get("phase") != "gameplay"
+            || !Guid.TryParse(message.Get("sessionId"), out var sessionId)
+            || !Guid.TryParse(message.Get("returnToken"), out var token)
+            || !int.TryParse(message.Get("generation"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var generation)) return;
+        lock (_stateGate)
+        {
+            var fence = _roundReturnFence;
+            if (fence is null || fence.Token != token || fence.Round.SessionId != sessionId
+                || fence.Round.LevelGeneration != generation || _start is null || _start.SessionId != sessionId
+                || _start.LevelGeneration != generation || fence.Closed.Task.IsCompleted) return;
+            if (fence.ConnectionId != Guid.Empty && fence.ConnectionId != value.ConnectionId) return;
+            fence.ConnectionId = value.ConnectionId;
+        }
+        _diagnostics.Log("PlayerLifecycle", $"Round {generation}: HUD ready; awaiting its connection closure.");
+    }
+
+    private void OnRoundBridgeConnectionClosed(object? sender, ScaleformBridgeConnectionClosed value)
+    {
+        if (value.Channel != "command" || !value.PeerClosed) return;
+        lock (_stateGate)
+        {
+            var fence = _roundReturnFence;
+            if (fence is null || fence.ConnectionId == Guid.Empty || fence.ConnectionId != value.ConnectionId) return;
+            if (fence.Closed.TrySetResult(true))
+                _diagnostics.Log("PlayerLifecycle", $"Round {fence.Round.LevelGeneration}: HUD connection closed after readiness.");
+        }
+    }
+
+    private async Task ReturnToLobbyAsync(RoundReturnFence fence)
     {
         await _commandGate.WaitAsync(_lifetime.Token).ConfigureAwait(false);
         try
         {
-            if (!EndRoundGameplayState(value)) return;
+            if (!EndRoundGameplayState(fence)) return;
             await CloseNativeWorldBusAsync("round-ended").ConfigureAwait(false);
+            lock (_stateGate)
+                if (!ReferenceEquals(_roundReturnFence, fence) || _start is not null) return;
             await RequestNativeFrontendAsync().ConfigureAwait(false);
+            lock (_stateGate)
+                if (ReferenceEquals(_roundReturnFence, fence)) _roundReturnFence = null;
             PublishState();
         }
         finally { _commandGate.Release(); }
@@ -115,11 +189,13 @@ internal sealed partial class MultiplayerSessionCoordinator
 
     // Keep the lobby connection and roster; drop every per-round replication
     // state exactly like a stop would, so the next LobbyStart starts clean.
-    private bool EndRoundGameplayState(RoundEndedPayload value)
+    private bool EndRoundGameplayState(RoundReturnFence fence)
     {
+        var value = fence.Round;
         lock (_stateGate)
         {
-            if (_start is null || _start.SessionId != value.SessionId || _start.LevelGeneration != value.LevelGeneration) return false;
+            if (!ReferenceEquals(_roundReturnFence, fence) || _start is null
+                || _start.SessionId != value.SessionId || _start.LevelGeneration != value.LevelGeneration) return false;
             _start = null;
             _uiGameplayLoaded = false;
             _localGameplayReady = false;
@@ -170,6 +246,8 @@ internal sealed partial class MultiplayerSessionCoordinator
 
     private void ClearRoundLifecycleState()
     {
+        _roundReturnFence?.Closed.TrySetResult(false);
+        _roundReturnFence = null;
         _deathReportedGeneration = 0;
         _roundEndingGeneration = 0;
         _frontendLobbyReturnRole = null;

@@ -129,7 +129,19 @@ package
       
       private var aimp_round_end_count_text:TextField;
       
-      private var aimp_round_end_timer:Timer;
+      private var aimp_round_end_deadline:int = 0;
+
+      private var aimp_round_end_active:Boolean = false;
+
+      private var aimp_round_return_fields:String = "";
+
+      private var aimp_returning:Boolean = false;
+
+      private var aimp_bridge_init_pending:Boolean = false;
+
+      private var aimp_bridge_connect_pending:Boolean = false;
+
+      private var aimp_bridge_error_pending:Boolean = false;
       
       private var aimp_round_end_remaining:int = 0;
       
@@ -525,26 +537,38 @@ package
          this.container_mc.item1_mc.inventoryfull_mc.txt.text = "AI_UI_INVENTORY_FULL";
          this.container_mc.item2_mc.inventoryfull_mc.txt.text = "AI_UI_INVENTORY_FULL";
          this.pickup_cursor_mc.alpha = 0;
-         this.aimp_init_runtime_bridge();
       }
       
       private function aimp_resume_bridge(param1:Event) : void
       {
-         if(this.aimp_bridge_socket == null)
+         if(!this.aimp_returning)
          {
-            this.aimp_init_runtime_bridge();
+            this.aimp_bridge_init_pending = this.aimp_bridge_socket == null;
+            addEventListener(Event.ENTER_FRAME,this.aimp_on_bridge_frame,false,0,true);
          }
       }
 
       private function aimp_release_bridge(param1:Event) : void
       {
+         removeEventListener(Event.ENTER_FRAME,this.aimp_on_bridge_frame);
+         this.aimp_bridge_init_pending = false;
          this.aimp_hide_round_end();
+         this.aimp_close_bridge();
+         this.aimp_returning = false;
+      }
+
+      private function aimp_close_bridge() : void
+      {
          this.aimp_bridge_connected = false;
+         this.aimp_bridge_connect_pending = false;
+         this.aimp_bridge_error_pending = false;
+         this.aimp_bridge_buffer = "";
          if(this.aimp_bridge_socket == null)
          {
             return;
          }
          this.aimp_bridge_socket.removeEventListener(Event.CONNECT,this.aimp_on_bridge_connect);
+         this.aimp_bridge_socket.removeEventListener(Event.CLOSE,this.aimp_on_bridge_close);
          this.aimp_bridge_socket.removeEventListener(ProgressEvent.SOCKET_DATA,this.aimp_on_bridge_data);
          this.aimp_bridge_socket.removeEventListener(IOErrorEvent.IO_ERROR,this.aimp_on_bridge_io_error);
          this.aimp_bridge_socket.removeEventListener(SecurityErrorEvent.SECURITY_ERROR,this.aimp_on_bridge_security_error);
@@ -556,28 +580,17 @@ package
          {
          }
          this.aimp_bridge_socket = null;
-         this.aimp_bridge_buffer = "";
       }
 
       private function aimp_init_runtime_bridge() : void
       {
          try
          {
-            if(this.aimp_bridge_socket != null)
-            {
-               try
-               {
-                  this.aimp_bridge_socket.close();
-               }
-               catch(closeError:Error)
-               {
-               }
-            }
-            this.aimp_bridge_buffer = "";
-            this.aimp_bridge_connected = false;
+            this.aimp_close_bridge();
             this.aimp_remote_state_ack_sent = false;
             this.aimp_bridge_socket = new Socket();
             this.aimp_bridge_socket.addEventListener(Event.CONNECT,this.aimp_on_bridge_connect);
+            this.aimp_bridge_socket.addEventListener(Event.CLOSE,this.aimp_on_bridge_close);
             this.aimp_bridge_socket.addEventListener(ProgressEvent.SOCKET_DATA,this.aimp_on_bridge_data);
             this.aimp_bridge_socket.addEventListener(IOErrorEvent.IO_ERROR,this.aimp_on_bridge_io_error);
             this.aimp_bridge_socket.addEventListener(SecurityErrorEvent.SECURITY_ERROR,this.aimp_on_bridge_security_error);
@@ -592,40 +605,102 @@ package
       
       private function aimp_on_bridge_connect(param1:Event) : void
       {
-         this.aimp_bridge_connected = true;
-         trace("AIMP gameplay bridge connected to launcher.");
-         this.aimp_set_remote_state_status("Connected - waiting for FakePlayer1");
-         this.aimp_send_bridge_message("HELLO|source=pickup_overlay|phase=gameplay");
-         this.aimp_send_bridge_message("PICKUP_OVERLAY_LOADED|source=pickup_overlay|phase=gameplay");
-         this.aimp_log_bridge("info","lifecycle","PickupOverlay bridge connected and ready");
+         if(param1.currentTarget == this.aimp_bridge_socket)
+         {
+            this.aimp_bridge_connect_pending = true;
+         }
       }
       
       private function aimp_on_bridge_data(param1:ProgressEvent) : void
       {
-         var _loc2_:String = null;
-         var _loc3_:int = 0;
-         if(this.aimp_bridge_socket == null)
+         if(param1.currentTarget != this.aimp_bridge_socket || this.aimp_bridge_socket == null || this.aimp_returning)
          {
             return;
          }
          try
          {
-            this.aimp_bridge_buffer += this.aimp_bridge_socket.readUTFBytes(this.aimp_bridge_socket.bytesAvailable);
-            while(true)
+            if(this.aimp_bridge_socket.bytesAvailable > 65536 || this.aimp_bridge_buffer.length + this.aimp_bridge_socket.bytesAvailable > 65536)
             {
-               _loc3_ = this.aimp_bridge_buffer.indexOf("\n");
-               if(_loc3_ < 0)
-               {
-                  break;
-               }
-               _loc2_ = this.aimp_bridge_buffer.substr(0,_loc3_);
-               this.aimp_bridge_buffer = this.aimp_bridge_buffer.substr(_loc3_ + 1);
-               this.aimp_handle_bridge_line(_loc2_);
+               trace("AIMP gameplay bridge exceeded its receive limit; closing connection.");
+               this.aimp_bridge_error_pending = true;
+               return;
             }
+            this.aimp_bridge_buffer += this.aimp_bridge_socket.readUTFBytes(this.aimp_bridge_socket.bytesAvailable);
          }
          catch(error:Error)
          {
             trace("AIMP gameplay bridge read failed: " + error.message);
+            this.aimp_bridge_error_pending = true;
+         }
+      }
+
+      // Socket callbacks only collect data. Display changes, native callbacks
+      // and the round deadline are consumed in order on the movie's frame.
+      private function aimp_on_bridge_frame(param1:Event) : void
+      {
+         var lineEnd:int = 0;
+         var line:String = null;
+         var count:int = 0;
+         var remaining:int = 0;
+         if(stage == null || this.aimp_returning)
+         {
+            return;
+         }
+         if(this.aimp_bridge_init_pending)
+         {
+            this.aimp_bridge_init_pending = false;
+            this.aimp_init_runtime_bridge();
+         }
+         if(this.aimp_bridge_connect_pending)
+         {
+            this.aimp_bridge_connect_pending = false;
+            this.aimp_bridge_connected = true;
+            this.aimp_send_bridge_message("HELLO|source=pickup_overlay|phase=gameplay");
+            this.aimp_send_bridge_message("PICKUP_OVERLAY_LOADED|source=pickup_overlay|phase=gameplay");
+            this.aimp_log_bridge("info","lifecycle","PickupOverlay bridge connected and ready");
+         }
+         while(count < 64 && stage != null && !this.aimp_returning)
+         {
+            lineEnd = this.aimp_bridge_buffer.indexOf("\n");
+            if(lineEnd < 0)
+            {
+               break;
+            }
+            line = this.aimp_bridge_buffer.substr(0,lineEnd);
+            this.aimp_bridge_buffer = this.aimp_bridge_buffer.substr(lineEnd + 1);
+            this.aimp_handle_bridge_line(line);
+            count++;
+         }
+         // Preserve the FIFO across frames, including commands received before
+         // a transport close. Never coalesce gameplay commands or round controls.
+         if(this.aimp_bridge_buffer.indexOf("\n") >= 0 || stage == null)
+         {
+            return;
+         }
+         if(this.aimp_bridge_error_pending)
+         {
+            this.aimp_close_bridge();
+            this.aimp_set_remote_state_status("Launcher bridge offline");
+         }
+         if(this.aimp_round_end_active)
+         {
+            remaining = Math.max(0,Math.ceil((this.aimp_round_end_deadline - getTimer()) / 1000));
+            if(remaining != this.aimp_round_end_remaining)
+            {
+               this.aimp_round_end_remaining = remaining;
+               this.aimp_update_round_end_count();
+            }
+            if(remaining == 0)
+            {
+               this.aimp_round_end_active = false;
+               this.aimp_returning = true;
+               if(!this.aimp_send_bridge_message("ROUND_RETURN_READY|source=pickup_overlay|phase=gameplay" + this.aimp_round_return_fields))
+               {
+                  this.aimp_round_end_count_text.text = "Unable to return to lobby. Use Disconnect in Pause.";
+               }
+               removeEventListener(Event.ENTER_FRAME,this.aimp_on_bridge_frame);
+               this.aimp_close_bridge();
+            }
          }
       }
       
@@ -721,10 +796,12 @@ package
             addChild(this.aimp_round_end_layer);
             this.aimp_round_end_remaining = _loc4_;
             this.aimp_update_round_end_count();
-            this.aimp_round_end_timer = new Timer(1000,_loc4_);
-            this.aimp_round_end_timer.addEventListener(TimerEvent.TIMER,this.aimp_on_round_end_tick);
-            this.aimp_round_end_timer.start();
-            this.aimp_send_bridge_message("ROUND_END_ACK|source=pickup_overlay|phase=gameplay|result=displayed");
+            this.aimp_round_end_deadline = getTimer() + _loc4_ * 1000;
+            this.aimp_round_end_active = true;
+            this.aimp_round_return_fields = "|sessionId=" + this.aimp_encode_bridge_value(this.aimp_get_bridge_value(param1,"sessionId"));
+            this.aimp_round_return_fields += "|generation=" + this.aimp_encode_bridge_value(this.aimp_get_bridge_value(param1,"generation"));
+            this.aimp_round_return_fields += "|returnToken=" + this.aimp_encode_bridge_value(this.aimp_get_bridge_value(param1,"returnToken"));
+            this.aimp_send_bridge_message("ROUND_END_ACK|source=pickup_overlay|phase=gameplay|result=displayed" + this.aimp_round_return_fields);
          }
          catch(error:Error)
          {
@@ -765,15 +842,6 @@ package
          return _loc5_;
       }
       
-      private function aimp_on_round_end_tick(param1:TimerEvent) : void
-      {
-         if(this.aimp_round_end_remaining > 0)
-         {
-            this.aimp_round_end_remaining--;
-         }
-         this.aimp_update_round_end_count();
-      }
-      
       private function aimp_update_round_end_count() : void
       {
          if(this.aimp_round_end_count_text == null)
@@ -792,12 +860,8 @@ package
       
       private function aimp_hide_round_end() : void
       {
-         if(this.aimp_round_end_timer != null)
-         {
-            this.aimp_round_end_timer.stop();
-            this.aimp_round_end_timer.removeEventListener(TimerEvent.TIMER,this.aimp_on_round_end_tick);
-            this.aimp_round_end_timer = null;
-         }
+         this.aimp_round_end_active = false;
+         this.aimp_round_return_fields = "";
          if(this.aimp_round_end_layer != null && this.aimp_round_end_layer.parent != null)
          {
             this.aimp_round_end_layer.parent.removeChild(this.aimp_round_end_layer);
@@ -806,13 +870,23 @@ package
          this.aimp_round_end_count_text = null;
       }
       
-      private function aimp_send_bridge_message(param1:String) : void
+      private function aimp_send_bridge_message(param1:String) : Boolean
       {
          if(this.aimp_bridge_socket != null && this.aimp_bridge_socket.connected)
          {
-            this.aimp_bridge_socket.writeUTFBytes(param1 + "\n");
-            this.aimp_bridge_socket.flush();
+            try
+            {
+               this.aimp_bridge_socket.writeUTFBytes(param1 + "\n");
+               this.aimp_bridge_socket.flush();
+               return true;
+            }
+            catch(error:Error)
+            {
+               this.aimp_bridge_error_pending = true;
+               trace("AIMP gameplay bridge send failed: " + error.message);
+            }
          }
+         return false;
       }
       
       private function aimp_log_bridge(param1:String, param2:String, param3:String, param4:String = "", param5:String = "", param6:String = "", param7:String = "", param8:String = "", param9:String = "") : void
@@ -1061,16 +1135,26 @@ package
       
       private function aimp_on_bridge_io_error(param1:IOErrorEvent) : void
       {
-         this.aimp_bridge_connected = false;
-         trace("AIMP gameplay bridge IO error: " + param1.text);
-         this.aimp_set_remote_state_status("Launcher bridge offline");
+         if(param1.currentTarget == this.aimp_bridge_socket)
+         {
+            this.aimp_bridge_error_pending = true;
+         }
       }
       
       private function aimp_on_bridge_security_error(param1:SecurityErrorEvent) : void
       {
-         this.aimp_bridge_connected = false;
-         trace("AIMP gameplay bridge security error: " + param1.text);
-         this.aimp_set_remote_state_status("Launcher bridge security error");
+         if(param1.currentTarget == this.aimp_bridge_socket)
+         {
+            this.aimp_bridge_error_pending = true;
+         }
+      }
+
+      private function aimp_on_bridge_close(param1:Event) : void
+      {
+         if(param1.currentTarget == this.aimp_bridge_socket)
+         {
+            this.aimp_bridge_error_pending = true;
+         }
       }
       
       public function SetExpandedUIButtons(param1:String, param2:String) : *

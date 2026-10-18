@@ -399,6 +399,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _diagnostics = controller.Diagnostics;
         _aiSync = new AISyncSession(controller, _performanceIsolation);
         _bridge.MessageReceived += OnBridgeMessage;
+        _bridge.ConnectionClosed += OnRoundBridgeConnectionClosed;
         _controller.WorldIntentProduced += OnNativeWorldIntentProduced;
         _controller.WorldMutationCompleted += OnNativeWorldMutationCompleted;
         _controller.PlayerSyncStateProduced += OnNativePlayerSyncStateProduced;
@@ -669,6 +670,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _lifetime.Cancel();
         _aiSync.Dispose();
         _bridge.MessageReceived -= OnBridgeMessage;
+        _bridge.ConnectionClosed -= OnRoundBridgeConnectionClosed;
         _controller.WorldIntentProduced -= OnNativeWorldIntentProduced;
         _controller.WorldMutationCompleted -= OnNativeWorldMutationCompleted;
         _controller.PlayerSyncStateProduced -= OnNativePlayerSyncStateProduced;
@@ -685,6 +687,10 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private void OnBridgeMessage(object? sender, ScaleformBridgeEvent value)
     {
         if (Volatile.Read(ref _disposed) != 0) return;
+        // Process on the reader before its EOF notification; never queue this
+        // behind the command gate while a round return is waiting for the HUD.
+        if (value.Message.Type.Equals("ROUND_RETURN_READY", StringComparison.OrdinalIgnoreCase))
+        { AcceptRoundReturnReady(value); return; }
         if (IsPauseMenuMessage(value.Message)) { _ = HandlePauseMenuMessageAsync(value); return; }
         _ = HandleBridgeMessageAsync(value.Message);
     }
@@ -2488,9 +2494,27 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     }
 
     private void OnLobbyStarted(object? sender, LobbyStartPayload value) =>
-        _ = HandleLobbyStartedAsync(value);
+        _ = HandleLobbyStartedAsync(sender, value);
 
-    private async Task HandleLobbyStartedAsync(LobbyStartPayload value)
+    private async Task HandleLobbyStartedAsync(object? sender, LobbyStartPayload value)
+    {
+        try
+        {
+            await _commandGate.WaitAsync(_lifetime.Token).ConfigureAwait(false);
+            try
+            {
+                lock (_stateGate)
+                    if (!IsCurrentLobbySource(sender, value.SessionId)) return;
+                await ApplyLobbyStartedAsync(value).ConfigureAwait(false);
+            }
+            finally { _commandGate.Release(); }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception exception)
+        { _diagnostics.Log("Multiplayer", $"Lobby start failed: {exception.Message}"); }
+    }
+
+    private async Task ApplyLobbyStartedAsync(LobbyStartPayload value)
     {
         var worldSyncEnabled = _settingsStore.Load().WorldSyncEnabled &&
             _performanceIsolation.IsEnabled(PerformanceIsolationModule.WorldSync);
@@ -2538,6 +2562,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
 
     private void ResetGameplayState(LobbyStartPayload start)
     {
+        ClearRoundLifecycleState();
         _start = start;
         _uiGameplayLoaded = false;
         _localGameplayReady = false;
