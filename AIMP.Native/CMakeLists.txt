@@ -123,6 +123,14 @@ if(BUILD_TESTING)
     target_include_directories(AIMP.AISyncTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     target_compile_options(AIMP.AISyncTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
     add_test(NAME AISyncOwnershipAndNavigation COMMAND AIMP.AISyncTests)
+    add_executable(AIMP.AISyncHookTests tests/AISyncHookInstallationTests.cpp)
+    target_link_libraries(AIMP.AISyncHookTests PRIVATE AIMP.Core)
+    target_compile_definitions(AIMP.AISyncHookTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(AIMP.AISyncHookTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.AISyncHookTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME AISyncHookInstallation COMMAND AIMP.AISyncHookTests "${CMAKE_CURRENT_SOURCE_DIR}/../AI.exe")
+    set_tests_properties(AISyncHookInstallation PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(AIMP.WorldActionTests EXCLUDE_FROM_ALL
         tests/WorldActionPortableTests.cpp
         src/WorldInteractionAdapterCodec.cpp)

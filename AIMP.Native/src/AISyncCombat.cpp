@@ -38,6 +38,7 @@ std::atomic<std::uint64_t> gEpoch{1U};
 std::atomic<Mode> gMode{Mode::Retail};
 std::atomic<NpcPredicate> gNpc{};
 std::atomic<void*> gDecisionOriginal{};
+void* gDecisionTrampoline{};
 std::uintptr_t gBase{};
 std::atomic<std::uint64_t> gCaptured{}, gDropped{}, gDecisionsBlocked{}, gStateApplied{};
 std::atomic<std::uint64_t> gShotsApplied{}, gDeferred{}, gFailed{}, gAimSubmitted{}, gAimCancelled{};
@@ -434,8 +435,11 @@ bool Install(HookManager& hooks, std::string& error) {
     request.expected.mask.assign(request.expected.bytes.size(), 'x');
     request.patchLength = request.expected.bytes.size();
     request.relocationSafePrefix = true;
+    request.trampolineOut = &gDecisionTrampoline;
     request.publishedTrampolineOut = &gDecisionOriginal;
-    return hooks.Install(request, error);
+    if (hooks.Install(request, error)) return true;
+    error = request.name + ": " + error;
+    return false;
 }
 void SetNpcPredicate(const NpcPredicate predicate) noexcept { gNpc.store(predicate, std::memory_order_release); }
 void SetMode(const Mode mode) noexcept {
