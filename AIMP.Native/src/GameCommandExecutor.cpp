@@ -1346,6 +1346,24 @@ bool InvokePopup(
 #endif
 }
 
+// 00793880: ECX = gameplay manager G, one byte argument, RET 4. Retail's
+// confirmed "back to frontend" UI callback calls it with 1 on the engine thread.
+using ReturnToFrontendFn = void(__thiscall*)(void* gameplayManager, std::uint32_t onlyIfFrontendAbsent);
+
+bool InvokeReturnToFrontend(const void* functionAddress, void* gameplayManager) noexcept {
+#if defined(_MSC_VER)
+    __try {
+        reinterpret_cast<ReturnToFrontendFn>(const_cast<void*>(functionAddress))(gameplayManager, 1U);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    reinterpret_cast<ReturnToFrontendFn>(const_cast<void*>(functionAddress))(gameplayManager, 1U);
+    return true;
+#endif
+}
+
 bool InvokeSpawnRequest130(
     const void* functionAddress,
     void* sink,
@@ -1435,6 +1453,7 @@ GameCommandExecutor::GameCommandExecutor(
       characterRuntimeIdCounterAddress_(
           resolver.ResolveMutable(SymbolId::CharacterRuntimeIdCounter)),
       globalStateRootAddress_(resolver.Resolve(SymbolId::GlobalStateRoot)),
+      returnToFrontendAddress_(resolver.Resolve(SymbolId::GameplayReturnToFrontend)),
       captures_(&captures),
       generations_(&generations),
       runtimeEvidence_(&runtimeEvidence),
@@ -1477,6 +1496,11 @@ bool GameCommandExecutor::RemoteEquipmentProvisionAvailable() const noexcept {
     return spawnTracker_ != nullptr;
 }
 
+bool GameCommandExecutor::ReturnToFrontendAvailable() const noexcept {
+    return exactExecutableHash_ && globalStateRootAddress_ != nullptr &&
+        returnToFrontendAddress_ != nullptr;
+}
+
 
 bool GameCommandExecutor::IsAvailable() const noexcept {
     return PopupAvailable() || SpawnAvailable() ||
@@ -1506,6 +1530,9 @@ bool GameCommandExecutor::CanExecute(const std::string_view command) const noexc
     }
     if (command == "REMOTE_EQUIPMENT_PROVISION") {
         return RemoteEquipmentProvisionAvailable();
+    }
+    if (command == "RETURN_TO_FRONTEND") {
+        return ReturnToFrontendAvailable();
     }
     if (command == "WORLD_REGISTRY_PROBE" ||
         command == "WORLD_MANIFEST_LOAD" ||
@@ -3953,6 +3980,44 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteSpawnNetZCharacter(
         "Character créé par le pipeline natif sans modifier la table des "
         "participants. L'enregistrement NetZ persistant reste bloqué tant que "
         "le registre auxiliaire du participant distant n'est pas initialisé.";
+    return result;
+}
+
+
+GameCommandExecutionResult GameCommandExecutor::ExecuteReturnToFrontend() const {
+    GameCommandExecutionResult result{};
+    if (!ReturnToFrontendAvailable()) {
+        result.statusCode = "RETURN_TO_FRONTEND_UNAVAILABLE";
+        result.message = "Le retour au menu principal n'est pas certifie pour cet executable.";
+        return result;
+    }
+    // Same G and mode guard as PlayerLifecycle: G = [GlobalStateRoot]+48,
+    // gameplay mode at G+14 (0/3 = frontend or inactive), state at G+8.
+    const auto root = crash_guard::SafeRead<std::uintptr_t>(globalStateRootAddress_);
+    const auto manager = root && *root != 0U
+        ? crash_guard::SafeRead<std::uintptr_t>(reinterpret_cast<const void*>(*root + 0x48U))
+        : std::optional<std::uintptr_t>{};
+    const auto mode = manager && *manager != 0U
+        ? crash_guard::SafeRead<std::int32_t>(reinterpret_cast<const void*>(*manager + 0x14U))
+        : std::optional<std::int32_t>{};
+    if (!mode) {
+        result.statusCode = "RETURN_TO_FRONTEND_CONTEXT_UNAVAILABLE";
+        result.message = "Le gestionnaire de gameplay est illisible.";
+        return result;
+    }
+    if (*mode == 0 || *mode == 3) {
+        result.statusCode = "RETURN_TO_FRONTEND_NOT_IN_GAMEPLAY";
+        result.message = "Aucun niveau de gameplay n'est actif.";
+        return result;
+    }
+    if (!InvokeReturnToFrontend(returnToFrontendAddress_, reinterpret_cast<void*>(*manager))) {
+        result.statusCode = "RETURN_TO_FRONTEND_NATIVE_FAULT";
+        result.message = "L'appel natif de retour au menu a declenche une exception protegee.";
+        return result;
+    }
+    result.executed = true;
+    result.statusCode = "RETURN_TO_FRONTEND_REQUESTED";
+    result.message = "Retour au menu principal demande au gestionnaire de gameplay.";
     return result;
 }
 

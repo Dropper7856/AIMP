@@ -30,6 +30,7 @@ struct DeathEvent {
 
 std::atomic<bool> gInstalled{false};
 std::atomic<bool> gEnabled{false};
+std::atomic<std::uint64_t> gLocalDeathSequence{0};
 const void* gGlobalRootAddress{};
 // Published before HookManager resumes patched threads. Neither destination
 // is cleared at logical shutdown: an in-flight naked detour still needs it.
@@ -125,7 +126,9 @@ int __stdcall DecideLocalDeath(const std::uintptr_t victim) noexcept {
         event.decision = Decision::Suppress;
     }
     RecordEvent(event);
-    return event.decision == Decision::Suppress ? 1 : 0;
+    if (event.decision != Decision::Suppress) return 0;
+    gLocalDeathSequence.fetch_add(1U, std::memory_order_acq_rel);
+    return 1;
 }
 
 #if defined(_MSC_VER) && defined(_M_IX86)
@@ -217,6 +220,10 @@ bool Install(const BuildProfile& profile, const SignatureResolver& resolver,
 
 bool Installed() noexcept {
     return gInstalled.load(std::memory_order_acquire);
+}
+
+std::uint64_t LocalDeathSequence() noexcept {
+    return gLocalDeathSequence.load(std::memory_order_acquire);
 }
 
 void Shutdown() noexcept {

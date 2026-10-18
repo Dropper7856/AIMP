@@ -1,0 +1,1873 @@
+package frontend
+{
+   import components.TextFieldWrapper;
+   import constants.KeyCodes;
+   import dlc.CharacterSelection;
+   import dlc.MapSelection;
+   import dlc.components.SelectionScreenParent;
+   import dlc.utils.CharacterData;
+   import dlc.utils.ChecklistItemData;
+   import dlc.utils.PlaylistData;
+   import dlc.utils.PlaylistDetailsData;
+   import events.MovieClipExEvent;
+   import flash.display.MovieClip;
+   import flash.events.Event;
+   import flash.external.ExternalInterface;
+   import frontend.enum.MenuItemId;
+   import frontend.enum.MenuPageId;
+   import frontend.enum.NewFrontendMenuState;
+   import frontend.events.MenuEvent;
+   import frontend.events.MenuItemEvent;
+   import frontend.events.MenuPageEvent;
+   import frontend.menu.MenuItem;
+   import frontend.menu.MenuItemExpandable;
+   import frontend.menu.MenuItemOptionCheckBox;
+   import frontend.menu.MenuItemOptionOptionStepper;
+   import frontend.menu.MenuPage;
+   import scaleform.clik.constants.InputValue;
+   import scaleform.clik.events.InputEvent;
+   import scaleform.clik.ui.InputDetails;
+   import scaleform.gfx.Extensions;
+   import utils.DisplayUtil;
+   
+   public class NewFrontendMenu extends GameMenu
+   {
+       
+      
+      public var splashText:TextFieldWrapper;
+      
+      public var logoAlien:MovieClip;
+      
+      public var logoIsolation:MovieClip;
+      
+      public var leaderboard_loading_spinner_mc:MovieClip;
+      
+      public var mapSelection:MapSelection;
+      
+      public var characterSelection:CharacterSelection;
+      
+      public var mapSelectionParent:SelectionScreenParent;
+      
+      public var characterSelectionParent:SelectionScreenParent;
+      
+      public var network_notification_mc:MovieClip;
+      
+      private var _state:NewFrontendMenuState;
+      
+      private var _mpBridge:MultiplayerBridge;
+      
+      private var _playGameItem:MenuItemExpandable;
+      
+      private var _extrasItem:MenuItemExpandable;
+      
+      private var _storeItem:MenuItem;
+      
+      private var _selectStorageDeviceItem:MenuItem;
+      
+      private var _campaignItem:MenuItemExpandable;
+      
+      private var _twoTeamsItem:MenuItemExpandable;
+      
+      private var _ripleyItem:MenuItemExpandable;
+      
+      private var _survivorItem:MenuItem;
+      
+      private var _startGameItem:MenuItemExpandable;
+      
+      private var _startOnlineGameItem:MenuItemExpandable;
+      
+      private var _newGamePlusItem:MenuItem;
+      
+      private var _continueGameItem:MenuItem;
+      
+      private var _continueOnlineGameItem:MenuItem;
+      
+      private var _selectLevelItem:MenuItemExpandable;
+      
+      private var _multiplayerItem:MenuItemExpandable;
+      
+      private var _createServerItem:MenuItemExpandable;
+      
+      private var _onlineCampaignItem:MenuItemExpandable;
+      
+      private var _mementoBtnKELCONKE:MenuItemExpandable;
+      
+      private var _onlineSurvivorItem:MenuItem;
+      
+      private var _joinServerItem:MenuItemExpandable;
+      
+      private var _directIpJoinItem:MenuItemExpandable;
+      
+      private var _serverNameItem:MenuItem;
+      
+      private var _serverPasswordItem:MenuItem;
+      
+      private var _serverNameValue:String = "Alien Isolation MP Test";
+      
+      private var _serverPasswordValue:String = "";
+      
+      private var _directJoinHostIpValue:String = "127.0.0.1";
+      
+      private var _directJoinPortValue:String = "28015";
+      
+      private var _serverModeItem:MenuItemOptionOptionStepper;
+      
+      private var _serverMapItem:MenuItemOptionOptionStepper;
+      
+      private var _survivorMapIds:Array;
+      
+      private var _survivorMapLabels:Array;
+      
+      private var _survivorMapDescriptions:Array;
+      
+      private var _serverMaxPlayersItem:MenuItemOptionOptionStepper;
+      
+      private var _serverVisibilityItem:MenuItemOptionOptionStepper;
+      
+      private var _serverStartItem:MenuItemExpandable;
+      
+      private var _serverRefreshItem:MenuItem;
+      
+      private var _serverFilterItem:MenuItemOptionOptionStepper;
+      
+      private var _serverLanItem:MenuItemExpandable;
+      
+      private var _serverCampaignItem:MenuItemExpandable;
+      
+      private var _serverSurvivalItem:MenuItemExpandable;
+      
+      private var _hostLobbyStatusItem:MenuItem;
+      
+      private var _hostLobbyPlayer1Item:MenuItem;
+      
+      private var _hostLobbyPlayer2Item:MenuItem;
+      
+      private var _hostLobbyPlayer3Item:MenuItem;
+      
+      private var _hostLobbyPlayer4Item:MenuItem;
+      
+      private var _hostLobbyKick2Item:MenuItem;
+      
+      private var _hostLobbyKick3Item:MenuItem;
+      
+      private var _hostLobbyKick4Item:MenuItem;
+      
+      private var _hostLobbyStartGameItem:MenuItem;
+      
+      private var _hostLobbyLeaveItem:MenuItem;
+      
+      private var _clientLobbyStatusItem:MenuItem;
+      
+      private var _clientLobbyPlayer1Item:MenuItem;
+      
+      private var _clientLobbyPlayer2Item:MenuItem;
+      
+      private var _clientLobbyReadyItem:MenuItemOptionCheckBox;
+      
+      private var _clientLobbyLeaveItem:MenuItem;
+      
+      private var _twoTeamsNoviceDifficultyItem:MenuItem;
+      
+      private var _twoTeamsEasyDifficultyItem:MenuItem;
+      
+      private var _twoTeamsMediumDifficultyItem:MenuItem;
+      
+      private var _twoTeamsHardDifficultyItem:MenuItem;
+      
+      private var _twoTeamsIronDifficultyItem:MenuItem;
+      
+      private var _ripleyNoviceDifficultyItem:MenuItem;
+      
+      private var _ripleyEasyDifficultyItem:MenuItem;
+      
+      private var _ripleyMediumDifficultyItem:MenuItem;
+      
+      private var _ripleyHardDifficultyItem:MenuItem;
+      
+      private var _ripleyIronDifficultyItem:MenuItem;
+      
+      private var _noviceDifficultyItem:MenuItem;
+      
+      private var _easyDifficultyItem:MenuItem;
+      
+      private var _mediumDifficultyItem:MenuItem;
+      
+      private var _hardDifficultyItem:MenuItem;
+      
+      private var _ironDifficultyItem:MenuItem;
+      
+      private var _headTrackingOnItem:MenuItemExpandable;
+      
+      private var _headTrackingOffItem:MenuItemExpandable;
+      
+      private var _movementDetectionOnItem:MenuItemExpandable;
+      
+      private var _movementDetectionOffItem:MenuItemExpandable;
+      
+      private var _noiseDetectionOnItem:MenuItemExpandable;
+      
+      private var _noiseDetectionOffItem:MenuItemExpandable;
+      
+      private var _mementoMoriOnItem:MenuItemExpandable;
+      
+      private var _mementoMoriOffItem:MenuItemExpandable;
+      
+      private var _creditsItem:MenuItem;
+      
+      private var _imageGalleryItem:MenuItem;
+      
+      private var _devDiariesItem:MenuItemExpandable;
+      
+      private var _achievementsItem:MenuItem;
+      
+      private var _makingOfItem:MenuItem;
+      
+      private var _deletedScenesItem:MenuItem;
+      
+      private var _trailerItem:MenuItem;
+      
+      private var _playlistData:PlaylistData;
+      
+      private var _playlistDetailsData:PlaylistDetailsData;
+      
+      private var _checklistItemData:ChecklistItemData;
+      
+      private var _characterData:CharacterData;
+      
+      private var _mpPendingStartGame:Boolean = false;
+      
+      private var _mpPendingStartMode:String = "";
+      
+      private var _mpPendingStartMapId:String = "";
+      
+      private var _mpPendingStartMapName:String = "";
+      
+      private var _mpPendingSessionId:String = "";
+      
+      private var _mpLobbyReturnRole:String = null;
+      
+      private var _mpLobbyReturnFrames:int = 0;
+      
+      private var _mpCharacterOptions:Array = null;
+      
+      private var _mpLastCapturedCharacterId:String = "";
+      
+      private var _mpLastCapturedCharacterIndex:int = -999;
+      
+      private var framecounter2:int = 0;
+      
+      private var _leaderboard_spinner_visible:Boolean;
+      
+      public function NewFrontendMenu()
+      {
+         this._state = NewFrontendMenuState.SPLASH;
+         this._mpBridge = new MultiplayerBridge();
+         this._mpBridge.onStatus = this.mpBridgeStatusHandler;
+         this._mpBridge.onError = this.mpBridgeErrorHandler;
+         this._mpBridge.onServerList = this.mpBridgeServerListHandler;
+         this._mpBridge.onLobbyState = this.mpBridgeLobbyStateHandler;
+         this._mpBridge.onGameStart = this.mpBridgeGameStartHandler;
+         this._mpBridge.onConfig = this.mpBridgeConfigHandler;
+         this._mpBridge.onLobbyReturn = this.mpBridgeLobbyReturnHandler;
+         this._playGameItem = new MenuItemExpandable("AI_UI_FRONTEND_PLAY_GAME");
+         this._extrasItem = new MenuItemExpandable("AI_UI_FRONTEND_EXTRAS");
+         this._storeItem = new MenuItem("AI_UI_FRONTEND_STORE",this.storeHandler);
+         this._selectStorageDeviceItem = new MenuItem("AI_UI_FRONTEND_SELECT_STORAGE_DEVICE",this.selectStorageDeviceHandler);
+         this._campaignItem = new MenuItemExpandable("AI_UI_FRONTEND_CAMPAIGN",this.campaignHandler);
+         this._twoTeamsItem = new MenuItemExpandable("AI_UI_DLC_NOSTROMO_TWO_TEAMS_TITLE");
+         this._ripleyItem = new MenuItemExpandable("AI_UI_DLC_NOSTROMO_RIPLEY_TITLE");
+         this._survivorItem = new MenuItem("AI_UI_FRONTEND_SURVIVOR",this.survivorHandler);
+         this._createServerItem = new MenuItemExpandable("Create Server");
+         this._onlineCampaignItem = new MenuItemExpandable("Campaign");
+         this._onlineSurvivorItem = new MenuItem("Survival",this.onlineSurvivor);
+         this._joinServerItem = new MenuItemExpandable("Join Server");
+         this._joinServerItem.addEventListener(MenuItemEvent.ITEM_PRESS,this.joinServerBrowserPressedHandler,false,0,true);
+         this._directIpJoinItem = new MenuItemExpandable("Join Direct IP: " + this.mpGetDirectJoinAddressLabel());
+         this._directIpJoinItem.addEventListener(MenuItemEvent.ITEM_PRESS,this.joinDirectIpHandler,false,0,true);
+         this._serverNameItem = new MenuItem("Server Name: " + this._serverNameValue);
+         this._serverPasswordItem = new MenuItem("Password: " + this.mpGetMaskedPasswordLabel());
+         this._survivorMapIds = ["survival_auto"];
+         this._survivorMapLabels = ["Auto Survivor Map"];
+         this._survivorMapDescriptions = ["Uses the first available survivor map until the game playlist data is loaded"];
+         this._serverModeItem = new MenuItemOptionOptionStepper("Game Mode",["campaign","survival"],["Campaign","Survival"],this.serverModeChangedHandler);
+         this._serverMapItem = new MenuItemOptionOptionStepper("Survivor Map",this._survivorMapIds,this._survivorMapLabels,this.serverMapChangedHandler);
+         this._serverMaxPlayersItem = new MenuItemOptionOptionStepper("Max Players",[2,3,4],["2 Players","3 Players","4 Players"],this.serverMaxPlayersChangedHandler);
+         this._serverVisibilityItem = new MenuItemOptionOptionStepper("Visibility",["public","private"],["Public","Private"],this.serverVisibilityChangedHandler);
+         this._serverStartItem = new MenuItemExpandable("Create Lobby");
+         this._serverStartItem.addEventListener(MenuItemEvent.ITEM_PRESS,this.startServerHandler,false,0,true);
+         this._serverRefreshItem = new MenuItem("Refresh List",this.refreshServersHandler);
+         this._serverFilterItem = new MenuItemOptionOptionStepper("Filter",["all","campaign","survival"],["All","Campaign","Survival"],this.serverFilterChangedHandler);
+         this._serverLanItem = new MenuItemExpandable("No lobby");
+         this._serverLanItem.addEventListener(MenuItemEvent.ITEM_PRESS,this.joinServerEntryHandler,false,0,true);
+         this._serverLanItem.data = "";
+         this._serverLanItem.enabled = false;
+         this._serverCampaignItem = new MenuItemExpandable("No lobby");
+         this._serverCampaignItem.addEventListener(MenuItemEvent.ITEM_PRESS,this.joinServerEntryHandler,false,0,true);
+         this._serverCampaignItem.data = "";
+         this._serverCampaignItem.enabled = false;
+         this._serverSurvivalItem = new MenuItemExpandable("No lobby");
+         this._serverSurvivalItem.addEventListener(MenuItemEvent.ITEM_PRESS,this.joinServerEntryHandler,false,0,true);
+         this._serverSurvivalItem.data = "";
+         this._serverSurvivalItem.enabled = false;
+         this._hostLobbyStatusItem = new MenuItem("Status: Waiting for players");
+         this._hostLobbyPlayer1Item = new MenuItem("1  Owner    You    Ready");
+         this._hostLobbyPlayer2Item = new MenuItem("2  Empty");
+         this._hostLobbyPlayer3Item = new MenuItem("3  Empty");
+         this._hostLobbyPlayer4Item = new MenuItem("4  Empty");
+         this._hostLobbyKick2Item = new MenuItem("Kick Player 2",this.kickLobbyPlayerHandler);
+         this._hostLobbyKick2Item.data = "slot2";
+         this._hostLobbyKick3Item = new MenuItem("Kick Player 3",this.kickLobbyPlayerHandler);
+         this._hostLobbyKick3Item.data = "slot3";
+         this._hostLobbyKick4Item = new MenuItem("Kick Player 4",this.kickLobbyPlayerHandler);
+         this._hostLobbyKick4Item.data = "slot4";
+         this._hostLobbyStartGameItem = new MenuItem("Start Game",this.startLobbyGameHandler);
+         this._hostLobbyLeaveItem = new MenuItem("Close Lobby",this.leaveLobbyHandler);
+         this._clientLobbyStatusItem = new MenuItem("Status: Joined lobby");
+         this._clientLobbyPlayer1Item = new MenuItem("1  Owner    Host");
+         this._clientLobbyPlayer2Item = new MenuItem("2  You      Waiting");
+         this._clientLobbyReadyItem = new MenuItemOptionCheckBox("Ready",true,["Ready","Not Ready"],this.readyChangedHandler);
+         this._clientLobbyLeaveItem = new MenuItem("Leave Lobby",this.leaveLobbyHandler);
+         this._startGameItem = new MenuItemExpandable("AI_UI_FRONTEND_START_GAME");
+         this._startOnlineGameItem = new MenuItemExpandable("AI_UI_FRONTEND_START_GAME");
+         this._newGamePlusItem = new MenuItem("AI_UI_FRONTEND_NEW_GAME_PLUS");
+         this._continueGameItem = new MenuItem("AI_UI_FRONTEND_CONTINUE_GAME",this.continueGameHandler);
+         this._continueOnlineGameItem = new MenuItem("AI_UI_FRONTEND_CONTINUE_GAME",this.continueOnlineGameHandler);
+         this._selectLevelItem = new MenuItemExpandable("Select Level");
+         this._multiplayerItem = new MenuItemExpandable("Multiplayer");
+         this._twoTeamsNoviceDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_NOVICE",this.twoTeamsNoviceDifficultyHandler);
+         this._twoTeamsEasyDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_EASY",this.twoTeamsEasyDifficultyHandler);
+         this._twoTeamsMediumDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_MEDIUM",this.twoTeamsMediumDifficultyHandler);
+         this._twoTeamsHardDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_HARD",this.twoTeamsHardDifficultyHandler);
+         this._twoTeamsIronDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_EXPERT",this.twoTeamsIronDifficultyHandler);
+         this._ripleyNoviceDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_NOVICE",this.ripleyNoviceDifficultyHandler);
+         this._ripleyEasyDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_EASY",this.ripleyEasyDifficultyHandler);
+         this._ripleyMediumDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_MEDIUM",this.ripleyMediumDifficultyHandler);
+         this._ripleyHardDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_HARD",this.ripleyHardDifficultyHandler);
+         this._ripleyIronDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_EXPERT",this.ripleyIronDifficultyHandler);
+         this._noviceDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_NOVICE",this.noviceDifficultyHandler);
+         this._easyDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_EASY",this.easyDifficultyHandler);
+         this._mediumDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_MEDIUM",this.mediumDifficultyHandler);
+         this._hardDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_HARD",this.hardDifficultyHandler);
+         this._ironDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_EXPERT",this.ironDifficultyHandler);
+         this._headTrackingOnItem = new MenuItemExpandable("AI_UI_MENU_QUALITY_NAME_ON",this.headTrackingOnHandler);
+         this._headTrackingOffItem = new MenuItemExpandable("AI_UI_MENU_QUALITY_NAME_OFF",this.headTrackingOffHandler);
+         this._movementDetectionOnItem = new MenuItemExpandable("AI_UI_MENU_QUALITY_NAME_ON",this.movementDetectionOnHandler);
+         this._movementDetectionOffItem = new MenuItemExpandable("AI_UI_MENU_QUALITY_NAME_OFF",this.movementDetectionOffHandler);
+         this._noiseDetectionOnItem = new MenuItemExpandable("AI_UI_MENU_QUALITY_NAME_ON",this.noiseDetectionOnHandler);
+         this._noiseDetectionOffItem = new MenuItemExpandable("AI_UI_MENU_QUALITY_NAME_OFF",this.noiseDetectionOffHandler);
+         this._mementoMoriOnItem = new MenuItemExpandable("AI_UI_MENU_QUALITY_NAME_ON",this.mementoMoriOnHandler);
+         this._mementoMoriOffItem = new MenuItemExpandable("AI_UI_MENU_QUALITY_NAME_OFF",this.mementoMoriOffHandler);
+         this._creditsItem = new MenuItem("AI_UI_FRONTEND_CREDITS",this.creditsHandler);
+         this._imageGalleryItem = new MenuItem("AI_UI_FRONTEND_GALLERY");
+         this._devDiariesItem = new MenuItemExpandable("AI_UI_FRONTEND_DEV_DIARIES");
+         this._achievementsItem = new MenuItem("AI_UI_FRONTEND_ACHIEVEMENTS");
+         this._makingOfItem = new MenuItem("AI_UI_FRONTEND_MAKING_OF");
+         this._deletedScenesItem = new MenuItem("AI_UI_FRONTEND_DELETED_SCENES");
+         this._trailerItem = new MenuItem("AI_UI_FRONTEND_TRAILER");
+         addFrameScript(0,this.frame1,9,this.frame10,19,this.frame20,29,this.frame30,35,this.frame36,45,this.frame46,53,this.frame54);
+         super("fe_");
+         var _loc1_:MenuPage = new MenuPage();
+         _loc1_.id = MenuPageId.ROOT;
+         _loc1_.addItem(this._playGameItem);
+         _loc1_.addItem(this._multiplayerItem);
+         _loc1_.addItem(_optionsItem);
+         _loc1_.addItem(this._extrasItem);
+         _loc1_.addItem(this._storeItem);
+         _loc1_.addItem(_helpItem);
+         _loc1_.addItem(_quitGameItem);
+         _optionsItem.page.addItem(this._selectStorageDeviceItem);
+         this._playGameItem.page.addItem(this._campaignItem);
+         this._playGameItem.page.addItem(this._twoTeamsItem);
+         this._playGameItem.page.addItem(this._ripleyItem);
+         this._playGameItem.page.addItem(this._survivorItem);
+         this._multiplayerItem.page.addItem(this._createServerItem);
+         this._multiplayerItem.page.addItem(this._joinServerItem);
+         this._multiplayerItem.page.addItem(this._directIpJoinItem);
+         this._createServerItem.page.title = "Create Server";
+         this._createServerItem.page.addItem(this._serverNameItem);
+         this._createServerItem.page.addItem(this._serverPasswordItem);
+         this._createServerItem.page.addItem(this._serverModeItem);
+         this._createServerItem.page.addItem(this._serverMapItem);
+         this._createServerItem.page.addItem(this._serverMaxPlayersItem);
+         this._createServerItem.page.addItem(this._serverVisibilityItem);
+         this._createServerItem.page.addItem(this._serverStartItem);
+         this._joinServerItem.page.title = "Server Browser";
+         this._joinServerItem.page.addItem(this._serverRefreshItem);
+         this._joinServerItem.page.addItem(this._serverFilterItem);
+         this._joinServerItem.page.addItem(this._serverLanItem);
+         this._joinServerItem.page.addItem(this._serverCampaignItem);
+         this._joinServerItem.page.addItem(this._serverSurvivalItem);
+         this._serverStartItem.page.title = "Lobby";
+         this._serverStartItem.page.addItem(this._hostLobbyStatusItem);
+         this._serverStartItem.page.addItem(this._hostLobbyPlayer1Item);
+         this._serverStartItem.page.addItem(this._hostLobbyPlayer2Item);
+         this._serverStartItem.page.addItem(this._hostLobbyPlayer3Item);
+         this._serverStartItem.page.addItem(this._hostLobbyPlayer4Item);
+         this._serverStartItem.page.addItem(this._hostLobbyKick2Item);
+         this._serverStartItem.page.addItem(this._hostLobbyKick3Item);
+         this._serverStartItem.page.addItem(this._hostLobbyKick4Item);
+         this._serverStartItem.page.addItem(this._hostLobbyStartGameItem);
+         this._serverStartItem.page.addItem(this._hostLobbyLeaveItem);
+         this._serverLanItem.page.title = "Lobby";
+         this._serverLanItem.page.addItem(this._clientLobbyStatusItem);
+         this._serverLanItem.page.addItem(this._clientLobbyPlayer1Item);
+         this._serverLanItem.page.addItem(this._clientLobbyPlayer2Item);
+         this._serverLanItem.page.addItem(this._clientLobbyReadyItem);
+         this._serverLanItem.page.addItem(this._clientLobbyLeaveItem);
+         this._serverCampaignItem.subPage = this._serverLanItem.page;
+         this._serverSurvivalItem.subPage = this._serverLanItem.page;
+         this._directIpJoinItem.subPage = this._serverLanItem.page;
+         this.updateServerMapVisibility();
+         this._onlineCampaignItem.page.addItem(this._startOnlineGameItem);
+         this._onlineCampaignItem.page.addItem(this._continueOnlineGameItem);
+         this._onlineCampaignItem.page.addItem(_loadGameItem);
+         this._onlineCampaignItem.page.addItem(this._selectLevelItem);
+         this._campaignItem.page.addItem(this._startGameItem);
+         this._campaignItem.page.addItem(this._continueGameItem);
+         this._campaignItem.page.addItem(_loadGameItem);
+         this._twoTeamsItem.page.addItem(this._twoTeamsNoviceDifficultyItem);
+         this._twoTeamsItem.page.addItem(this._twoTeamsEasyDifficultyItem);
+         this._twoTeamsItem.page.addItem(this._twoTeamsMediumDifficultyItem);
+         this._twoTeamsItem.page.addItem(this._twoTeamsHardDifficultyItem);
+         this._twoTeamsItem.page.addItem(this._twoTeamsIronDifficultyItem);
+         this._twoTeamsItem.page.defaultSelectedIndex = 2;
+         this._ripleyItem.page.addItem(this._ripleyNoviceDifficultyItem);
+         this._ripleyItem.page.addItem(this._ripleyEasyDifficultyItem);
+         this._ripleyItem.page.addItem(this._ripleyMediumDifficultyItem);
+         this._ripleyItem.page.addItem(this._ripleyHardDifficultyItem);
+         this._ripleyItem.page.addItem(this._ripleyIronDifficultyItem);
+         this._ripleyItem.page.defaultSelectedIndex = 2;
+         this._startGameItem.page.addItem(this._noviceDifficultyItem);
+         this._startGameItem.page.addItem(this._easyDifficultyItem);
+         this._startGameItem.page.addItem(this._mediumDifficultyItem);
+         this._startGameItem.page.addItem(this._hardDifficultyItem);
+         this._startGameItem.page.addItem(this._ironDifficultyItem);
+         this._startOnlineGameItem.page.addItem(this._noviceDifficultyItem);
+         this._startOnlineGameItem.page.addItem(this._easyDifficultyItem);
+         this._startOnlineGameItem.page.addItem(this._mediumDifficultyItem);
+         this._startOnlineGameItem.page.addItem(this._hardDifficultyItem);
+         this._startOnlineGameItem.page.addItem(this._ironDifficultyItem);
+         this._extrasItem.page.addItem(this._creditsItem);
+         this._devDiariesItem.page.addItem(this._makingOfItem);
+         this._devDiariesItem.page.addItem(this._deletedScenesItem);
+         this._devDiariesItem.page.addItem(this._trailerItem);
+         extras.backButtonCallback = this.backButtonCallback;
+         menu.extrasTopLevel = true;
+         menu.additionalDescription = description;
+         menu.additionalTransitions = transitions;
+         menu.extras = extras;
+         menu.moviePlayer = moviePlayer;
+         menu.rootPage = _loc1_;
+         this.mapSelection = this.mapSelectionParent.selectionScreen as MapSelection;
+         this.characterSelection = this.characterSelectionParent.selectionScreen as CharacterSelection;
+         this.mapSelection.menu = menu;
+         this.mapSelection.leaderboardLoadedCallback = this.leaderboardLoadedCallback;
+         this.mapSelection.leaderboard_loading_spinner_mc = this.leaderboard_loading_spinner_mc;
+         menu.addEventListener(MenuEvent.INACTIVITY,this.menuInactivityHandler);
+         addEventListener(MovieClipExEvent.STOP,this.movieStopHandler);
+         addEventListener(Event.ENTER_FRAME,this.mpCharacterSelectionFrameHandler,false,0,true);
+         if(Extensions.isGFxPlayer)
+         {
+            stage.addEventListener(InputEvent.INPUT,this.startInputHandler,false,0,true);
+         }
+         this.__setProp_description_Scene1_description_0();
+         this.__setProp_userProfilePanel_Scene1_profile_0();
+      }
+      
+      public static function requestState(param1:NewFrontendMenuState) : void
+      {
+         if(param1 != null)
+         {
+            ExternalInterface.call("fe_set_state",param1.id);
+         }
+      }
+      
+      public function pressed_leaderboards() : *
+      {
+      }
+      
+      public function pressed_view_player_info() : *
+      {
+      }
+      
+      public function pressed_changed_filter() : *
+      {
+      }
+      
+      public function transition_in_spinner() : *
+      {
+         trace("transition_in_spinner called");
+         if(this.leaderboard_loading_spinner_mc)
+         {
+            this._leaderboard_spinner_visible = true;
+            this.leaderboard_loading_spinner_mc.gotoAndPlay("trans_in");
+         }
+      }
+      
+      public function transition_out_spinner() : *
+      {
+         trace("transition_out_spinner called");
+         if(this.leaderboard_loading_spinner_mc && this._leaderboard_spinner_visible)
+         {
+            this._leaderboard_spinner_visible = false;
+            this.leaderboard_loading_spinner_mc.gotoAndPlay("trans_out");
+         }
+      }
+      
+      override public function init_image_substitution(param1:String, param2:Boolean, param3:Boolean) : void
+      {
+         trace("New image substitution for NewFrontendMenu");
+         if(param2)
+         {
+            this.mapSelection.leaderboardTutorialLabel.text = "Select challenge             ";
+            this.mapSelection.set_is_using_keyboard(true);
+            this.characterSelection.set_is_using_keyboard(true);
+            this.mapSelection.mapSelectTutorialLabel.text = "Challenge selection           ";
+            this.mapSelection.mapSelectTutorialNoLeaderboardLabel.text = "No leaderboard data                         ";
+            this.characterSelection.characterSelectionTutorialLabel.text = "AI_UI_TIP_CHARACTER_SELECTION_KB";
+            this.splashText.text = "~AI_UI_FRONTEND_PRESS_TO_START_KB";
+         }
+         else
+         {
+            this.mapSelection.leaderboardTutorialLabel.text = "Select challenge        ";
+            this.mapSelection.mapSelectTutorialLabel.text = "Challenge selection      ";
+            this.mapSelection.mapSelectTutorialNoLeaderboardLabel.text = "No leaderboard data                   ";
+            this.characterSelection.characterSelectionTutorialLabel.text = "AI_UI_TIP_CHARACTER_SELECTION";
+            this.splashText.text = "~AI_UI_FRONTEND_PRESS_TO_START";
+            this.mapSelection.set_is_using_keyboard(false);
+            this.characterSelection.set_is_using_keyboard(false);
+         }
+         super.init_image_substitution(param1,param2,param3);
+      }
+      
+      override protected function imageSubstitutionLoadedCallback() : void
+      {
+         super.imageSubstitutionLoadedCallback();
+         _imageSubstitution.Add_TextField(this.splashText.textField);
+         _imageSubstitution.Add_TextField(this.characterSelection.characterSelectionTutorialLabel);
+         _imageSubstitution.Add_TextField(this.network_notification_mc.network_notification_sub_mc.txt);
+         _imageSubstitution.Add_TextField(this.mapSelection.leaderboardTutorialLabel);
+         _imageSubstitution.Add_TextField(this.mapSelection.mapSelectTutorialLabel);
+         _imageSubstitution.Add_TextField(this.mapSelection.mapSelectTutorialNoLeaderboardLabel);
+         this.mapSelection.applyImageSubstitution(_imageSubstitution);
+      }
+      
+      private function leaderboardLoadedCallback() : void
+      {
+         this.mapSelection.applyImageSubstitution(_imageSubstitution);
+      }
+      
+      private function backButtonCallback() : Boolean
+      {
+         return undefined;
+      }
+      
+      public function populate_leaderboard(param1:Array, param2:Number, param3:Number) : void
+      {
+         this.mapSelection.populateLeaderboard(param1,param2,param3);
+      }
+      
+      public function update_leaderboard_enabled(param1:Boolean, param2:String) : void
+      {
+         this.mapSelection.update_leaderboard_enabled(param1,param2);
+      }
+      
+      public function set_best_score_and_time(param1:Number, param2:Number) : void
+      {
+         this.mapSelection.set_best_score_and_time(param1,param2);
+      }
+      
+      public function set_leaderboard_focused(param1:Boolean) : void
+      {
+         this.mapSelection.set_leaderboard_focused(param1);
+      }
+      
+      public function setLanguage(param1:int) : void
+      {
+      }
+      
+      public function addStartGameSettings(param1:int) : void
+      {
+      }
+      
+      public function addLevel(param1:String) : void
+      {
+         var _loc2_:MenuItem = new MenuItem(param1,this.levelSelectionHandler);
+         _loc2_.data = param1;
+         this._selectLevelItem.page.addItem(_loc2_);
+      }
+      
+      public function addDLC(param1:String, param2:String, param3:String, param4:int, param5:Boolean) : void
+      {
+      }
+      
+      public function removeAllPlaylists() : void
+      {
+         this.mapSelection.removeAllPlaylists();
+         this.resetCachedSurvivorMaps();
+      }
+      
+      public function setPackagePlaylists(param1:int, param2:String, param3:Array) : void
+      {
+         this.mapSelection.setPackagePlaylists(param1,param2,param3);
+         this.cacheSurvivorMapArray(param3,"package_" + String(param1));
+      }
+      
+      public function setCustomPlaylists(param1:Array) : void
+      {
+         this.mapSelection.setCustomPlaylists(param1);
+         this.cacheSurvivorMapArray(param1,"custom");
+      }
+      
+      public function setMarathonPlaylist(param1:PlaylistData) : void
+      {
+         this.mapSelection.setMarathonPlaylist(param1);
+         this.cacheSurvivorMapCandidate(param1,"marathon",0);
+      }
+      
+      public function setPlaylistDetails(param1:PlaylistDetailsData) : void
+      {
+         this.mapSelection.setPlaylistDetails(param1);
+      }
+      
+      public function setCharacterSelection(characters:Array) : void
+      {
+         this._mpCharacterOptions = characters;
+         this._mpLastCapturedCharacterId = "";
+         this._mpLastCapturedCharacterIndex = -999;
+         this.characterSelection.setCharacters(characters);
+         requestState(NewFrontendMenuState.DLC_CHAR);
+         this.mpCaptureCurrentCharacterSelection("gfx-character-options",false);
+         if(this._mpPendingStartGame && this._mpPendingStartMode == "survival")
+         {
+            this._mpPendingStartGame = false;
+            this.show_network_notification("Select a character");
+            this._mpBridge.ackStartGame(this._mpPendingSessionId,"character_selection_opened");
+         }
+      }
+      
+      public function setSurvivorModeInfo(param1:String, param2:String) : void
+      {
+         this._survivorItem.name = param1;
+         this._survivorItem.description = param2;
+      }
+      
+      public function restartInactivityTimer() : void
+      {
+         menu.restartInactivityTimer();
+      }
+      
+      public function setState(param1:int, param2:Boolean) : void
+      {
+         var _loc4_:NewFrontendMenuState = null;
+         var _loc5_:String = null;
+         var _loc3_:NewFrontendMenuState = NewFrontendMenuState.getState(param1);
+         if(_loc3_ != null)
+         {
+            _loc4_ = this._state;
+            _loc5_ = this._state.getTransition(_loc3_.id);
+            this._state = _loc3_;
+            if(menu != null)
+            {
+               if(NewFrontendMenuState.MENU.equals(this._state))
+               {
+                  menuParent.menuOnStage = true;
+               }
+               menu.inputEnabled = Boolean(Boolean(Boolean(Boolean(Boolean(Boolean(NewFrontendMenuState.MENU.equals(this._state)))))));
+            }
+            if(this.mapSelection != null)
+            {
+               if(NewFrontendMenuState.DLC_MAP.equals(this._state))
+               {
+                  this.mapSelectionParent.selectionScreenOnStage = true;
+               }
+               this.mapSelection.initSelectionEnabled = !NewFrontendMenuState.DLC_CHAR.equals(_loc4_);
+               this.mapSelection.inputEnabled = Boolean(Boolean(Boolean(Boolean(Boolean(Boolean(NewFrontendMenuState.DLC_MAP.equals(this._state)))))));
+            }
+            if(this.characterSelection != null)
+            {
+               if(NewFrontendMenuState.DLC_CHAR.equals(this._state))
+               {
+                  this.characterSelectionParent.selectionScreenOnStage = true;
+               }
+               this.characterSelection.initSelectionEnabled = true;
+               this.characterSelection.inputEnabled = Boolean(Boolean(Boolean(Boolean(Boolean(Boolean(NewFrontendMenuState.DLC_CHAR.equals(this._state)))))));
+            }
+            if(param2 && DisplayUtil.frameLabelExists(_loc5_,this))
+            {
+               playTransition(_loc5_);
+            }
+            else
+            {
+               if(!DisplayUtil.frameLabelExists(_loc3_.name,this))
+               {
+                  throw new Error("No label for NewFrontendMenuState: " + _loc3_.name);
+               }
+               DisplayUtil.stopOnLabel(_loc3_.name,this);
+            }
+         }
+      }
+      
+      private function campaignHandler(param1:MenuPageEvent) : void
+      {
+      }
+      
+      private function survivorHandler(param1:MenuItemEvent) : void
+      {
+         ExternalInterface.call("request_map_selection");
+      }
+      
+      private function createServer(param1:MenuItemEvent) : void
+      {
+      }
+      
+      private function onlineSurvivor(param1:MenuItemEvent) : void
+      {
+         ExternalInterface.call("request_map_selection");
+      }
+      
+      private function joinServer(param1:MenuItemEvent) : void
+      {
+      }
+      
+      private function serverModeChangedHandler(param1:MenuItemEvent) : void
+      {
+         this.updateServerMapVisibility();
+      }
+      
+      private function serverMapChangedHandler(param1:MenuItemEvent) : void
+      {
+      }
+      
+      private function serverMaxPlayersChangedHandler(param1:MenuItemEvent) : void
+      {
+      }
+      
+      private function serverVisibilityChangedHandler(param1:MenuItemEvent) : void
+      {
+      }
+      
+      private function serverFilterChangedHandler(param1:MenuItemEvent) : void
+      {
+         this.applyServerFilter(String(this._serverFilterItem.selectedItem));
+      }
+      
+      private function refreshServersHandler(param1:MenuItemEvent) : void
+      {
+         this.show_network_notification("Refreshing server list");
+         this._mpBridge.refreshServers(String(this._serverFilterItem.selectedItem));
+      }
+      
+      private function joinServerBrowserPressedHandler(param1:MenuItemEvent) : void
+      {
+         this.show_network_notification("Refreshing server list");
+         this._mpBridge.refreshServers(String(this._serverFilterItem.selectedItem));
+      }
+      
+      private function joinServerEntryHandler(param1:MenuItemEvent) : void
+      {
+         var serverId:String = "";
+         if(param1 != null && param1.item != null && param1.item.data != null)
+         {
+            serverId = String(param1.item.data);
+         }
+         if(serverId == null || serverId.length == 0)
+         {
+            this.show_network_notification("No lobby selected");
+            return;
+         }
+         this.show_network_notification("Joining lobby");
+         this._mpBridge.joinServer(serverId);
+      }
+      
+      private function joinDirectIpHandler(param1:MenuItemEvent) : void
+      {
+         this.show_network_notification("Joining " + this.mpGetDirectJoinAddressLabel());
+         this._mpBridge.joinDirectIp();
+      }
+      
+      private function startServerHandler(param1:MenuItemEvent) : void
+      {
+         this.show_network_notification("Creating lobby");
+         this._mpBridge.createLobby(String(this._serverModeItem.selectedItem),int(this._serverMaxPlayersItem.selectedItem),String(this._serverVisibilityItem.selectedItem),this.getSelectedSurvivorMapId(),this.getSelectedSurvivorMapName());
+      }
+      
+      private function readyChangedHandler(param1:MenuItemEvent) : void
+      {
+         this._mpBridge.setReady(Boolean(this._clientLobbyReadyItem.selected));
+      }
+      
+      private function kickLobbyPlayerHandler(param1:MenuItemEvent) : void
+      {
+         this.show_network_notification("Kick requested");
+         this._mpBridge.kickPlayer(String(param1.item.data));
+      }
+      
+      private function startLobbyGameHandler(param1:MenuItemEvent) : void
+      {
+         this.show_network_notification("Starting game");
+         this._mpBridge.startGame(String(this._serverModeItem.selectedItem),this.getSelectedSurvivorMapId(),this.getSelectedSurvivorMapName());
+      }
+      
+      private function leaveLobbyHandler(param1:MenuItemEvent) : void
+      {
+         this.show_network_notification("Leaving lobby");
+         this._mpBridge.leaveLobby();
+      }
+      
+      public function mp_update_lobby(param1:String) : void
+      {
+         this._hostLobbyStatusItem.name = "Status: " + param1;
+         this._clientLobbyStatusItem.name = "Status: " + param1;
+         this.refreshNetworkMenuRenderers();
+      }
+      
+      public function mp_set_lobby_players(param1:String, param2:String, param3:String, param4:String) : void
+      {
+         this._hostLobbyPlayer1Item.name = param1;
+         this._hostLobbyPlayer2Item.name = param2;
+         this._hostLobbyPlayer3Item.name = param3;
+         this._hostLobbyPlayer4Item.name = param4;
+         this._clientLobbyPlayer1Item.name = param1;
+         this._clientLobbyPlayer2Item.name = param2;
+         this.refreshNetworkMenuRenderers();
+      }
+      
+      private function mpBridgeConfigHandler(param1:Object) : void
+      {
+         var _loc2_:String = null;
+         var _loc3_:String = null;
+         var _loc4_:String = null;
+         var _loc5_:String = null;
+         if(param1 == null)
+         {
+            return;
+         }
+         _loc2_ = String(param1["serverName"]);
+         if(_loc2_ != null && _loc2_ != "undefined")
+         {
+            this._serverNameValue = _loc2_;
+         }
+         _loc3_ = String(param1["serverPassword"]);
+         if(_loc3_ != null && _loc3_ != "undefined")
+         {
+            this._serverPasswordValue = _loc3_;
+         }
+         _loc4_ = String(param1["hostIp"]);
+         if(_loc4_ != null && _loc4_ != "undefined" && _loc4_.length > 0)
+         {
+            this._directJoinHostIpValue = _loc4_;
+         }
+         _loc5_ = String(param1["port"]);
+         if(_loc5_ != null && _loc5_ != "undefined" && _loc5_.length > 0)
+         {
+            this._directJoinPortValue = _loc5_;
+         }
+         this.mpRefreshServerConfigItems();
+      }
+      
+      private function mpRefreshServerConfigItems() : void
+      {
+         var _loc1_:String = this._serverNameValue;
+         if(_loc1_ == null || _loc1_.length == 0)
+         {
+            _loc1_ = "Alien Isolation MP Test";
+         }
+         if(this._serverNameItem != null)
+         {
+            this._serverNameItem.name = "Server Name: " + _loc1_;
+         }
+         if(this._serverPasswordItem != null)
+         {
+            this._serverPasswordItem.name = "Password: " + this.mpGetMaskedPasswordLabel();
+         }
+         if(this._directIpJoinItem != null)
+         {
+            this._directIpJoinItem.name = "Join Direct IP: " + this.mpGetDirectJoinAddressLabel();
+         }
+         this.refreshNetworkMenuRenderers();
+      }
+      
+      private function mpGetDirectJoinAddressLabel() : String
+      {
+         var _loc1_:String = this._directJoinHostIpValue;
+         var _loc2_:String = this._directJoinPortValue;
+         if(_loc1_ == null || _loc1_.length == 0)
+         {
+            _loc1_ = "127.0.0.1";
+         }
+         if(_loc2_ == null || _loc2_.length == 0)
+         {
+            _loc2_ = "28015";
+         }
+         return _loc1_ + ":" + _loc2_;
+      }
+      
+      private function mpGetMaskedPasswordLabel() : String
+      {
+         var _loc1_:int = 0;
+         var _loc2_:String = "";
+         if(this._serverPasswordValue == null || this._serverPasswordValue.length == 0)
+         {
+            return "<empty>";
+         }
+         while(_loc1_ < this._serverPasswordValue.length && _loc1_ < 12)
+         {
+            _loc2_ += "*";
+            _loc1_++;
+         }
+         if(this._serverPasswordValue.length > 12)
+         {
+            _loc2_ += "+";
+         }
+         return _loc2_;
+      }
+      
+      private function mpBridgeStatusHandler(param1:String) : void
+      {
+         this.show_network_notification(param1);
+         this._hostLobbyStatusItem.name = "Status: " + param1;
+         this._clientLobbyStatusItem.name = "Status: " + param1;
+         this.refreshNetworkMenuRenderers();
+      }
+      
+      private function mpBridgeErrorHandler(param1:String) : void
+      {
+         this.show_network_notification(param1);
+         this._hostLobbyStatusItem.name = "Error: " + param1;
+         this._clientLobbyStatusItem.name = "Error: " + param1;
+         this.refreshNetworkMenuRenderers();
+      }
+      
+      private function mpBridgeServerListHandler(param1:Array) : void
+      {
+         this.updateServerRow(this._serverLanItem,param1.length > 0 ? param1[0] : null,0);
+         this.updateServerRow(this._serverCampaignItem,param1.length > 1 ? param1[1] : null,1);
+         this.updateServerRow(this._serverSurvivalItem,param1.length > 2 ? param1[2] : null,2);
+         this.show_network_notification("Server list updated");
+         this.refreshNetworkMenuRenderers();
+      }
+      
+      private function updateServerRow(row:Object, server:Object, rowIndex:int) : void
+      {
+         if(row == null)
+         {
+            return;
+         }
+         if(server == null)
+         {
+            row.name = "No lobby";
+            row.enabled = false;
+            row.data = "";
+            return;
+         }
+         var serverName:String = String(getObjectString(server,"name","Server"));
+         var serverMode:String = String(getObjectString(server,"mode","Survival"));
+         var serverPlayers:String = String(getObjectString(server,"players","1"));
+         var serverMaxPlayers:String = String(getObjectString(server,"maxPlayers",""));
+         if(serverMaxPlayers != null && serverMaxPlayers.length > 0)
+         {
+            serverPlayers += "/" + serverMaxPlayers;
+         }
+         var serverPing:String = String(getObjectString(server,"ping","LAN"));
+         var serverMap:String = String(getObjectString(server,"mapName","Auto Map"));
+         row.name = serverName + " | " + serverMode + " | " + serverMap + " | " + serverPlayers + " | " + serverPing;
+         row.enabled = true;
+         row.data = getObjectString(server,"id","");
+      }
+      
+      private function getObjectString(source:Object, key:String, fallback:String) : String
+      {
+         var value:* = undefined;
+         try
+         {
+            if(source != null)
+            {
+               value = source[key];
+               if(value != undefined && value != null && String(value) != "undefined")
+               {
+                  return String(value);
+               }
+            }
+         }
+         catch(error:Error)
+         {
+         }
+         return fallback == null ? "" : fallback;
+      }
+      
+      private function mpBridgeLobbyStateHandler(param1:String, param2:String, param3:String, param4:String, param5:String, param6:String) : void
+      {
+         this._hostLobbyStatusItem.name = "Status: " + param2;
+         this._clientLobbyStatusItem.name = "Status: " + param2;
+         this._hostLobbyPlayer1Item.name = param3;
+         this._hostLobbyPlayer2Item.name = param4;
+         this._hostLobbyPlayer3Item.name = param5;
+         this._hostLobbyPlayer4Item.name = param6;
+         this._clientLobbyPlayer1Item.name = param3;
+         this._clientLobbyPlayer2Item.name = param4;
+         this.refreshNetworkMenuRenderers();
+      }
+      
+      private function mpBridgeLobbyReturnHandler(param1:String) : void
+      {
+         this._mpLobbyReturnRole = param1 == "host" ? "host" : "client";
+         this._mpLobbyReturnFrames = 0;
+         removeEventListener(Event.ENTER_FRAME,this.mpLobbyReturnFrameHandler);
+         addEventListener(Event.ENTER_FRAME,this.mpLobbyReturnFrameHandler);
+      }
+      
+      private function mpLobbyReturnFrameHandler(param1:Event) : void
+      {
+         this._mpLobbyReturnFrames++;
+         if(this._mpLobbyReturnRole == null || this._mpLobbyReturnFrames > 3600)
+         {
+            this.mpStopLobbyReturn();
+            return;
+         }
+         if(menu == null || this._state == null)
+         {
+            return;
+         }
+         if(NewFrontendMenuState.SPLASH.equals(this._state))
+         {
+            if(this._mpLobbyReturnFrames == 30)
+            {
+               this.setState(NewFrontendMenuState.MENU.id,true);
+            }
+            return;
+         }
+         if(!NewFrontendMenuState.MENU.equals(this._state))
+         {
+            return;
+         }
+         this.mpOpenLobbyPage(this._mpLobbyReturnRole);
+         this.mpStopLobbyReturn();
+      }
+      
+      private function mpOpenLobbyPage(param1:String) : void
+      {
+         var _loc2_:MenuPage = param1 == "host" ? this._serverStartItem.page : this._serverLanItem.page;
+         try
+         {
+            menu.rebuildPageMap();
+            menu.setCurrentPage(_loc2_.id.value,0);
+            this.show_network_notification("Retour au lobby");
+         }
+         catch(error:Error)
+         {
+         }
+         this.refreshNetworkMenuRenderers();
+      }
+      
+      private function mpStopLobbyReturn() : void
+      {
+         removeEventListener(Event.ENTER_FRAME,this.mpLobbyReturnFrameHandler);
+         this._mpLobbyReturnRole = null;
+      }
+      
+      private function refreshNetworkMenuRenderers() : void
+      {
+         try
+         {
+            if(this.menu != null)
+            {
+               this.menu.invalidateData();
+               this.menu.invalidateRenderers();
+            }
+         }
+         catch(error:Error)
+         {
+         }
+      }
+      
+      private function resetCachedSurvivorMaps() : void
+      {
+         this._survivorMapIds = ["survival_auto"];
+         this._survivorMapLabels = ["Auto Survivor Map"];
+         this._survivorMapDescriptions = ["Uses the first available survivor map until the game playlist data is loaded"];
+         this.refreshSurvivorMapOptions();
+      }
+      
+      private function cacheSurvivorMapArray(param1:Array, param2:String) : void
+      {
+         var _loc3_:int = 0;
+         if(param1 == null)
+         {
+            return;
+         }
+         while(_loc3_ < param1.length)
+         {
+            this.cacheSurvivorMapCandidate(param1[_loc3_],param2,_loc3_);
+            _loc3_++;
+         }
+      }
+      
+      private function cacheSurvivorMapCandidate(param1:Object, param2:String, param3:int) : void
+      {
+         var _loc4_:String = null;
+         var _loc5_:String = null;
+         if(param1 == null)
+         {
+            return;
+         }
+         _loc4_ = this.extractFirstString(param1,["id","Id","ID","identifier","Identifier","playlistId","PlaylistId","playlist_id","challengeId","ChallengeId","mapId","MapId","name","Name","title","Title"]);
+         _loc5_ = this.extractFirstString(param1,["title","Title","displayName","DisplayName","name","Name","label","Label","playlistName","PlaylistName","challengeName","ChallengeName","mapName","MapName"]);
+         if(_loc4_ == null || _loc4_.length == 0)
+         {
+            _loc4_ = param2 + "_" + String(param3);
+         }
+         if(_loc5_ == null || _loc5_.length == 0)
+         {
+            _loc5_ = "Survivor Map " + String(this._survivorMapIds.length);
+         }
+         this.addSurvivorMapOption(_loc4_,_loc5_);
+      }
+      
+      private function addSurvivorMapOption(param1:String, param2:String) : void
+      {
+         var _loc3_:int = 0;
+         if(param1 == null || param1.length == 0)
+         {
+            return;
+         }
+         while(_loc3_ < this._survivorMapIds.length)
+         {
+            if(String(this._survivorMapIds[_loc3_]) == param1)
+            {
+               return;
+            }
+            _loc3_++;
+         }
+         if(this._survivorMapIds.length == 1 && String(this._survivorMapIds[0]) == "survival_auto")
+         {
+            this._survivorMapIds = [];
+            this._survivorMapLabels = [];
+            this._survivorMapDescriptions = [];
+         }
+         this._survivorMapIds.push(param1);
+         this._survivorMapLabels.push(param2);
+         this._survivorMapDescriptions.push("Host this survivor map: " + param2);
+         this.refreshSurvivorMapOptions();
+      }
+      
+      private function refreshSurvivorMapOptions() : void
+      {
+         if(this._serverMapItem != null)
+         {
+            this._serverMapItem.setItems(this._survivorMapIds,this._survivorMapLabels,this._survivorMapDescriptions);
+            this._serverMapItem.selectedIndex = 0;
+         }
+         this.updateServerMapVisibility();
+         this.refreshNetworkMenuRenderers();
+      }
+      
+      private function updateServerMapVisibility() : void
+      {
+         if(this._serverMapItem != null && this._serverModeItem != null)
+         {
+            this._serverMapItem.visible = String(this._serverModeItem.selectedItem) == "survival";
+         }
+      }
+      
+      private function getSelectedSurvivorMapId() : String
+      {
+         if(String(this._serverModeItem.selectedItem) != "survival")
+         {
+            return "";
+         }
+         if(this._serverMapItem == null || this._serverMapItem.selectedItem == null)
+         {
+            return "survival_auto";
+         }
+         return String(this._serverMapItem.selectedItem);
+      }
+      
+      private function getSelectedSurvivorMapName() : String
+      {
+         if(String(this._serverModeItem.selectedItem) != "survival")
+         {
+            return "";
+         }
+         if(this._serverMapItem == null)
+         {
+            return "Auto Survivor Map";
+         }
+         return this.lookupSurvivorMapLabel(this.getSelectedSurvivorMapId());
+      }
+      
+      private function lookupSurvivorMapLabel(param1:String) : String
+      {
+         var _loc2_:int = 0;
+         while(_loc2_ < this._survivorMapIds.length)
+         {
+            if(String(this._survivorMapIds[_loc2_]) == param1)
+            {
+               return String(this._survivorMapLabels[_loc2_]);
+            }
+            _loc2_++;
+         }
+         return "Auto Survivor Map";
+      }
+      
+      private function extractFirstString(param1:Object, param2:Array) : String
+      {
+         var _loc3_:int = 0;
+         var _loc4_:String = null;
+         var _loc5_:* = undefined;
+         while(_loc3_ < param2.length)
+         {
+            _loc4_ = String(param2[_loc3_]);
+            try
+            {
+               _loc5_ = param1[_loc4_];
+               if(_loc5_ != undefined && _loc5_ != null && String(_loc5_).length > 0)
+               {
+                  return String(_loc5_);
+               }
+            }
+            catch(error:Error)
+            {
+            }
+            _loc3_++;
+         }
+         return "";
+      }
+      
+      private function mpBridgeGameStartHandler(mode:String, mapId:String = null, mapName:String = null, sessionId:String = null) : void
+      {
+         this._mpPendingStartGame = true;
+         this._mpPendingStartMode = mode == null ? "" : mode.toLowerCase();
+         this._mpPendingStartMapId = mapId == null ? "" : mapId;
+         this._mpPendingStartMapName = mapName == null ? "" : mapName;
+         this._mpPendingSessionId = sessionId == null ? "" : sessionId;
+         this._hostLobbyStatusItem.name = "Status: Starting game";
+         this._clientLobbyStatusItem.name = "Status: Starting game";
+         this.refreshNetworkMenuRenderers();
+         this._mpBridge.ackStartGame(this._mpPendingSessionId,"gfx_received_start_game");
+         if(this._mpPendingStartMode == "survival")
+         {
+            this.startPendingSurvivorMap();
+         }
+         else
+         {
+            this.show_network_notification("Campaign MP start not implemented yet");
+            this._mpBridge.ackStartGame(this._mpPendingSessionId,"campaign_not_implemented");
+         }
+      }
+      
+      private function mpCharacterSelectionFrameHandler(event:Event) : void
+      {
+         if(this._state == null || this.characterSelection == null)
+         {
+            return;
+         }
+         if(NewFrontendMenuState.DLC_CHAR.equals(this._state))
+         {
+            this.mpCaptureCurrentCharacterSelection("gfx-character-frame",true);
+         }
+      }
+      
+      private function mpCaptureCurrentCharacterSelection(source:String, confirmed:Boolean) : void
+      {
+         var selectedIndex:int = this.mpGetCharacterSelectedIndex();
+         var data:Object = this.mpGetCharacterDataForIndex(selectedIndex);
+         var characterId:String = this.mpExtractCharacterId(data);
+         var characterName:String = this.mpExtractCharacterName(data);
+         var modelHint:String = this.mpExtractModelHint(data);
+         if(characterId == null || characterId.length == 0)
+         {
+            return;
+         }
+         if(characterName == null || characterName.length == 0)
+         {
+            characterName = characterId;
+         }
+         if(characterId == this._mpLastCapturedCharacterId && selectedIndex == this._mpLastCapturedCharacterIndex)
+         {
+            return;
+         }
+         this._mpLastCapturedCharacterId = characterId;
+         this._mpLastCapturedCharacterIndex = selectedIndex;
+         if(this._mpBridge != null)
+         {
+            this._mpBridge.selectCharacter(this._mpPendingSessionId,characterId,characterName,modelHint,source,confirmed);
+         }
+         this.show_network_notification("Character: " + characterName);
+      }
+      
+      private function mpGetCharacterSelectedIndex() : int
+      {
+         var selectedIndex:int = -1;
+         var fn:Function = null;
+         try
+         {
+            fn = this.characterSelection["get_selected_item_position"] as Function;
+            if(fn != null)
+            {
+               selectedIndex = int(fn.apply(this.characterSelection));
+            }
+         }
+         catch(error1:Error)
+         {
+         }
+         if(selectedIndex >= 0)
+         {
+            return selectedIndex;
+         }
+         try
+         {
+            selectedIndex = int(this.characterSelection["local_menu_selection"]);
+         }
+         catch(error2:Error)
+         {
+         }
+         if(selectedIndex >= 0)
+         {
+            return selectedIndex;
+         }
+         try
+         {
+            if(this.characterSelection["characterGroup"] != null)
+            {
+               selectedIndex = int(this.characterSelection["characterGroup"]["selectedButtonIndex"]);
+            }
+         }
+         catch(error3:Error)
+         {
+         }
+         if(selectedIndex >= 0)
+         {
+            return selectedIndex;
+         }
+         try
+         {
+            if(this.characterSelection["selectedRenderer"] != null)
+            {
+               selectedIndex = int(this.characterSelection["selectedRenderer"]["index"]);
+            }
+         }
+         catch(error4:Error)
+         {
+         }
+         return selectedIndex;
+      }
+      
+      private function mpGetCharacterDataForIndex(selectedIndex:int) : Object
+      {
+         var data:Object = null;
+         try
+         {
+            if(this.characterSelection != null && this.characterSelection["selectedRenderer"] != null)
+            {
+               data = this.characterSelection["selectedRenderer"]["characterData"];
+               if(data != null)
+               {
+                  return data;
+               }
+               data = this.characterSelection["selectedRenderer"]["data"];
+               if(data != null)
+               {
+                  return data;
+               }
+            }
+         }
+         catch(error1:Error)
+         {
+         }
+         try
+         {
+            if(this.characterSelection != null && this.characterSelection["characterInfo"] != null)
+            {
+               data = this.characterSelection["characterInfo"]["characterData"];
+               if(data != null)
+               {
+                  return data;
+               }
+            }
+         }
+         catch(error2:Error)
+         {
+         }
+         if(this._mpCharacterOptions != null && selectedIndex >= 0 && selectedIndex < this._mpCharacterOptions.length)
+         {
+            return this._mpCharacterOptions[selectedIndex];
+         }
+         if(this._mpCharacterOptions != null && this._mpCharacterOptions.length > 0)
+         {
+            return this._mpCharacterOptions[0];
+         }
+         return null;
+      }
+      
+      private function mpExtractCharacterId(data:Object) : String
+      {
+         var value:String = this.extractFirstString(data,["characterId","CharacterId","id","Id","ID","identifier","Identifier","name","Name","entry_character","entryCharacter"]);
+         if(value != null && value.length > 0)
+         {
+            return value;
+         }
+         try
+         {
+            if(data != null && data["getCharacter"] != null)
+            {
+               return String(data["getCharacter"]());
+            }
+         }
+         catch(error:Error)
+         {
+         }
+         return "";
+      }
+      
+      private function mpExtractCharacterName(data:Object) : String
+      {
+         return this.extractFirstString(data,["characterName","CharacterName","displayName","DisplayName","title","Title","name","Name","label","Label"]);
+      }
+      
+      private function mpExtractModelHint(data:Object) : String
+      {
+         return this.extractFirstString(data,["modelHint","ModelHint","model","Model","modelName","ModelName","asset","Asset","assetName","AssetName","texture","Texture","icon","Icon"]);
+      }
+      
+      private function startPendingSurvivorMap() : void
+      {
+         if(this._mpPendingStartMapId == null || this._mpPendingStartMapId.length == 0 || this._mpPendingStartMapId == "survival_auto")
+         {
+            this.show_network_notification("No survivor map selected");
+            this._mpBridge.ackStartGame(this._mpPendingSessionId,"missing_survivor_map");
+            return;
+         }
+         if(this._mpPendingStartMapName != null && this._mpPendingStartMapName.length > 0)
+         {
+            this.show_network_notification("Loading " + this._mpPendingStartMapName);
+         }
+         else
+         {
+            this.show_network_notification("Loading survivor map");
+         }
+         ExternalInterface.call("request_character_selection",this._mpPendingStartMapId);
+      }
+      
+      private function tryAutoStartSurvivorCharacter(characters:Array) : void
+      {
+         this.show_network_notification("Select a character");
+         this._mpBridge.ackStartGame(this._mpPendingSessionId,"character_selection_opened");
+         this._mpPendingStartGame = false;
+      }
+      
+      private function applyServerFilter(param1:String) : void
+      {
+         this._serverLanItem.visible = param1 == "all" || param1 == "campaign";
+         this._serverCampaignItem.visible = param1 == "all" || param1 == "campaign";
+         this._serverSurvivalItem.visible = param1 == "all" || param1 == "survival";
+      }
+      
+      private function twoTeamsNoviceDifficultyHandler(param1:MenuItemEvent) : void
+      {
+         call("play_dlc_two_teams",GameMenu.DIFFICULTY_NOVICE);
+      }
+      
+      private function twoTeamsEasyDifficultyHandler(param1:MenuItemEvent) : void
+      {
+         call("play_dlc_two_teams",GameMenu.DIFFICULTY_EASY);
+      }
+      
+      private function twoTeamsMediumDifficultyHandler(param1:MenuItemEvent) : void
+      {
+         call("play_dlc_two_teams",GameMenu.DIFFICULTY_MEDIUM);
+      }
+      
+      private function twoTeamsHardDifficultyHandler(param1:MenuItemEvent) : void
+      {
+         call("play_dlc_two_teams",GameMenu.DIFFICULTY_HARD);
+      }
+      
+      private function twoTeamsIronDifficultyHandler(param1:MenuItemEvent) : void
+      {
+         call("play_dlc_two_teams",GameMenu.DIFFICULTY_IRON);
+      }
+      
+      private function ripleyNoviceDifficultyHandler(param1:MenuItemEvent) : void
+      {
+         call("play_dlc_ripley",GameMenu.DIFFICULTY_NOVICE);
+      }
+      
+      private function ripleyEasyDifficultyHandler(param1:MenuItemEvent) : void
+      {
+         call("play_dlc_ripley",GameMenu.DIFFICULTY_EASY);
+      }
+      
+      private function ripleyMediumDifficultyHandler(param1:MenuItemEvent) : void
+      {
+         call("play_dlc_ripley",GameMenu.DIFFICULTY_MEDIUM);
+      }
+      
+      private function ripleyHardDifficultyHandler(param1:MenuItemEvent) : void
+      {
+         call("play_dlc_ripley",GameMenu.DIFFICULTY_HARD);
+      }
+      
+      private function ripleyIronDifficultyHandler(param1:MenuItemEvent) : void
+      {
+         call("play_dlc_ripley",GameMenu.DIFFICULTY_IRON);
+      }
+      
+      private function storeHandler(param1:MenuItemEvent) : void
+      {
+         call("open_store");
+      }
+      
+      private function selectStorageDeviceHandler(param1:MenuItemEvent) : void
+      {
+         call("select_storage_device");
+      }
+      
+      private function continueGameHandler(param1:MenuItemEvent) : void
+      {
+         call("load_current_checkpoint");
+      }
+      
+      private function continueOnlineGameHandler(param1:MenuItemEvent) : void
+      {
+         call("load_current_checkpoint");
+      }
+      
+      private function noviceDifficultyHandler(param1:MenuItemEvent) : void
+      {
+         call("start_game",GameMenu.DIFFICULTY_NOVICE);
+      }
+      
+      private function easyDifficultyHandler(param1:MenuItemEvent) : void
+      {
+         call("start_game",GameMenu.DIFFICULTY_EASY);
+      }
+      
+      private function mediumDifficultyHandler(param1:MenuItemEvent) : void
+      {
+         call("start_game",GameMenu.DIFFICULTY_MEDIUM);
+      }
+      
+      private function hardDifficultyHandler(param1:MenuItemEvent) : void
+      {
+         call("start_game",GameMenu.DIFFICULTY_HARD);
+      }
+      
+      private function ironDifficultyHandler(param1:MenuItemEvent) : void
+      {
+         call("start_game",GameMenu.DIFFICULTY_IRON);
+      }
+      
+      private function creditsHandler(param1:MenuItemEvent) : void
+      {
+         call("show_credits_screen");
+      }
+      
+      private function levelSelectionHandler(param1:MenuItemEvent) : void
+      {
+         call("load_level",param1.item.data as String);
+      }
+      
+      private function startMultiplayerServer(levelName:String) : void
+      {
+         if(ExternalInterface.available)
+         {
+            try
+            {
+               ExternalInterface.call("startMultiplayerServer",levelName);
+            }
+            catch(error:Error)
+            {
+               trace("Une erreur s\'est produite lors de l\'appel de startMultiplayerServer: " + error.message);
+            }
+         }
+         else
+         {
+            trace("ExternalInterface n\'est pas disponible.");
+         }
+      }
+      
+      private function menuInactivityHandler(param1:MenuEvent) : void
+      {
+         requestState(NewFrontendMenuState.ATTRACT);
+      }
+      
+      private function movieStopHandler(param1:MovieClipExEvent) : void
+      {
+         if(NewFrontendMenuState.ATTRACT.equals(this._state))
+         {
+            call("show_attract_screen");
+         }
+         if(!NewFrontendMenuState.MENU.equals(this._state))
+         {
+            menuParent.menuOnStage = false;
+         }
+         if(!NewFrontendMenuState.DLC_MAP.equals(this._state))
+         {
+            this.mapSelectionParent.selectionScreenOnStage = false;
+         }
+         if(!NewFrontendMenuState.DLC_CHAR.equals(this._state))
+         {
+            this.characterSelectionParent.selectionScreenOnStage = false;
+         }
+      }
+      
+      private function startInputHandler(param1:InputEvent) : void
+      {
+         if(param1.handled || this._state.id != NewFrontendMenuState.SPLASH.id)
+         {
+            return;
+         }
+         var _loc2_:InputDetails = param1.details;
+         var _loc3_:Boolean = _loc2_.value == InputValue.KEY_DOWN || _loc2_.value == InputValue.KEY_HOLD;
+         if(_loc3_ && _loc2_.code == KeyCodes.GAMEPAD_START)
+         {
+            this.setState(NewFrontendMenuState.MENU.id,true);
+         }
+      }
+      
+      private function headTrackingOnHandler(param1:MenuPageEvent) : void
+      {
+         call("set_head_tracking",true);
+      }
+      
+      private function headTrackingOffHandler(param1:MenuPageEvent) : void
+      {
+         call("set_head_tracking",false);
+      }
+      
+      private function movementDetectionOnHandler(param1:MenuPageEvent) : void
+      {
+         call("set_movement_detection",true);
+      }
+      
+      private function movementDetectionOffHandler(param1:MenuPageEvent) : void
+      {
+         call("set_movement_detection",false);
+      }
+      
+      private function noiseDetectionOnHandler(param1:MenuPageEvent) : void
+      {
+         call("set_noise_detection",true);
+      }
+      
+      private function noiseDetectionOffHandler(param1:MenuPageEvent) : void
+      {
+         call("set_noise_detection",false);
+      }
+      
+      private function mementoMoriOnHandler(param1:MenuPageEvent) : void
+      {
+         call("set_memento_mori",true);
+      }
+      
+      private function mementoMoriOffHandler(param1:MenuPageEvent) : void
+      {
+         call("set_memento_mori",false);
+      }
+      
+      override protected function setIds() : void
+      {
+         super.setIds();
+         this._startGameItem.id = MenuItemId.START_GAME;
+         this._continueGameItem.id = MenuItemId.CONTINUE_GAME;
+         this._storeItem.id = MenuItemId.STORE;
+         this._selectStorageDeviceItem.id = MenuItemId.SELECT_STORAGE_DEVICE;
+         this._ripleyItem.id = MenuItemId.RIPLEY;
+         this._survivorItem.id = MenuItemId.SURVIVOR;
+         this._selectLevelItem.id = MenuItemId.DEBUG_LOAD_LEVEL;
+         this._playGameItem.page.id = MenuPageId.PLAY_GAME;
+         this._extrasItem.page.id = MenuPageId.EXTRAS;
+         this._startGameItem.page.id = MenuPageId.START_GAME;
+         this._selectLevelItem.page.id = MenuPageId.SELECT_LEVEL;
+      }
+      
+      override protected function setDescriptions() : void
+      {
+         super.setDescriptions();
+         this._playGameItem.description = "AI_UI_FRONTEND_PLAY_GAME_DESC";
+         this._extrasItem.description = "AI_UI_FRONTEND_EXTRAS_DESC";
+         this._storeItem.description = "AI_UI_FRONTEND_STORE_DESC";
+         this._selectStorageDeviceItem.description = "AI_UI_FRONTEND_SELECT_STORAGE_DEVICE_DESC";
+         this._campaignItem.description = "AI_UI_FRONTEND_CAMPAIGN_DESC";
+         this._twoTeamsItem.description = "AI_UI_DLC_NOSTROMO_TWO_TEAMS_DESC";
+         this._ripleyItem.description = "AI_UI_DLC_NOSTROMO_RIPLEY_DESC";
+         this._survivorItem.description = "AI_UI_FRONTEND_SURVIVOR_DESC";
+         this._startGameItem.description = "AI_UI_FRONTEND_START_GAME";
+         this._continueGameItem.description = "AI_UI_FRONTEND_CONTINUE_GAME";
+         _loadGameItem.description = "AI_UI_MENU_LOAD_GAME";
+         this._twoTeamsNoviceDifficultyItem.description = "AI_UI_MENU_DIFF_DESC_NOVICE";
+         this._twoTeamsEasyDifficultyItem.description = "AI_UI_MENU_DIFF_DESC_EASY";
+         this._twoTeamsMediumDifficultyItem.description = "AI_UI_MENU_DIFF_DESC_MEDIUM";
+         this._twoTeamsHardDifficultyItem.description = "AI_UI_MENU_DIFF_DESC_HARD";
+         this._twoTeamsIronDifficultyItem.description = "AI_UI_MENU_DIFF_DESC_EXPERT";
+         this._ripleyNoviceDifficultyItem.description = "AI_UI_MENU_DIFF_DESC_NOVICE";
+         this._ripleyEasyDifficultyItem.description = "AI_UI_MENU_DIFF_DESC_EASY";
+         this._ripleyMediumDifficultyItem.description = "AI_UI_MENU_DIFF_DESC_MEDIUM";
+         this._ripleyHardDifficultyItem.description = "AI_UI_MENU_DIFF_DESC_HARD";
+         this._ripleyIronDifficultyItem.description = "AI_UI_MENU_DIFF_DESC_EXPERT";
+         this._noviceDifficultyItem.description = "AI_UI_MENU_DIFF_DESC_NOVICE";
+         this._easyDifficultyItem.description = "AI_UI_MENU_DIFF_DESC_EASY";
+         this._mediumDifficultyItem.description = "AI_UI_MENU_DIFF_DESC_MEDIUM";
+         this._hardDifficultyItem.description = "AI_UI_MENU_DIFF_DESC_HARD";
+         this._ironDifficultyItem.description = "AI_UI_MENU_DIFF_DESC_EXPERT";
+         this._creditsItem.description = "AI_UI_FRONTEND_CREDITS_DESC";
+         this._headTrackingOnItem.description = "AI_UI_MENU_HEAD_TRACKING_DESC";
+         this._movementDetectionOnItem.description = "AI_UI_MENU_MOVEMENT_DETECTION_DESC";
+         this._noiseDetectionOnItem.description = "AI_UI_MENU_NOISE_DETECTION_DESC";
+         this._mementoMoriOnItem.description = "AI_UI_MENU_MEMENTO_MORI_DESC";
+         this._headTrackingOnItem.visualsName = "HeadTrackingDiagram";
+         this._movementDetectionOnItem.visualsName = "MovementDetectionDiagram";
+         this._noiseDetectionOnItem.visualsName = "NoiseDetectionDiagram";
+         this._mementoMoriOnItem.visualsName = "MementoMoriDiagram";
+         this._multiplayerItem.description = "Experimental multiplayer";
+         this._createServerItem.description = "Configure a new server";
+         this._joinServerItem.description = "Browse available servers";
+         this._directIpJoinItem.description = "Connect directly to the Host IP and Port configured in the launcher";
+         this._serverNameItem.description = "Configured in the launcher settings";
+         this._serverPasswordItem.description = "Configured in the launcher settings";
+         this._serverModeItem.descriptions = ["Create a campaign server","Create a survival server"];
+         this._serverMapItem.descriptions = this._survivorMapDescriptions;
+         this._serverMaxPlayersItem.descriptions = ["Two player MVP","Three players experimental","Four players experimental"];
+         this._serverVisibilityItem.descriptions = ["Visible in server list","Requires password or invite"];
+         this._serverStartItem.description = "Create lobby and wait for players";
+         this._serverRefreshItem.description = "Refresh the server list";
+         this._serverFilterItem.descriptions = ["Show every server","Show campaign servers","Show survival servers"];
+         this._serverLanItem.description = "Available lobby";
+         this._serverCampaignItem.description = "Available lobby";
+         this._serverSurvivalItem.description = "Available lobby";
+         this._hostLobbyStatusItem.description = "Host-authoritative lobby state";
+         this._hostLobbyPlayer1Item.description = "Local owner slot";
+         this._hostLobbyPlayer2Item.description = "Remote player slot";
+         this._hostLobbyPlayer3Item.description = "Future player slot";
+         this._hostLobbyPlayer4Item.description = "Future player slot";
+         this._hostLobbyKick2Item.description = "Owner only kick action";
+         this._hostLobbyKick3Item.description = "Owner only kick action";
+         this._hostLobbyKick4Item.description = "Owner only kick action";
+         this._hostLobbyStartGameItem.description = "Owner only start action";
+         this._hostLobbyLeaveItem.description = "Close hosted lobby";
+         this._clientLobbyStatusItem.description = "Connected lobby state";
+         this._clientLobbyPlayer1Item.description = "Host player";
+         this._clientLobbyPlayer2Item.description = "Your client slot";
+         this._clientLobbyReadyItem.descriptions = ["Ready for game start","Not ready yet"];
+         this._clientLobbyLeaveItem.description = "Disconnect from lobby";
+      }
+      
+      override protected function setTransitions() : void
+      {
+         super.setTransitions();
+      }
+      
+      override protected function setVisibility() : void
+      {
+         super.setVisibility();
+         _difficultyItem.visible = false;
+         this._selectStorageDeviceItem.visible = false;
+         this._twoTeamsItem.visible = true;
+         this._ripleyItem.visible = true;
+         this._selectLevelItem.visible = true;
+         this._playGameItem.visible = true;
+         this._extrasItem.visible = true;
+         this._storeItem.visible = true;
+         this.applyServerFilter("all");
+      }
+      
+      public function show_network_notification(param1:String) : void
+      {
+         this.network_notification_mc.network_notification_sub_mc.txt.text = param1;
+         this.network_notification_mc.gotoAndPlay("fade_in");
+      }
+      
+      public function hide_network_notification() : void
+      {
+         this.network_notification_mc.gotoAndPlay("fade_out");
+      }
+      
+      internal function __setProp_description_Scene1_description_0() : *
+      {
+         try
+         {
+            description["componentInspectorSetting"] = true;
+         }
+         catch(e:Error)
+         {
+         }
+         description.transitionInEnabled = true;
+         description.transitionInLabel = "transition_in";
+         description.transitionOutEnabled = true;
+         description.transitionOutLabel = "transition_out";
+         description.transitionOwner = "self";
+         description.visible = true;
+         try
+         {
+            description["componentInspectorSetting"] = false;
+            return;
+         }
+         catch(e:Error)
+         {
+            return;
+         }
+      }
+      
+      internal function __setProp_userProfilePanel_Scene1_profile_0() : *
+      {
+         try
+         {
+            userProfilePanel["componentInspectorSetting"] = true;
+         }
+         catch(e:Error)
+         {
+         }
+         userProfilePanel.transitionInEnabled = false;
+         userProfilePanel.transitionInLabel = "transition_in";
+         userProfilePanel.transitionOutEnabled = false;
+         userProfilePanel.transitionOutLabel = "transition_out";
+         userProfilePanel.transitionOwner = "self";
+         userProfilePanel.visible = false;
+         try
+         {
+            userProfilePanel["componentInspectorSetting"] = false;
+            return;
+         }
+         catch(e:Error)
+         {
+            return;
+         }
+      }
+      
+      internal function frame1() : *
+      {
+         stop();
+      }
+      
+      internal function frame10() : *
+      {
+         stop();
+      }
+      
+      internal function frame20() : *
+      {
+         stop();
+      }
+      
+      internal function frame30() : *
+      {
+         gotoAndStop("menu");
+      }
+      
+      internal function frame36() : *
+      {
+         stop();
+      }
+      
+      internal function frame46() : *
+      {
+         stop();
+      }
+      
+      internal function frame54() : *
+      {
+         stop();
+      }
+   }
+}

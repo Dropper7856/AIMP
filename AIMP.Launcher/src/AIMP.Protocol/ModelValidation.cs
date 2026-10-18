@@ -77,6 +77,41 @@ public static class ModelValidation
         }
     }
 
+    public static void Validate(PlayerDeathPayload? value)
+    {
+        if (value is null
+            || value.SessionId == Guid.Empty
+            || value.PeerId == 0
+            || value.LevelGeneration < 1)
+        {
+            throw new ProtocolException("The player-death payload is invalid.");
+        }
+    }
+
+    public static void Validate(RoundEndedPayload? value)
+    {
+        if (value is null
+            || value.SessionId == Guid.Empty
+            || value.LevelGeneration < 1
+            || string.IsNullOrWhiteSpace(value.Reason)
+            || value.Reason.Length > 32
+            || value.ReturnDelayMilliseconds is < 0 or > 60000)
+        {
+            throw new ProtocolException("The round-ended payload is invalid.");
+        }
+    }
+
+    public static void Validate(NativePlayerLifecycleStatePayload? value)
+    {
+        if (value is null
+            || value.SchemaVersion != 1
+            || value.DeathSequence == 0
+            || !value.LocalPlayerDead)
+        {
+            throw new ProtocolException("The native player-lifecycle state is invalid.");
+        }
+    }
+
     public static void Validate(PlayerSpawnPositionPayload? value)
     {
         if (value is null || value.PeerId == 0 || !ValidSpawnCoordinate(value.X)
@@ -633,6 +668,10 @@ public static class ModelValidation
             || string.Equals(
                 value.Command,
                 GameCommandNames.WorldStateDiscoveryStatus,
+                StringComparison.Ordinal)
+            || string.Equals(
+                value.Command,
+                GameCommandNames.ReturnToFrontend,
                 StringComparison.Ordinal))
         {
             if (value.Arguments.Count != 0)

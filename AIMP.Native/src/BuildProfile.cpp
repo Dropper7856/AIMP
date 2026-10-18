@@ -683,7 +683,7 @@ bool IsProfileCompatible(
 const BuildProfile& Retail2015Profile() {
     static const BuildProfile profile{
         "ai-retail-2015-02-17-sha256-00d6",
-        15,
+        16,
         {0x00, 0xD6, 0xBB, 0x84, 0x6A, 0xC5, 0xA7, 0x89,
          0x16, 0xBA, 0xF3, 0x63, 0xEB, 0x14, 0x8A, 0xA2,
          0x55, 0xA2, 0x3B, 0xF2, 0x16, 0xA2, 0x71, 0xCF,
@@ -762,6 +762,17 @@ const BuildProfile& Retail2015Profile() {
                 Bytes({0x8B, 0x4C, 0x24, 0x14, 0x5F, 0x5E, 0x5D, 0x5B,
                        0x64, 0x89, 0x0D, 0x00, 0x00, 0x00, 0x00, 0x83,
                        0xC4, 0x10, 0xC3}, "xxxxxxxxxxxxxxxxxxx")),
+            // FUN_00793880(G, 1): the retail pause/game-over "back_to_frontend"
+            // callback target (UI handler 00806F00 -> 00805620). Thiscall on
+            // G = [GlobalStateRoot]+48, one byte argument, RET 4. It locks
+            // G+1DC itself and is a no-op while NEW_FRONTEND_MENU is loaded.
+            Code(SymbolId::GameplayReturnToFrontend,
+                "gameplay_return_to_frontend", 0x00393880,
+                Bytes({0x6A, 0xFF, 0x68, 0x48, 0x2E, 0x13, 0x01, 0x64,
+                       0xA1, 0x00, 0x00, 0x00, 0x00, 0x50, 0x64, 0x89,
+                       0x25, 0x00, 0x00, 0x00, 0x00, 0x51, 0x56, 0x57,
+                       0x8B, 0xF1, 0x8D, 0xBE, 0xDC, 0x01, 0x00, 0x00},
+                      "xxx????xxxxxxxxxxxxxxxxxxxxxxxxx")),
             Code(SymbolId::DescriptorListHead, "descriptor_list_head", 0x012F2DAC, {}),
             Code(SymbolId::NetzVtable, "netz_vtable", 0x00EF74FC, {}),
             Code(

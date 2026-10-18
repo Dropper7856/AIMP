@@ -66,6 +66,9 @@ public sealed class LobbyHost : IAsyncDisposable
     private string _level;
     private string _state = "Lobby";
     private int _levelGeneration;
+    // Participants whose THE_PLAYER died during _levelGeneration. Guarded by
+    // _stateLock and cleared whenever a generation starts or a round ends.
+    private readonly HashSet<ulong> _deadPeers = new();
     private SpawnPositionRound? _activeSpawnRound;
     private int _disposed;
 
@@ -135,6 +138,10 @@ public sealed class LobbyHost : IAsyncDisposable
     public event EventHandler<LobbyStartPayload>? Started;
 
     public event EventHandler<GameplayReadyPayload>? GameplayReadyReceived;
+
+    public event EventHandler<PlayerDeathPayload>? PlayerDeathReceived;
+
+    public event EventHandler<RoundEndedPayload>? RoundEnded;
 
     public event EventHandler<SpawnRemotePlayersPayload>? SpawnRemotePlayersRequested;
 
@@ -232,6 +239,7 @@ public sealed class LobbyHost : IAsyncDisposable
 
                 _state = "Starting";
                 _levelGeneration++;
+                _deadPeers.Clear();
                 payload = new LobbyStartPayload(
                     SessionId,
                     startAtUtc.ToUnixTimeMilliseconds(),
@@ -267,6 +275,78 @@ public sealed class LobbyHost : IAsyncDisposable
             cancellationToken).ConfigureAwait(false);
         GameplayReadyReceived?.Invoke(this, payload);
         return payload;
+    }
+
+    public const int RoundReturnDelayMilliseconds = 5000;
+
+    public Task ReportHostPlayerDeathAsync(
+        int levelGeneration,
+        CancellationToken cancellationToken = default)
+    {
+        var payload = new PlayerDeathPayload(SessionId, HostPeerId, levelGeneration);
+        ModelValidation.Validate(payload);
+        return RecordPlayerDeathAsync(payload, cancellationToken);
+    }
+
+    private async Task RecordPlayerDeathAsync(
+        PlayerDeathPayload payload,
+        CancellationToken cancellationToken)
+    {
+        RoundEndedPayload? ended;
+        lock (_stateLock)
+        {
+            if (!string.Equals(_state, "Starting", StringComparison.Ordinal)
+                || payload.LevelGeneration != _levelGeneration
+                || !_deadPeers.Add(payload.PeerId)) return;
+            ended = TryEndRoundLocked();
+        }
+
+        Log?.Invoke(this, $"Participant {payload.PeerId} died in generation {payload.LevelGeneration}.");
+        PlayerDeathReceived?.Invoke(this, payload);
+        if (ended is not null)
+            await PublishRoundEndedAsync(ended, cancellationToken).ConfigureAwait(false);
+    }
+
+    // A departed participant can no longer survive: re-evaluate the round so
+    // the remaining dead players are not stranded in a finished level.
+    private async Task EvaluateRoundAfterDepartureAsync()
+    {
+        RoundEndedPayload? ended;
+        lock (_stateLock)
+        {
+            if (!string.Equals(_state, "Starting", StringComparison.Ordinal)) return;
+            ended = TryEndRoundLocked();
+        }
+
+        if (ended is null) return;
+        try { await PublishRoundEndedAsync(ended, _shutdown.Token).ConfigureAwait(false); }
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested) { }
+    }
+
+    // Caller holds _stateLock. Ends the round only when the Host and every
+    // connected client of the active generation reported a terminal death.
+    private RoundEndedPayload? TryEndRoundLocked()
+    {
+        if (!_deadPeers.Contains(HostPeerId)
+            || _clients.Keys.Any(peerId => !_deadPeers.Contains(peerId))) return null;
+        _state = "Lobby";
+        _deadPeers.Clear();
+        var payload = new RoundEndedPayload(SessionId, _levelGeneration,
+            "AllPlayersDead", RoundReturnDelayMilliseconds);
+        ModelValidation.Validate(payload);
+        return payload;
+    }
+
+    private async Task PublishRoundEndedAsync(
+        RoundEndedPayload payload,
+        CancellationToken cancellationToken)
+    {
+        Log?.Invoke(this, $"Round {payload.LevelGeneration} ended: {payload.Reason}.");
+        await BroadcastAsync(MessageType.RoundEnded, JsonPayload.Serialize(payload),
+            cancellationToken).ConfigureAwait(false);
+        await BroadcastSnapshotAsync(cancellationToken).ConfigureAwait(false);
+        PublishSnapshot();
+        RoundEnded?.Invoke(this, payload);
     }
 
     public async Task<SpawnRemotePlayersPayload> RequestRemotePlayerSpawnsAsync(
@@ -926,6 +1006,7 @@ public sealed class LobbyHost : IAsyncDisposable
                 Log?.Invoke(this, $"{state.DisplayName} left the lobby.");
                 PublishSnapshot();
                 _ = BroadcastSnapshotSafelyAsync();
+                _ = EvaluateRoundAfterDepartureAsync();
             }
         }
     }
@@ -985,6 +1066,11 @@ public sealed class LobbyHost : IAsyncDisposable
 
                 case MessageType.SpawnPositionResponse:
                     await HandleSpawnPositionResponseAsync(state, frame.Payload, cancellationToken)
+                        .ConfigureAwait(false);
+                    break;
+
+                case MessageType.PlayerDeath:
+                    await HandlePlayerDeathAsync(state, frame.Payload, cancellationToken)
                         .ConfigureAwait(false);
                     break;
 
@@ -1245,6 +1331,26 @@ public sealed class LobbyHost : IAsyncDisposable
         {
             _worldMutationGate.Release();
         }
+    }
+
+    private async Task HandlePlayerDeathAsync(
+        ClientState state,
+        ReadOnlyMemory<byte> bytes,
+        CancellationToken cancellationToken)
+    {
+        var payload = JsonPayload.Deserialize<PlayerDeathPayload>(bytes.Span);
+        ModelValidation.Validate(payload);
+        if (payload.SessionId != SessionId || payload.PeerId != state.PeerId)
+        {
+            await SendErrorAsync(state.Connection, "INVALID_PLAYER_DEATH",
+                "Player death identity is invalid.", cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        // A stale generation (death reported after the round already ended)
+        // is ignored without error: the client is already returning to Lobby.
+        await RecordPlayerDeathAsync(payload, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task HandleGameplayReadyAsync(
