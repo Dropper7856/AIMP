@@ -53,6 +53,8 @@ public sealed class LobbyClient : IAsyncDisposable
 
     public event EventHandler<GameplayReadyPayload>? GameplayReadyReceived;
 
+    public event EventHandler<RoundEndedPayload>? RoundEnded;
+
     public event EventHandler<SpawnPositionRequestPayload>? SpawnPositionRequested;
 
     public event EventHandler<SpawnRemotePlayersPayload>? SpawnRemotePlayersRequested;
@@ -194,6 +196,18 @@ public sealed class LobbyClient : IAsyncDisposable
         ModelValidation.Validate(payload);
         return _connection.SendAsync(
             MessageType.GameplayReady,
+            JsonPayload.Serialize(payload),
+            cancellationToken).AsTask();
+    }
+
+    public Task SendPlayerDeathAsync(
+        int levelGeneration,
+        CancellationToken cancellationToken = default)
+    {
+        var payload = new PlayerDeathPayload(SessionId, PeerId, levelGeneration);
+        ModelValidation.Validate(payload);
+        return _connection.SendAsync(
+            MessageType.PlayerDeath,
             JsonPayload.Serialize(payload),
             cancellationToken).AsTask();
     }
@@ -449,6 +463,14 @@ public sealed class LobbyClient : IAsyncDisposable
                         if (recoveryStatus.SessionId != SessionId || recoveryStatus.PeerId != PeerId)
                             throw new ProtocolException("World recovery status identity is invalid.");
                         WorldRecoveryStatusReceived?.Invoke(this, recoveryStatus);
+                        break;
+
+                    case MessageType.RoundEnded:
+                        var roundEnded = JsonPayload.Deserialize<RoundEndedPayload>(frame.Payload.Span);
+                        ModelValidation.Validate(roundEnded);
+                        if (roundEnded.SessionId != SessionId)
+                            throw new ProtocolException("The round-ended SessionId is invalid.");
+                        RoundEnded?.Invoke(this, roundEnded);
                         break;
 
                     case MessageType.InboundNetZFrame:

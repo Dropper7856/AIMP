@@ -17,7 +17,7 @@ internal sealed record MultiplayerSessionView(
         "Disconnected", false, false, false, false, string.Empty);
 }
 
-internal sealed class MultiplayerSessionCoordinator : IDisposable
+internal sealed partial class MultiplayerSessionCoordinator : IDisposable
 {
     private readonly NativeRuntimeController _controller;
     private readonly AISyncSession _aiSync;
@@ -403,6 +403,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         _controller.WorldMutationCompleted += OnNativeWorldMutationCompleted;
         _controller.PlayerSyncStateProduced += OnNativePlayerSyncStateProduced;
         _controller.PlayerSyncActionProduced += OnNativePlayerSyncActionProduced;
+        _controller.PlayerLifecycleStateChanged += OnNativePlayerLifecycleStateChanged;
     }
 
     internal async Task ApplyPerformanceIsolationModuleAsync(
@@ -672,6 +673,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         _controller.WorldMutationCompleted -= OnNativeWorldMutationCompleted;
         _controller.PlayerSyncStateProduced -= OnNativePlayerSyncStateProduced;
         _controller.PlayerSyncActionProduced -= OnNativePlayerSyncActionProduced;
+        _controller.PlayerLifecycleStateChanged -= OnNativePlayerLifecycleStateChanged;
         StopNetworkAsync("Launcher closed").GetAwaiter().GetResult();
         _commandGate.Dispose();
         _spawnGate.Dispose();
@@ -722,7 +724,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         var source = message.Get("source", "frontend");
         var phase = message.Get("phase", "unknown");
         if (IsGameplaySource(source, phase)) await MarkGameplayUiLoadedAsync(message).ConfigureAwait(false);
-        else await SendStatusAsync("Launcher bridge ready").ConfigureAwait(false);
+        else await SendFrontendReadyAsync().ConfigureAwait(false);
     }
 
     private static bool IsGameplaySource(string source, string phase) =>
@@ -2347,6 +2349,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         host.SnapshotChanged += OnLobbySnapshot;
         host.Started += OnLobbyStarted;
         host.GameplayReadyReceived += OnGameplayReady;
+        host.RoundEnded += OnRoundEnded;
         host.SpawnRemotePlayersRequested += OnSpawnRemotePlayersRequested;
         host.PlayerPositionReceived += OnPlayerPositionReceived;
         host.PlayerEquipmentReceived += OnPlayerEquipmentReceived;
@@ -2364,6 +2367,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         host.SnapshotChanged -= OnLobbySnapshot;
         host.Started -= OnLobbyStarted;
         host.GameplayReadyReceived -= OnGameplayReady;
+        host.RoundEnded -= OnRoundEnded;
         host.SpawnRemotePlayersRequested -= OnSpawnRemotePlayersRequested;
         host.PlayerPositionReceived -= OnPlayerPositionReceived;
         host.PlayerEquipmentReceived -= OnPlayerEquipmentReceived;
@@ -2381,6 +2385,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         client.SnapshotChanged += OnLobbySnapshot;
         client.Started += OnLobbyStarted;
         client.GameplayReadyReceived += OnGameplayReady;
+        client.RoundEnded += OnRoundEnded;
         client.SpawnPositionRequested += OnSpawnPositionRequested;
         client.SpawnRemotePlayersRequested += OnSpawnRemotePlayersRequested;
         client.PlayerPositionReceived += OnPlayerPositionReceived;
@@ -2401,6 +2406,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
         client.SnapshotChanged -= OnLobbySnapshot;
         client.Started -= OnLobbyStarted;
         client.GameplayReadyReceived -= OnGameplayReady;
+        client.RoundEnded -= OnRoundEnded;
         client.SpawnPositionRequested -= OnSpawnPositionRequested;
         client.SpawnRemotePlayersRequested -= OnSpawnRemotePlayersRequested;
         client.PlayerPositionReceived -= OnPlayerPositionReceived;
@@ -4518,6 +4524,7 @@ internal sealed class MultiplayerSessionCoordinator : IDisposable
 
     private void ClearSessionState()
     {
+        ClearRoundLifecycleState();
         _host = null;
         _client = null;
         _lobby = null;
@@ -4666,7 +4673,8 @@ internal static class LobbyCompatibility
     private static string EffectiveProfileId(LauncherSettings settings) => ProfileId +
         ":ws3" +
         (settings.WorldSync3EmptyCallbackEnabled ? ":probe-callback-test" : ":strict") +
-        ":aisync-v6-participants";
+        ":aisync-v6-participants" +
+        ":round-end-v1";
 
     internal static CompatibilityInfo Create(LauncherSettings settings)
     {

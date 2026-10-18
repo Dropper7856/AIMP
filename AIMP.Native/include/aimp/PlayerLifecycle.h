@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 namespace aimp {
@@ -16,6 +17,9 @@ namespace player_lifecycle {
 bool Install(const BuildProfile& profile, const SignatureResolver& resolver,
     HookManager& hooks, bool exactExecutableHash, std::string& error);
 [[nodiscard]] bool Installed() noexcept;
+// Monotonic count of suppressed local THE_PLAYER deaths (0 = none yet). The
+// IPC worker publishes each new value to the Launcher as a round event.
+[[nodiscard]] std::uint64_t LocalDeathSequence() noexcept;
 // Stop suppressing immediately. HookManager owns restoration/retirement;
 // all detour data remain process-local and alive while its trampoline exists.
 void Shutdown() noexcept;

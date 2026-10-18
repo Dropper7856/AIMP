@@ -2621,6 +2621,8 @@ void TestProtocol() {
     CHECK(aimp::protocol::IsKnownMessageType(16));
     CHECK(aimp::protocol::IsKnownMessageType(17));
     CHECK(aimp::protocol::IsKnownMessageType(18));
+    CHECK(aimp::protocol::IsKnownMessageType(27));
+    CHECK(!aimp::protocol::IsKnownMessageType(28));
     CHECK(!aimp::protocol::IsKnownMessageType(199));
     for (std::uint16_t value = 200; value <= 216; ++value) {
         CHECK(aimp::protocol::IsKnownMessageType(value));
@@ -3182,9 +3184,16 @@ void TestWorldAnimatedAdapterPayload() {
 
 void TestProfile(const std::wstring& aiPath) {
     const auto& profile = aimp::Retail2015Profile();
-    CHECK(profile.version == 14);
+    CHECK(profile.version == 16);
     CHECK(profile.sections.size() == 5);
-    CHECK(profile.symbols.size() == 73);
+    CHECK(profile.symbols.size() == 108);
+    const auto* returnToFrontend =
+        profile.Find(aimp::SymbolId::GameplayReturnToFrontend);
+    CHECK(returnToFrontend != nullptr);
+    if (returnToFrontend != nullptr) {
+        CHECK(returnToFrontend->rva == 0x00393880U);
+        CHECK(returnToFrontend->expected.IsValid());
+    }
     const auto* characterDirectMove =
         profile.Find(aimp::SymbolId::CharacterDirectMove);
     CHECK(characterDirectMove != nullptr);

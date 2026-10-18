@@ -1341,7 +1341,8 @@ internal static class ProtocolTests
                  {
                      GameCommandNames.WorldStateDiscoveryBaseline,
                      GameCommandNames.WorldStateDiscoveryAfter,
-                     GameCommandNames.WorldStateDiscoveryStatus
+                     GameCommandNames.WorldStateDiscoveryStatus,
+                     GameCommandNames.ReturnToFrontend
                  })
         {
             var stateDiscoveryCommand = command with

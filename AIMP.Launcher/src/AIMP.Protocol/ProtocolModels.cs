@@ -101,6 +101,21 @@ public sealed record GameplayReadyPayload(
     ulong PeerId,
     int LevelGeneration);
 
+// Client -> Host: the sender's own THE_PLAYER reached its terminal death
+// boundary during this launch generation.
+public sealed record PlayerDeathPayload(
+    Guid SessionId,
+    ulong PeerId,
+    int LevelGeneration);
+
+// Host -> Clients: every participant of the generation is dead. The Host is
+// already back in Lobby; peers show the end message, then return to frontend.
+public sealed record RoundEndedPayload(
+    Guid SessionId,
+    int LevelGeneration,
+    string Reason,
+    int ReturnDelayMilliseconds);
+
 public sealed record PlayerSpawnPositionPayload(
     ulong PeerId,
     float X,
@@ -167,6 +182,11 @@ public sealed record NativePlayerEquipmentStatePayload(
     int PresentationState,
     bool AimHeld,
     bool PrimaryHeld);
+
+public sealed record NativePlayerLifecycleStatePayload(
+    int SchemaVersion,
+    ulong DeathSequence,
+    bool LocalPlayerDead);
 
 public sealed record NativePlayerActionEventPayload(
     int SchemaVersion,

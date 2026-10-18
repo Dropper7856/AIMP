@@ -129,6 +129,7 @@ private:
     void Run();
     void PublishWorldReplicationTraffic();
     void PublishPlayerSyncTraffic();
+    void PublishPlayerLifecycleTraffic();
     void PublishAISyncTraffic();
     bool HandleAISyncFrame(const protocol::Frame& frame);
     bool TryConnect();
@@ -165,6 +166,7 @@ private:
     std::array<std::uint8_t, 32> executableHash_{};
     std::uint32_t processId_{};
     std::uint64_t aiSyncRejectedFrames_{}; // IPC-worker only, retained across reconnects.
+    std::uint64_t publishedDeathSequence_{}; // IPC-worker only.
     bool buildValidated_{};
     std::string profileId_;
     std::string resolutionMode_;

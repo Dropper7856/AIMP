@@ -23,6 +23,7 @@
 #include "aimp/WorldAnimatedAdapters.h"
 #include "aimp/ProductVersion.h"
 #include "aimp/PlayerSyncObserver.h"
+#include "aimp/PlayerLifecycle.h"
 
 #include <bcrypt.h>
 
@@ -664,6 +665,33 @@ void LauncherIPC::PublishAISyncTraffic() {
     }
 }
 
+void LauncherIPC::PublishPlayerLifecycleTraffic() {
+    const auto sequence = player_lifecycle::LocalDeathSequence();
+    if (!sessionConfigured_.load(std::memory_order_acquire) ||
+        !netzReadySent_.load(std::memory_order_acquire)) {
+        // A death outside an active session is never a round event; do not
+        // replay it to a Launcher that connects or configures later.
+        publishedDeathSequence_ = sequence;
+        return;
+    }
+    if (sequence == publishedDeathSequence_) return;
+
+    // Retried every worker tick until queued: the Host needs this exact edge
+    // to decide that every participant of the round is dead.
+    std::ostringstream json;
+    json << "{\"schemaVersion\":1"
+         << ",\"deathSequence\":" << sequence
+         << ",\"localPlayerDead\":true"
+         << '}';
+    if (Queue(
+            protocol::MessageType::PlayerLifecycleState,
+            0,
+            localSequence_.fetch_add(1U, std::memory_order_relaxed),
+            JsonBytes(json.str()))) {
+        publishedDeathSequence_ = sequence;
+    }
+}
+
 void LauncherIPC::PublishPlayerSyncTraffic() {
     if (playerSyncObserver_ == nullptr) {
         return;
@@ -1106,6 +1134,7 @@ void LauncherIPC::Run() {
 
             PublishWorldReplicationTraffic();
             PublishPlayerSyncTraffic();
+            PublishPlayerLifecycleTraffic();
             PublishAISyncTraffic();
 
             if (!FlushOutgoing(96U)) continue;
@@ -2764,6 +2793,9 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
             } else if (
                 pending->request.command == "WORLD_STATE_DISCOVERY_STATUS") {
                 result = gameCommands_->ExecuteWorldStateDiscoveryStatus();
+            } else if (
+                pending->request.command == "RETURN_TO_FRONTEND") {
+                result = gameCommands_->ExecuteReturnToFrontend();
             } else {
                 result = gameCommands_->ExecutePopupMessage(
                     pending->request.popupMessage);

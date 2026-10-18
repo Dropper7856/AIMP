@@ -52,6 +52,8 @@ internal sealed class NativeRuntimeController : IDisposable
 
     internal event EventHandler<NativePlayerActionEventPayload>? PlayerSyncActionProduced;
 
+    internal event EventHandler<NativePlayerLifecycleStatePayload>? PlayerLifecycleStateChanged;
+
     internal event EventHandler<ReadOnlyMemory<byte>>? AISyncStateProduced;
 
     internal event EventHandler<ReadOnlyMemory<byte>>? AISyncImpactProduced;
@@ -608,6 +610,7 @@ internal sealed class NativeRuntimeController : IDisposable
         session.WorldMutationResultReceived += OnWorldMutationResultReceived;
         session.PlayerSyncStateChanged += OnPlayerSyncStateChanged;
         session.PlayerSyncActionProduced += OnPlayerSyncActionProduced;
+        session.PlayerLifecycleStateChanged += OnPlayerLifecycleStateChanged;
         session.AISyncStateProduced += OnAISyncStateProduced;
         session.AISyncImpactProduced += OnAISyncImpactProduced;
         session.ConnectionClosed += OnConnectionClosed;
@@ -625,6 +628,7 @@ internal sealed class NativeRuntimeController : IDisposable
         session.WorldMutationResultReceived -= OnWorldMutationResultReceived;
         session.PlayerSyncStateChanged -= OnPlayerSyncStateChanged;
         session.PlayerSyncActionProduced -= OnPlayerSyncActionProduced;
+        session.PlayerLifecycleStateChanged -= OnPlayerLifecycleStateChanged;
         session.AISyncStateProduced -= OnAISyncStateProduced;
         session.AISyncImpactProduced -= OnAISyncImpactProduced;
         session.ConnectionClosed -= OnConnectionClosed;
@@ -648,6 +652,11 @@ internal sealed class NativeRuntimeController : IDisposable
         object? sender,
         NativePlayerEquipmentStatePayload value) =>
         PlayerSyncStateProduced?.Invoke(this, value);
+
+    private void OnPlayerLifecycleStateChanged(
+        object? sender,
+        NativePlayerLifecycleStatePayload value) =>
+        PlayerLifecycleStateChanged?.Invoke(this, value);
 
     private void OnPlayerSyncActionProduced(
         object? sender,

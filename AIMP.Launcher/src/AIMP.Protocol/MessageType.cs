@@ -30,6 +30,7 @@ public enum MessageType : ushort
     AISyncConfigure = 24,
     AISyncState = 25,
     AISyncImpact = 26,
+    PlayerLifecycleState = 27, // DLL -> launcher only: local THE_PLAYER death boundary.
 
     LobbyJoin = 100,
     LobbyJoinAccepted = 101,
@@ -53,6 +54,8 @@ public enum MessageType : ushort
     PlayerActionEvent = 119,
     AISyncNetworkState = 120, // Host -> Clients only; never relayed from a Client.
     AISyncNetworkImpact = 121, // Client -> Host only; Host applies consequence natively.
+    PlayerDeath = 122, // Client -> Host only; the Host owns round termination.
+    RoundEnded = 123, // Host -> Clients only; the session is back in Lobby.
 
     TestModeConfigure = 200,
     CapabilityQuery = 201,

@@ -152,6 +152,10 @@ public:
     [[nodiscard]] virtual GameCommandExecutionResult ExecuteWorldStateDiscoveryBaseline() const = 0;
     [[nodiscard]] virtual GameCommandExecutionResult ExecuteWorldStateDiscoveryAfter() const = 0;
     [[nodiscard]] virtual GameCommandExecutionResult ExecuteWorldStateDiscoveryStatus() const = 0;
+    // Default rejection keeps other executor implementations source-compatible.
+    [[nodiscard]] virtual GameCommandExecutionResult ExecuteReturnToFrontend() const {
+        return {false, "RETURN_TO_FRONTEND_UNAVAILABLE", "Return to frontend is not supported by this executor."};
+    }
 };
 
 class GameCommandExecutor final : public IGameCommandExecutor {
@@ -195,6 +199,7 @@ public:
     [[nodiscard]] GameCommandExecutionResult ExecuteWorldStateDiscoveryBaseline() const override;
     [[nodiscard]] GameCommandExecutionResult ExecuteWorldStateDiscoveryAfter() const override;
     [[nodiscard]] GameCommandExecutionResult ExecuteWorldStateDiscoveryStatus() const override;
+    [[nodiscard]] GameCommandExecutionResult ExecuteReturnToFrontend() const override;
 
     void AttachWorldEntityRegistry(WorldEntityRegistry& registry) noexcept;
     void AttachGameThreadDispatcher(GameThreadDispatcher& dispatcher) noexcept;
@@ -228,6 +233,7 @@ private:
     [[nodiscard]] bool CharacterDirectStepAvailable() const noexcept;
     [[nodiscard]] bool CharacterActionTestAvailable() const noexcept;
     [[nodiscard]] bool RemoteEquipmentProvisionAvailable() const noexcept;
+    [[nodiscard]] bool ReturnToFrontendAvailable() const noexcept;
 
     const void* uiRegistryRootAddress_{};
     const void* findNamedElementAddress_{};
@@ -235,6 +241,7 @@ private:
     const void* spawnRequest130ReceiverAddress_{};
     void* characterRuntimeIdCounterAddress_{};
     const void* globalStateRootAddress_{};
+    const void* returnToFrontendAddress_{};
     CaptureCatalog* captures_{};
     LevelGenerationTracker* generations_{};
     const GameThreadRuntimeEvidence* runtimeEvidence_{};

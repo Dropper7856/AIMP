@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.198-aisync-backstage-route";
+    "0.11.4.199-playerlifecycle-round-end";
 
 } // namespace aimp

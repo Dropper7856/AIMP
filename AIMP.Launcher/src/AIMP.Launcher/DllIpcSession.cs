@@ -62,6 +62,8 @@ internal sealed class DllIpcSession : IAsyncDisposable
 
     internal event EventHandler<NativePlayerActionEventPayload>? PlayerSyncActionProduced;
 
+    internal event EventHandler<NativePlayerLifecycleStatePayload>? PlayerLifecycleStateChanged;
+
     internal event EventHandler<ReadOnlyMemory<byte>>? AISyncStateProduced;
 
     internal event EventHandler<ReadOnlyMemory<byte>>? AISyncImpactProduced;
@@ -444,6 +446,7 @@ internal sealed class DllIpcSession : IAsyncDisposable
             case MessageType.LevelState: HandleLevel(frame); return true;
             case MessageType.PlayerSyncState: HandlePlayerSyncState(frame); return true;
             case MessageType.PlayerSyncAction: HandlePlayerSyncAction(frame); return true;
+            case MessageType.PlayerLifecycleState: HandlePlayerLifecycleState(frame); return true;
             case MessageType.AISyncState:
                 HandleAISyncState(frame);
                 return true;
@@ -525,6 +528,13 @@ internal sealed class DllIpcSession : IAsyncDisposable
         var value = JsonPayload.Deserialize<NativePlayerActionEventPayload>(frame.Payload.Span);
         ModelValidation.Validate(value);
         PlayerSyncActionProduced?.Invoke(this, value);
+    }
+
+    private void HandlePlayerLifecycleState(AimpFrame frame)
+    {
+        var value = JsonPayload.Deserialize<NativePlayerLifecycleStatePayload>(frame.Payload.Span);
+        ModelValidation.Validate(value);
+        PlayerLifecycleStateChanged?.Invoke(this, value);
     }
 
     private void CompleteGameCommand(AimpFrame frame)
