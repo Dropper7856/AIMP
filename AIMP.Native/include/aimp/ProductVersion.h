@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.199-playerlifecycle-round-end";
+    "0.11.4.200-playerlifecycle-session-exit";
 
 } // namespace aimp

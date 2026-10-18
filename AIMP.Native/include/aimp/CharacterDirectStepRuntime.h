@@ -71,6 +71,7 @@ struct RuntimeSnapshot {
 // animation/locomotion cycle itself remains untouched and continues to tick.
 bool Install(
     std::uintptr_t moduleBase,
+    const void* globalStateRootAddress,
     HookManager& hooks,
     std::string& error);
 
@@ -203,6 +204,11 @@ bool Arm(
 
 void Stop() noexcept;
 [[nodiscard]] bool Stop(std::uintptr_t characterAddress) noexcept;
+// Drop the network mailbox WITHOUT touching the Character: used when the
+// Character is being destroyed or its whole level is about to be unloaded.
+// Stop() would still write a native stop request into that memory.
+void ForgetCharacter(std::uintptr_t characterAddress) noexcept;
+void ForgetAll() noexcept;
 [[nodiscard]] std::uint32_t RemainingFrames() noexcept;
 [[nodiscard]] std::uint32_t RemainingFrames(std::uintptr_t characterAddress) noexcept;
 [[nodiscard]] RuntimeSnapshot Snapshot() noexcept;

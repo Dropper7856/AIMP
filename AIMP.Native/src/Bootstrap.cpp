@@ -652,10 +652,11 @@ DWORD Bootstrap::RunImpl() {
         }
     }
 
-    if (signaturesValid && moduleBase != 0U) {
+    if (signaturesValid && resolver != nullptr && moduleBase != 0U) {
         std::string characterMovementHookError;
         if (character_direct_step_runtime::Install(
                 moduleBase,
+                resolver->Resolve(SymbolId::GlobalStateRoot),
                 *hooks,
                 characterMovementHookError)) {
             diagnostics.Log(

@@ -148,6 +148,8 @@ package
          super();
          addFrameScript(0,this.frame1);
          addEventListener(Event.ADDED_TO_STAGE,this.initclass);
+         addEventListener(Event.ADDED_TO_STAGE,this.aimp_resume_bridge);
+         addEventListener(Event.REMOVED_FROM_STAGE,this.aimp_release_bridge);
          this.container_hide_timer.addEventListener(TimerEvent.TIMER,this.end_exit_timer);
       }
       
@@ -526,6 +528,37 @@ package
          this.aimp_init_runtime_bridge();
       }
       
+      private function aimp_resume_bridge(param1:Event) : void
+      {
+         if(this.aimp_bridge_socket == null)
+         {
+            this.aimp_init_runtime_bridge();
+         }
+      }
+
+      private function aimp_release_bridge(param1:Event) : void
+      {
+         this.aimp_hide_round_end();
+         this.aimp_bridge_connected = false;
+         if(this.aimp_bridge_socket == null)
+         {
+            return;
+         }
+         this.aimp_bridge_socket.removeEventListener(Event.CONNECT,this.aimp_on_bridge_connect);
+         this.aimp_bridge_socket.removeEventListener(ProgressEvent.SOCKET_DATA,this.aimp_on_bridge_data);
+         this.aimp_bridge_socket.removeEventListener(IOErrorEvent.IO_ERROR,this.aimp_on_bridge_io_error);
+         this.aimp_bridge_socket.removeEventListener(SecurityErrorEvent.SECURITY_ERROR,this.aimp_on_bridge_security_error);
+         try
+         {
+            this.aimp_bridge_socket.close();
+         }
+         catch(error:Error)
+         {
+         }
+         this.aimp_bridge_socket = null;
+         this.aimp_bridge_buffer = "";
+      }
+
       private function aimp_init_runtime_bridge() : void
       {
          try
@@ -679,7 +712,7 @@ package
             this.aimp_round_end_layer.graphics.beginFill(0,0.75);
             this.aimp_round_end_layer.graphics.drawRect(0,0,_loc5_,_loc6_);
             this.aimp_round_end_layer.graphics.endFill();
-            _loc7_ = this.aimp_create_round_end_text(_loc2_ == "" ? "FIN DE LA PARTIE" : _loc2_,52,_loc5_,_loc6_ * 0.36);
+            _loc7_ = this.aimp_create_round_end_text(_loc2_ == "" ? "GAME OVER" : _loc2_,52,_loc5_,_loc6_ * 0.36);
             this.aimp_round_end_layer.addChild(_loc7_);
             _loc7_ = this.aimp_create_round_end_text(_loc3_,28,_loc5_,_loc6_ * 0.36 + 80);
             this.aimp_round_end_layer.addChild(_loc7_);
@@ -749,11 +782,11 @@ package
          }
          if(this.aimp_round_end_remaining > 0)
          {
-            this.aimp_round_end_count_text.text = "Retour au lobby dans " + this.aimp_round_end_remaining + " s";
+            this.aimp_round_end_count_text.text = "Returning to lobby in " + this.aimp_round_end_remaining + " s";
          }
          else
          {
-            this.aimp_round_end_count_text.text = "Retour au lobby...";
+            this.aimp_round_end_count_text.text = "Returning to lobby...";
          }
       }
       

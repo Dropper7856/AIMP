@@ -1014,7 +1014,7 @@ package frontend
          this._mpLobbyReturnRole = param1 == "host" ? "host" : "client";
          this._mpLobbyReturnFrames = 0;
          removeEventListener(Event.ENTER_FRAME,this.mpLobbyReturnFrameHandler);
-         addEventListener(Event.ENTER_FRAME,this.mpLobbyReturnFrameHandler);
+         addEventListener(Event.ENTER_FRAME,this.mpLobbyReturnFrameHandler,false,0,true);
       }
       
       private function mpLobbyReturnFrameHandler(param1:Event) : void
@@ -1052,7 +1052,7 @@ package frontend
          {
             menu.rebuildPageMap();
             menu.setCurrentPage(_loc2_.id.value,0);
-            this.show_network_notification("Retour au lobby");
+            this.show_network_notification("Returning to lobby");
          }
          catch(error:Error)
          {

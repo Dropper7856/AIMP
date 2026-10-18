@@ -206,12 +206,12 @@ internal sealed class ScaleformBridgeListener : IDisposable
         string first,
         CancellationToken token)
     {
-        PublishMessage(channel, first);
+        PublishMessage(channel, first, stream);
         while (!token.IsCancellationRequested)
         {
             var message = await ReadMessageAsync(stream, token).ConfigureAwait(false);
             if (message is null) return;
-            if (message.Length != 0) PublishMessage(channel, message);
+            if (message.Length != 0) PublishMessage(channel, message, stream);
         }
     }
 
@@ -231,14 +231,30 @@ internal sealed class ScaleformBridgeListener : IDisposable
         throw new InvalidDataException("The UI bridge message exceeded 64 KiB.");
     }
 
-    private void PublishMessage(string channel, string raw)
+    private void PublishMessage(string channel, string raw, NetworkStream stream)
     {
         var message = _protocol.Parse(raw);
         var details = _protocol.Describe(message);
         var suffix = details.Length == 0 ? string.Empty : $" | {details}";
         var type = message.Type.Length == 0 ? "UNKNOWN" : message.Type.ToUpperInvariant();
         _diagnostics.Log("UI Bridge", $"Event received: channel={channel}, type={type}{suffix}");
-        MessageReceived?.Invoke(this, new ScaleformBridgeEvent(channel, raw, message));
+        MessageReceived?.Invoke(this, new ScaleformBridgeEvent(channel, raw, message,
+            (replyType, values) => ReplyAsync(stream, replyType, values)));
+    }
+
+    // Replies on the exact connection that sent the message. Event-port
+    // movies (e.g. the pause menu) never own the single command channel.
+    private async Task<bool> ReplyAsync(
+        NetworkStream stream,
+        string type,
+        IReadOnlyDictionary<string, string>? values)
+    {
+        var bytes = Encoding.UTF8.GetBytes(_protocol.Build(type, values) + "\n");
+        await _sendGate.WaitAsync().ConfigureAwait(false);
+        try { await stream.WriteAsync(bytes).ConfigureAwait(false); return true; }
+        catch (Exception exception) when (exception is IOException or SocketException
+            or ObjectDisposedException) { LogSendFailure(type, exception); return false; }
+        finally { _sendGate.Release(); }
     }
 
     private async Task<bool> WriteCommandAsync(

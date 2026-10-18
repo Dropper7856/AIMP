@@ -685,6 +685,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private void OnBridgeMessage(object? sender, ScaleformBridgeEvent value)
     {
         if (Volatile.Read(ref _disposed) != 0) return;
+        if (IsPauseMenuMessage(value.Message)) { _ = HandlePauseMenuMessageAsync(value); return; }
         _ = HandleBridgeMessageAsync(value.Message);
     }
 
@@ -823,7 +824,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         await SetNativeWorldSyncLifecycleAsync(
             client.SessionId, client.PeerId, false, 0, true, false, "lobby-client-joined")
             .ConfigureAwait(false);
-        await PublishLobbyAsync(client.Snapshot).ConfigureAwait(false);
+        await PublishLobbyAsync(client, client.Snapshot).ConfigureAwait(false);
         await SendStatusAsync($"Connected to {settings.HostAddress}:{settings.Port}")
             .ConfigureAwait(false);
     }
@@ -2422,16 +2423,32 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     }
 
     private void OnLobbySnapshot(object? sender, LobbySnapshotPayload value) =>
-        _ = PublishLobbyAsync(value);
+        _ = PublishLobbyAsync(sender, value);
 
-    private async Task PublishLobbyAsync(LobbySnapshotPayload? value)
+    private async Task PublishLobbyAsync(object? sender, LobbySnapshotPayload? value)
     {
         if (value is null) return;
-        var departedCharacters = UpdateLobbySnapshot(value);
+        string[] departedNames;
+        uint[] departedCharacters;
+        lock (_stateGate)
+        {
+            if (!IsCurrentLobbySource(sender, value.SessionId)) return;
+            departedNames = CaptureDepartedPlayerNames(value);
+            departedCharacters = UpdateLobbySnapshot(value);
+        }
         if (departedCharacters.Length != 0)
             await StopRemoteCharactersBestEffortAsync(departedCharacters).ConfigureAwait(false);
+        lock (_stateGate)
+            if (!IsCurrentLobbySource(sender, value.SessionId)) return;
+        await ShowPlayersLeftAsync(departedNames, value.SessionId).ConfigureAwait(false);
         PublishState();
-        await SendLobbyStateAsync(value).ConfigureAwait(false);
+        LobbySnapshotPayload? latest;
+        lock (_stateGate)
+        {
+            if (!IsCurrentLobbySource(sender, value.SessionId)) return;
+            latest = _lobby;
+        }
+        if (latest is not null) await SendLobbyStateAsync(latest).ConfigureAwait(false);
     }
 
     private uint[] UpdateLobbySnapshot(LobbySnapshotPayload value)
@@ -3517,12 +3534,24 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _ = SendErrorAsync($"{value.Code}: {value.Message}");
 
     private void OnClientDisconnected(object? sender, EventArgs value) =>
-        _ = HandleClientDisconnectedAsync();
+        _ = HandleClientDisconnectedAsync(sender as LobbyClient);
 
-    private async Task HandleClientDisconnectedAsync()
+    private async Task HandleClientDisconnectedAsync(LobbyClient? disconnected)
     {
         await Task.Yield();
-        await StopNetworkAsync("Disconnected from host").ConfigureAwait(false);
+        string? departedHost;
+        long stopVersion;
+        await _commandGate.WaitAsync(_lifetime.Token).ConfigureAwait(false);
+        try
+        {
+            lock (_stateGate)
+                if (disconnected is null || !ReferenceEquals(disconnected, _client)) return;
+            departedHost = CaptureInGameHostName();
+            await StopNetworkAsync("Disconnected from host").ConfigureAwait(false);
+            lock (_stateGate) stopVersion = _networkStopVersion;
+        }
+        finally { _commandGate.Release(); }
+        if (departedHost is not null) await HandleHostLeftGameAsync(departedHost, stopVersion).ConfigureAwait(false);
     }
 
     private void OnNetworkLog(object? sender, string value) =>
@@ -4479,6 +4508,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     {
         lock (_stateGate)
         {
+            ++_networkStopVersion;
             _localGameplayReady = false;
             var characters = _remoteCharacters.Values.Distinct().ToArray();
             _start = null;
@@ -4763,6 +4793,17 @@ internal static class RemoteSpawnPlanner
         {
             ["headerText"] = "AIMP",
             ["mainText"] = $"{playerName} join the game",
+            ["duration"] = "5.0",
+            ["icon"] = PopupMessageIcons.Alert,
+            ["soundEvent"] = PopupMessageSoundEvents.ObjectiveNew
+        };
+
+    internal static IReadOnlyDictionary<string, string> CreateLeftMessage(
+        string playerName) =>
+        new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["headerText"] = "AIMP",
+            ["mainText"] = $"{playerName} left the game",
             ["duration"] = "5.0",
             ["icon"] = PopupMessageIcons.Alert,
             ["soundEvent"] = PopupMessageSoundEvents.ObjectiveNew

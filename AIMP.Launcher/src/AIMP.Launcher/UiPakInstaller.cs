@@ -12,7 +12,8 @@ internal static class UiBridgeAssetCatalog
         "NEWFRONTENDMENU.GFX",
         "PICKUPOVERLAY.GFX",
         "CHALLENGEMAPOVERLAY.GFX",
-        "LOADINGSCREEN.GFX"
+        "LOADINGSCREEN.GFX",
+        "PAUSEMENU.GFX"
     };
 
     internal static IReadOnlyList<UiBridgeAsset> Resolve(string outputDirectory) =>
