@@ -54,6 +54,8 @@ struct GoalHint final {
 std::array<GoalHint, kNavigationCapacity> gGoalHints{};
 SRWLOCK gGoalHintsLock = SRWLOCK_INIT;
 std::atomic<void*> gDirectedStartOriginal{}, gDirectedUpdateOriginal{};
+void* gDirectedStartTrampoline{};
+void* gDirectedUpdateTrampoline{};
 template<typename T> bool Read(const std::uintptr_t address, T& value) noexcept {
     __try { value = *reinterpret_cast<const T*>(address); return true; }
     __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
@@ -267,8 +269,12 @@ bool InstallGoalObservers(HookManager& hooks, std::string& error) {
     std::memcpy(start.expected.bytes.data() + 3U, &handler, sizeof(handler));
     start.expected.mask.assign(start.expected.bytes.size(), 'x');
     start.patchLength = start.expected.bytes.size(); start.relocationSafePrefix = true;
+    start.trampolineOut = &gDirectedStartTrampoline;
     start.publishedTrampolineOut = &gDirectedStartOriginal;
-    if (!hooks.Install(start, error)) return false;
+    if (!hooks.Install(start, error)) {
+        error = start.name + ": " + error;
+        return false;
+    }
     HookRequest update;
     update.name = "aisync_directed_world_goal_update";
     update.target = reinterpret_cast<void*>(gBase + 0x00286860U);
@@ -276,8 +282,11 @@ bool InstallGoalObservers(HookManager& hooks, std::string& error) {
     update.expected.bytes = {0x55U,0x8BU,0xECU,0x83U,0xE4U,0xF0U};
     update.expected.mask.assign(update.expected.bytes.size(), 'x');
     update.patchLength = update.expected.bytes.size(); update.relocationSafePrefix = true;
+    update.trampolineOut = &gDirectedUpdateTrampoline;
     update.publishedTrampolineOut = &gDirectedUpdateOriginal;
-    return hooks.Install(update, error);
+    if (hooks.Install(update, error)) return true;
+    error = update.name + ": " + error;
+    return false;
 }
 void SetSubmissionGuard(const SubmissionGuard guard) noexcept {
     const auto previous = gSubmissionGuard.exchange(guard, std::memory_order_acq_rel);
