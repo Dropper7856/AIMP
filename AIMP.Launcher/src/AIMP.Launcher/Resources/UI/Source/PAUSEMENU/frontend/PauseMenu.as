@@ -4,9 +4,8 @@ package frontend
    import flash.events.IOErrorEvent;
    import flash.events.ProgressEvent;
    import flash.events.SecurityErrorEvent;
-   import flash.events.TimerEvent;
    import flash.net.Socket;
-   import flash.utils.Timer;
+   import flash.utils.getTimer;
    import frontend.enum.MenuPageId;
    import frontend.events.MenuItemEvent;
    import frontend.menu.MenuItem;
@@ -24,20 +23,20 @@ package frontend
       private var _challengeOrPreorderEnabled:Boolean;
 
       private var _aimpSocket:Socket;
-
       private var _aimpBuffer:String = "";
-
+      private var _aimpLines:Array = [];
       private var _aimpMultiplayer:Boolean = false;
-
-      private var _aimpDisconnectItem:MenuItem;
-
-      private var _aimpQuitTimer:Timer;
-
-      private var _aimpStateTimer:Timer;
-
+      private var _aimpStateRequested:Boolean = false;
+      private var _aimpStateKnown:Boolean = false;
+      private var _aimpLeaveWhenKnown:Boolean = false;
+      private var _aimpStateDeadline:int = 0;
       private var _aimpDisconnectPending:Boolean = false;
-
       private var _aimpDisconnectRequest:uint = 0;
+      private var _aimpDisconnectDeadline:int = 0;
+      private var _aimpRetryAt:int = 0;
+      private var _aimpBridgeFailed:Boolean = false;
+      private var _aimpExitRequested:Boolean = false;
+      private var _aimpExitOnNextFrame:Boolean = false;
 
       public function PauseMenu()
       {
@@ -61,62 +60,102 @@ package frontend
          menu.rootPage = _loc1_;
          this.__setProp_description_Scene1_description_0();
          this.__setProp_userProfilePanel_Scene1_profile_0();
-         this._aimpDisconnectItem = new MenuItem("Disconnect",this.aimpDisconnectHandler);
-         this._aimpDisconnectItem.description = "Leave the multiplayer game and return to the main menu";
-         this._aimpStateTimer = new Timer(1000);
-         this._aimpStateTimer.addEventListener(TimerEvent.TIMER,this.aimpRefreshState);
          addEventListener(Event.ADDED_TO_STAGE,this.aimpAddedToStage);
          addEventListener(Event.REMOVED_FROM_STAGE,this.aimpRemovedFromStage);
-         this._aimpStateTimer.start();
-         this.aimpConnectBridge();
+         addEventListener(Event.ENTER_FRAME,this.aimpFrame,false,0,true);
       }
 
       private function aimpAddedToStage(param1:Event) : void
       {
-         this._aimpStateTimer.start();
-         this.aimpRefreshState(null);
+         this._aimpStateRequested = false;
+         addEventListener(Event.ENTER_FRAME,this.aimpFrame,false,0,true);
       }
 
       private function aimpRemovedFromStage(param1:Event) : void
       {
-         this._aimpStateTimer.stop();
-         this.aimpStopQuitTimer();
+         removeEventListener(Event.ENTER_FRAME,this.aimpFrame);
          this._aimpDisconnectPending = false;
-         try
-         {
-            if(this._aimpSocket != null)
-            {
-               this._aimpSocket.close();
-            }
-         }
-         catch(error:Error)
-         {
-         }
-         this._aimpSocket = null;
+         this._aimpLeaveWhenKnown = false;
+         this._aimpExitRequested = false;
+         this._aimpExitOnNextFrame = false;
+         this.aimpCloseBridge();
       }
 
-      private function aimpRefreshState(param1:TimerEvent) : void
+      private function aimpFrame(param1:Event) : void
       {
-         if(this._aimpDisconnectPending)
+         // Wait for retail initialization. Socket callbacks only collect data;
+         // menu changes and native navigation execute on this UI frame.
+         if(stage == null || menu == null || !menu.initialized)
          {
             return;
          }
+         if(this._aimpExitOnNextFrame)
+         {
+            removeEventListener(Event.ENTER_FRAME,this.aimpFrame);
+            this._aimpExitOnNextFrame = false;
+            call("back_to_frontend");
+            return;
+         }
+         if(this._aimpBridgeFailed)
+         {
+            this._aimpBridgeFailed = false;
+            this.aimpCloseBridge();
+            this._aimpRetryAt = getTimer() + 3000;
+            if(this._aimpDisconnectPending)
+            {
+               this.aimpDisconnectFailed();
+            }
+         }
+         while(this._aimpLines.length > 0)
+         {
+            this.aimpHandleLine(String(this._aimpLines.shift()));
+            if(this._aimpExitRequested)
+            {
+               this._aimpExitRequested = false;
+               this.aimpCloseBridge();
+               this._aimpExitOnNextFrame = true;
+               return;
+            }
+         }
+         if(this._aimpLeaveWhenKnown)
+         {
+            if(this._aimpStateKnown)
+            {
+               this._aimpLeaveWhenKnown = false;
+               this.backToFrontendHandler(null);
+            }
+            else if(getTimer() - this._aimpStateDeadline >= 0)
+            {
+               this._aimpLeaveWhenKnown = false;
+               _backToFrontendItem.description = "Unable to read session status. Please try again.";
+               menu.refresh();
+            }
+         }
+         if(this._aimpDisconnectPending && getTimer() - this._aimpDisconnectDeadline >= 0)
+         {
+            this.aimpDisconnectFailed();
+         }
          if(this._aimpSocket == null)
          {
-            this.aimpConnectBridge();
+            if(getTimer() - this._aimpRetryAt >= 0)
+            {
+               this.aimpConnectBridge();
+            }
          }
-         else
+         else if(this._aimpSocket.connected && !this._aimpStateRequested)
          {
-            this.aimpSend("PAUSE_MENU_HELLO|source=pause_menu|phase=pause");
+            this._aimpStateRequested = this.aimpSend("PAUSE_MENU_HELLO|source=pause_menu|phase=pause");
          }
       }
 
       private function aimpConnectBridge() : void
       {
+         this._aimpRetryAt = getTimer() + 3000;
+         this._aimpBuffer = "";
+         this._aimpLines = [];
          try
          {
             this._aimpSocket = new Socket();
-            this._aimpSocket.addEventListener(Event.CONNECT,this.aimpBridgeConnected);
             this._aimpSocket.addEventListener(ProgressEvent.SOCKET_DATA,this.aimpBridgeData);
             this._aimpSocket.addEventListener(IOErrorEvent.IO_ERROR,this.aimpBridgeError);
             this._aimpSocket.addEventListener(SecurityErrorEvent.SECURITY_ERROR,this.aimpBridgeError);
@@ -125,13 +164,33 @@ package frontend
          }
          catch(error:Error)
          {
-            this._aimpSocket = null;
+            this.aimpCloseBridge();
          }
       }
 
-      private function aimpBridgeConnected(param1:Event) : void
+      private function aimpCloseBridge() : void
       {
-         this.aimpSend("PAUSE_MENU_HELLO|source=pause_menu|phase=pause");
+         var _loc1_:Socket = this._aimpSocket;
+         this._aimpSocket = null;
+         this._aimpStateRequested = false;
+         this._aimpStateKnown = false;
+         this._aimpBuffer = "";
+         this._aimpLines = [];
+         if(_loc1_ == null)
+         {
+            return;
+         }
+         _loc1_.removeEventListener(ProgressEvent.SOCKET_DATA,this.aimpBridgeData);
+         _loc1_.removeEventListener(IOErrorEvent.IO_ERROR,this.aimpBridgeError);
+         _loc1_.removeEventListener(SecurityErrorEvent.SECURITY_ERROR,this.aimpBridgeError);
+         _loc1_.removeEventListener(Event.CLOSE,this.aimpBridgeError);
+         try
+         {
+            _loc1_.close();
+         }
+         catch(error:Error)
+         {
+         }
       }
 
       private function aimpBridgeError(param1:Event) : void
@@ -140,7 +199,7 @@ package frontend
          {
             return;
          }
-         this._aimpSocket = null;
+         this._aimpBridgeFailed = true;
       }
 
       private function aimpSend(param1:String) : Boolean
@@ -156,26 +215,43 @@ package frontend
          }
          catch(error:Error)
          {
+            this.aimpCloseBridge();
          }
          return false;
       }
 
       private function aimpBridgeData(param1:ProgressEvent) : void
       {
-         var _loc2_:int = 0;
+         var _loc2_:Socket = param1.currentTarget as Socket;
+         var _loc3_:int = 0;
+         if(_loc2_ == null || _loc2_ != this._aimpSocket)
+         {
+            return;
+         }
          try
          {
-            this._aimpBuffer += this._aimpSocket.readUTFBytes(this._aimpSocket.bytesAvailable);
-            _loc2_ = this._aimpBuffer.indexOf("\n");
-            while(_loc2_ >= 0)
+            this._aimpBuffer += _loc2_.readUTFBytes(_loc2_.bytesAvailable);
+            if(this._aimpBuffer.length > 65536)
             {
-               this.aimpHandleLine(this._aimpBuffer.substr(0,_loc2_).split("\r").join(""));
-               this._aimpBuffer = this._aimpBuffer.substr(_loc2_ + 1);
-               _loc2_ = this._aimpBuffer.indexOf("\n");
+               this.aimpBridgeError(param1);
+               return;
+            }
+            _loc3_ = this._aimpBuffer.indexOf("\n");
+            while(_loc3_ >= 0)
+            {
+               if(this._aimpLines.length >= 16)
+               {
+                  this.aimpBridgeError(param1);
+                  return;
+               }
+               this._aimpLines.push(this._aimpBuffer.substr(0,_loc3_).split("\r").join(""));
+               this._aimpBuffer = this._aimpBuffer.substr(_loc3_ + 1);
+               _loc3_ = this._aimpBuffer.indexOf("\n");
             }
          }
          catch(error:Error)
          {
+            this.aimpBridgeError(param1);
          }
       }
 
@@ -187,23 +263,21 @@ package frontend
             {
                return;
             }
-            this.aimpStopQuitTimer();
             this._aimpDisconnectPending = false;
             if(this.aimpGetValue(param1,"success") == "1")
             {
-               call("back_to_frontend");
+               this._aimpExitRequested = true;
             }
             else
             {
-               this.aimpDisconnectFailed(null);
+               this.aimpDisconnectFailed();
             }
-            return;
          }
-         if(param1.indexOf("PAUSE_MENU_STATE") != 0)
+         else if(param1.indexOf("PAUSE_MENU_STATE|") == 0)
          {
-            return;
+            this.aimpSetMultiplayer(this.aimpGetValue(param1,"multiplayer") == "1");
+            this._aimpStateKnown = true;
          }
-         this.aimpSetMultiplayer(param1.indexOf("|multiplayer=1") >= 0);
       }
 
       private function aimpGetValue(param1:String, param2:String) : String
@@ -223,35 +297,32 @@ package frontend
 
       private function aimpSetMultiplayer(param1:Boolean) : void
       {
-         var _loc2_:int = 0;
          if(this._aimpMultiplayer == param1)
          {
             return;
          }
          this._aimpMultiplayer = param1;
-         if(param1)
-         {
-            _loc2_ = menu.rootPage.items.indexOf(_backToFrontendItem);
-            if(_loc2_ < 0)
-            {
-               _loc2_ = menu.rootPage.items.length;
-            }
-            menu.rootPage.removeItem(_backToFrontendItem);
-            menu.rootPage.addItemAtIndex(this._aimpDisconnectItem,_loc2_);
-         }
-         else
-         {
-            _loc2_ = menu.rootPage.items.indexOf(this._aimpDisconnectItem);
-            menu.rootPage.removeItem(this._aimpDisconnectItem);
-            menu.rootPage.addItemAtIndex(_backToFrontendItem,_loc2_ < 0 ? menu.rootPage.items.length : _loc2_);
-         }
-         menu.rebuildItemMap();
-         menu.rebuildPageMap();
+         // Preserve the retail BACK_TO_FRONTEND id, bindings and page entry.
+         _backToFrontendItem.name = param1 ? "Disconnect" : "AI_UI_PAUSE_TO_FRONTEND";
+         _backToFrontendItem.description = param1 ? "Leave the multiplayer game and return to the main menu" : "AI_UI_PAUSE_TO_FRONTEND_DESC";
          menu.refresh();
       }
 
-      private function aimpDisconnectHandler(param1:MenuItemEvent) : void
+      override protected function backToFrontendHandler(param1:MenuItemEvent) : void
       {
+         if(!this._aimpStateKnown)
+         {
+            this._aimpLeaveWhenKnown = true;
+            this._aimpStateDeadline = getTimer() + 15000;
+            _backToFrontendItem.description = "Waiting for session status...";
+            menu.refresh();
+            return;
+         }
+         if(!this._aimpMultiplayer)
+         {
+            super.backToFrontendHandler(param1);
+            return;
+         }
          if(this._aimpDisconnectPending)
          {
             return;
@@ -260,31 +331,18 @@ package frontend
          this._aimpDisconnectPending = true;
          if(!this.aimpSend("PAUSE_MENU_DISCONNECT|source=pause_menu|phase=pause|requestId=" + this._aimpDisconnectRequest))
          {
-            this.aimpDisconnectFailed(null);
+            this.aimpDisconnectFailed();
             return;
          }
-         this._aimpDisconnectItem.description = "Disconnecting...";
-         this._aimpQuitTimer = new Timer(15000,1);
-         this._aimpQuitTimer.addEventListener(TimerEvent.TIMER_COMPLETE,this.aimpDisconnectFailed);
-         this._aimpQuitTimer.start();
+         this._aimpDisconnectDeadline = getTimer() + 15000;
+         _backToFrontendItem.description = "Disconnecting...";
          menu.refresh();
       }
 
-      private function aimpStopQuitTimer() : void
+      private function aimpDisconnectFailed() : void
       {
-         if(this._aimpQuitTimer != null)
-         {
-            this._aimpQuitTimer.stop();
-            this._aimpQuitTimer.removeEventListener(TimerEvent.TIMER_COMPLETE,this.aimpDisconnectFailed);
-            this._aimpQuitTimer = null;
-         }
-      }
-
-      private function aimpDisconnectFailed(param1:TimerEvent) : void
-      {
-         this.aimpStopQuitTimer();
          this._aimpDisconnectPending = false;
-         this._aimpDisconnectItem.description = "Unable to disconnect. Please try again.";
+         _backToFrontendItem.description = "Unable to disconnect. Please try again.";
          menu.refresh();
       }
 

@@ -82,6 +82,7 @@ bool CheckPages(
 wchar_t gCrashReportPath[32768]{};
 LPTOP_LEVEL_EXCEPTION_FILTER gPreviousUnhandledFilter{};
 volatile LONG gExceptionRecorderInstalled{};
+volatile LONG gCrashReportClaimed{};
 
 bool ReadCrashWord(const std::uintptr_t address, std::uint32_t& word) noexcept {
     if (address < 0x10000U || address > 0xFFFF0000U) return false;
@@ -114,11 +115,15 @@ void WriteCrashWords(const HANDLE file, const char* label,
 }
 
 LONG WINAPI RecordUnhandledException(EXCEPTION_POINTERS* pointers) noexcept {
-    if (pointers != nullptr && pointers->ExceptionRecord != nullptr) {
+    // Concurrent failing threads must not truncate/interleave the same report.
+    // Keep the first unhandled fault for the lifetime of this process; later
+    // filters still forward normally, but never open this file again.
+    if (pointers != nullptr && pointers->ExceptionRecord != nullptr &&
+        InterlockedCompareExchange(&gCrashReportClaimed, 1, 0) == 0) {
         HANDLE file = CreateFileW(
             gCrashReportPath,
             GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
             nullptr,
             CREATE_ALWAYS,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
