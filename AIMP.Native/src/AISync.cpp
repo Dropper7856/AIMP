@@ -239,6 +239,7 @@ struct Actor {
     NavigationGoalState convergenceGoal{};
     ULONGLONG convergenceDivergenceSince{};
     bool convergenceActive{};
+    std::uint32_t convergenceAuthorityRequest{};
     std::uint32_t remoteBirth{}, remoteRevision{};
     std::uint32_t healthRevision{}, damageRevision{};
     health::DamageReplayCursor damageCursor{};
@@ -429,6 +430,7 @@ thread_local std::uintptr_t gSchedulerTransitionOwner{};
 thread_local std::uint32_t gSchedulerTransitionRva{};
 std::atomic<std::uint32_t> gLastPairedBlockedSchedulerRva{};
 std::atomic<std::uint64_t> gNavigationConvergenceApplied{}, gNavigationConvergenceFailed{};
+std::atomic<std::uint64_t> gNavigationPaused{};
 std::atomic<std::uint64_t> gPairedRuntimePlayerRemaps{};
 std::atomic<void*> gPlayerPreparationPublished{}, gPlayerCategoryPublished{};
 void* gVictimUpdateTrampoline{};
@@ -5196,7 +5198,9 @@ void RememberPresentationPose(Actor& actor, const State& state, const ULONGLONG 
 }
 bool NativeMoveConvergenceEligible(const State& state) noexcept {
     const auto required = PoseValid | Moving | ExecutionValid;
-    return (state.stateFlags & required) == required && state.navigation.flags == 0U &&
+    const bool point = (state.navigation.flags & navigation::kLiveGoal) != 0U &&
+        navigation::LocalRequestKind(state.navigation) == navigation::kPointRequest;
+    return (state.stateFlags & required) == required && (state.navigation.flags == 0U || point) &&
         state.executionCycleState == 0x38U && state.executionCycleTypeRva == 0x00EABF80U &&
         state.locomotionIntensity > 0.0F && !ProxyWithdrawn(state) &&
         (state.lifecycleFlags & (LifecycleSpatialDiscontinuity | LifecycleTraversalAction)) == 0U;
@@ -5319,14 +5323,27 @@ bool ApplyNativeNavigationConvergence(Actor& actor, const ULONGLONG now) noexcep
     const bool readable = Read(actor.character + kPositionOffset, x) &&
         Read(actor.character + kPositionOffset + 8U, z) && FiniteCoordinate(x) && FiniteCoordinate(z);
     const auto distance = readable ? std::hypot(state.position[0] - x, state.position[2] - z) : 0.0F;
-    if (!eligible || !readable || distance < (actor.convergenceActive ? 0.65F : 1.5F)) {
+    const bool hasGoal = (state.navigation.flags & navigation::kLiveGoal) != 0U;
+    const auto authorityRequest = hasGoal ? state.navigation.requestRevision : 0U;
+    if (actor.convergenceAuthorityRequest != authorityRequest) {
+        if (actor.convergenceActive) navigation::Cancel(actor.character);
+        actor.convergenceActive = false; actor.convergenceDivergenceSince = 0U;
+        actor.convergenceAuthorityRequest = authorityRequest;
+    }
+    // With a real Host goal, only a proxy lagging along the Host's current
+    // travel direction may rejoin. A proxy already ahead must not turn around
+    // to chase an older pose; Host pause/stop below handles that case.
+    const auto along = readable ? (state.position[0] - x) * state.velocityX +
+        (state.position[2] - z) * state.velocityZ : 0.0F;
+    if (!eligible || !readable || (hasGoal && along <= 0.0F) ||
+        distance < (actor.convergenceActive ? 0.65F : hasGoal ? 2.5F : 1.5F)) {
         if (actor.convergenceActive) navigation::Cancel(actor.character);
         actor.convergenceActive = false; actor.convergenceDivergenceSince = 0U;
         return false;
     }
     if (!actor.convergenceActive) {
         if (actor.convergenceDivergenceSince == 0U) actor.convergenceDivergenceSince = now;
-        if (now - actor.convergenceDivergenceSince < 250ULL) return false;
+        if (now - actor.convergenceDivergenceSince < (hasGoal ? 500ULL : 250ULL)) return false;
     }
     auto& goal = actor.convergenceGoal;
     float targetDistance{};
@@ -5342,7 +5359,8 @@ bool ApplyNativeNavigationConvergence(Actor& actor, const ULONGLONG now) noexcep
     std::string error;
     // Temporary local path correction for a demonstrated Host Move. The
     // authoritative pose is a reachable route anchor, never a transform write.
-    // A real Host goal always wins; paired/root-motion/unknown cycles are excluded.
+    // The real Host goal stays in state.navigation and is restored when this
+    // bounded rejoin ends. Paired/root-motion/unknown cycles are excluded.
     if (navigation::Apply(actor.character, goal, actor.lastReceive + kMotionLease, error, true) &&
         navigation::ApplyGait(actor.character, state.moveType)) {
         actor.convergenceActive = true;
@@ -5419,12 +5437,13 @@ bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
         actor.convergenceActive = false; actor.convergenceDivergenceSince = 0U;
     }
     if (!RecoverCatastrophicIntentDivergence(actor, state, now)) return false;
-    if (HostSuspendsNavigation(state)) navigation::Cancel(actor.character);
+    const bool hostPaused = HostPausesPointNavigation(state);
+    if (HostSuspendsNavigation(state) || hostPaused) navigation::Cancel(actor.character);
     if (!ApplyAuthoritativeExecution(actor, now)) return false;
 
     const bool executionApplied = actor.replayedExecutionRevision != 0U &&
         actor.replayedExecutionRevision == state.executionRevision;
-    if (HostSuspendsNavigation(state) && !executionApplied) {
+    if ((HostSuspendsNavigation(state) || hostPaused) && !executionApplied) {
         // Keep the Host stop decision after the LOCAL 3B ends. Do not allow
         // a still-published path goal to immediately undo that decision.
         actor.movementOwner = MovementOwner::Neutral;
@@ -5432,6 +5451,7 @@ bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
         if (!character_direct_step_runtime::HoldAIIntentIdle(actor.character, state.moveType, idleError)) return false;
         actor.completedRevision = state.revision;
         actor.lastProxyRefresh = now;
+        if (hostPaused) gNavigationPaused.fetch_add(1U, std::memory_order_relaxed);
         return true;
     }
     actor.movementOwner = ChooseMovementOwner(false, false, executionApplied, (state.navigation.flags & 1U) != 0U);
@@ -5441,7 +5461,7 @@ bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
         return true;
     }
     if (actor.movementOwner == MovementOwner::Navigation) {
-        actor.convergenceActive = false; actor.convergenceDivergenceSince = 0U;
+        if (ApplyNativeNavigationConvergence(actor, now)) return true;
         const bool rejected = actor.rejectedNavigationRevision == state.navigation.revision &&
             actor.rejectedNavigationRequestRevision == state.navigation.requestRevision;
         const auto backoff = rejected ? kRejectedNavigationRetry : kRefreshPeriod;
@@ -8520,6 +8540,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"lastPairedBlockedSchedulerRva", Diagnostics::Unsigned(gLastPairedBlockedSchedulerRva.load()), true},
          {"navigationConvergenceApplied", Diagnostics::Unsigned(gNavigationConvergenceApplied.load()), true},
          {"navigationConvergenceFailed", Diagnostics::Unsigned(gNavigationConvergenceFailed.load()), true},
+         {"navigationHostPauses", Diagnostics::Unsigned(gNavigationPaused.load()), true},
          {"pairedAdmissionRetries", Diagnostics::Unsigned(gPairedAdmissionRetries.load()), true},
          {"pairedAdmissionAbandoned", Diagnostics::Unsigned(gPairedAdmissionAbandoned.load()), true},
          {"pairedRuntimePlayerRemaps", Diagnostics::Unsigned(gPairedRuntimePlayerRemaps.load()), true},

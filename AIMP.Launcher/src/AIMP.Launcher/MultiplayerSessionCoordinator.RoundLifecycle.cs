@@ -22,6 +22,8 @@ internal sealed partial class MultiplayerSessionCoordinator
         internal RoundEndedPayload Round { get; } = round;
         internal Guid Token { get; } = Guid.NewGuid();
         internal Guid ConnectionId { get; set; }
+        internal bool Acknowledged { get; set; }
+        internal bool ConnectionClosed { get; set; }
         internal TaskCompletionSource<bool> Closed { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
@@ -141,21 +143,52 @@ internal sealed partial class MultiplayerSessionCoordinator
     private void AcceptRoundReturnReady(ScaleformBridgeEvent value)
     {
         var message = value.Message;
-        if (value.Channel != "command" || value.ConnectionId == Guid.Empty
+        if (value.Channel != "command" || value.ConnectionId == Guid.Empty || value.Reply is null
             || message.Get("source") != "pickup_overlay" || message.Get("phase") != "gameplay"
             || !Guid.TryParse(message.Get("sessionId"), out var sessionId)
             || !Guid.TryParse(message.Get("returnToken"), out var token)
             || !int.TryParse(message.Get("generation"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var generation)) return;
+        RoundReturnFence fence;
         lock (_stateGate)
         {
-            var fence = _roundReturnFence;
-            if (fence is null || fence.Token != token || fence.Round.SessionId != sessionId
-                || fence.Round.LevelGeneration != generation || _start is null || _start.SessionId != sessionId
-                || _start.LevelGeneration != generation || fence.Closed.Task.IsCompleted) return;
+            if (_roundReturnFence is not { } current || current.Token != token || current.Round.SessionId != sessionId
+                || current.Round.LevelGeneration != generation || _start is null || _start.SessionId != sessionId
+                || _start.LevelGeneration != generation || current.Closed.Task.IsCompleted) return;
+            fence = current;
             if (fence.ConnectionId != Guid.Empty && fence.ConnectionId != value.ConnectionId) return;
             fence.ConnectionId = value.ConnectionId;
         }
-        _diagnostics.Log("PlayerLifecycle", $"Round {generation}: HUD ready; awaiting its connection closure.");
+        _diagnostics.Log("PlayerLifecycle", $"Round {generation}: HUD ready; acknowledging before its connection closes.");
+        _ = AcknowledgeRoundReturnAsync(value, fence);
+    }
+
+    private async Task AcknowledgeRoundReturnAsync(ScaleformBridgeEvent value, RoundReturnFence fence)
+    {
+        try
+        {
+            if (!await value.Reply!("ROUND_RETURN_CLOSE", new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["sessionId"] = fence.Round.SessionId.ToString("D"),
+                ["generation"] = fence.Round.LevelGeneration.ToString(CultureInfo.InvariantCulture),
+                ["returnToken"] = fence.Token.ToString("D")
+            }).ConfigureAwait(false)) return;
+            lock (_stateGate)
+            {
+                if (!ReferenceEquals(_roundReturnFence, fence)) return;
+                fence.Acknowledged = true;
+                CompleteRoundReturnFence(fence);
+            }
+        }
+        catch (Exception exception) when (exception is IOException or ObjectDisposedException)
+        { _diagnostics.Log("PlayerLifecycle", $"Round return acknowledgement failed: {exception.Message}"); }
+    }
+
+    // The ACK write continuation and reader termination can run in either order.
+    // Both must complete for this authorized connection before native teardown.
+    private void CompleteRoundReturnFence(RoundReturnFence fence)
+    {
+        if (fence.Acknowledged && fence.ConnectionClosed && fence.Closed.TrySetResult(true))
+            _diagnostics.Log("PlayerLifecycle", $"Round {fence.Round.LevelGeneration}: acknowledged HUD connection closed.");
     }
 
     private void OnRoundBridgeConnectionClosed(object? sender, ScaleformBridgeConnectionClosed value)
@@ -165,8 +198,8 @@ internal sealed partial class MultiplayerSessionCoordinator
         {
             var fence = _roundReturnFence;
             if (fence is null || fence.ConnectionId == Guid.Empty || fence.ConnectionId != value.ConnectionId) return;
-            if (fence.Closed.TrySetResult(true))
-                _diagnostics.Log("PlayerLifecycle", $"Round {fence.Round.LevelGeneration}: HUD connection closed after readiness.");
+            fence.ConnectionClosed = true;
+            CompleteRoundReturnFence(fence);
         }
     }
 

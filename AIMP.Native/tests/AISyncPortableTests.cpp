@@ -60,6 +60,27 @@ int main() {
     assert(!HostSuspendsNavigation(stopped));
     stopped.navigation.kind = navigation::kDirectedRequest;
     assert(HostSuspendsNavigation(stopped));
+    // A live point goal with an idle/stopped Host Move executor pauses the
+    // Client proxy, but only a Move cycle: turn/stance/other cycles keep ownership.
+    State paused{};
+    paused.stateFlags = ExecutionValid;
+    paused.executionCycleTypeRva = 0x00EABF80U;
+    paused.executionCycleState = 0x38U;
+    paused.navigation.flags = 1U;
+    paused.navigation.kind = navigation::kPointRequest;
+    assert(HostPausesPointNavigation(paused));
+    paused.stateFlags |= Moving;
+    paused.locomotionIntensity = 1.0F;
+    assert(!HostPausesPointNavigation(paused)); // Host is genuinely moving
+    paused.locomotionIntensity = 0.0F;
+    assert(HostPausesPointNavigation(paused)); // Moving flag without intensity
+    paused.navigation.kind = navigation::kTurnRequest;
+    assert(!HostPausesPointNavigation(paused));
+    paused.navigation.kind = navigation::kDirectedRequest;
+    paused.navigation.flags = 3U; // directed MOVE with a world endpoint
+    assert(HostPausesPointNavigation(paused));
+    paused.executionCycleState = 0x3BU;
+    assert(!HostPausesPointNavigation(paused));
     // Ownership through a real replication timeline, including rejected and
     // successfully replayed execution, pair admission and observer handoff.
     assert(ChooseMovementOwner(false, false, false, false) == MovementOwner::Intent);
