@@ -9,8 +9,8 @@ namespace AIMP.Launcher;
 // retail "quit to main menu" path. The lobby connection itself stays alive.
 internal sealed partial class MultiplayerSessionCoordinator
 {
-    private const string RoundEndTitle = "FIN DE LA PARTIE";
-    private const string RoundEndMessage = "Tous les joueurs sont morts.";
+    private const string RoundEndTitle = "GAME OVER";
+    private const string RoundEndMessage = "All players are dead.";
     private readonly record struct DeathReport(LobbyHost? Host, LobbyClient? Client, int Generation);
     private int _deathReportedGeneration;
     private int _roundEndingGeneration;
@@ -54,8 +54,16 @@ internal sealed partial class MultiplayerSessionCoordinator
         return report.Client!.SendPlayerDeathAsync(report.Generation, _lifetime.Token);
     }
 
-    private void OnRoundEnded(object? sender, RoundEndedPayload value) =>
+    private bool IsCurrentLobbySource(object? sender, Guid sessionId) =>
+        sender is LobbyHost host && ReferenceEquals(host, _host) && host.SessionId == sessionId
+        || sender is LobbyClient client && ReferenceEquals(client, _client) && client.SessionId == sessionId;
+
+    private void OnRoundEnded(object? sender, RoundEndedPayload value)
+    {
+        lock (_stateGate)
+            if (!IsCurrentLobbySource(sender, value.SessionId)) return;
         _ = HandleRoundEndedAsync(value);
+    }
 
     private async Task HandleRoundEndedAsync(RoundEndedPayload value)
     {
@@ -73,7 +81,7 @@ internal sealed partial class MultiplayerSessionCoordinator
     {
         lock (_stateGate)
         {
-            if (_start is null || _start.LevelGeneration != value.LevelGeneration
+            if (_start is null || _start.SessionId != value.SessionId || _start.LevelGeneration != value.LevelGeneration
                 || _roundEndingGeneration == value.LevelGeneration) return false;
             _roundEndingGeneration = value.LevelGeneration;
             return true;
@@ -94,10 +102,15 @@ internal sealed partial class MultiplayerSessionCoordinator
 
     private async Task ReturnToLobbyAsync(RoundEndedPayload value)
     {
-        if (!EndRoundGameplayState(value)) return;
-        await CloseNativeWorldBusAsync("round-ended").ConfigureAwait(false);
-        await RequestNativeFrontendAsync().ConfigureAwait(false);
-        PublishState();
+        await _commandGate.WaitAsync(_lifetime.Token).ConfigureAwait(false);
+        try
+        {
+            if (!EndRoundGameplayState(value)) return;
+            await CloseNativeWorldBusAsync("round-ended").ConfigureAwait(false);
+            await RequestNativeFrontendAsync().ConfigureAwait(false);
+            PublishState();
+        }
+        finally { _commandGate.Release(); }
     }
 
     // Keep the lobby connection and roster; drop every per-round replication
@@ -106,7 +119,7 @@ internal sealed partial class MultiplayerSessionCoordinator
     {
         lock (_stateGate)
         {
-            if (_start is null || _start.LevelGeneration != value.LevelGeneration) return false;
+            if (_start is null || _start.SessionId != value.SessionId || _start.LevelGeneration != value.LevelGeneration) return false;
             _start = null;
             _uiGameplayLoaded = false;
             _localGameplayReady = false;

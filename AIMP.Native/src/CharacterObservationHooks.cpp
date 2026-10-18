@@ -1,5 +1,6 @@
 #include "aimp/AISync.h"
 #include "aimp/CharacterActionRuntime.h"
+#include "aimp/CharacterDirectStepRuntime.h"
 #include "aimp/CharacterObservationHooks.h"
 
 #include "aimp/BuildProfile.h"
@@ -179,6 +180,9 @@ void __fastcall CharacterFullDestroyDetour(
     ActiveDetour active;
     ai_sync::ForgetCharacter(reinterpret_cast<std::uintptr_t>(character));
     character_action_runtime::ForgetCharacter(reinterpret_cast<std::uintptr_t>(character));
+    // The network movement pump caches raw Character addresses and writes yaw
+    // and control every frame; it must never outlive the Character.
+    character_direct_step_runtime::ForgetCharacter(reinterpret_cast<std::uintptr_t>(character));
     Lifecycle(
         LifecycleEventKind::CharacterFullDestroyBegin,
         reinterpret_cast<std::uintptr_t>(manager),

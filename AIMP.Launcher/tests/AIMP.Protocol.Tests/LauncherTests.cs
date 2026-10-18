@@ -194,6 +194,8 @@ internal static class LauncherTests
         AssertEx.Equal("1.000", spawn["x"]);
         AssertEx.Equal("2.000", spawn["y"]);
         AssertEx.Equal("3.000", spawn["z"]);
+        var leftMessage = RemoteSpawnPlanner.CreateLeftMessage("Ripley");
+        AssertEx.Equal("Ripley left the game", leftMessage["mainText"]);
         var joinMessage = RemoteSpawnPlanner.CreateJoinMessage("Ripley");
         AssertEx.Equal("AIMP", joinMessage["headerText"]);
         AssertEx.Equal("Ripley join the game", joinMessage["mainText"]);
@@ -520,9 +522,9 @@ internal static class LauncherTests
     private static void AssertUiAssets()
     {
         var assets = UiBridgeAssetCatalog.Resolve(@"C:\AIMP");
-        AssertEx.Equal(4, assets.Count);
+        AssertEx.Equal(5, assets.Count);
         AssertEx.SequenceEqual(new[] { "CHALLENGEMAPOVERLAY.GFX", "LOADINGSCREEN.GFX",
-            "NEWFRONTENDMENU.GFX", "PICKUPOVERLAY.GFX" },
+            "NEWFRONTENDMENU.GFX", "PAUSEMENU.GFX", "PICKUPOVERLAY.GFX" },
             assets.Select(value => Path.GetFileName(value.SourcePath)).Order(StringComparer.Ordinal));
         AssertEx.True(assets.All(value => value.PakPath.StartsWith("DATA/UI/",
             StringComparison.Ordinal)));

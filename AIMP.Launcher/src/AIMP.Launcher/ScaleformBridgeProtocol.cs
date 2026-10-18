@@ -13,7 +13,8 @@ internal sealed record ScaleformBridgeMessage(
 internal sealed record ScaleformBridgeEvent(
     string Channel,
     string RawMessage,
-    ScaleformBridgeMessage Message);
+    ScaleformBridgeMessage Message,
+    Func<string, IReadOnlyDictionary<string, string>?, Task<bool>>? Reply = null);
 
 internal sealed class ScaleformBridgeProtocol
 {

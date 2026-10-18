@@ -3988,7 +3988,7 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteReturnToFrontend() const 
     GameCommandExecutionResult result{};
     if (!ReturnToFrontendAvailable()) {
         result.statusCode = "RETURN_TO_FRONTEND_UNAVAILABLE";
-        result.message = "Le retour au menu principal n'est pas certifie pour cet executable.";
+        result.message = "Return to frontend is not certified for this executable.";
         return result;
     }
     // Same G and mode guard as PlayerLifecycle: G = [GlobalStateRoot]+48,
@@ -4002,22 +4002,26 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteReturnToFrontend() const 
         : std::optional<std::int32_t>{};
     if (!mode) {
         result.statusCode = "RETURN_TO_FRONTEND_CONTEXT_UNAVAILABLE";
-        result.message = "Le gestionnaire de gameplay est illisible.";
+        result.message = "The gameplay manager is unreadable.";
         return result;
     }
     if (*mode == 0 || *mode == 3) {
         result.statusCode = "RETURN_TO_FRONTEND_NOT_IN_GAMEPLAY";
-        result.message = "Aucun niveau de gameplay n'est actif.";
+        result.message = "No gameplay level is active.";
         return result;
     }
+    // Remote proxies are freed by the level unload. Drop every network
+    // movement mailbox first so the engine-thread pump cannot write into
+    // their memory while the frontend reuses the heap.
+    character_direct_step_runtime::ForgetAll();
     if (!InvokeReturnToFrontend(returnToFrontendAddress_, reinterpret_cast<void*>(*manager))) {
         result.statusCode = "RETURN_TO_FRONTEND_NATIVE_FAULT";
-        result.message = "L'appel natif de retour au menu a declenche une exception protegee.";
+        result.message = "The native return-to-frontend call raised a protected exception.";
         return result;
     }
     result.executed = true;
     result.statusCode = "RETURN_TO_FRONTEND_REQUESTED";
-    result.message = "Retour au menu principal demande au gestionnaire de gameplay.";
+    result.message = "Return to frontend requested from the gameplay manager.";
     return result;
 }
 

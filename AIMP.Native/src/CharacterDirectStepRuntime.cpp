@@ -174,6 +174,7 @@ std::atomic<NativeAITransitionGuard> gNativeAITransitionGuard{nullptr};
 std::array<MovementSlot, MaximumConcurrentTargets()> gSlots{};
 std::atomic<std::uintptr_t> gLastArmedCharacter{0U};
 std::uintptr_t gModuleBase{};
+std::uintptr_t gGlobalStateRootAddress{};
 ActivateLocomotionCycleFn gActivateLocomotionCycle{};
 EnterIdleCycleFn gEnterIdleCycle{};
 SubmitLocomotionFn gSubmitLocomotion{};
@@ -204,6 +205,18 @@ bool GuardedReadValue(const std::uintptr_t address, T& value) noexcept {
     value = *read;
     return true;
 #endif
+}
+
+bool GameplayLoaded() noexcept {
+    std::uintptr_t root{}, gameplay{};
+    std::uint32_t state{}, mode{};
+    // The retail frontend request (793780) synchronously sets G+14=0 and
+    // G+8=7, before queued network commands can be drained again. Read the
+    // profile-resolved global cell; never cache the per-level manager.
+    return GuardedReadValue(gGlobalStateRootAddress, root) && root != 0U &&
+        GuardedReadValue(root + 0x48U, gameplay) && gameplay != 0U &&
+        GuardedReadValue(gameplay + 0x14U, mode) && mode != 0U && mode != 3U &&
+        GuardedReadValue(gameplay + 0x08U, state) && state != 7U;
 }
 
 template <typename T>
@@ -1468,6 +1481,11 @@ void __fastcall ActivateLocomotionCycleDetour(
         original(cycle);
         return;
     }
+    if (!GameplayLoaded()) {
+        ReleaseSlot(*slot);
+        original(cycle);
+        return;
+    }
 
     // If the network is currently asking this Character to move, an AI-side
     // activation can safely be co-opted as a native 0x38 state transition. The
@@ -1501,6 +1519,11 @@ void __fastcall EnterIdleCycleDetour(
     if (!GuardedReadValue(
             cycleAddress + kNpcLocomotionCycleOwnerOffset, owner) ||
         owner == 0U) {
+        original(cycle);
+        return;
+    }
+    if (!GameplayLoaded()) {
+        ForgetCharacter(owner);
         original(cycle);
         return;
     }
@@ -1547,6 +1570,10 @@ void __cdecl ApplyReplicatedEffectiveMoveType(
     if (slot == nullptr ||
         !slot->driveRequested.load(std::memory_order_acquire))
         return;
+    if (!GameplayLoaded()) {
+        ReleaseSlot(*slot);
+        return;
+    }
     if (RetailOwnsPhysicalCycle(
             slot->characterAddress.load(std::memory_order_acquire))) return;
 
@@ -1628,6 +1655,10 @@ void __cdecl ApplyAtNpcLocomotionPreTransform(
 
     auto* slot = FindSlot(characterAddress);
     if (slot == nullptr || cycleAddress == 0U) return;
+    if (!GameplayLoaded()) {
+        ReleaseSlot(*slot);
+        return;
+    }
     if (RetailOwnsPhysicalCycle(characterAddress)) return;
 
     // ESI is the live retail locomotion cycle and characterAddress is read from
@@ -1812,6 +1843,11 @@ bool ArmCore(
     }
     if (!Installed()) {
         error = "Character remote-player controller is not installed";
+        return false;
+    }
+    if (!GameplayLoaded()) {
+        ForgetCharacter(characterAddress);
+        error = "Remote movement rejected while gameplay is inactive or unloading";
         return false;
     }
     if (characterAddress == 0U ||
@@ -2404,6 +2440,7 @@ bool TryBuildOrientationAwareNativeCycleControlPlan(
 
 bool Install(
     const std::uintptr_t moduleBase,
+    const void* globalStateRootAddress,
     HookManager& hooks,
     std::string& error) {
 #if !defined(_MSC_VER) || !defined(_M_IX86)
@@ -2411,8 +2448,8 @@ bool Install(
     return false;
 #else
     if (gInstalled.load(std::memory_order_acquire)) return true;
-    if (moduleBase == 0U) {
-        error = "AI.exe module base is unavailable";
+    if (moduleBase == 0U || globalStateRootAddress == nullptr) {
+        error = "AI.exe module base or certified gameplay root is unavailable";
         return false;
     }
 
@@ -2446,6 +2483,7 @@ bool Install(
     }
 
     gModuleBase = moduleBase;
+    gGlobalStateRootAddress = reinterpret_cast<std::uintptr_t>(globalStateRootAddress);
     gSubmitLocomotion = reinterpret_cast<SubmitLocomotionFn>(submitAddress);
     gTeleportCharacter =
         reinterpret_cast<TeleportCharacterFn>(teleportAddress);
@@ -2597,6 +2635,10 @@ void PumpOnEngineThread(const EnginePumpPhase phase) noexcept {
             runtime_features::Feature::RemoteMovementRuntime)) {
         return;
     }
+    if (!GameplayLoaded()) {
+        ForgetAll();
+        return;
+    }
     for (auto& slot : gSlots) {
         PumpSlotOnEngineThread(slot, phase);
     }
@@ -2709,6 +2751,11 @@ AIExecutionReplayResult ReplayAIExecutionTransition(
     const std::uint32_t cycleTypeRva,
     const std::uint32_t cycleState,
     std::string& error) noexcept {
+    if (!GameplayLoaded()) {
+        ForgetCharacter(characterAddress);
+        error = "AI execution replay rejected while gameplay is inactive or unloading";
+        return AIExecutionReplayResult::Failed;
+    }
     if (!Installed() || gModuleBase == 0U || characterAddress == 0U ||
         cycleTypeRva == 0U || cycleState > 0xFFU) {
         error = "AI execution replay arguments are invalid";
@@ -2865,6 +2912,11 @@ bool ApplyReplicatedYaw(
     const std::uintptr_t characterAddress,
     const float yaw,
     std::string& error) noexcept {
+    if (!GameplayLoaded()) {
+        ForgetCharacter(characterAddress);
+        error = "Replicated yaw rejected while gameplay is inactive or unloading";
+        return false;
+    }
     if (characterAddress == 0U || !std::isfinite(yaw) ||
         yaw < -3.3F || yaw > 3.3F) {
         error = "Replicated yaw or CharacterBase is invalid";
@@ -2876,6 +2928,10 @@ bool ApplyReplicatedYaw(
 }
 
 bool FinishReplicatedInteraction(const std::uintptr_t characterAddress) noexcept {
+    if (!GameplayLoaded()) {
+        ForgetCharacter(characterAddress);
+        return true;
+    }
     std::uintptr_t cycle{};
     std::uint8_t state{};
     if (!ReadNativeCycle(characterAddress, cycle, state)) return false;
@@ -2933,7 +2989,24 @@ void Stop() noexcept {
     }
 }
 
+void ForgetCharacter(const std::uintptr_t characterAddress) noexcept {
+    if (auto* slot = FindSlot(characterAddress); slot != nullptr) ReleaseSlot(*slot);
+}
+
+void ForgetAll() noexcept {
+    for (auto& slot : gSlots) {
+        const auto character =
+            slot.characterAddress.load(std::memory_order_acquire);
+        if (character == 0U || character == kReservedSlot) continue;
+        ReleaseSlot(slot);
+    }
+}
+
 bool Stop(const std::uintptr_t characterAddress) noexcept {
+    if (!GameplayLoaded()) {
+        ForgetCharacter(characterAddress);
+        return true;
+    }
     auto* slot = FindSlot(characterAddress);
     if (slot == nullptr) return true;
     slot->remainingFrames.store(0U, std::memory_order_release);
