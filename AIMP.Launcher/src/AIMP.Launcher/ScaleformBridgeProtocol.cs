@@ -14,7 +14,10 @@ internal sealed record ScaleformBridgeEvent(
     string Channel,
     string RawMessage,
     ScaleformBridgeMessage Message,
-    Func<string, IReadOnlyDictionary<string, string>?, Task<bool>>? Reply = null);
+    Func<string, IReadOnlyDictionary<string, string>?, Task<bool>>? Reply = null,
+    Guid ConnectionId = default);
+
+internal sealed record ScaleformBridgeConnectionClosed(string Channel, Guid ConnectionId, bool PeerClosed);
 
 internal sealed class ScaleformBridgeProtocol
 {

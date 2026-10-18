@@ -35,6 +35,7 @@ internal sealed class ScaleformBridgeListener : IDisposable
 
     internal event EventHandler<ScaleformBridgeState>? StateChanged;
     internal event EventHandler<ScaleformBridgeEvent>? MessageReceived;
+    internal event EventHandler<ScaleformBridgeConnectionClosed>? ConnectionClosed;
 
     internal ScaleformBridgeState State
     {
@@ -164,10 +165,16 @@ internal sealed class ScaleformBridgeListener : IDisposable
         var first = await ReadMessageAsync(stream, token).ConfigureAwait(false);
         if (first is null) return;
         if (await TryHandlePolicyAsync(stream, first, token).ConfigureAwait(false)) return;
+        var connectionId = Guid.NewGuid();
         var command = RegisterCommandClient(channel, client, stream);
         AddConnection(channel);
-        try { await ProcessMessagesAsync(stream, channel, first, token).ConfigureAwait(false); }
-        finally { DisconnectClient(channel, client, command); }
+        var peerClosed = false;
+        try { peerClosed = await ProcessMessagesAsync(stream, channel, first, connectionId, token).ConfigureAwait(false); }
+        finally
+        {
+            DisconnectClient(channel, client, command);
+            ConnectionClosed?.Invoke(this, new ScaleformBridgeConnectionClosed(channel, connectionId, peerClosed));
+        }
     }
 
     private bool RegisterCommandClient(string channel, TcpClient client, NetworkStream stream)
@@ -200,19 +207,21 @@ internal sealed class ScaleformBridgeListener : IDisposable
         return true;
     }
 
-    private async Task ProcessMessagesAsync(
+    private async Task<bool> ProcessMessagesAsync(
         NetworkStream stream,
         string channel,
         string first,
+        Guid connectionId,
         CancellationToken token)
     {
-        PublishMessage(channel, first, stream);
+        PublishMessage(channel, first, stream, connectionId);
         while (!token.IsCancellationRequested)
         {
             var message = await ReadMessageAsync(stream, token).ConfigureAwait(false);
-            if (message is null) return;
-            if (message.Length != 0) PublishMessage(channel, message, stream);
+            if (message is null) return true;
+            if (message.Length != 0) PublishMessage(channel, message, stream, connectionId);
         }
+        return false;
     }
 
     private static async Task<string?> ReadMessageAsync(
@@ -231,7 +240,7 @@ internal sealed class ScaleformBridgeListener : IDisposable
         throw new InvalidDataException("The UI bridge message exceeded 64 KiB.");
     }
 
-    private void PublishMessage(string channel, string raw, NetworkStream stream)
+    private void PublishMessage(string channel, string raw, NetworkStream stream, Guid connectionId)
     {
         var message = _protocol.Parse(raw);
         var details = _protocol.Describe(message);
@@ -239,7 +248,7 @@ internal sealed class ScaleformBridgeListener : IDisposable
         var type = message.Type.Length == 0 ? "UNKNOWN" : message.Type.ToUpperInvariant();
         _diagnostics.Log("UI Bridge", $"Event received: channel={channel}, type={type}{suffix}");
         MessageReceived?.Invoke(this, new ScaleformBridgeEvent(channel, raw, message,
-            (replyType, values) => ReplyAsync(stream, replyType, values)));
+            (replyType, values) => ReplyAsync(stream, replyType, values), connectionId));
     }
 
     // Replies on the exact connection that sent the message. Event-port

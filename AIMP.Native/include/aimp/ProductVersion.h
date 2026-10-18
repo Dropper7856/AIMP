@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.201-playerlifecycle-pause-ui";
+    "0.11.4.202-playerlifecycle-hud-return";
 
 } // namespace aimp
