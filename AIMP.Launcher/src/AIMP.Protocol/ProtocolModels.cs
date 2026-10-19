@@ -133,6 +133,23 @@ public sealed record ItemCollectedPayload(
     string EntityId,
     ulong CollectorPeerId);
 
+// ItemSync spawn authority. Kind "owner": a GCIP_WorldPickup spawn result for
+// OwnerKey (CATHODE runtime key, 16 hex), Spawn=false when nothing spawns.
+// Kind "drop": a player-dropped pickup with a synthetic OwnerKey. Transform is
+// the 3x4 row-major pickup transform (translation at [3], [7], [11]).
+// Proposal (Client -> Host): PeerId is the sender. Decision (Host -> Clients):
+// PeerId is the participant whose proposal won.
+public sealed record ItemSpawnPayload(
+    Guid SessionId,
+    ulong PeerId,
+    int LevelGeneration,
+    string Kind,
+    string OwnerKey,
+    bool Spawn,
+    string Path,
+    int Quantity,
+    float[] Transform);
+
 public sealed record PlayerSpawnPositionPayload(
     ulong PeerId,
     float X,
@@ -209,6 +226,16 @@ public sealed record NativeItemSyncPickupPayload(
     int SchemaVersion,
     ulong Sequence,
     string EntityId);
+
+public sealed record NativeItemSyncSpawnPayload(
+    int SchemaVersion,
+    ulong Sequence,
+    string Kind,
+    string OwnerKey,
+    bool Spawn,
+    string Path,
+    int Quantity,
+    float[] Transform);
 
 public sealed record NativePlayerActionEventPayload(
     int SchemaVersion,

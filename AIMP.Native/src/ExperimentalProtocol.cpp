@@ -897,6 +897,63 @@ bool DecodeGameCommand(
             return true;
         }
 
+        if (command->stringValue == "ITEM_SYNC_SPAWN") {
+            if (arguments->objectValue.size() != 6U) return false;
+            const auto* kind = Field(*arguments, "kind", JsonType::String);
+            const auto* ownerKey = Field(*arguments, "ownerKey", JsonType::String);
+            const auto* spawn = Field(*arguments, "spawn", JsonType::String);
+            const auto* path = Field(*arguments, "path", JsonType::String);
+            const auto* quantity = Field(*arguments, "quantity", JsonType::String);
+            const auto* transform = Field(*arguments, "transform", JsonType::String);
+            if (kind == nullptr || ownerKey == nullptr || spawn == nullptr || path == nullptr ||
+                quantity == nullptr || transform == nullptr) return false;
+            auto& spawnCommand = output.itemSyncSpawn;
+            if (kind->stringValue == "owner") spawnCommand.drop = false;
+            else if (kind->stringValue == "drop") spawnCommand.drop = true;
+            else return false;
+            const auto& keyText = ownerKey->stringValue;
+            if (keyText.size() != 16U) return false;
+            const auto parsedKey = std::from_chars(
+                keyText.data(), keyText.data() + keyText.size(), spawnCommand.ownerKey, 16);
+            if (parsedKey.ec != std::errc{} || parsedKey.ptr != keyText.data() + keyText.size() ||
+                spawnCommand.ownerKey == 0U) return false;
+            if (spawn->stringValue == "1") spawnCommand.spawn = true;
+            else if (spawn->stringValue == "0") spawnCommand.spawn = false;
+            else return false;
+            spawnCommand.path = path->stringValue;
+            if (spawnCommand.path.size() >= 96U ||
+                (spawnCommand.spawn && spawnCommand.path.empty()) ||
+                (!spawnCommand.spawn && !spawnCommand.path.empty())) return false;
+            for (const char character : spawnCommand.path)
+                if (static_cast<unsigned char>(character) < 0x20U ||
+                    static_cast<unsigned char>(character) > 0x7EU) return false;
+            const auto& quantityText = quantity->stringValue;
+            const auto parsedQuantity = std::from_chars(quantityText.data(),
+                quantityText.data() + quantityText.size(), spawnCommand.quantity, 10);
+            if (parsedQuantity.ec != std::errc{} ||
+                parsedQuantity.ptr != quantityText.data() + quantityText.size() ||
+                spawnCommand.quantity < 0 || spawnCommand.quantity > 100000) return false;
+            // 12 invariant floats separated by ',': 3x4 row-major transform.
+            const auto& floats = transform->stringValue;
+            const char* cursor = floats.data();
+            const char* const end = floats.data() + floats.size();
+            for (std::size_t index = 0U; index < 12U; ++index) {
+                if (index != 0U) {
+                    if (cursor == end || *cursor != ',') return false;
+                    ++cursor;
+                }
+                float value{};
+                const auto parsed = std::from_chars(cursor, end, value);
+                if (parsed.ec != std::errc{} || !std::isfinite(value) ||
+                    std::fabs(value) > 100000.0F) return false;
+                spawnCommand.transform[index] = value;
+                cursor = parsed.ptr;
+            }
+            if (cursor != end) return false;
+            output.command = command->stringValue;
+            return true;
+        }
+
         if (command->stringValue == "ITEM_SYNC_APPLY") {
             if (arguments->objectValue.size() != 1U) return false;
             const auto* entityId = Field(*arguments, "entityId", JsonType::String);

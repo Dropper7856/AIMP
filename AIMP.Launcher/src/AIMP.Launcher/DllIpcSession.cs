@@ -66,6 +66,8 @@ internal sealed class DllIpcSession : IAsyncDisposable
 
     internal event EventHandler<NativeItemSyncPickupPayload>? ItemSyncPickupProduced;
 
+    internal event EventHandler<NativeItemSyncSpawnPayload>? ItemSyncSpawnProduced;
+
     internal event EventHandler<ReadOnlyMemory<byte>>? AISyncStateProduced;
 
     internal event EventHandler<ReadOnlyMemory<byte>>? AISyncImpactProduced;
@@ -452,6 +454,7 @@ internal sealed class DllIpcSession : IAsyncDisposable
             case MessageType.PlayerSyncAction: HandlePlayerSyncAction(frame); return true;
             case MessageType.PlayerLifecycleState: HandlePlayerLifecycleState(frame); return true;
             case MessageType.ItemSyncPickup: HandleItemSyncPickup(frame); return true;
+            case MessageType.ItemSyncSpawn: HandleItemSyncSpawn(frame); return true;
             case MessageType.AISyncState:
                 HandleAISyncState(frame);
                 return true;
@@ -547,6 +550,13 @@ internal sealed class DllIpcSession : IAsyncDisposable
         var value = JsonPayload.Deserialize<NativeItemSyncPickupPayload>(frame.Payload.Span);
         ModelValidation.Validate(value);
         ItemSyncPickupProduced?.Invoke(this, value);
+    }
+
+    private void HandleItemSyncSpawn(AimpFrame frame)
+    {
+        var value = JsonPayload.Deserialize<NativeItemSyncSpawnPayload>(frame.Payload.Span);
+        ModelValidation.Validate(value);
+        ItemSyncSpawnProduced?.Invoke(this, value);
     }
 
     private void CompleteGameCommand(AimpFrame frame)

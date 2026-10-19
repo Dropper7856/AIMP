@@ -1535,7 +1535,7 @@ bool GameCommandExecutor::CanExecute(const std::string_view command) const noexc
     if (command == "RETURN_TO_FRONTEND") {
         return ReturnToFrontendAvailable();
     }
-    if (command == "ITEM_SYNC_APPLY") {
+    if (command == "ITEM_SYNC_APPLY" || command == "ITEM_SYNC_SPAWN") {
         return item_sync::Installed();
     }
     if (command == "WORLD_REGISTRY_PROBE" ||
@@ -4026,6 +4026,36 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteReturnToFrontend() const 
     result.executed = true;
     result.statusCode = "RETURN_TO_FRONTEND_REQUESTED";
     result.message = "Return to frontend requested from the gameplay manager.";
+    return result;
+}
+
+GameCommandExecutionResult GameCommandExecutor::ExecuteItemSyncSpawn(
+    const ItemSyncSpawnCommand& command) const {
+    GameCommandExecutionResult result{};
+    item_sync::SpawnData data{};
+    data.kind = command.drop ? item_sync::SpawnKind::Drop : item_sync::SpawnKind::Owner;
+    data.ownerKey = command.ownerKey;
+    data.spawn = command.spawn;
+    if (command.path.size() >= sizeof(data.path)) {
+        result.statusCode = "ITEM_SYNC_REJECTED";
+        result.message = "Item path is too long.";
+        return result;
+    }
+    std::memcpy(data.path, command.path.c_str(), command.path.size() + 1U);
+    data.quantity = command.quantity;
+    std::copy(command.transform.begin(), command.transform.end(), data.transform);
+    const auto outcome = item_sync::ApplySpawnDecision(data);
+    result.statusCode = item_sync::ApplyStatusCode(outcome);
+    result.executed = outcome == item_sync::ApplyStatus::Applied ||
+        outcome == item_sync::ApplyStatus::AlreadyApplied ||
+        outcome == item_sync::ApplyStatus::Deferred;
+    char ownerKey[17]{};
+    std::snprintf(ownerKey, sizeof(ownerKey), "%016llX",
+        static_cast<unsigned long long>(command.ownerKey));
+    result.message = std::string(command.drop ? "Drop " : "Owner ") + ownerKey + ": " +
+        (outcome == item_sync::ApplyStatus::Deferred
+            ? "decision stored until the local owner runs."
+            : item_sync::ApplyStatusMessage(outcome));
     return result;
 }
 

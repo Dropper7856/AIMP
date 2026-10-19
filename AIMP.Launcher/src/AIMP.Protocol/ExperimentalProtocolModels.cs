@@ -166,6 +166,8 @@ public static class GameCommandNames
     public const string ReturnToFrontend = "RETURN_TO_FRONTEND";
     // Internal ItemSync: remove a pickup another participant collected, absent from the UI catalogue.
     public const string ItemSyncApply = "ITEM_SYNC_APPLY";
+    // Internal ItemSync: spawn a Host-decided GCIP pickup or a remote player drop.
+    public const string ItemSyncSpawn = "ITEM_SYNC_SPAWN";
 
     public static readonly IReadOnlySet<string> All = new HashSet<string>(
         new[]
@@ -189,7 +191,8 @@ public static class GameCommandNames
             WorldStateDiscoveryAfter,
             WorldStateDiscoveryStatus,
             ReturnToFrontend,
-            ItemSyncApply
+            ItemSyncApply,
+            ItemSyncSpawn
         },
         StringComparer.Ordinal);
 }

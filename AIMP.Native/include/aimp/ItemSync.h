@@ -3,6 +3,7 @@
 #include "aimp/ItemSyncKey.h"
 #include "aimp/WorldReplicationTypes.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -23,6 +24,36 @@ struct PickupEvent final {
     WorldEntityId entity{};
 };
 
+// Spawn authority. Owner: a GCIP_WorldPickup spawn (random item, difficulty
+// skip) proposed by the peer whose owner ran, decided once by the Host.
+// Drop: a pickup the local player dropped, replicated with a synthetic owner.
+enum class SpawnKind : std::uint8_t {
+    Owner = 1,
+    Drop = 2,
+};
+
+inline constexpr std::size_t kSpawnPathCapacity = 96U; // NUL included
+
+struct SpawnData final {
+    SpawnKind kind{SpawnKind::Owner};
+    // Owner CATHODE runtime key packed as (ShortGuid << 32) | instance id.
+    std::uint64_t ownerKey{};
+    bool spawn{};
+    char path[kSpawnPathCapacity]{}; // item definition composite path, "Pickups\\..."
+    std::int32_t quantity{};
+    float transform[12]{};           // 3x4 row-major, translation at [3], [7], [11]
+};
+
+struct SpawnEvent final {
+    std::uint64_t sequence{};
+    SpawnData data{};
+};
+
+// Synthetic drop owners never match a CATHODE entity: the pickup manager's
+// owner messages to them are dropped by the retail resolver.
+inline constexpr std::uint32_t kDropOwnerInstanceTag = 0xA1D00000U;
+inline constexpr std::uint32_t kDropOwnerInstanceMask = 0xFFF00000U;
+
 enum class ApplyStatus : std::uint8_t {
     Applied,
     AlreadyApplied,
@@ -42,6 +73,13 @@ void Shutdown() noexcept;
 // head until the Launcher frame is queued.
 [[nodiscard]] bool TryPeekObservedPickup(PickupEvent& event) noexcept;
 void PopObservedPickup() noexcept;
+// IPC worker: local spawn proposals and drops, same Peek/Pop contract.
+[[nodiscard]] bool TryPeekObservedSpawn(SpawnEvent& event) noexcept;
+void PopObservedSpawn() noexcept;
+
+// Engine thread. Owner: stores the Host decision and spawns it once the local
+// owner has run. Drop: spawns the remote player's dropped pickup now.
+[[nodiscard]] ApplyStatus ApplySpawnDecision(const SpawnData& decision) noexcept;
 
 // Engine thread only. Removes the pickup now, or keeps it pending until the
 // pickup is spawned locally (streaming, late spawn). Idempotent per level.

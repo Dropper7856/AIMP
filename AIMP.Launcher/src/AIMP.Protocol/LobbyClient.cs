@@ -57,6 +57,8 @@ public sealed class LobbyClient : IAsyncDisposable
 
     public event EventHandler<ItemCollectedPayload>? ItemCollected;
 
+    public event EventHandler<ItemSpawnPayload>? ItemSpawnDecided;
+
     public event EventHandler<SpawnPositionRequestPayload>? SpawnPositionRequested;
 
     public event EventHandler<SpawnRemotePlayersPayload>? SpawnRemotePlayersRequested;
@@ -223,6 +225,20 @@ public sealed class LobbyClient : IAsyncDisposable
         ModelValidation.Validate(payload);
         return _connection.SendAsync(
             MessageType.ItemPickupRequest,
+            JsonPayload.Serialize(payload),
+            cancellationToken).AsTask();
+    }
+
+    public Task SendItemSpawnProposalAsync(
+        int levelGeneration,
+        NativeItemSyncSpawnPayload value,
+        CancellationToken cancellationToken = default)
+    {
+        var payload = new ItemSpawnPayload(SessionId, PeerId, levelGeneration, value.Kind,
+            value.OwnerKey, value.Spawn, value.Path, value.Quantity, value.Transform);
+        ModelValidation.Validate(payload);
+        return _connection.SendAsync(
+            MessageType.ItemSpawnProposal,
             JsonPayload.Serialize(payload),
             cancellationToken).AsTask();
     }
@@ -494,6 +510,14 @@ public sealed class LobbyClient : IAsyncDisposable
                         if (itemCollected.SessionId != SessionId)
                             throw new ProtocolException("The item-collected SessionId is invalid.");
                         ItemCollected?.Invoke(this, itemCollected);
+                        break;
+
+                    case MessageType.ItemSpawnDecision:
+                        var itemSpawn = JsonPayload.Deserialize<ItemSpawnPayload>(frame.Payload.Span);
+                        ModelValidation.Validate(itemSpawn);
+                        if (itemSpawn.SessionId != SessionId)
+                            throw new ProtocolException("The item-spawn SessionId is invalid.");
+                        ItemSpawnDecided?.Invoke(this, itemSpawn);
                         break;
 
                     case MessageType.InboundNetZFrame:

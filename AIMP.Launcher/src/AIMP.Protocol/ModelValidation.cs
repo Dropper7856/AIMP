@@ -147,6 +147,78 @@ public static class ModelValidation
         }
     }
 
+    public static void Validate(ItemSpawnPayload? value)
+    {
+        if (value is null
+            || value.SessionId == Guid.Empty
+            || value.PeerId == 0
+            || value.LevelGeneration < 1
+            || !IsItemSpawn(value.Kind, value.OwnerKey, value.Spawn, value.Path,
+                value.Quantity, value.Transform))
+        {
+            throw new ProtocolException("The item-spawn payload is invalid.");
+        }
+    }
+
+    public static void Validate(NativeItemSyncSpawnPayload? value)
+    {
+        if (value is null
+            || value.SchemaVersion != 1
+            || value.Sequence == 0
+            || !IsItemSpawn(value.Kind, value.OwnerKey, value.Spawn, value.Path,
+                value.Quantity, value.Transform))
+        {
+            throw new ProtocolException("The native ItemSync spawn is invalid.");
+        }
+    }
+
+    public const uint ItemDropOwnerInstanceTag = 0xA1D00000U;
+    public const uint ItemDropOwnerInstanceMask = 0xFFF00000U;
+
+    private static bool IsItemSpawn(
+        string? kind, string? ownerKey, bool spawn, string? path, int quantity, float[]? transform)
+    {
+        if (ownerKey is not { Length: 16 }
+            || !ulong.TryParse(ownerKey, NumberStyles.AllowHexSpecifier,
+                CultureInfo.InvariantCulture, out var owner)
+            || owner == 0
+            || path is null
+            || transform is not { Length: 12 })
+            return false;
+        var drop = string.Equals(kind, "drop", StringComparison.Ordinal);
+        if (!drop && !string.Equals(kind, "owner", StringComparison.Ordinal)) return false;
+        if (drop && (!spawn || ((uint)owner & ItemDropOwnerInstanceMask) != ItemDropOwnerInstanceTag))
+            return false;
+        if (!spawn) return path.Length == 0 && quantity == 0;
+        return IsItemPath(path)
+            && quantity is >= 0 and <= 100000
+            && transform.All(value => float.IsFinite(value) && Math.Abs(value) <= 100000F);
+    }
+
+    public static string FormatItemTransform(IReadOnlyList<float> transform) =>
+        string.Join(",", transform.Select(value => value.ToString("R", CultureInfo.InvariantCulture)));
+
+    public static bool TryParseItemTransform(string? value, out float[] transform)
+    {
+        transform = Array.Empty<float>();
+        var parts = value?.Split(',');
+        if (parts is not { Length: 12 }) return false;
+        var parsed = new float[12];
+        for (var index = 0; index < parts.Length; index++)
+        {
+            if (!float.TryParse(parts[index], NumberStyles.Float, CultureInfo.InvariantCulture,
+                    out parsed[index]))
+                return false;
+        }
+        transform = parsed;
+        return true;
+    }
+
+    // Item definition composite path ("Pickups\..."), printable ASCII.
+    public static bool IsItemPath(string? value) =>
+        value is { Length: > 0 and < 96 }
+        && value.All(character => character is >= ' ' and <= '~');
+
     // 32 uppercase or lowercase hex digits (WorldEntityId High:X16 + Low:X16),
     // never the all-zero id.
     public static bool IsWorldEntityIdText(string? value) =>
@@ -773,6 +845,27 @@ public static class ModelValidation
                 || !entityId.All(Uri.IsHexDigit)
                 || entityId.All(value => value == '0'))
                 throw new ProtocolException("WORLD_NET_PROBE parameters are invalid.");
+            return;
+        }
+
+        if (string.Equals(
+                value.Command,
+                GameCommandNames.ItemSyncSpawn,
+                StringComparison.Ordinal))
+        {
+            var expected = new HashSet<string>(
+                new[] { "kind", "ownerKey", "spawn", "path", "quantity", "transform" },
+                StringComparer.Ordinal);
+            if (value.Arguments.Count != expected.Count
+                || value.Arguments.Keys.Any(key => !expected.Contains(key))
+                || !value.Arguments.TryGetValue("spawn", out var spawnText)
+                || spawnText is not ("0" or "1")
+                || !int.TryParse(value.Arguments["quantity"], NumberStyles.None,
+                    CultureInfo.InvariantCulture, out var quantity)
+                || !TryParseItemTransform(value.Arguments["transform"], out var transform)
+                || !IsItemSpawn(value.Arguments["kind"], value.Arguments["ownerKey"],
+                    spawnText == "1", value.Arguments["path"], quantity, transform))
+                throw new ProtocolException("ITEM_SYNC_SPAWN parameters are invalid.");
             return;
         }
 

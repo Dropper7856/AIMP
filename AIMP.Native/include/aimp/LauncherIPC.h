@@ -131,6 +131,7 @@ private:
     void PublishPlayerSyncTraffic();
     void PublishPlayerLifecycleTraffic();
     void PublishItemSyncTraffic();
+    void PublishItemSyncSpawnTraffic();
     void PublishAISyncTraffic();
     bool HandleAISyncFrame(const protocol::Frame& frame);
     bool TryConnect();
