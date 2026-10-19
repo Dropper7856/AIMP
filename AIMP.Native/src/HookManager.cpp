@@ -264,6 +264,62 @@ bool ReplaceBytes(
     return true;
 }
 
+bool ReplaceBatch(const std::span<const BytePatchRequest> patches,
+    const bool restore, std::string& error) {
+    // Prepare all storage before suspending threads. In particular, never log
+    // or allocate while a suspended game thread may hold the CRT heap lock.
+    std::vector<std::vector<std::byte>> current;
+    current.reserve(patches.size());
+    for (const auto& patch : patches) current.emplace_back(patch.expected.size());
+    std::vector<DWORD> protections(patches.size());
+    FrozenThreads frozen;
+    if (!frozen.Freeze(error)) return false;
+    const char* failure = nullptr;
+    for (std::size_t i = 0U; i < patches.size(); ++i) {
+        const auto& patch = patches[i];
+        const auto& expected = restore ? patch.replacement : patch.expected;
+        if (!frozen.InstructionPointersOutside(patch.target, expected.size()) ||
+            !crash_guard::TryCopy(current[i].data(), patch.target, expected.size()) ||
+            current[i] != expected) {
+            failure = "batch instruction changed or a thread is inside a patch site";
+            break;
+        }
+    }
+    std::size_t writable = 0U;
+    if (failure == nullptr) {
+        for (; writable < patches.size(); ++writable) {
+            if (!VirtualProtect(patches[writable].target, patches[writable].expected.size(),
+                    PAGE_EXECUTE_READWRITE, &protections[writable])) {
+                failure = "VirtualProtect failed before batch mutation; no instructions changed";
+                break;
+            }
+        }
+    }
+    if (failure == nullptr) {
+        for (const auto& patch : patches) {
+            const auto& bytes = restore ? patch.expected : patch.replacement;
+            std::memcpy(patch.target, bytes.data(), bytes.size());
+            FlushInstructionCache(GetCurrentProcess(), patch.target, bytes.size());
+        }
+    }
+    bool protectionFailure = false;
+    // Multiple sites may share a page. Restore in reverse order so the first
+    // captured protection, rather than an intermediate RWX one, wins.
+    while (writable != 0U) {
+        --writable;
+        DWORD ignored{};
+        if (!VirtualProtect(patches[writable].target, patches[writable].expected.size(),
+                protections[writable], &ignored)) protectionFailure = true;
+    }
+    frozen.ResumeNow();
+    if (failure != nullptr) { error = failure; return false; }
+    // All instructions are installed/restored together. Retain bookkeeping even
+    // if Windows failed to restore page protection; never report an untracked
+    // partially active hook or free a destination that remains callable.
+    if (protectionFailure) error = "batch applied; page protection restoration failed";
+    return true;
+}
+
 } // namespace
 
 struct HookManager::Hook {
@@ -275,6 +331,7 @@ struct HookManager::Hook {
     std::vector<std::byte> installed;
     void** trampolineOut{};
     std::atomic<void*>* publishedTrampolineOut{};
+    std::vector<BytePatchRequest> patches;
 };
 
 HookManager::HookManager(
@@ -327,7 +384,12 @@ bool HookManager::Install(const HookRequest& request, std::string& error) {
         return false;
     }
     if (std::any_of(hooks_.begin(), hooks_.end(), [&](const auto& hook) {
-            return hook->target == request.target;
+            if (hook->target == request.target) return true;
+            const auto begin = reinterpret_cast<std::uintptr_t>(request.target);
+            return std::any_of(hook->patches.begin(), hook->patches.end(), [&](const auto& patch) {
+                const auto other = reinterpret_cast<std::uintptr_t>(patch.target);
+                return begin < other + patch.expected.size() && other < begin + request.patchLength;
+            });
         })) {
         error = "target is already hooked";
         return false;
@@ -457,7 +519,12 @@ bool HookManager::InstallCallRedirect(
         return false;
     }
     if (std::any_of(hooks_.begin(), hooks_.end(), [&](const auto& hook) {
-            return hook->target == request.callSite;
+            if (hook->target == request.callSite) return true;
+            const auto begin = reinterpret_cast<std::uintptr_t>(request.callSite);
+            return std::any_of(hook->patches.begin(), hook->patches.end(), [&](const auto& patch) {
+                const auto other = reinterpret_cast<std::uintptr_t>(patch.target);
+                return begin < other + patch.expected.size() && other < begin + 5U;
+            });
         })) {
         error = "direct-CALL site is already patched";
         return false;
@@ -507,6 +574,51 @@ bool HookManager::UninstallAll(std::string& error) {
     return UninstallFrom(0, error);
 }
 
+bool HookManager::InstallPatchBatch(const std::string& name,
+    const std::span<const BytePatchRequest> patches, std::string& error) {
+    std::lock_guard lock(mutex_);
+    if (!MutationAllowed() || patches.empty()) {
+        error = "instruction batch requires a validated target and nonempty patches";
+        return false;
+    }
+#if !defined(_M_IX86)
+    error = "instruction batches support MSVC x86 only";
+    return false;
+#endif
+    for (std::size_t i = 0U; i < patches.size(); ++i) {
+        const auto& patch = patches[i];
+        if (patch.target == nullptr || patch.expected.empty() || patch.expected.size() > 32U ||
+            patch.expected.size() != patch.replacement.size()) {
+            error = "invalid instruction batch site"; return false;
+        }
+        const auto begin = reinterpret_cast<std::uintptr_t>(patch.target);
+        const auto overlaps = [begin, &patch](const void* target, const std::size_t length) {
+            const auto other = reinterpret_cast<std::uintptr_t>(target);
+            return begin < other + length && other < begin + patch.expected.size();
+        };
+        for (std::size_t j = 0U; j < i; ++j)
+            if (overlaps(patches[j].target, patches[j].expected.size())) {
+                error = "overlapping instruction batch sites"; return false;
+            }
+        for (const auto& hook : hooks_) {
+            if (hook->target != nullptr && overlaps(hook->target, hook->installed.size())) {
+                error = "instruction batch overlaps an installed hook"; return false;
+            }
+            for (const auto& installed : hook->patches)
+                if (overlaps(installed.target, installed.expected.size())) {
+                    error = "instruction batch overlaps an installed batch"; return false;
+                }
+        }
+    }
+    auto hook = std::make_unique<Hook>();
+    hook->name = name;
+    hook->patches.assign(patches.begin(), patches.end());
+    hooks_.reserve(hooks_.size() + 1U);
+    if (!ReplaceBatch(hook->patches, false, error)) return false;
+    hooks_.push_back(std::move(hook));
+    return true;
+}
+
 bool HookManager::UninstallFrom(
     const std::size_t installedCount,
     std::string& error) {
@@ -518,6 +630,12 @@ bool HookManager::UninstallFrom(
     retired_.reserve(retired_.size() + hooks_.size() - installedCount);
     while (hooks_.size() > installedCount) {
         auto& hook = *hooks_.back();
+        if (!hook.patches.empty()) {
+            if (!ReplaceBatch(hook.patches, true, error)) return false;
+            retired_.push_back(std::move(hooks_.back()));
+            hooks_.pop_back();
+            continue;
+        }
         std::vector<std::byte> current(hook.installed.size());
         if (!crash_guard::TryCopy(current.data(), hook.target, current.size()) ||
             current != hook.installed) {

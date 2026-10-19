@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.203-round-return-ack-nav-pause";
+    "0.11.4.204-ui-heap-live-menus";
 
 } // namespace aimp

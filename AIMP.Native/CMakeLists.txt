@@ -51,6 +51,8 @@ set(AIMP_CORE_SOURCES
     src/ParticipantRegistry.cpp
     src/PlayerSyncObserver.cpp
     src/PlayerLifecycle.cpp
+    src/UIHeapGuard.cpp
+    src/MultiplayerPause.cpp
     src/RuntimeFeatureFlags.cpp
     src/Protocol.cpp
     src/ReadyReplayGate.cpp

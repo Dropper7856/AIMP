@@ -37,6 +37,10 @@ internal sealed class ScaleformBridgeListener : IDisposable
     internal event EventHandler<ScaleformBridgeEvent>? MessageReceived;
     internal event EventHandler<ScaleformBridgeConnectionClosed>? ConnectionClosed;
 
+    // HELLO starts automatic injection. Do not feed incoming Socket events to
+    // an unprotected GFx heap while that injection is still in progress.
+    internal Func<bool>? NativeUiReady { get; set; }
+
     internal ScaleformBridgeState State
     {
         get { lock (_gate) return CreateState(); }
@@ -60,6 +64,7 @@ internal sealed class ScaleformBridgeListener : IDisposable
         IReadOnlyDictionary<string, string>? values = null,
         CancellationToken cancellationToken = default)
     {
+        if (NativeUiReady?.Invoke() != true) return false;
         var bytes = Encoding.UTF8.GetBytes(_protocol.Build(type, values) + "\n");
         await _sendGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try { return await WriteCommandAsync(type, bytes, cancellationToken).ConfigureAwait(false); }
@@ -268,6 +273,7 @@ internal sealed class ScaleformBridgeListener : IDisposable
         string type,
         IReadOnlyDictionary<string, string>? values)
     {
+        if (NativeUiReady?.Invoke() != true) return false;
         var bytes = Encoding.UTF8.GetBytes(_protocol.Build(type, values) + "\n");
         await _sendGate.WaitAsync().ConfigureAwait(false);
         try { await stream.WriteAsync(bytes).ConfigureAwait(false); return true; }
