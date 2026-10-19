@@ -735,6 +735,15 @@ void LauncherIPC::PublishItemSyncSpawnTraffic() {
         if (!sessionConfigured_.load(std::memory_order_acquire) ||
             !netzReadySent_.load(std::memory_order_acquire)) break;
         const auto& data = event.data;
+        // Item paths are printable ASCII ("Pickups\..."): escape the JSON
+        // specials and drop anything else rather than emit invalid JSON.
+        std::string path;
+        for (const char* cursor = data.spawn ? data.path : ""; *cursor != '\0'; ++cursor) {
+            const auto character = static_cast<unsigned char>(*cursor);
+            if (character < 0x20U || character > 0x7EU) continue;
+            if (character == '"' || character == '\\') path += '\\';
+            path += static_cast<char>(character);
+        }
         std::ostringstream json;
         json.imbue(std::locale::classic());
         json << std::setprecision(9);
@@ -746,7 +755,7 @@ void LauncherIPC::PublishItemSyncSpawnTraffic() {
              << ",\"kind\":\"" << (data.kind == item_sync::SpawnKind::Drop ? "drop" : "owner") << '"'
              << ",\"ownerKey\":\"" << ownerKey << '"'
              << ",\"spawn\":" << (data.spawn ? "true" : "false")
-             << ",\"path\":\"" << Diagnostics::EscapeJson(data.spawn ? data.path : "") << '"'
+             << ",\"path\":\"" << path << '"'
              << ",\"quantity\":" << (data.spawn ? data.quantity : 0)
              << ",\"transform\":[";
         for (std::size_t index = 0U; index < 12U; ++index)

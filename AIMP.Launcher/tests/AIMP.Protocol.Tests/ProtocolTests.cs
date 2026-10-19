@@ -161,9 +161,9 @@ internal static class ProtocolTests
             new NativeItemSyncPickupPayload(1, 0UL, itemKey)));
 
         // ItemSync spawn authority: owner decisions (including "nothing") and drops.
-        var identity = new float[] { 1F, 0F, 0F, 12.5F, 0F, 1F, 0F, -3F, 0F, 0F, 1F, 0.25F };
+        var itemTransform = new float[] { 1F, 0F, 0F, 12.5F, 0F, 1F, 0F, -3F, 0F, 0F, 1F, 0.25F };
         var ownerSpawn = new ItemSpawnPayload(itemSession, 7UL, 1, "owner", "12345678000000AB",
-            true, "Pickups\\Medkit", 1, identity);
+            true, "Pickups\\Medkit", 1, itemTransform);
         ModelValidation.Validate(ownerSpawn);
         ModelValidation.Validate(ownerSpawn with { Spawn = false, Path = "", Quantity = 0 });
         ModelValidation.Validate(ownerSpawn with { Kind = "drop", OwnerKey = "00000001A1D12345" });
@@ -186,8 +186,8 @@ internal static class ProtocolTests
         AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(
             ownerSpawn with { Kind = "unknown" }));
         AssertEx.True(ModelValidation.TryParseItemTransform(
-            ModelValidation.FormatItemTransform(identity), out var parsedTransform));
-        AssertEx.True(parsedTransform.SequenceEqual(identity));
+            ModelValidation.FormatItemTransform(itemTransform), out var parsedTransform));
+        AssertEx.True(parsedTransform.SequenceEqual(itemTransform));
         AssertEx.False(Enum.IsDefined(typeof(MessageType), (ushort)218));
 
         AssertGameCommand(identity);
