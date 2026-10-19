@@ -31,6 +31,7 @@ public enum MessageType : ushort
     AISyncState = 25,
     AISyncImpact = 26,
     PlayerLifecycleState = 27, // DLL -> launcher only: local THE_PLAYER death boundary.
+    ItemSyncPickup = 28, // DLL -> launcher only: the local player collected a world pickup.
 
     LobbyJoin = 100,
     LobbyJoinAccepted = 101,
@@ -56,6 +57,8 @@ public enum MessageType : ushort
     AISyncNetworkImpact = 121, // Client -> Host only; Host applies consequence natively.
     PlayerDeath = 122, // Client -> Host only; the Host owns round termination.
     RoundEnded = 123, // Host -> Clients only; the session is back in Lobby.
+    ItemPickupRequest = 124, // Client -> Host only; the Host arbitrates the first collector.
+    ItemCollected = 125, // Host -> Clients only; the pickup is gone for every participant.
 
     TestModeConfigure = 200,
     CapabilityQuery = 201,

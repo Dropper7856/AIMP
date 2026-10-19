@@ -41,6 +41,7 @@ enum class MessageType : std::uint16_t {
     AISyncImpact = 26, // Client-native weapon impact -> Host-native AI consequence.
     PlayerSyncAction = 23, // Native -> Launcher ordered Aim/Primary/Reload edge.
     PlayerLifecycleState = 27, // Native -> Launcher local THE_PLAYER death boundary.
+    ItemSyncPickup = 28, // Native -> Launcher: the local player collected a world pickup.
     TestModeConfigure = 200,
     CapabilityQuery = 201,
     CapabilityState = 202,

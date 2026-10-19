@@ -38,6 +38,7 @@
 #include "aimp/PlayerLifecycle.h"
 #include "aimp/UIHeapGuard.h"
 #include "aimp/MultiplayerPause.h"
+#include "aimp/ItemSync.h"
 #include "aimp/PeerManager.h"
 #include "aimp/RangeProvider.h"
 #include "aimp/SignatureResolver.h"
@@ -656,6 +657,15 @@ DWORD Bootstrap::RunImpl() {
         if (installed && !pauseError.empty()) diagnostics.Log("warning", "multiplayer_pause_protection", pauseError);
     }
 
+    {
+        std::string itemSyncError;
+        const bool installed = validation.hashMatch && levelGenerations != nullptr &&
+            item_sync::Install(moduleBase, *hooks, *levelGenerations, itemSyncError);
+        diagnostics.Log(installed ? "info" : "error", "itemsync_initialized",
+            installed ? "[ItemSync] initialized: pickup_collected requests are observed; remote collections remove the local pickup through the retail pickup manager."
+                : (itemSyncError.empty() ? "[ItemSync] unavailable: exact executable hash required." : itemSyncError));
+    }
+
     if (signaturesValid && resolver != nullptr) {
         std::string spawnTrackerHookError;
         if (spawnTracker->Install(
@@ -1008,6 +1018,7 @@ DWORD Bootstrap::RunImpl() {
         player_lifecycle::DrainDiagnostics(diagnostics);
         if (GetTickCount64() - lastPauseCounterLogTick >= 5000ULL) {
             multiplayer_pause::LogDiagnostics(diagnostics);
+            item_sync::LogDiagnostics(diagnostics);
             lastPauseCounterLogTick = GetTickCount64();
         }
         if (ipc.ShutdownRequested()) {
@@ -1530,6 +1541,7 @@ DWORD Bootstrap::RunImpl() {
     ipc.Stop();
     player_lifecycle::Shutdown();
     multiplayer_pause::Shutdown();
+    item_sync::Shutdown();
     player_lifecycle::DrainDiagnostics(diagnostics);
     character_action_runtime::RequestStopAll();
     const auto actionReleaseDeadline = GetTickCount64() + 5500U;
@@ -1538,7 +1550,9 @@ DWORD Bootstrap::RunImpl() {
         Sleep(10U);
     }
     const bool retainAISyncHooks = ai_sync::Installed();
-    const bool retainUiRuntime = ui_heap_guard::Installed() || multiplayer_pause::Installed();
+    // The ItemSync detour runs on the engine thread like the pause shims: keep it for the process lifetime.
+    const bool retainUiRuntime = ui_heap_guard::Installed() || multiplayer_pause::Installed() ||
+        item_sync::Installed();
     ai_sync::BeginLogicalShutdown();
     const bool retainActionReleaseHook = character_action_runtime::BeginLogicalShutdown();
     character_action_probe::BeginLogicalShutdown();

@@ -54,6 +54,8 @@ internal sealed class NativeRuntimeController : IDisposable
 
     internal event EventHandler<NativePlayerLifecycleStatePayload>? PlayerLifecycleStateChanged;
 
+    internal event EventHandler<NativeItemSyncPickupPayload>? ItemSyncPickupProduced;
+
     internal event EventHandler<ReadOnlyMemory<byte>>? AISyncStateProduced;
 
     internal event EventHandler<ReadOnlyMemory<byte>>? AISyncImpactProduced;
@@ -611,6 +613,7 @@ internal sealed class NativeRuntimeController : IDisposable
         session.PlayerSyncStateChanged += OnPlayerSyncStateChanged;
         session.PlayerSyncActionProduced += OnPlayerSyncActionProduced;
         session.PlayerLifecycleStateChanged += OnPlayerLifecycleStateChanged;
+        session.ItemSyncPickupProduced += OnItemSyncPickupProduced;
         session.AISyncStateProduced += OnAISyncStateProduced;
         session.AISyncImpactProduced += OnAISyncImpactProduced;
         session.ConnectionClosed += OnConnectionClosed;
@@ -629,6 +632,7 @@ internal sealed class NativeRuntimeController : IDisposable
         session.PlayerSyncStateChanged -= OnPlayerSyncStateChanged;
         session.PlayerSyncActionProduced -= OnPlayerSyncActionProduced;
         session.PlayerLifecycleStateChanged -= OnPlayerLifecycleStateChanged;
+        session.ItemSyncPickupProduced -= OnItemSyncPickupProduced;
         session.AISyncStateProduced -= OnAISyncStateProduced;
         session.AISyncImpactProduced -= OnAISyncImpactProduced;
         session.ConnectionClosed -= OnConnectionClosed;
@@ -657,6 +661,11 @@ internal sealed class NativeRuntimeController : IDisposable
         object? sender,
         NativePlayerLifecycleStatePayload value) =>
         PlayerLifecycleStateChanged?.Invoke(this, value);
+
+    private void OnItemSyncPickupProduced(
+        object? sender,
+        NativeItemSyncPickupPayload value) =>
+        ItemSyncPickupProduced?.Invoke(this, value);
 
     private void OnPlayerSyncActionProduced(
         object? sender,

@@ -5746,6 +5746,17 @@ void ObserveTypedInteractionPairCandidate(
     case 0x00100003U:
     case 0x00100004U:
     case 0x00100049U:
+    // ItemSync owns world pickups. The pickup manager's owner messages
+    // (0x1E spawned, 0x1F collected) and the pickup use/range messages
+    // (0x34 use, 0x36/0x37 in/out of range) describe one peer's local
+    // spawn and collection. Replaying them elsewhere would mark the remote
+    // owner collected without removing its pickup; ItemSync removes the
+    // pickup itself through the pickup manager.
+    case 0x0020001EU:
+    case 0x0020001FU:
+    case 0x00200034U:
+    case 0x00200036U:
+    case 0x00200037U:
         return true;
     default:
         return false;

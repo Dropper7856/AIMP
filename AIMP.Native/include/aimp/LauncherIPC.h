@@ -130,6 +130,7 @@ private:
     void PublishWorldReplicationTraffic();
     void PublishPlayerSyncTraffic();
     void PublishPlayerLifecycleTraffic();
+    void PublishItemSyncTraffic();
     void PublishAISyncTraffic();
     bool HandleAISyncFrame(const protocol::Frame& frame);
     bool TryConnect();

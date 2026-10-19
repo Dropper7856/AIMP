@@ -164,6 +164,8 @@ public static class GameCommandNames
     public const string WorldStateDiscoveryStatus = "WORLD_STATE_DISCOVERY_STATUS";
     // Internal round lifecycle: retail "quit to main menu" path, absent from the UI catalogue.
     public const string ReturnToFrontend = "RETURN_TO_FRONTEND";
+    // Internal ItemSync: remove a pickup another participant collected, absent from the UI catalogue.
+    public const string ItemSyncApply = "ITEM_SYNC_APPLY";
 
     public static readonly IReadOnlySet<string> All = new HashSet<string>(
         new[]
@@ -186,7 +188,8 @@ public static class GameCommandNames
             WorldStateDiscoveryBaseline,
             WorldStateDiscoveryAfter,
             WorldStateDiscoveryStatus,
-            ReturnToFrontend
+            ReturnToFrontend,
+            ItemSyncApply
         },
         StringComparer.Ordinal);
 }

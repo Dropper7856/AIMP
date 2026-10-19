@@ -12,6 +12,7 @@
 #include "aimp/HistoricalParticipantTransaction.h"
 #include "aimp/HookManager.h"
 #include "aimp/InboundQueue.h"
+#include "aimp/ItemSyncKey.h"
 #include "aimp/LauncherIPC.h"
 #include "aimp/LevelGenerationTracker.h"
 #include "aimp/LifecycleCatalog.h"
@@ -215,6 +216,34 @@ std::vector<std::byte> ReadFileBytes(const std::wstring& path) {
 std::vector<std::byte> Bytes(const std::string_view value) {
     const auto* begin = reinterpret_cast<const std::byte*>(value.data());
     return std::vector<std::byte>(begin, begin + value.size());
+}
+
+void TestItemSyncKey() {
+    using namespace aimp::item_sync;
+    ItemKey key{};
+    key.ownerShortGuid = 0x12345678U;
+    key.ownerInstance = 0x000000ABU;
+    key.x = QuantizeItemCoordinate(1.04F);
+    key.y = QuantizeItemCoordinate(2.0F);
+    key.z = QuantizeItemCoordinate(-3.0F);
+    CHECK(key.x == 10);
+    CHECK(key.y == 20);
+    CHECK(key.z == -30);
+    const auto id = EncodeItemKey(key);
+    CHECK(id.high == 0x4954000A0014FFE2ULL);
+    CHECK(id.low == 0x12345678000000ABULL);
+    ItemKey decoded{};
+    CHECK(DecodeItemKey(id, decoded));
+    CHECK(decoded.ownerShortGuid == key.ownerShortGuid);
+    CHECK(decoded.ownerInstance == key.ownerInstance);
+    CHECK(decoded.x == 10 && decoded.y == 20 && decoded.z == -30);
+    CHECK(ItemCoordinate(decoded.z) == -3.0F);
+    CHECK(QuantizeItemCoordinate(1.0e9F) == 32767);
+    CHECK(QuantizeItemCoordinate(-1.0e9F) == -32768);
+    CHECK(QuantizeItemCoordinate(std::numeric_limits<float>::quiet_NaN()) == 0);
+    // Foreign WorldEntityIds and owner-less pickups are never ItemSync keys.
+    CHECK(!DecodeItemKey(aimp::WorldEntityId{0x1122334455667788ULL, 1U}, decoded));
+    CHECK(!DecodeItemKey(aimp::WorldEntityId{kItemKeyTag, 0U}, decoded));
 }
 
 void TestCapabilities() {
@@ -2010,6 +2039,15 @@ void TestExperimentalProtocol() {
         invalidWorldNetProbeCommand,
         gameCommandRequest));
 
+    const auto itemSyncApplyCommand = Bytes(
+        R"({"schemaVersion":1,"requestId":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","levelGeneration":3,"portableDummyId":"11111111-1111-1111-1111-111111111111","command":"ITEM_SYNC_APPLY","arguments":{"entityId":"4954000A0014FFE212345678000000AB"}})");
+    CHECK(aimp::experimental::DecodeGameCommand(
+        itemSyncApplyCommand,
+        gameCommandRequest));
+    CHECK(gameCommandRequest.command == "ITEM_SYNC_APPLY");
+    CHECK(gameCommandRequest.itemSyncApply.entityHigh == 0x4954000A0014FFE2ULL);
+    CHECK(gameCommandRequest.itemSyncApply.entityLow == 0x12345678000000ABULL);
+
     const auto worldInteractionStatsCommand = Bytes(
         R"({"schemaVersion":1,"requestId":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","levelGeneration":3,"portableDummyId":"11111111-1111-1111-1111-111111111111","command":"WORLD_INTERACTION_STATS","arguments":{}})");
     CHECK(aimp::experimental::DecodeGameCommand(
@@ -2622,7 +2660,8 @@ void TestProtocol() {
     CHECK(aimp::protocol::IsKnownMessageType(17));
     CHECK(aimp::protocol::IsKnownMessageType(18));
     CHECK(aimp::protocol::IsKnownMessageType(27));
-    CHECK(!aimp::protocol::IsKnownMessageType(28));
+    CHECK(aimp::protocol::IsKnownMessageType(28));
+    CHECK(!aimp::protocol::IsKnownMessageType(29));
     CHECK(!aimp::protocol::IsKnownMessageType(199));
     for (std::uint16_t value = 200; value <= 216; ++value) {
         CHECK(aimp::protocol::IsKnownMessageType(value));
@@ -3775,6 +3814,7 @@ int wmain(int argc, wchar_t** argv) {
     TestExperimentalProtocol();
     TestCharacterDirectStepNativeLifecycle();
     TestProtocol();
+    TestItemSyncKey();
     TestWorldReplicationCodec();
     TestCathodePrimitivePayload();
     TestWorldInteractionAdapterPayload();

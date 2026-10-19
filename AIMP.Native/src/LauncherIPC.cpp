@@ -12,6 +12,7 @@
 #include "aimp/GameThreadDispatcher.h"
 #include "aimp/GameCommandExecutor.h"
 #include "aimp/InboundQueue.h"
+#include "aimp/ItemSync.h"
 #include "aimp/LevelGenerationTracker.h"
 #include "aimp/NetZDiscovery.h"
 #include "aimp/ReplicationCore.h"
@@ -693,6 +694,32 @@ void LauncherIPC::PublishPlayerLifecycleTraffic() {
     }
 }
 
+void LauncherIPC::PublishItemSyncTraffic() {
+    item_sync::PickupEvent pickup{};
+    for (std::size_t i = 0U; i < 16U && item_sync::TryPeekObservedPickup(pickup); ++i) {
+        // A pickup outside a bound session is a solo event: drop it.
+        if (!sessionConfigured_.load(std::memory_order_acquire) ||
+            !netzReadySent_.load(std::memory_order_acquire) ||
+            !worldSyncAuthorityBound_) {
+            item_sync::PopObservedPickup();
+            continue;
+        }
+        std::ostringstream json;
+        json << "{\"schemaVersion\":1"
+             << ",\"sequence\":" << pickup.sequence
+             << ",\"entityId\":\"" << item_sync::EntityIdHex(pickup.entity) << '"'
+             << '}';
+        // Kept at the head of the ring until queued: the Host must see every
+        // pickup to remove it for the other participants.
+        if (!Queue(
+                protocol::MessageType::ItemSyncPickup,
+                0,
+                localSequence_.fetch_add(1U, std::memory_order_relaxed),
+                JsonBytes(json.str()))) break;
+        item_sync::PopObservedPickup();
+    }
+}
+
 void LauncherIPC::PublishPlayerSyncTraffic() {
     if (playerSyncObserver_ == nullptr) {
         return;
@@ -1136,6 +1163,7 @@ void LauncherIPC::Run() {
             PublishWorldReplicationTraffic();
             PublishPlayerSyncTraffic();
             PublishPlayerLifecycleTraffic();
+            PublishItemSyncTraffic();
             PublishAISyncTraffic();
 
             if (!FlushOutgoing(96U)) continue;
@@ -2797,6 +2825,10 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
             } else if (
                 pending->request.command == "RETURN_TO_FRONTEND") {
                 result = gameCommands_->ExecuteReturnToFrontend();
+            } else if (
+                pending->request.command == "ITEM_SYNC_APPLY") {
+                result = gameCommands_->ExecuteItemSyncApply(
+                    pending->request.itemSyncApply);
             } else {
                 result = gameCommands_->ExecutePopupMessage(
                     pending->request.popupMessage);
@@ -2940,6 +2972,7 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
     }
     case protocol::MessageType::DiagnosticSnapshotRequest: {
         ai_sync::LogDiagnostics(*diagnostics_);
+        item_sync::LogDiagnostics(*diagnostics_);
         experimental::DiagnosticSnapshotRequest request;
         if (!sessionConfigured_.load(std::memory_order_acquire) ||
             !netzReadySent_.load(std::memory_order_acquire) ||

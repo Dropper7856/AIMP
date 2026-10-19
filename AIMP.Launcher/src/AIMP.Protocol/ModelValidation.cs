@@ -112,6 +112,48 @@ public static class ModelValidation
         }
     }
 
+    public static void Validate(ItemPickupRequestPayload? value)
+    {
+        if (value is null
+            || value.SessionId == Guid.Empty
+            || value.PeerId == 0
+            || value.LevelGeneration < 1
+            || !IsWorldEntityIdText(value.EntityId))
+        {
+            throw new ProtocolException("The item-pickup request is invalid.");
+        }
+    }
+
+    public static void Validate(ItemCollectedPayload? value)
+    {
+        if (value is null
+            || value.SessionId == Guid.Empty
+            || value.LevelGeneration < 1
+            || value.CollectorPeerId == 0
+            || !IsWorldEntityIdText(value.EntityId))
+        {
+            throw new ProtocolException("The item-collected payload is invalid.");
+        }
+    }
+
+    public static void Validate(NativeItemSyncPickupPayload? value)
+    {
+        if (value is null
+            || value.SchemaVersion != 1
+            || value.Sequence == 0
+            || !IsWorldEntityIdText(value.EntityId))
+        {
+            throw new ProtocolException("The native ItemSync pickup is invalid.");
+        }
+    }
+
+    // 32 uppercase or lowercase hex digits (WorldEntityId High:X16 + Low:X16),
+    // never the all-zero id.
+    public static bool IsWorldEntityIdText(string? value) =>
+        value is { Length: 32 }
+        && value.All(Uri.IsHexDigit)
+        && value.Any(character => character != '0');
+
     public static void Validate(PlayerSpawnPositionPayload? value)
     {
         if (value is null || value.PeerId == 0 || !ValidSpawnCoordinate(value.X)
@@ -731,6 +773,18 @@ public static class ModelValidation
                 || !entityId.All(Uri.IsHexDigit)
                 || entityId.All(value => value == '0'))
                 throw new ProtocolException("WORLD_NET_PROBE parameters are invalid.");
+            return;
+        }
+
+        if (string.Equals(
+                value.Command,
+                GameCommandNames.ItemSyncApply,
+                StringComparison.Ordinal))
+        {
+            if (value.Arguments.Count != 1
+                || !value.Arguments.TryGetValue("entityId", out var entityId)
+                || !IsWorldEntityIdText(entityId))
+                throw new ProtocolException("ITEM_SYNC_APPLY parameters are invalid.");
             return;
         }
 
