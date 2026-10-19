@@ -32,6 +32,9 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdio>
+#include <iomanip>
+#include <locale>
 #include <limits>
 #include <map>
 #include <memory>
@@ -720,6 +723,44 @@ void LauncherIPC::PublishItemSyncTraffic() {
     }
 }
 
+void LauncherIPC::PublishItemSyncSpawnTraffic() {
+    item_sync::SpawnEvent event{};
+    for (std::size_t i = 0U; i < 16U && item_sync::TryPeekObservedSpawn(event); ++i) {
+        if (!worldSyncAuthorityBound_) {
+            item_sync::PopObservedSpawn();
+            continue;
+        }
+        // Owner spawns run while the level loads: keep them until the
+        // session is ready instead of losing the Host decision request.
+        if (!sessionConfigured_.load(std::memory_order_acquire) ||
+            !netzReadySent_.load(std::memory_order_acquire)) break;
+        const auto& data = event.data;
+        std::ostringstream json;
+        json.imbue(std::locale::classic());
+        json << std::setprecision(9);
+        char ownerKey[17]{};
+        std::snprintf(ownerKey, sizeof(ownerKey), "%016llX",
+            static_cast<unsigned long long>(data.ownerKey));
+        json << "{\"schemaVersion\":1"
+             << ",\"sequence\":" << event.sequence
+             << ",\"kind\":\"" << (data.kind == item_sync::SpawnKind::Drop ? "drop" : "owner") << '"'
+             << ",\"ownerKey\":\"" << ownerKey << '"'
+             << ",\"spawn\":" << (data.spawn ? "true" : "false")
+             << ",\"path\":\"" << Diagnostics::EscapeJson(data.spawn ? data.path : "") << '"'
+             << ",\"quantity\":" << (data.spawn ? data.quantity : 0)
+             << ",\"transform\":[";
+        for (std::size_t index = 0U; index < 12U; ++index)
+            json << (index == 0U ? "" : ",") << (data.spawn ? data.transform[index] : 0.0F);
+        json << "]}";
+        if (!Queue(
+                protocol::MessageType::ItemSyncSpawn,
+                0,
+                localSequence_.fetch_add(1U, std::memory_order_relaxed),
+                JsonBytes(json.str()))) break;
+        item_sync::PopObservedSpawn();
+    }
+}
+
 void LauncherIPC::PublishPlayerSyncTraffic() {
     if (playerSyncObserver_ == nullptr) {
         return;
@@ -1164,6 +1205,7 @@ void LauncherIPC::Run() {
             PublishPlayerSyncTraffic();
             PublishPlayerLifecycleTraffic();
             PublishItemSyncTraffic();
+            PublishItemSyncSpawnTraffic();
             PublishAISyncTraffic();
 
             if (!FlushOutgoing(96U)) continue;
@@ -2829,6 +2871,10 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
                 pending->request.command == "ITEM_SYNC_APPLY") {
                 result = gameCommands_->ExecuteItemSyncApply(
                     pending->request.itemSyncApply);
+            } else if (
+                pending->request.command == "ITEM_SYNC_SPAWN") {
+                result = gameCommands_->ExecuteItemSyncSpawn(
+                    pending->request.itemSyncSpawn);
             } else {
                 result = gameCommands_->ExecutePopupMessage(
                     pending->request.popupMessage);

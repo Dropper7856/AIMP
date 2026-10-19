@@ -407,6 +407,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _controller.PlayerSyncActionProduced += OnNativePlayerSyncActionProduced;
         _controller.PlayerLifecycleStateChanged += OnNativePlayerLifecycleStateChanged;
         _controller.ItemSyncPickupProduced += OnNativeItemSyncPickupProduced;
+        _controller.ItemSyncSpawnProduced += OnNativeItemSyncSpawnProduced;
     }
 
     internal async Task ApplyPerformanceIsolationModuleAsync(
@@ -679,6 +680,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _controller.PlayerSyncActionProduced -= OnNativePlayerSyncActionProduced;
         _controller.PlayerLifecycleStateChanged -= OnNativePlayerLifecycleStateChanged;
         _controller.ItemSyncPickupProduced -= OnNativeItemSyncPickupProduced;
+        _controller.ItemSyncSpawnProduced -= OnNativeItemSyncSpawnProduced;
         StopNetworkAsync("Launcher closed").GetAwaiter().GetResult();
         _commandGate.Dispose();
         _spawnGate.Dispose();
@@ -2373,6 +2375,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         host.GameplayReadyReceived += OnGameplayReady;
         host.RoundEnded += OnRoundEnded;
         host.ItemCollected += OnItemCollected;
+        host.ItemSpawnDecided += OnItemSpawnDecided;
         host.SpawnRemotePlayersRequested += OnSpawnRemotePlayersRequested;
         host.PlayerPositionReceived += OnPlayerPositionReceived;
         host.PlayerEquipmentReceived += OnPlayerEquipmentReceived;
@@ -2392,6 +2395,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         host.GameplayReadyReceived -= OnGameplayReady;
         host.RoundEnded -= OnRoundEnded;
         host.ItemCollected -= OnItemCollected;
+        host.ItemSpawnDecided -= OnItemSpawnDecided;
         host.SpawnRemotePlayersRequested -= OnSpawnRemotePlayersRequested;
         host.PlayerPositionReceived -= OnPlayerPositionReceived;
         host.PlayerEquipmentReceived -= OnPlayerEquipmentReceived;
@@ -2411,6 +2415,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         client.GameplayReadyReceived += OnGameplayReady;
         client.RoundEnded += OnRoundEnded;
         client.ItemCollected += OnItemCollected;
+        client.ItemSpawnDecided += OnItemSpawnDecided;
         client.SpawnPositionRequested += OnSpawnPositionRequested;
         client.SpawnRemotePlayersRequested += OnSpawnRemotePlayersRequested;
         client.PlayerPositionReceived += OnPlayerPositionReceived;
@@ -2433,6 +2438,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         client.GameplayReadyReceived -= OnGameplayReady;
         client.RoundEnded -= OnRoundEnded;
         client.ItemCollected -= OnItemCollected;
+        client.ItemSpawnDecided -= OnItemSpawnDecided;
         client.SpawnPositionRequested -= OnSpawnPositionRequested;
         client.SpawnRemotePlayersRequested -= OnSpawnRemotePlayersRequested;
         client.PlayerPositionReceived -= OnPlayerPositionReceived;
@@ -4749,7 +4755,7 @@ internal static class LobbyCompatibility
         (settings.WorldSync3EmptyCallbackEnabled ? ":probe-callback-test" : ":strict") +
         ":aisync-v6-participants" +
         ":round-end-v1" +
-        ":itemsync-v1";
+        ":itemsync-v2";
 
     internal static CompatibilityInfo Create(LauncherSettings settings)
     {

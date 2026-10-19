@@ -32,6 +32,7 @@ public enum MessageType : ushort
     AISyncImpact = 26,
     PlayerLifecycleState = 27, // DLL -> launcher only: local THE_PLAYER death boundary.
     ItemSyncPickup = 28, // DLL -> launcher only: the local player collected a world pickup.
+    ItemSyncSpawn = 29, // DLL -> launcher only: GCIP spawn proposal or local player drop.
 
     LobbyJoin = 100,
     LobbyJoinAccepted = 101,
@@ -59,6 +60,8 @@ public enum MessageType : ushort
     RoundEnded = 123, // Host -> Clients only; the session is back in Lobby.
     ItemPickupRequest = 124, // Client -> Host only; the Host arbitrates the first collector.
     ItemCollected = 125, // Host -> Clients only; the pickup is gone for every participant.
+    ItemSpawnProposal = 126, // Client -> Host only; GCIP spawn result or player drop.
+    ItemSpawnDecision = 127, // Host -> Clients only; first decision per owner, every drop.
 
     TestModeConfigure = 200,
     CapabilityQuery = 201,

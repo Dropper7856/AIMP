@@ -79,6 +79,7 @@ bool IsKnownMessageType(const std::uint16_t raw) noexcept {
     case MessageType::AISyncImpact:
     case MessageType::PlayerLifecycleState:
     case MessageType::ItemSyncPickup:
+    case MessageType::ItemSyncSpawn:
     case MessageType::TestModeConfigure:
     case MessageType::CapabilityQuery:
     case MessageType::CapabilityState:

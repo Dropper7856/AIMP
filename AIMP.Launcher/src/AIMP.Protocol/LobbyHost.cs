@@ -71,6 +71,9 @@ public sealed class LobbyHost : IAsyncDisposable
     private readonly HashSet<ulong> _deadPeers = new();
     // ItemSync: first collector of each pickup in the active generation.
     private readonly Dictionary<string, ulong> _collectedItems = new(StringComparer.Ordinal);
+    // ItemSync spawn authority: first decision per owner key, in decision order.
+    private readonly Dictionary<string, ItemSpawnPayload> _spawnDecisions = new(StringComparer.Ordinal);
+    private readonly List<ItemSpawnPayload> _spawnDecisionOrder = new();
     private SpawnPositionRound? _activeSpawnRound;
     private int _disposed;
 
@@ -146,6 +149,8 @@ public sealed class LobbyHost : IAsyncDisposable
     public event EventHandler<RoundEndedPayload>? RoundEnded;
 
     public event EventHandler<ItemCollectedPayload>? ItemCollected;
+
+    public event EventHandler<ItemSpawnPayload>? ItemSpawnDecided;
 
     public event EventHandler<SpawnRemotePlayersPayload>? SpawnRemotePlayersRequested;
 
@@ -245,6 +250,7 @@ public sealed class LobbyHost : IAsyncDisposable
                 _levelGeneration++;
                 _deadPeers.Clear();
                 _collectedItems.Clear();
+                ClearSpawnDecisionsLocked();
                 payload = new LobbyStartPayload(
                     SessionId,
                     startAtUtc.ToUnixTimeMilliseconds(),
@@ -337,6 +343,7 @@ public sealed class LobbyHost : IAsyncDisposable
         _state = "Lobby";
         _deadPeers.Clear();
         _collectedItems.Clear();
+        ClearSpawnDecisionsLocked();
         var payload = new RoundEndedPayload(SessionId, _levelGeneration,
             "AllPlayersDead", RoundReturnDelayMilliseconds);
         ModelValidation.Validate(payload);
@@ -397,6 +404,49 @@ public sealed class LobbyHost : IAsyncDisposable
         ItemCollected?.Invoke(this, collected);
     }
 
+    public Task ReportHostItemSpawnAsync(
+        int levelGeneration,
+        NativeItemSyncSpawnPayload value,
+        CancellationToken cancellationToken = default)
+    {
+        var payload = new ItemSpawnPayload(SessionId, HostPeerId, levelGeneration, value.Kind,
+            value.OwnerKey, value.Spawn, value.Path, value.Quantity, value.Transform);
+        ModelValidation.Validate(payload);
+        return RecordItemSpawnAsync(payload, cancellationToken);
+    }
+
+    // Caller holds _stateLock.
+    private void ClearSpawnDecisionsLocked()
+    {
+        _spawnDecisions.Clear();
+        _spawnDecisionOrder.Clear();
+    }
+
+    // The first proposal per owner key becomes the decision for every peer,
+    // including "nothing spawns here". Drops have unique synthetic owners.
+    private async Task RecordItemSpawnAsync(
+        ItemSpawnPayload payload,
+        CancellationToken cancellationToken)
+    {
+        ItemSpawnPayload decision;
+        lock (_stateLock)
+        {
+            if (!string.Equals(_state, "Starting", StringComparison.Ordinal)
+                || payload.LevelGeneration != _levelGeneration) return;
+            decision = payload with { OwnerKey = payload.OwnerKey.ToUpperInvariant() };
+            if (!_spawnDecisions.TryAdd(decision.OwnerKey, decision)) return;
+            _spawnDecisionOrder.Add(decision);
+        }
+
+        Log?.Invoke(this, decision.Spawn
+            ? $"ItemSync: {decision.Kind} {decision.OwnerKey} spawns {decision.Path} x{decision.Quantity} " +
+              $"(participant {decision.PeerId})."
+            : $"ItemSync: owner {decision.OwnerKey} spawns nothing (participant {decision.PeerId}).");
+        await BroadcastAsync(MessageType.ItemSpawnDecision, JsonPayload.Serialize(decision),
+            cancellationToken).ConfigureAwait(false);
+        ItemSpawnDecided?.Invoke(this, decision);
+    }
+
     // A client that reaches gameplay after pickups were already collected
     // receives the full set; the native side applies each id once loaded.
     private async Task ReplayCollectedItemsAsync(
@@ -405,16 +455,23 @@ public sealed class LobbyHost : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         ItemCollectedPayload[] replay;
+        ItemSpawnPayload[] decisions;
         lock (_stateLock)
         {
             if (!string.Equals(_state, "Starting", StringComparison.Ordinal)
                 || levelGeneration != _levelGeneration) return;
+            // Spawn decisions first: a collected pickup whose decision arrives
+            // later is then never spawned (the native removal stays pending).
+            decisions = _spawnDecisionOrder.ToArray();
             replay = _collectedItems
                 .Where(item => item.Value != state.PeerId)
                 .Select(item => new ItemCollectedPayload(SessionId, levelGeneration, item.Key, item.Value))
                 .ToArray();
         }
 
+        foreach (var decision in decisions)
+            await SendToClientSafelyAsync(state, MessageType.ItemSpawnDecision,
+                JsonPayload.Serialize(decision), cancellationToken).ConfigureAwait(false);
         foreach (var collected in replay)
             await SendToClientSafelyAsync(state, MessageType.ItemCollected,
                 JsonPayload.Serialize(collected), cancellationToken).ConfigureAwait(false);
@@ -1150,6 +1207,11 @@ public sealed class LobbyHost : IAsyncDisposable
                         .ConfigureAwait(false);
                     break;
 
+                case MessageType.ItemSpawnProposal:
+                    await HandleItemSpawnProposalAsync(state, frame.Payload, cancellationToken)
+                        .ConfigureAwait(false);
+                    break;
+
                 case MessageType.PlayerPositionSnapshot:
                     await HandlePlayerPositionAsync(state, frame.Payload, cancellationToken)
                         .ConfigureAwait(false);
@@ -1446,6 +1508,24 @@ public sealed class LobbyHost : IAsyncDisposable
 
         // A stale generation is ignored without error, like PlayerDeath.
         await RecordItemPickupAsync(payload, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task HandleItemSpawnProposalAsync(
+        ClientState state,
+        ReadOnlyMemory<byte> bytes,
+        CancellationToken cancellationToken)
+    {
+        var payload = JsonPayload.Deserialize<ItemSpawnPayload>(bytes.Span);
+        ModelValidation.Validate(payload);
+        if (payload.SessionId != SessionId || payload.PeerId != state.PeerId)
+        {
+            await SendErrorAsync(state.Connection, "INVALID_ITEM_SPAWN",
+                "Item spawn identity is invalid.", cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        await RecordItemSpawnAsync(payload, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task HandleGameplayReadyAsync(

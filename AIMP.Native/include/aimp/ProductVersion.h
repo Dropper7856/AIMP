@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.206-itemsync";
+    "0.11.4.207-itemsync-authority";
 
 } // namespace aimp

@@ -107,6 +107,15 @@ struct ItemSyncApplyCommand {
     std::uint64_t entityLow{};
 };
 
+struct ItemSyncSpawnCommand {
+    bool drop{};
+    std::uint64_t ownerKey{};
+    bool spawn{};
+    std::string path;
+    std::int32_t quantity{};
+    std::array<float, 12> transform{};
+};
+
 struct SpawnNetZCharacterCommand {
     float x{};
     float y{};
@@ -165,6 +174,10 @@ public:
         const ItemSyncApplyCommand&) const {
         return {false, "ITEM_SYNC_UNAVAILABLE", "ItemSync is not supported by this executor."};
     }
+    [[nodiscard]] virtual GameCommandExecutionResult ExecuteItemSyncSpawn(
+        const ItemSyncSpawnCommand&) const {
+        return {false, "ITEM_SYNC_UNAVAILABLE", "ItemSync is not supported by this executor."};
+    }
 };
 
 class GameCommandExecutor final : public IGameCommandExecutor {
@@ -211,6 +224,8 @@ public:
     [[nodiscard]] GameCommandExecutionResult ExecuteReturnToFrontend() const override;
     [[nodiscard]] GameCommandExecutionResult ExecuteItemSyncApply(
         const ItemSyncApplyCommand& command) const override;
+    [[nodiscard]] GameCommandExecutionResult ExecuteItemSyncSpawn(
+        const ItemSyncSpawnCommand& command) const override;
 
     void AttachWorldEntityRegistry(WorldEntityRegistry& registry) noexcept;
     void AttachGameThreadDispatcher(GameThreadDispatcher& dispatcher) noexcept;

@@ -137,10 +137,10 @@ internal static class ProtocolTests
                 new uint[] { 0x11223344U, 0x55667788U }, WorldManifestRuntimeIdentity.RootInstanceBaseId));
 
         AssertWorldManifestV5RoundTrip(worldEntityId);
-        foreach (var raw in new ushort[] { 16, 17, 18, 28, 111, 112, 113, 114, 124, 125 })
+        foreach (var raw in new ushort[] { 16, 17, 18, 28, 29, 111, 112, 113, 114, 124, 125, 126, 127 })
             AssertEx.True(Enum.IsDefined(typeof(MessageType), raw));
-        AssertEx.False(Enum.IsDefined(typeof(MessageType), (ushort)29));
-        AssertEx.False(Enum.IsDefined(typeof(MessageType), (ushort)126));
+        AssertEx.False(Enum.IsDefined(typeof(MessageType), (ushort)30));
+        AssertEx.False(Enum.IsDefined(typeof(MessageType), (ushort)128));
         AssertEx.False(Enum.IsDefined(typeof(MessageType), (ushort)217));
 
         // ItemSync: 32-hex item keys, never all-zero; identities are validated.
@@ -159,6 +159,35 @@ internal static class ProtocolTests
             new NativeItemSyncPickupPayload(2, 1UL, itemKey)));
         AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(
             new NativeItemSyncPickupPayload(1, 0UL, itemKey)));
+
+        // ItemSync spawn authority: owner decisions (including "nothing") and drops.
+        var identity = new float[] { 1F, 0F, 0F, 12.5F, 0F, 1F, 0F, -3F, 0F, 0F, 1F, 0.25F };
+        var ownerSpawn = new ItemSpawnPayload(itemSession, 7UL, 1, "owner", "12345678000000AB",
+            true, "Pickups\\Medkit", 1, identity);
+        ModelValidation.Validate(ownerSpawn);
+        ModelValidation.Validate(ownerSpawn with { Spawn = false, Path = "", Quantity = 0 });
+        ModelValidation.Validate(ownerSpawn with { Kind = "drop", OwnerKey = "00000001A1D12345" });
+        ModelValidation.Validate(new NativeItemSyncSpawnPayload(1, 1UL, "owner", "12345678000000AB",
+            false, "", 0, new float[12]));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(
+            ownerSpawn with { Kind = "drop" }));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(
+            ownerSpawn with { Kind = "drop", OwnerKey = "00000001A1D12345", Spawn = false, Path = "" }));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(
+            ownerSpawn with { Spawn = false }));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(
+            ownerSpawn with { OwnerKey = "0000000000000000" }));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(
+            ownerSpawn with { Transform = new float[11] }));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(
+            ownerSpawn with { Transform = Enumerable.Repeat(float.NaN, 12).ToArray() }));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(
+            ownerSpawn with { Path = "Pickups\\\nMedkit" }));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(
+            ownerSpawn with { Kind = "unknown" }));
+        AssertEx.True(ModelValidation.TryParseItemTransform(
+            ModelValidation.FormatItemTransform(identity), out var parsedTransform));
+        AssertEx.True(parsedTransform.SequenceEqual(identity));
         AssertEx.False(Enum.IsDefined(typeof(MessageType), (ushort)218));
 
         AssertGameCommand(identity);
@@ -1409,6 +1438,38 @@ internal static class ProtocolTests
             }));
         AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(
             itemSyncApply with { Arguments = new Dictionary<string, string>(StringComparer.Ordinal) }));
+
+        var itemSyncSpawn = command with
+        {
+            Command = GameCommandNames.ItemSyncSpawn,
+            Arguments = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["kind"] = "owner",
+                ["ownerKey"] = "12345678000000AB",
+                ["spawn"] = "1",
+                ["path"] = "Pickups\\Medkit",
+                ["quantity"] = "2",
+                ["transform"] = "1,0,0,12.5,0,1,0,-3,0,0,1,0.25"
+            }
+        };
+        AssertEx.True(GameCommandNames.All.Contains(GameCommandNames.ItemSyncSpawn));
+        ModelValidation.Validate(itemSyncSpawn);
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(
+            itemSyncSpawn with
+            {
+                Arguments = new Dictionary<string, string>(itemSyncSpawn.Arguments, StringComparer.Ordinal)
+                {
+                    ["transform"] = "1,0,0,12.5,0,1,0,-3,0,0,1"
+                }
+            }));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(
+            itemSyncSpawn with
+            {
+                Arguments = new Dictionary<string, string>(itemSyncSpawn.Arguments, StringComparer.Ordinal)
+                {
+                    ["spawn"] = "yes"
+                }
+            }));
 
         var netzCommand = command with
         {

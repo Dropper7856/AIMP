@@ -2048,6 +2048,27 @@ void TestExperimentalProtocol() {
     CHECK(gameCommandRequest.itemSyncApply.entityHigh == 0x4954000A0014FFE2ULL);
     CHECK(gameCommandRequest.itemSyncApply.entityLow == 0x12345678000000ABULL);
 
+    const auto itemSyncSpawnCommand = Bytes(
+        R"({"schemaVersion":1,"requestId":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","levelGeneration":3,"portableDummyId":"11111111-1111-1111-1111-111111111111","command":"ITEM_SYNC_SPAWN","arguments":{"kind":"drop","ownerKey":"00000001A1D12345","spawn":"1","path":"Pickups\\Medkit","quantity":"2","transform":"1,0,0,12.5,0,1,0,-3,0,0,1,0.25"}})");
+    CHECK(aimp::experimental::DecodeGameCommand(
+        itemSyncSpawnCommand,
+        gameCommandRequest));
+    CHECK(gameCommandRequest.command == "ITEM_SYNC_SPAWN");
+    CHECK(gameCommandRequest.itemSyncSpawn.drop);
+    CHECK(gameCommandRequest.itemSyncSpawn.ownerKey == 0x00000001A1D12345ULL);
+    CHECK(gameCommandRequest.itemSyncSpawn.spawn);
+    CHECK(gameCommandRequest.itemSyncSpawn.path == "Pickups\\Medkit");
+    CHECK(gameCommandRequest.itemSyncSpawn.quantity == 2);
+    CHECK(gameCommandRequest.itemSyncSpawn.transform[3] == 12.5F);
+    CHECK(gameCommandRequest.itemSyncSpawn.transform[7] == -3.0F);
+    CHECK(gameCommandRequest.itemSyncSpawn.transform[11] == 0.25F);
+
+    const auto invalidItemSyncSpawnCommand = Bytes(
+        R"({"schemaVersion":1,"requestId":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","levelGeneration":3,"portableDummyId":"11111111-1111-1111-1111-111111111111","command":"ITEM_SYNC_SPAWN","arguments":{"kind":"owner","ownerKey":"12345678000000AB","spawn":"0","path":"Pickups\\Medkit","quantity":"0","transform":"0,0,0,0,0,0,0,0,0,0,0,0"}})");
+    CHECK(!aimp::experimental::DecodeGameCommand(
+        invalidItemSyncSpawnCommand,
+        gameCommandRequest));
+
     const auto worldInteractionStatsCommand = Bytes(
         R"({"schemaVersion":1,"requestId":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","levelGeneration":3,"portableDummyId":"11111111-1111-1111-1111-111111111111","command":"WORLD_INTERACTION_STATS","arguments":{}})");
     CHECK(aimp::experimental::DecodeGameCommand(
@@ -2661,7 +2682,8 @@ void TestProtocol() {
     CHECK(aimp::protocol::IsKnownMessageType(18));
     CHECK(aimp::protocol::IsKnownMessageType(27));
     CHECK(aimp::protocol::IsKnownMessageType(28));
-    CHECK(!aimp::protocol::IsKnownMessageType(29));
+    CHECK(aimp::protocol::IsKnownMessageType(29));
+    CHECK(!aimp::protocol::IsKnownMessageType(30));
     CHECK(!aimp::protocol::IsKnownMessageType(199));
     for (std::uint16_t value = 200; value <= 216; ++value) {
         CHECK(aimp::protocol::IsKnownMessageType(value));
