@@ -21,12 +21,16 @@ namespace {
 
 constexpr std::uintptr_t kGlobalRoot = 0x012F0C88U;
 constexpr std::uintptr_t kPauseManager = 0x012F194CU;
+constexpr std::uintptr_t kUiManager = 0x0134A78CU;
+constexpr std::uintptr_t kHubType = 0x00EFF260U;
+constexpr std::uintptr_t kRenderer = 0x015D0970U;
 constexpr std::uintptr_t kRetailMaskAddress = 0x00EF3014U;
 constexpr std::uint32_t kRetailMask = 0x000179FFU;
 // FUN_0078F7E0 adds 0x2000 for the retail pause menu and 0x10000 for
 // platform/challenge overlays. Other reasons, including loading, explicit
 // scripted pauses, death screens and system dialogs, remain authoritative.
 constexpr std::uint32_t kMenuReasons = 0x00012000U;
+constexpr std::uint32_t kPauseGameReason = 0x401U;
 
 std::uintptr_t gBase{};
 LevelGenerationTracker* gGenerations{};
@@ -34,6 +38,8 @@ std::atomic<bool> gInstalled{};
 std::atomic<bool> gEnabled{};
 std::atomic<std::uint64_t> gQueries{}, gFiltered{}, gSafetyPreserved{}, gReadFailures{};
 std::atomic<std::uint32_t> gLastMenuFlags{}, gLastRemainingReasons{};
+std::atomic<std::uint64_t> gPauseGameFiltered{}, gUiContextRejected{};
+std::atomic<std::uint64_t> gRenderQueries{}, gRenderFiltered{};
 
 template<typename T>
 bool Read(const std::uintptr_t address, T& result) noexcept {
@@ -77,11 +83,56 @@ bool ActiveMultiplayerWorld(const std::uintptr_t pauseManager) noexcept {
         gGenerations->IsStableGeneration(generation);
 }
 
+bool NativeMenuOwnsPause() noexcept {
+    // 00810420's exact movie index, without invoking UI code from a simulation
+    // worker or keeping a movie pointer beyond this query. +1CE2 belongs to the
+    // HUB movie, NOT to the smaller UI manager. Pause_Game/Unpause_Game own it.
+    std::uintptr_t manager{}, movies{};
+    std::uint32_t count{};
+    if (!Read(gBase + kUiManager, manager) || manager == 0U ||
+        !Read(manager + 0x38U, movies) || movies == 0U ||
+        !Read(manager + 0x3CU, count) || count == 0U || count > 256U) return false;
+    bool owned = false;
+    for (std::uint32_t i = 0U; i < count && !owned; ++i) {
+        std::uintptr_t movie{}, type{}, name{};
+        std::uint8_t active{}, pauseOwned{};
+        if (!Read(movies + i * sizeof(std::uintptr_t), movie) || movie == 0U || !Read(movie, type)) continue;
+        if (type == gBase + kHubType && Read(movie + 0x1CE2U, pauseOwned) && pauseOwned != 0U)
+            owned = true;
+        else if (Read(movie + 0x0CU, active) && active != 0U &&
+            Read(movie + 0x34U, name) && name != 0U) {
+            constexpr char kPauseMenu[] = "pause_menu";
+            owned = true;
+            for (std::size_t j = 0U; j < sizeof(kPauseMenu); ++j) {
+                char actual{};
+                if (!Read(name + j, actual) || actual != kPauseMenu[j]) { owned = false; break; }
+            }
+        }
+    }
+    std::uintptr_t currentManager{}, currentMovies{};
+    std::uint32_t currentCount{};
+    if (!Read(gBase + kUiManager, currentManager) || currentManager != manager ||
+        !Read(manager + 0x38U, currentMovies) || currentMovies != movies ||
+        !Read(manager + 0x3CU, currentCount) || currentCount != count) {
+        gUiContextRejected.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+    return owned;
+}
+
 std::uint32_t FilterMask(const std::uintptr_t pauseManager,
     const std::uint32_t flags, const std::uint32_t mask) noexcept {
-    if ((flags & mask & kMenuReasons) == 0U || !ActiveMultiplayerWorld(pauseManager))
+    const bool pauseGame = (flags & kPauseGameReason) == kPauseGameReason;
+    if ((flags & mask & (kMenuReasons | 1U)) == 0U || !ActiveMultiplayerWorld(pauseManager))
         return mask;
-    const auto filtered = mask & ~kMenuReasons;
+    auto ignored = kMenuReasons;
+    if (pauseGame && ((flags & kMenuReasons) != 0U || NativeMenuOwnsPause())) {
+        // 00807010 and the Escape path in 00790000 add the SAME 0x401 pair.
+        // Ignore its blocking bit only with a certified active menu owner.
+        ignored |= kPauseGameReason;
+        gPauseGameFiltered.fetch_add(1U, std::memory_order_relaxed);
+    }
+    const auto filtered = mask & ~ignored;
     gLastMenuFlags.store(flags, std::memory_order_relaxed);
     gLastRemainingReasons.store(flags & filtered, std::memory_order_relaxed);
     gFiltered.fetch_add(1U, std::memory_order_relaxed);
@@ -113,6 +164,26 @@ std::uint32_t __cdecl SimulationPauseMask() noexcept {
         return mask;
     }
     return FilterMask(pauseManager, flags, mask);
+}
+
+std::uint32_t __cdecl SimulationRenderByte(const std::uintptr_t renderer) noexcept {
+    std::uint8_t enabled{};
+    if (!Read(renderer + 0x1B64U, enabled)) {
+        gReadFailures.fetch_add(1U, std::memory_order_relaxed);
+        return 0U;
+    }
+    // Keep the renderer's own state intact. Only its certified query sites
+    // admit live world updates under a menu that no longer pauses simulation.
+    if (enabled != 0U || renderer != gBase + kRenderer) return enabled;
+    gRenderQueries.fetch_add(1U, std::memory_order_relaxed);
+    std::uintptr_t pauseManager{};
+    std::uint32_t flags{};
+    if (!Read(gBase + kPauseManager, pauseManager) || pauseManager == 0U ||
+        !Read(pauseManager + 4U, flags) || (flags & (kMenuReasons | 1U)) == 0U) return enabled;
+    const auto mask = FilterMask(pauseManager, flags, kRetailMask);
+    if (mask == kRetailMask || (flags & mask) != 0U) return enabled;
+    gRenderFiltered.fetch_add(1U, std::memory_order_relaxed);
+    return 1U;
 }
 
 #if defined(_MSC_VER) && defined(_M_IX86)
@@ -208,6 +279,42 @@ __declspec(naked) void MaskEsiShim() {
     AIMP_PAUSE_RESTORE_CONTEXT
 }
 
+// These sites originally compare one byte, so SF and parity come from AL.
+// Unlike TEST, CMP also defines AF: merge it along with the other arithmetic
+// flags, preserving DF/IF and all non-arithmetic caller state.
+#define AIMP_PAUSE_CMP_FLAGS \
+    __asm { cmp al, 0 } \
+    __asm { pushfd } \
+    __asm { pop eax } \
+    __asm { and eax, 000008D5h } \
+    __asm { mov edx, [edi + 020h] } \
+    __asm { and edx, 0FFFFF72Ah } \
+    __asm { or edx, eax } \
+    __asm { mov [edi + 020h], edx }
+
+__declspec(naked) void RenderEcxShim() {
+    AIMP_PAUSE_SAVE_CONTEXT
+    __asm {
+        push [edi + 018h]
+        call SimulationRenderByte
+        add esp, 4
+    }
+    AIMP_PAUSE_CMP_FLAGS
+    AIMP_PAUSE_RESTORE_CONTEXT
+}
+
+__declspec(naked) void RenderEsiShim() {
+    AIMP_PAUSE_SAVE_CONTEXT
+    __asm {
+        push [edi + 004h]
+        call SimulationRenderByte
+        add esp, 4
+    }
+    AIMP_PAUSE_CMP_FLAGS
+    AIMP_PAUSE_RESTORE_CONTEXT
+}
+
+#undef AIMP_PAUSE_CMP_FLAGS
 #undef AIMP_PAUSE_SAVE_CONTEXT
 #undef AIMP_PAUSE_RESTORE_CONTEXT
 #undef AIMP_PAUSE_TEST_FLAGS
@@ -296,7 +403,7 @@ bool Install(const std::uintptr_t moduleBase, HookManager& hooks,
     gBase = moduleBase;
     gGenerations = &generations;
     std::vector<BytePatchRequest> patches;
-    patches.reserve(kPredicates.size() + 6U);
+    patches.reserve(kPredicates.size() + 6U + 15U);
     for (const auto& site : kPredicates) {
         patches.push_back(CallPatch(site.rva,
             Bytes({0xF7, static_cast<unsigned char>(site.ecx ? 0x41 : 0x40),
@@ -314,8 +421,17 @@ bool Install(const std::uintptr_t moduleBase, HookManager& hooks,
     patches.push_back(CallPatch(0x003DDBBFU, MaskLoadBytes({0xA1}), &MaskEaxShim));
     patches.push_back(CallPatch(0x00390129U, Bytes({0xBE,0xFF,0x79,0x01,0x00}), &MaskEsiShim));
 
+    // 009F22A0 disables the world's render-update queues while a menu is up.
+    // Unpausing physics alone would still leave a frozen scene behind the UI.
+    // Preserve the native field and change all 15 certified consumer queries.
+    for (std::uintptr_t i = 0U; i < 14U; ++i)
+        patches.push_back(CallPatch(0x00600CD0U + i * 0x30U,
+            Bytes({0x80,0xB9,0x64,0x1B,0x00,0x00,0x00}), &RenderEcxShim));
+    patches.push_back(CallPatch(0x006048D3U,
+        Bytes({0x80,0xBE,0x64,0x1B,0x00,0x00,0x00}), &RenderEsiShim));
+
     // Publish immutable shim data before the one transactional install resumes
-    // process threads. A rejected batch leaves all 27 retail instructions intact.
+    // process threads. A rejected batch leaves all 42 retail instructions intact.
     gEnabled.store(true, std::memory_order_release);
     if (!hooks.InstallPatchBatch("multiplayer_simulation_pause_queries", patches, error)) {
         gEnabled.store(false, std::memory_order_release);
@@ -343,10 +459,15 @@ void LogDiagnostics(Diagnostics& diagnostics) {
         "Certified simulation queries ignore retail menu/overlay pauses in an active multiplayer world; native UI, input focus and other pause reasons remain intact.",
         {{"installed", Diagnostics::Boolean(Installed()), true},
          {"enabled", Diagnostics::Boolean(gEnabled.load()), true},
-         {"sites", "27", true},
+         {"sites", "42", true},
          {"menuReasonMask", Diagnostics::Unsigned(kMenuReasons), true},
+         {"pauseGameReason", Diagnostics::Unsigned(kPauseGameReason), true},
          {"queries", Diagnostics::Unsigned(gQueries.load()), true},
          {"filtered", Diagnostics::Unsigned(gFiltered.load()), true},
+         {"pauseGameFiltered", Diagnostics::Unsigned(gPauseGameFiltered.load()), true},
+         {"renderQueries", Diagnostics::Unsigned(gRenderQueries.load()), true},
+         {"renderFiltered", Diagnostics::Unsigned(gRenderFiltered.load()), true},
+         {"uiContextRejected", Diagnostics::Unsigned(gUiContextRejected.load()), true},
          {"safetyReasonsPreserved", Diagnostics::Unsigned(gSafetyPreserved.load()), true},
          {"lastMenuFlags", Diagnostics::Unsigned(gLastMenuFlags.load()), true},
          {"lastRemainingReasons", Diagnostics::Unsigned(gLastRemainingReasons.load()), true},
