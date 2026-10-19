@@ -5596,21 +5596,32 @@ bool ApplyAuthoritativeHealth(Actor& actor, const State& state) noexcept {
             // result. Never reopen a wound/death reaction after joining late.
             actor.damageRevision = event.revision;
         } else {
-            if ((event.flags & health::CommitOnly) == 0U &&
+            const bool commitOnly = (event.flags & health::CommitOnly) != 0U;
+            if (!commitOnly &&
                 (actor.damageCursor.revision != event.revision || !actor.damageCursor.invoked)) {
                 const health::State before{event.result.revision, health::Present,
                     event.hpBefore, event.healthStateBefore};
                 if (!matched(health::ApplySnapshot(actor.character, actor.runtimeId, before, source))) return false;
             }
-            navigation::Cancel(actor.character);
-            static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
+            // A native HP setter (e.g. regeneration) is not a new impact or
+            // movement reaction. Preserve its live path and execution lease.
+            // Real hits and terminal commits still yield to native reactions.
             const bool wasInvoked = actor.damageCursor.revision == event.revision && actor.damageCursor.invoked;
+            if (!wasInvoked && (!commitOnly || health::Terminal(event.result))) {
+                navigation::Cancel(actor.character);
+                static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
+            }
+            std::uintptr_t previousCycle{};
+            std::uint8_t previousSerial{};
+            const bool previousKnown = Read(actor.character + 0x36CU, previousCycle) && previousCycle != 0U &&
+                Read(previousCycle + 0x19U, previousSerial);
             const auto result = health::ApplyDamageEvent(actor.character, actor.runtimeId, event, source, actor.damageCursor);
-            if (!wasInvoked && actor.damageCursor.invoked) {
+            if (!commitOnly && !wasInvoked && actor.damageCursor.invoked) {
                 std::uintptr_t cycle{};
                 std::uint8_t nativeState{}, serial{};
                 if (Read(actor.character + 0x36CU, cycle) && Read(cycle + 0x1AU, nativeState) &&
-                    nativeState != 1U && nativeState != 0x38U && Read(cycle + 0x19U, serial)) {
+                    nativeState != 1U && nativeState != 0x38U && Read(cycle + 0x19U, serial) &&
+                    previousKnown && (cycle != previousCycle || serial != previousSerial)) {
                     actor.reactionCycle = cycle; actor.reactionSerial = serial;
                 }
             }

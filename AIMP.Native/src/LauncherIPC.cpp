@@ -24,6 +24,7 @@
 #include "aimp/ProductVersion.h"
 #include "aimp/PlayerSyncObserver.h"
 #include "aimp/PlayerLifecycle.h"
+#include "aimp/UIHeapGuard.h"
 
 #include <bcrypt.h>
 
@@ -3910,6 +3911,7 @@ std::vector<std::byte> LauncherIPC::BuildHelloPayload() const {
          << ",\"processId\":" << processId_
          << ",\"observationOnly\":true"
          << ",\"aiSyncV1Available\":" << (ai_sync::Installed() ? "true" : "false")
+         << ",\"uiHeapSynchronized\":" << (ui_heap_guard::Installed() ? "true" : "false")
          << ",\"nonce\":\"" << nonce_ << "\"}";
     return JsonBytes(json.str());
 }

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,13 @@ struct CallRedirectRequest {
     void* detour{};
 };
 
+// Complete, exact-build instructions changed as one transaction. No trampoline
+// or relocations: every site is verified before any bytes are changed.
+struct BytePatchRequest {
+    void* target{};
+    std::vector<std::byte> expected, replacement;
+};
+
 class HookManager final {
 public:
     HookManager(bool exactBuildValidated, bool explicitOptIn) noexcept;
@@ -47,6 +55,8 @@ public:
 
     bool Install(const HookRequest& request, std::string& error);
     bool InstallCallRedirect(const CallRedirectRequest& request, std::string& error);
+    bool InstallPatchBatch(const std::string& name,
+        std::span<const BytePatchRequest> patches, std::string& error);
     // Restores target prologues but deliberately retains trampolines. The
     // caller must prove detour quiescence before releasing them.
     bool UninstallAll(std::string& error);

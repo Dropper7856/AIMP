@@ -14,7 +14,8 @@ public sealed record HelloPayload(
     int ProcessId,
     bool ObservationOnly,
     string Nonce,
-    bool AiSyncV1Available = false);
+    bool AiSyncV1Available = false,
+    bool UiHeapSynchronized = false);
 
 public sealed record HelloAckPayload(
     ushort ProtocolVersion,

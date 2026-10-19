@@ -187,6 +187,8 @@ internal sealed class DllIpcSession : IAsyncDisposable
                 StringComparison.Ordinal))
             throw new ProtocolException(
                 $"Native DLL {hello.DllVersion} is already loaded; restart AI.exe to load {ProductInfo.ExpectedDllVersion}.");
+        if (!hello.UiHeapSynchronized)
+            throw new ProtocolException("Native UI heap synchronization is unavailable; inspect ui_heap_guard. UI bridge payloads remain blocked.");
         AISyncAvailable = hello.AiSyncV1Available;
         if (!AISyncAvailable)
             Log?.Invoke(this, "AISync unavailable: native hooks were not installed; inspect aisync_v2_install. IPC remains connected for PlayerSync, WorldSync and diagnostics.");

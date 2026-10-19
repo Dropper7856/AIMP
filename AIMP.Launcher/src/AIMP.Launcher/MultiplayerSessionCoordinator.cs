@@ -395,6 +395,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _controller = controller ?? throw new ArgumentNullException(nameof(controller));
         _settingsStore = settingsStore ?? throw new ArgumentNullException(nameof(settingsStore));
         _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
+        _bridge.NativeUiReady = () => _controller.Snapshot.IpcConnected;
         _performanceIsolation = performanceIsolation ?? throw new ArgumentNullException(nameof(performanceIsolation));
         _diagnostics = controller.Diagnostics;
         _aiSync = new AISyncSession(controller, _performanceIsolation);
@@ -726,6 +727,18 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
 
     private async Task HandleHelloAsync(ScaleformBridgeMessage message)
     {
+        // The first frontend connection triggers injection. Complete its UI
+        // handshake only after the native HELLO certifies synchronized heaps.
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(30);
+        while (!_controller.Snapshot.IpcConnected)
+        {
+            if (DateTimeOffset.UtcNow >= deadline)
+            {
+                _diagnostics.Log("UI Bridge", "UI initialization deferred: native heap synchronization handshake is not ready.");
+                return;
+            }
+            await Task.Delay(100, _lifetime.Token).ConfigureAwait(false);
+        }
         await SendConfigAsync().ConfigureAwait(false);
         await SendCurrentLobbyAsync().ConfigureAwait(false);
         var source = message.Get("source", "frontend");

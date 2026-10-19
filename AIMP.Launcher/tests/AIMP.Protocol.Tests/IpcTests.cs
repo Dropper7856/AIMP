@@ -130,7 +130,8 @@ internal static class IpcTests
             ProductInfo.ExpectedDllVersion,
             Environment.ProcessId,
             true,
-            nonce);
+            nonce,
+            UiHeapSynchronized: true);
         await WriteAsync(client, MessageType.Hello, hello, 1, token).ConfigureAwait(false);
         var ackFrame = await ReadExpectedAsync(
             client, MessageType.HelloAck, serverFrames, token).ConfigureAwait(false);

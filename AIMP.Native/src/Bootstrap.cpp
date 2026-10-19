@@ -36,6 +36,8 @@
 #include "aimp/ProductVersion.h"
 #include "aimp/PlayerSyncObserver.h"
 #include "aimp/PlayerLifecycle.h"
+#include "aimp/UIHeapGuard.h"
+#include "aimp/MultiplayerPause.h"
 #include "aimp/PeerManager.h"
 #include "aimp/RangeProvider.h"
 #include "aimp/SignatureResolver.h"
@@ -622,6 +624,16 @@ DWORD Bootstrap::RunImpl() {
         true);
 
     {
+        std::string heapError;
+        const bool installed = validation.hashMatch &&
+            ui_heap_guard::Install(moduleBase, *hooks, heapError);
+        diagnostics.Log(installed ? "info" : "error", "ui_heap_guard",
+            installed ? "All six retail GFx heap mutators now use their native critical sections (10 certified branches)."
+                : (heapError.empty() ? "UI heap synchronization requires the exact executable hash." : heapError));
+        if (installed && !heapError.empty()) diagnostics.Log("warning", "ui_heap_guard_protection", heapError);
+    }
+
+    {
         std::string lifecycleError;
         const bool installed = signaturesValid && resolver != nullptr &&
             player_lifecycle::Install(profile, *resolver, *hooks,
@@ -632,6 +644,16 @@ DWORD Bootstrap::RunImpl() {
                 : (lifecycleError.empty()
                     ? "[PlayerLifecycle] unavailable: exact executable/profile signatures required."
                     : lifecycleError));
+    }
+
+    {
+        std::string pauseError;
+        const bool installed = validation.hashMatch && levelGenerations != nullptr &&
+            multiplayer_pause::Install(moduleBase, *hooks, *levelGenerations, pauseError);
+        diagnostics.Log(installed ? "info" : "error", "multiplayer_pause_initialized",
+            installed ? "Simulation queries ignore native menu/overlay pause reasons only in a stable multiplayer world; UI/input flags stay retail."
+                : (pauseError.empty() ? "Multiplayer menu pause requires the exact executable hash." : pauseError));
+        if (installed && !pauseError.empty()) diagnostics.Log("warning", "multiplayer_pause_protection", pauseError);
     }
 
     if (signaturesValid && resolver != nullptr) {
@@ -978,11 +1000,16 @@ DWORD Bootstrap::RunImpl() {
     std::uint64_t lastLoggedReadinessBarrier = 0;
     std::uint64_t lastReadinessCounterLogTick = 0;
     std::uint64_t lastAISyncCounterLogTick = 0;
+    std::uint64_t lastPauseCounterLogTick = 0;
     std::uint32_t lastLoggedEngineThreadId = 0;
     std::uint32_t lastLoggedMismatchedThreadId = 0;
     RuntimeObservationSnapshot lastRuntime{};
     while (WaitForSingleObject(stopEvent, 250) == WAIT_TIMEOUT) {
         player_lifecycle::DrainDiagnostics(diagnostics);
+        if (GetTickCount64() - lastPauseCounterLogTick >= 5000ULL) {
+            multiplayer_pause::LogDiagnostics(diagnostics);
+            lastPauseCounterLogTick = GetTickCount64();
+        }
         if (ipc.ShutdownRequested()) {
             RequestStop();
             break;
@@ -1502,6 +1529,7 @@ DWORD Bootstrap::RunImpl() {
         static_cast<LONG>(BootstrapState::ShuttingDown));
     ipc.Stop();
     player_lifecycle::Shutdown();
+    multiplayer_pause::Shutdown();
     player_lifecycle::DrainDiagnostics(diagnostics);
     character_action_runtime::RequestStopAll();
     const auto actionReleaseDeadline = GetTickCount64() + 5500U;
@@ -1510,6 +1538,7 @@ DWORD Bootstrap::RunImpl() {
         Sleep(10U);
     }
     const bool retainAISyncHooks = ai_sync::Installed();
+    const bool retainUiRuntime = ui_heap_guard::Installed() || multiplayer_pause::Installed();
     ai_sync::BeginLogicalShutdown();
     const bool retainActionReleaseHook = character_action_runtime::BeginLogicalShutdown();
     character_action_probe::BeginLogicalShutdown();
@@ -1529,7 +1558,9 @@ DWORD Bootstrap::RunImpl() {
     gameThreadDispatcher->Clear();
     inboundQueue.Clear();
 
-    bool safeToUnload = !retainActionReleaseHook && !retainAISyncHooks;
+    bool safeToUnload = !retainActionReleaseHook && !retainAISyncHooks && !retainUiRuntime;
+    if (retainUiRuntime) diagnostics.Log("info", "ui_runtime_process_lifetime",
+        "GFx heap synchronization and disabled pause-query shims remain resident until process exit; Socket workers may outlive the Launcher.");
     if (retainAISyncHooks) diagnostics.Log("warning", "aisync_process_lifetime",
         "Experimental AISync hooks remain resident; pending locomotion releases on the engine thread and Client brains stay passive until process exit.");
     if (retainActionReleaseHook) {
@@ -1539,7 +1570,7 @@ DWORD Bootstrap::RunImpl() {
         diagnostics.Log("warning", "character_action_release_pending",
             "Input release is waiting for natural engine updates; hooks and DLL must remain loaded until process exit.");
     }
-    if (hooks != nullptr && !retainActionReleaseHook && !retainAISyncHooks) {
+    if (hooks != nullptr && !retainActionReleaseHook && !retainAISyncHooks && !retainUiRuntime) {
         std::string error;
         if (!hooks->UninstallAll(error)) {
             safeToUnload = false;
@@ -1592,7 +1623,7 @@ DWORD Bootstrap::RunImpl() {
         captureCatalog.release();
         lifecycleCatalog.release();
     }
-    if (retainGameThreadServices || retainActionReleaseHook || retainAISyncHooks) {
+    if (retainGameThreadServices || retainActionReleaseHook || retainAISyncHooks || retainUiRuntime) {
         // The main callback calls the original trampoline before attempting a
         // bounded drain. A pre-detach invocation may therefore still hold
         // these two pointers after the hook prologue is restored.
@@ -1600,10 +1631,10 @@ DWORD Bootstrap::RunImpl() {
         gameThreadDispatcher.release();
     }
     if (retainSpawnTrackerServices || retainCharacterServices ||
-        retainGameThreadServices || retainActionReleaseHook || retainAISyncHooks) {
+        retainGameThreadServices || retainActionReleaseHook || retainAISyncHooks || retainUiRuntime) {
         levelGenerations.release();
     }
-    if (retainActionReleaseHook || retainAISyncHooks) {
+    if (retainActionReleaseHook || retainAISyncHooks || retainUiRuntime) {
         // HookManager::~HookManager would otherwise remove the pending-release
         // boundary. Small process-lifetime retention is deliberate and bounded.
         hooks.release();
