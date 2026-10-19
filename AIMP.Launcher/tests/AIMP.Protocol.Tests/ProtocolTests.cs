@@ -137,9 +137,28 @@ internal static class ProtocolTests
                 new uint[] { 0x11223344U, 0x55667788U }, WorldManifestRuntimeIdentity.RootInstanceBaseId));
 
         AssertWorldManifestV5RoundTrip(worldEntityId);
-        foreach (var raw in new ushort[] { 16, 17, 18, 111, 112, 113, 114 })
+        foreach (var raw in new ushort[] { 16, 17, 18, 28, 111, 112, 113, 114, 124, 125 })
             AssertEx.True(Enum.IsDefined(typeof(MessageType), raw));
+        AssertEx.False(Enum.IsDefined(typeof(MessageType), (ushort)29));
+        AssertEx.False(Enum.IsDefined(typeof(MessageType), (ushort)126));
         AssertEx.False(Enum.IsDefined(typeof(MessageType), (ushort)217));
+
+        // ItemSync: 32-hex item keys, never all-zero; identities are validated.
+        const string itemKey = "4954000A0014FFE212345678000000AB";
+        var itemSession = Guid.NewGuid();
+        ModelValidation.Validate(new ItemPickupRequestPayload(itemSession, 7UL, 1, itemKey));
+        ModelValidation.Validate(new ItemCollectedPayload(itemSession, 1, itemKey.ToLowerInvariant(), 7UL));
+        ModelValidation.Validate(new NativeItemSyncPickupPayload(1, 1UL, itemKey));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(
+            new ItemPickupRequestPayload(itemSession, 7UL, 1, "00000000000000000000000000000000")));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(
+            new ItemPickupRequestPayload(itemSession, 7UL, 1, itemKey[..31])));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(
+            new ItemCollectedPayload(itemSession, 1, itemKey, 0UL)));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(
+            new NativeItemSyncPickupPayload(2, 1UL, itemKey)));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(
+            new NativeItemSyncPickupPayload(1, 0UL, itemKey)));
         AssertEx.False(Enum.IsDefined(typeof(MessageType), (ushort)218));
 
         AssertGameCommand(identity);
@@ -1369,6 +1388,27 @@ internal static class ProtocolTests
                     ["entityId"] = "00000000000000000000000000000000"
                 }
             }));
+
+        var itemSyncApply = command with
+        {
+            Command = GameCommandNames.ItemSyncApply,
+            Arguments = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["entityId"] = "4954000A0014FFE212345678000000AB"
+            }
+        };
+        AssertEx.True(GameCommandNames.All.Contains(GameCommandNames.ItemSyncApply));
+        ModelValidation.Validate(itemSyncApply);
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(
+            itemSyncApply with
+            {
+                Arguments = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["entityId"] = "00000000000000000000000000000000"
+                }
+            }));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(
+            itemSyncApply with { Arguments = new Dictionary<string, string>(StringComparer.Ordinal) }));
 
         var netzCommand = command with
         {

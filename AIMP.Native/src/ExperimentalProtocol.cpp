@@ -897,6 +897,26 @@ bool DecodeGameCommand(
             return true;
         }
 
+        if (command->stringValue == "ITEM_SYNC_APPLY") {
+            if (arguments->objectValue.size() != 1U) return false;
+            const auto* entityId = Field(*arguments, "entityId", JsonType::String);
+            if (entityId == nullptr || entityId->stringValue.size() != 32U) return false;
+            const auto parseHalf = [](std::string_view value, std::uint64_t& outputValue) {
+                const auto parsed = std::from_chars(
+                    value.data(), value.data() + value.size(), outputValue, 16);
+                return parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size();
+            };
+            std::uint64_t high = 0U;
+            std::uint64_t low = 0U;
+            if (!parseHalf(std::string_view(entityId->stringValue).substr(0U, 16U), high) ||
+                !parseHalf(std::string_view(entityId->stringValue).substr(16U, 16U), low) ||
+                (high == 0U && low == 0U)) return false;
+            output.command = command->stringValue;
+            output.itemSyncApply.entityHigh = high;
+            output.itemSyncApply.entityLow = low;
+            return true;
+        }
+
         if (command->stringValue == "WORLD_NET_PROBE") {
             if (arguments->objectValue.size() != 1U) return false;
             const auto* entityId = Field(*arguments, "entityId", JsonType::String);

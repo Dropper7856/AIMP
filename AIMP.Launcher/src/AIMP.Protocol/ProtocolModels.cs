@@ -117,6 +117,22 @@ public sealed record RoundEndedPayload(
     string Reason,
     int ReturnDelayMilliseconds);
 
+// Client -> Host: the sender's own player collected the world pickup EntityId
+// (32-hex WorldEntityId from the level's WorldManifest).
+public sealed record ItemPickupRequestPayload(
+    Guid SessionId,
+    ulong PeerId,
+    int LevelGeneration,
+    string EntityId);
+
+// Host -> Clients: the first collector of EntityId in this generation. Every
+// other participant removes the pickup from its own world.
+public sealed record ItemCollectedPayload(
+    Guid SessionId,
+    int LevelGeneration,
+    string EntityId,
+    ulong CollectorPeerId);
+
 public sealed record PlayerSpawnPositionPayload(
     ulong PeerId,
     float X,
@@ -188,6 +204,11 @@ public sealed record NativePlayerLifecycleStatePayload(
     int SchemaVersion,
     ulong DeathSequence,
     bool LocalPlayerDead);
+
+public sealed record NativeItemSyncPickupPayload(
+    int SchemaVersion,
+    ulong Sequence,
+    string EntityId);
 
 public sealed record NativePlayerActionEventPayload(
     int SchemaVersion,

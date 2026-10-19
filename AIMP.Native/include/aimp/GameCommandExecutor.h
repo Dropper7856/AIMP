@@ -102,6 +102,11 @@ struct WorldNetProbeCommand {
     std::uint64_t entityLow{};
 };
 
+struct ItemSyncApplyCommand {
+    std::uint64_t entityHigh{};
+    std::uint64_t entityLow{};
+};
+
 struct SpawnNetZCharacterCommand {
     float x{};
     float y{};
@@ -156,6 +161,10 @@ public:
     [[nodiscard]] virtual GameCommandExecutionResult ExecuteReturnToFrontend() const {
         return {false, "RETURN_TO_FRONTEND_UNAVAILABLE", "Return to frontend is not supported by this executor."};
     }
+    [[nodiscard]] virtual GameCommandExecutionResult ExecuteItemSyncApply(
+        const ItemSyncApplyCommand&) const {
+        return {false, "ITEM_SYNC_UNAVAILABLE", "ItemSync is not supported by this executor."};
+    }
 };
 
 class GameCommandExecutor final : public IGameCommandExecutor {
@@ -200,6 +209,8 @@ public:
     [[nodiscard]] GameCommandExecutionResult ExecuteWorldStateDiscoveryAfter() const override;
     [[nodiscard]] GameCommandExecutionResult ExecuteWorldStateDiscoveryStatus() const override;
     [[nodiscard]] GameCommandExecutionResult ExecuteReturnToFrontend() const override;
+    [[nodiscard]] GameCommandExecutionResult ExecuteItemSyncApply(
+        const ItemSyncApplyCommand& command) const override;
 
     void AttachWorldEntityRegistry(WorldEntityRegistry& registry) noexcept;
     void AttachGameThreadDispatcher(GameThreadDispatcher& dispatcher) noexcept;

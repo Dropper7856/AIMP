@@ -10,6 +10,7 @@
 #include "aimp/LevelGenerationTracker.h"
 #include "aimp/GameThreadObservationHooks.h"
 #include "aimp/GameThreadDispatcher.h"
+#include "aimp/ItemSync.h"
 #include "aimp/NativeLimits.h"
 #include "aimp/SignatureResolver.h"
 #include "aimp/SpawnCharacterTracker.h"
@@ -1533,6 +1534,9 @@ bool GameCommandExecutor::CanExecute(const std::string_view command) const noexc
     }
     if (command == "RETURN_TO_FRONTEND") {
         return ReturnToFrontendAvailable();
+    }
+    if (command == "ITEM_SYNC_APPLY") {
+        return item_sync::Installed();
     }
     if (command == "WORLD_REGISTRY_PROBE" ||
         command == "WORLD_MANIFEST_LOAD" ||
@@ -4022,6 +4026,20 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteReturnToFrontend() const 
     result.executed = true;
     result.statusCode = "RETURN_TO_FRONTEND_REQUESTED";
     result.message = "Return to frontend requested from the gameplay manager.";
+    return result;
+}
+
+GameCommandExecutionResult GameCommandExecutor::ExecuteItemSyncApply(
+    const ItemSyncApplyCommand& command) const {
+    GameCommandExecutionResult result{};
+    const WorldEntityId entity{command.entityHigh, command.entityLow};
+    const auto outcome = item_sync::ApplyRemoteCollected(entity);
+    result.statusCode = item_sync::ApplyStatusCode(outcome);
+    result.executed = outcome == item_sync::ApplyStatus::Applied ||
+        outcome == item_sync::ApplyStatus::AlreadyApplied ||
+        outcome == item_sync::ApplyStatus::Deferred;
+    result.message = std::string(item_sync::ApplyStatusMessage(outcome)) + " Entity " +
+        WorldEntityIdText(entity) + '.';
     return result;
 }
 

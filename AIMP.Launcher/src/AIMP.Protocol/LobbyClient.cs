@@ -55,6 +55,8 @@ public sealed class LobbyClient : IAsyncDisposable
 
     public event EventHandler<RoundEndedPayload>? RoundEnded;
 
+    public event EventHandler<ItemCollectedPayload>? ItemCollected;
+
     public event EventHandler<SpawnPositionRequestPayload>? SpawnPositionRequested;
 
     public event EventHandler<SpawnRemotePlayersPayload>? SpawnRemotePlayersRequested;
@@ -208,6 +210,19 @@ public sealed class LobbyClient : IAsyncDisposable
         ModelValidation.Validate(payload);
         return _connection.SendAsync(
             MessageType.PlayerDeath,
+            JsonPayload.Serialize(payload),
+            cancellationToken).AsTask();
+    }
+
+    public Task SendItemPickupAsync(
+        int levelGeneration,
+        string entityId,
+        CancellationToken cancellationToken = default)
+    {
+        var payload = new ItemPickupRequestPayload(SessionId, PeerId, levelGeneration, entityId);
+        ModelValidation.Validate(payload);
+        return _connection.SendAsync(
+            MessageType.ItemPickupRequest,
             JsonPayload.Serialize(payload),
             cancellationToken).AsTask();
     }
@@ -471,6 +486,14 @@ public sealed class LobbyClient : IAsyncDisposable
                         if (roundEnded.SessionId != SessionId)
                             throw new ProtocolException("The round-ended SessionId is invalid.");
                         RoundEnded?.Invoke(this, roundEnded);
+                        break;
+
+                    case MessageType.ItemCollected:
+                        var itemCollected = JsonPayload.Deserialize<ItemCollectedPayload>(frame.Payload.Span);
+                        ModelValidation.Validate(itemCollected);
+                        if (itemCollected.SessionId != SessionId)
+                            throw new ProtocolException("The item-collected SessionId is invalid.");
+                        ItemCollected?.Invoke(this, itemCollected);
                         break;
 
                     case MessageType.InboundNetZFrame:

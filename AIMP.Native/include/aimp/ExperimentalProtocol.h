@@ -63,6 +63,7 @@ struct GameCommandRequest : RequestEnvelope {
     WorldRegistryProbeCommand worldRegistryProbe;
     WorldManifestLoadCommand worldManifestLoad;
     WorldNetProbeCommand worldNetProbe;
+    ItemSyncApplyCommand itemSyncApply;
 };
 
 bool DecodeTestModeConfigure(
