@@ -24,6 +24,7 @@ class WorldEntityRegistry;
 struct CathodePrimitiveLeaseAccess;
 struct WorldInteractionLeaseAccess;
 struct WorldPublicActionLeaseAccess;
+struct ItemSyncLeaseAccess;
 
 struct CathodeRuntimeKey final {
     std::uint32_t entityA{};
@@ -58,6 +59,7 @@ private:
     friend struct CathodePrimitiveLeaseAccess;
     friend struct WorldInteractionLeaseAccess;
     friend struct WorldPublicActionLeaseAccess;
+    friend struct ItemSyncLeaseAccess;
 
     WorldEntityLease(
         void* sharedRef,

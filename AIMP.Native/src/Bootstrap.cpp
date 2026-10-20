@@ -659,10 +659,10 @@ DWORD Bootstrap::RunImpl() {
 
     {
         std::string itemSyncError;
-        const bool installed = validation.hashMatch && levelGenerations != nullptr &&
-            item_sync::Install(moduleBase, *hooks, *levelGenerations, itemSyncError);
+        const bool installed = validation.hashMatch && levelGenerations != nullptr && worldRegistry != nullptr &&
+            item_sync::Install(moduleBase, *hooks, *levelGenerations, *worldRegistry, itemSyncError);
         diagnostics.Log(installed ? "info" : "error", "itemsync_initialized",
-            installed ? "[ItemSync] initialized: pickup_collected requests are observed; remote collections remove the local pickup through the retail pickup manager."
+            installed ? "[ItemSync] initialized: InventoryItem collections are observed; spawned pickups use the pickup manager, placed pickups replay native completion without an inventory grant."
                 : (itemSyncError.empty() ? "[ItemSync] unavailable: exact executable hash required." : itemSyncError));
     }
 

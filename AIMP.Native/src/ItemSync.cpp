@@ -1,6 +1,8 @@
 #include "aimp/ItemSync.h"
 
 #include "aimp/Diagnostics.h"
+#include "aimp/CathodePrimitiveExecutor.h"
+#include "aimp/WorldEntityRegistry.h"
 #include "aimp/HookManager.h"
 #include "aimp/LevelGenerationTracker.h"
 #include "aimp/WorldPublicActions.h"
@@ -17,6 +19,12 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+namespace aimp {
+struct ItemSyncLeaseAccess final {
+    static void* SharedRef(const WorldEntityLease& lease) noexcept { return lease.sharedRef_; }
+};
+}
 
 namespace aimp::item_sync {
 namespace {
@@ -35,6 +43,14 @@ constexpr std::uintptr_t kInventoryRecordGetter = 0x00123C80U;
 constexpr std::uintptr_t kInventoryRecord = 0x0CU;
 constexpr std::uintptr_t kSlotInventoryRecord = 0x7CU;
 constexpr std::uintptr_t kMessageType = 0x20U;
+constexpr std::uintptr_t kInterface = 0x14U;
+constexpr std::uintptr_t kInventoryInterfaceVtable = 0x00E2E5E0U;
+constexpr std::uintptr_t kAddToInventoryVtable = 0x00E2C278U;
+constexpr std::uintptr_t kAddToInventoryInterfaceVtable = 0x00E2BEE0U;
+constexpr std::uintptr_t kInventorySuccess = 0x004D1BB0U;
+constexpr std::uintptr_t kGetInventoryItems = 0x005065A0U; // 009065A0 thiscall(iface,outList*,sourceRef*) RET8
+constexpr std::uintptr_t kClearInventoryList = 0x001F5FE0U; // 005F5FE0 thiscall(listHolder), RET
+constexpr std::uintptr_t kFreeMemoryBlock = 0x004BAA10U; // 008BAA10 thiscall(block), RET
 constexpr std::uintptr_t kRemove = 0x003A3200U;         // FUN_007A3200 thiscall(PM+1C, key*) RET 4
 constexpr std::uintptr_t kExtractKey = 0x004C3360U;     // FUN_008C3360 thiscall(entity, out*) RET 4
 constexpr std::uintptr_t kSlotTable = 0x3CU;
@@ -56,12 +72,15 @@ constexpr float kMultipleMatchRadius = 1.5F;
 constexpr float kPositionMismatchRadius = 3.0F;
 
 using InventoryMessageFn = std::uint32_t(__thiscall*)(void* iface, int* entityRef, int* messageRef);
+using InventorySuccessFn = void(__thiscall*)(void* iface, void** entityRef, void** context, double delay);
 using RemoveFn = void(__thiscall*)(void* context, const std::uint32_t* compositeKey);
 using ExtractKeyFn = std::uint32_t*(__thiscall*)(void* entity, std::uint32_t* output);
 
 struct Observed final {
     std::uint32_t ownerShortGuid{}, ownerInstance{};
     float x{}, y{}, z{};
+    ItemKeyKind kind{ItemKeyKind::Spawned};
+    std::uint32_t sourceShortGuid{};
 };
 
 struct Entry final {
@@ -71,6 +90,7 @@ struct Entry final {
 
 std::uintptr_t gBase{};
 LevelGenerationTracker* gGenerations{};
+WorldEntityRegistry* gRegistry{};
 void* gInventoryMessageTrampoline{};
 std::atomic<void*> gInventoryMessageOriginal{};
 std::atomic<bool> gInstalled{}, gEnabled{};
@@ -88,8 +108,12 @@ std::size_t gPendingCount{};
 std::array<Entry, kAppliedCapacity> gApplied{};
 std::size_t gAppliedCount{}, gAppliedNext{};
 std::uint64_t gLastPumpTick{};
+std::array<Entry, 16U> gInFlight{};
+std::size_t gInFlightCount{};
+thread_local bool gPumping{};
 
 std::atomic<std::uint64_t> gCollectSeen{}, gCollectNoSlot{}, gCollectRecordMatched{}, gNoOwner{}, gReadFaults{};
+std::atomic<std::uint64_t> gPlacedMatched{}, gPlacedContextRejected{}, gPlacedIdentityRejected{}, gPlacedLinkRejected{}, gPlacedApplied{};
 std::atomic<std::uint64_t> gPartialCollections{}, gCollectAmbiguous{}, gCollectNoSpawnRef{}, gDuplicateCollections{};
 std::atomic<std::uint64_t> gObservedOverflow{}, gObservedQueued{};
 std::atomic<std::uint64_t> gApplyRequests{}, gAppliedTotal{}, gAlreadyApplied{}, gDeferred{};
@@ -146,12 +170,123 @@ CollectionMessage ClassifyCollectionMessage(const int* messageRef) noexcept {
     }
 }
 
+// Same array ownership protocol as AddToInventory's epilogue 005751B6..E2:
+// clear contained entity refs only on the last list owner, then release the
+// MemoryAllocation block. Never use the entity-ref destructor on this list.
+bool ReleaseInventoryList(std::uintptr_t& list) noexcept {
+    __try {
+        if (list == 0U) return true;
+        if (*reinterpret_cast<const std::uint32_t*>(list + 4U) == 1U)
+            reinterpret_cast<void(__thiscall*)(std::uintptr_t*)>(gBase + kClearInventoryList)(&list);
+        if (InterlockedDecrement(reinterpret_cast<volatile LONG*>(list + 4U)) == 0)
+            reinterpret_cast<void(__thiscall*)(void*)>(gBase + kFreeMemoryBlock)(reinterpret_cast<void*>(list));
+        list = 0U;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        gReadFaults.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+}
+
+// Complete-message IDs alone do not prove that all linked items succeeded.
+// For this continuation route, require exactly one InventoryItem linked by the
+// native items getter, and require that it is THIS notification's target.
+bool SingleLinkedInventoryItem(void* sourceInterface, void* sourceBlock, void* itemBlock) noexcept {
+    std::uintptr_t list{};
+    bool matches{};
+    __try {
+        __try {
+            using GetFn = void*(__thiscall*)(void*, std::uintptr_t*, void**);
+            reinterpret_cast<GetFn>(gBase + kGetInventoryItems)(sourceInterface, &list, &sourceBlock);
+            if (list != 0U && *reinterpret_cast<const std::uint32_t*>(list + 8U) == 1U) {
+                const auto data = *reinterpret_cast<const std::uintptr_t*>(list + 0x0CU);
+                matches = data != 0U && *reinterpret_cast<void* const*>(data) == itemBlock;
+            }
+        } __finally { matches = ReleaseInventoryList(list) && matches; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        gReadFaults.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+    return matches;
+}
+
+// Authored CATHODE keys fold the entire GUID hierarchy (008C3260), never
+// process addresses. Exact manifest entries are the strongest witness. Some
+// nested retail scopes alias B: accept that shape only for the same real
+// parent and a fully readable chain without a PM runtime-activation root.
+// Missing/unreadable chains and known PM runtime roots fail closed; this is
+// not a universal classification of every other dynamic-composite family.
+bool PortablePlacedScope(const std::uintptr_t item, const std::uintptr_t source,
+    const CathodeRuntimeKey& itemKey, const CathodeRuntimeKey& sourceKey) noexcept {
+    if (gRegistry != nullptr && gRegistry->FindWorldEntityId(itemKey) && gRegistry->FindWorldEntityId(sourceKey))
+        return true;
+    __try {
+        const auto parent = *reinterpret_cast<const std::uintptr_t*>(item + 8U);
+        if (parent == 0U || parent != *reinterpret_cast<const std::uintptr_t*>(source + 8U)) return false;
+        auto block = parent;
+        for (std::uint32_t depth = 0U; depth < 32U; ++depth) {
+            const auto object = *reinterpret_cast<const std::uintptr_t*>(block + kRefObject);
+            if (object == 0U || (*reinterpret_cast<const std::uint8_t*>(object + 0x2DU) & 4U) != 0U)
+                return false;
+            block = *reinterpret_cast<const std::uintptr_t*>(object + 8U);
+            if (block == 0U) return true;
+        }
+        return false;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Typed complete-notification source is the AddToInventory entity. Its key
+// and the InventoryItem key identify the native continuation without a spawn
+// owner. Both endpoints must share a certified local pickup scope.
+bool ObservePlacedIdentity(int* entityRef, int* messageRef, const void* iface,
+    Observed& output) noexcept {
+    __try {
+        if (gRegistry == nullptr || entityRef == nullptr || messageRef == nullptr) return false;
+        const auto itemBlock = *reinterpret_cast<const std::uintptr_t*>(entityRef);
+        const auto message = *reinterpret_cast<const std::uintptr_t*>(messageRef);
+        if (itemBlock == 0U || message == 0U) return false;
+        const auto item = *reinterpret_cast<const std::uintptr_t*>(itemBlock + kRefObject);
+        const auto sourceBlock = *reinterpret_cast<const std::uintptr_t*>(message + 8U);
+        if (item == 0U || sourceBlock == 0U || item + kInterface != reinterpret_cast<std::uintptr_t>(iface))
+            return false;
+        const auto source = *reinterpret_cast<const std::uintptr_t*>(sourceBlock + kRefObject);
+        if (source == 0U || *reinterpret_cast<const std::uintptr_t*>(source) != gBase + kAddToInventoryVtable ||
+            *reinterpret_cast<const std::uintptr_t*>(source + kInterface) != gBase + kAddToInventoryInterfaceVtable ||
+            *reinterpret_cast<const std::uintptr_t*>(iface) != gBase + kInventoryInterfaceVtable) {
+            gPlacedContextRejected.fetch_add(1U, std::memory_order_relaxed);
+            return false;
+        }
+        CathodeRuntimeKey itemKey{}, sourceKey{};
+        reinterpret_cast<ExtractKeyFn>(gBase + kExtractKey)(reinterpret_cast<void*>(item), &itemKey.entityA);
+        reinterpret_cast<ExtractKeyFn>(gBase + kExtractKey)(reinterpret_cast<void*>(source), &sourceKey.entityA);
+        if (itemKey.entityA == 0U || sourceKey.entityA == 0U || itemKey.entityB == 0U ||
+            itemKey.entityB != sourceKey.entityB ||
+            !PortablePlacedScope(item, source, itemKey, sourceKey)) {
+            gPlacedIdentityRejected.fetch_add(1U, std::memory_order_relaxed);
+            return false;
+        }
+        if (!SingleLinkedInventoryItem(reinterpret_cast<void*>(source + kInterface),
+            reinterpret_cast<void*>(sourceBlock), reinterpret_cast<void*>(itemBlock))) {
+            gPlacedLinkRejected.fetch_add(1U, std::memory_order_relaxed);
+            return false;
+        }
+        output.kind = ItemKeyKind::Placed;
+        output.ownerShortGuid = itemKey.entityA;
+        output.ownerInstance = itemKey.entityB;
+        output.sourceShortGuid = sourceKey.entityA;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        gReadFaults.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+}
+
 // Same relation as retail FUN_007762C0(PM, InventoryItem record). That
 // relation is written by UI_Icon activation FUN_0056B530 after resolving its
 // target_pickup_item. Restrict to one live slot, and snapshot before retail
 // clears record[0] and emits collect. Never retain a native pointer afterwards.
 CollectSlot FindCollectedSlot(const std::uintptr_t manager, const void* iface,
-    Observed& output) noexcept {
+    int* entityRef, int* messageRef, Observed& output) noexcept {
     __try {
         if (iface == nullptr) return CollectSlot::None;
         const auto record = *reinterpret_cast<const std::uintptr_t*>(
@@ -168,8 +303,11 @@ CollectSlot FindCollectedSlot(const std::uintptr_t manager, const void* iface,
             slot = candidate;
         }
         if (slot == 0U) return CollectSlot::None;
-        if (*reinterpret_cast<const std::uintptr_t*>(slot + kSlotRef) == 0U)
-            return CollectSlot::NoSpawnRef;
+        if (*reinterpret_cast<const std::uintptr_t*>(slot + kSlotRef) == 0U) {
+            if (!ObservePlacedIdentity(entityRef, messageRef, iface, output)) return CollectSlot::NoSpawnRef;
+            gPlacedMatched.fetch_add(1U, std::memory_order_relaxed);
+            return CollectSlot::Found;
+        }
         output.ownerShortGuid = *reinterpret_cast<const std::uint32_t*>(slot + kSlotOwner);
         output.ownerInstance = *reinterpret_cast<const std::uint32_t*>(slot + kSlotOwner + 4U);
         output.x = *reinterpret_cast<const float*>(slot + kSlotPosition);
@@ -198,6 +336,8 @@ void Publish(const Observed& observed, const std::uint64_t generation) noexcept 
     ItemKey key{};
     key.ownerShortGuid = observed.ownerShortGuid;
     key.ownerInstance = observed.ownerInstance;
+    key.kind = observed.kind;
+    key.sourceShortGuid = observed.sourceShortGuid;
     key.x = QuantizeItemCoordinate(observed.x);
     key.y = QuantizeItemCoordinate(observed.y);
     key.z = QuantizeItemCoordinate(observed.z);
@@ -249,7 +389,7 @@ std::uint32_t __fastcall InventoryMessageDetour(void* iface, void*, int* entityR
         } else if (message == CollectionMessage::Complete) {
             gCollectSeen.fetch_add(1U, std::memory_order_relaxed);
             const auto manager = PickupManager();
-            const auto found = manager == 0U ? CollectSlot::None : FindCollectedSlot(manager, iface, observed);
+            const auto found = manager == 0U ? CollectSlot::None : FindCollectedSlot(manager, iface, entityRef, messageRef, observed);
             switch (found) {
             case CollectSlot::Fault: gReadFaults.fetch_add(1U, std::memory_order_relaxed); break;
             case CollectSlot::None: gCollectNoSlot.fetch_add(1U, std::memory_order_relaxed); break;
@@ -342,10 +482,128 @@ bool RemovePickup(const std::uintptr_t manager, const std::uintptr_t slot,
 
 enum class TryResult : std::uint8_t { Applied, NotYet, Fault };
 
+struct PlacedReplay final {
+    const WorldEntityLease* item{};
+    const WorldEntityLease* source{};
+    void* itemInterface{};
+    void* sourceInterface{};
+    bool applied{};
+};
+
+// The shared references and native callback outlive the entire output fan-out.
+// Neither function below invokes the inventory grant trigger (00574EF0).
+bool InvokePlacedCompletion(PlacedReplay& replay, void** work) noexcept {
+    auto* itemRef = ItemSyncLeaseAccess::SharedRef(*replay.item);
+    auto* sourceRef = ItemSyncLeaseAccess::SharedRef(*replay.source);
+    const auto inventory = reinterpret_cast<InventoryMessageFn>(gInventoryMessageOriginal.load(std::memory_order_acquire));
+    if (inventory == nullptr) return false;
+    __try {
+        const auto result = inventory(replay.itemInterface,
+            reinterpret_cast<int*>(&itemRef), reinterpret_cast<int*>(work));
+        if ((result & 0xFFU) == 0U) return false;
+        reinterpret_cast<InventorySuccessFn>(gBase + kInventorySuccess)(
+            replay.sourceInterface, &sourceRef, work, 0.0);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+void ReplayPlacedCompletion(void* context) noexcept {
+    auto& replay = *static_cast<PlacedReplay*>(context);
+    cathode_primitives::NativeCallbackLease callback;
+    if (cathode_primitives::CreateNativeCallback(*replay.source, 0x10000000U, {}, callback) !=
+        cathode_primitives::ExecuteStatus::Queued) return;
+    void* work = callback.Get();
+    replay.applied = InvokePlacedCompletion(replay, &work);
+}
+
+bool PlacedInterfaces(const WorldEntityLease& item, const WorldEntityLease& source,
+    void*& itemInterface, void*& sourceInterface, std::uintptr_t& record) noexcept {
+    __try {
+        const auto itemAddress = reinterpret_cast<std::uintptr_t>(item.Get());
+        const auto sourceAddress = reinterpret_cast<std::uintptr_t>(source.Get());
+        itemInterface = reinterpret_cast<void*>(itemAddress + kInterface);
+        sourceInterface = reinterpret_cast<void*>(sourceAddress + kInterface);
+        if (*static_cast<const std::uintptr_t*>(itemInterface) != gBase + kInventoryInterfaceVtable ||
+            *reinterpret_cast<const std::uintptr_t*>(sourceAddress) != gBase + kAddToInventoryVtable ||
+            *static_cast<const std::uintptr_t*>(sourceInterface) != gBase + kAddToInventoryInterfaceVtable)
+            return false;
+        record = *reinterpret_cast<const std::uintptr_t*>(itemAddress + kInterface + kInventoryRecord);
+        return record != 0U;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Caller does not hold gStateLock: retail output callbacks may re-enter module
+// hooks. Leases keep both CATHODE entities alive throughout native execution.
+TryResult TryApplyPlaced(const ItemKey& key) noexcept {
+    if (gRegistry == nullptr || !cathode_primitives::Initialized()) return TryResult::NotYet;
+    const CathodeRuntimeKey itemKey{key.ownerShortGuid, key.ownerInstance};
+    const CathodeRuntimeKey sourceKey{key.sourceShortGuid, key.ownerInstance};
+    bool fault{};
+    auto item = gRegistry->ResolveRuntimeReference(itemKey, fault);
+    if (!item) return fault ? TryResult::Fault : TryResult::NotYet;
+    auto source = gRegistry->ResolveRuntimeReference(sourceKey, fault);
+    if (!source) return fault ? TryResult::Fault : TryResult::NotYet;
+    if (!PortablePlacedScope(reinterpret_cast<std::uintptr_t>(item.Get()),
+        reinterpret_cast<std::uintptr_t>(source.Get()), itemKey, sourceKey)) return TryResult::Fault;
+    PlacedReplay replay{&item, &source};
+    std::uintptr_t record{};
+    if (!PlacedInterfaces(item, source, replay.itemInterface, replay.sourceInterface, record))
+        return TryResult::Fault;
+    if (!SingleLinkedInventoryItem(replay.sourceInterface, ItemSyncLeaseAccess::SharedRef(source),
+        ItemSyncLeaseAccess::SharedRef(item))) {
+        gPlacedLinkRejected.fetch_add(1U, std::memory_order_relaxed);
+        return TryResult::Fault;
+    }
+    const auto manager = PickupManager();
+    if (manager == 0U) return TryResult::NotYet;
+    std::uint32_t matches{};
+    for (std::uint32_t i = 0U; i < kSlotCount; ++i) {
+        const auto slot = manager + kSlotTable + i * kSlotStride;
+        std::uint8_t flags{};
+        std::uintptr_t slotRecord{};
+        if (!Read(slot + kSlotFlags, flags) || !Read(slot + kSlotInventoryRecord, slotRecord))
+            return TryResult::Fault;
+        if ((flags & kSlotInUse) != 0U && slotRecord == record) ++matches;
+    }
+    if (matches != 1U) {
+        if (matches > 1U) gAmbiguous.fetch_add(1U, std::memory_order_relaxed);
+        return TryResult::NotYet;
+    }
+    // Mark constructor work and every descendant as a replicated continuation
+    // so WorldSync cannot publish a second copy of the pickup consequences.
+    if (!world_actions::InvokeLocalActionNoCapture(&ReplayPlacedCompletion, &replay) || !replay.applied)
+        return TryResult::Fault;
+    gPlacedApplied.fetch_add(1U, std::memory_order_relaxed);
+    return TryResult::Applied;
+}
+
 // Caller holds gStateLock.
 TryResult TryApply(const WorldEntityId& entity, const std::uint64_t generation) noexcept {
     ItemKey key{};
     if (!DecodeItemKey(entity, key)) return TryResult::Fault;
+    if (key.kind == ItemKeyKind::Placed) {
+        // A synchronous native callback can re-enter apply for this key. Defer
+        // that duplicate until the outer continuation has finished.
+        for (std::size_t i = 0U; i < gInFlightCount; ++i)
+            if (gInFlight[i].entity == entity && gInFlight[i].generation == generation)
+                return TryResult::NotYet;
+        if (gInFlightCount == gInFlight.size()) return TryResult::NotYet;
+        gInFlight[gInFlightCount++] = Entry{entity, generation};
+        ReleaseSRWLockExclusive(&gStateLock);
+        const auto result = TryApplyPlaced(key);
+        AcquireSRWLockExclusive(&gStateLock);
+        for (std::size_t i = 0U; i < gInFlightCount; ++i) {
+            if (gInFlight[i].entity == entity && gInFlight[i].generation == generation) {
+                gInFlight[i] = gInFlight[--gInFlightCount];
+                break;
+            }
+        }
+        if (result == TryResult::Applied) {
+            RememberApplied(entity, generation);
+            gLastRemote.store(entity.low, std::memory_order_relaxed);
+        }
+        return result;
+    }
     const auto manager = PickupManager();
     if (manager == 0U) return TryResult::NotYet;
     std::uintptr_t object{}, slot{};
@@ -594,7 +852,7 @@ OwnerState* FindOwnerLocked(const std::uint64_t key, const bool create) noexcept
 bool TakePendingRemovalLocked(const std::uint64_t ownerKey) noexcept {
     for (std::size_t i = 0U; i < gPendingCount; ++i) {
         ItemKey key{};
-        if (!DecodeItemKey(gPending[i].entity, key)) continue;
+        if (!DecodeItemKey(gPending[i].entity, key) || key.kind != ItemKeyKind::Spawned) continue;
         const std::uint32_t owner[2]{key.ownerShortGuid, key.ownerInstance};
         if (PackKey(owner) != ownerKey) continue;
         RememberApplied(gPending[i].entity, gPending[i].generation);
@@ -856,7 +1114,7 @@ bool ValidSpawnData(const SpawnData& data) noexcept {
 } // namespace
 
 bool Install(const std::uintptr_t moduleBase, HookManager& hooks,
-    LevelGenerationTracker& generations, std::string& error) {
+    LevelGenerationTracker& generations, WorldEntityRegistry& registry, std::string& error) {
     if (Installed()) return true;
     if (moduleBase == 0U || !hooks.MutationAllowed()) {
         error = "ItemSync requires the SHA-256-certified executable and hook opt-in.";
@@ -867,6 +1125,12 @@ bool Install(const std::uintptr_t moduleBase, HookManager& hooks,
     // InventoryItem message handler, exact virtual slot and both RET 8 exits.
     std::uintptr_t messageHandler{};
     if (!Match(kInventoryMessage, {0x83,0xEC,0x08,0x53,0x8B,0x5C,0x24,0x14,0x8B,0x03,0x66,0x83,0x78,0x20,0x6A}) ||
+        !Match(kInventorySuccess, {0x55,0x8B,0xEC,0xDD,0x45,0x10}) ||
+        !Match(kInventorySuccess + 0x1FU, {0xC2,0x10,0x00}) ||
+        !Match(kGetInventoryItems, {0x55,0x8B,0xEC,0x6A,0xFF}) ||
+        !Match(kGetInventoryItems + 0x71U, {0xC2,0x08,0x00}) ||
+        !Match(kClearInventoryList, {0x83,0xEC,0x08,0x53,0x8B,0xD9,0x8B,0x03}) ||
+        !Match(kFreeMemoryBlock, {0x56,0x8B,0xF1,0x8B,0x06}) ||
         !Match(kInventoryRecordGetter, {0x8B,0x41,0x0C,0xC2,0x04,0x00}) ||
         !Match(kInventoryMessage + 0x7BU, {0xC2,0x08,0x00}) ||
         !Match(kInventoryMessage + 0xBEU, {0xC2,0x08,0x00}) ||
@@ -897,6 +1161,7 @@ bool Install(const std::uintptr_t moduleBase, HookManager& hooks,
         return false;
     }
     gGenerations = &generations;
+    gRegistry = &registry;
 
     // Detours forward to retail while gEnabled is false.
     const auto install = [&](const char* name, const std::uintptr_t rva, void* detour,
@@ -943,6 +1208,7 @@ bool Install(const std::uintptr_t moduleBase, HookManager& hooks,
 #else
     (void)hooks;
     (void)generations;
+    (void)registry;
     error = "ItemSync requires the MSVC x86 retail ABI.";
     return false;
 #endif
@@ -1080,43 +1346,41 @@ ApplyStatus ApplyRemoteCollected(const WorldEntityId& entity) noexcept {
 }
 
 void PumpOnEngineThread() noexcept {
-    if (!gEnabled.load(std::memory_order_acquire)) return;
+    if (!gEnabled.load(std::memory_order_acquire) || gPumping) return;
+    struct PumpGuard final { ~PumpGuard() { gPumping = false; } } guard;
+    gPumping = true;
     TagPendingDrops();
     const auto now = GetTickCount64();
     if (now - gLastPumpTick < kPumpIntervalMs) return;
     gLastPumpTick = now;
-    std::uint64_t generation{};
-    const bool active = ActiveGeneration(generation);
 
+    // Own a batch before native calls. A re-entrant callback may append new
+    // pending entries; never overwrite its queue with an old compaction count.
+    std::array<Entry, kPendingCapacity> batch{};
     AcquireSRWLockExclusive(&gStateLock);
-    std::size_t kept = 0U;
-    for (std::size_t i = 0U; i < gPendingCount; ++i) {
-        const auto entry = gPending[i];
-        if (!active) {
-            // Loading or frontend: keep only the current generation's entries.
-            if (entry.generation == generation) gPending[kept++] = entry;
-            else gPendingDropped.fetch_add(1U, std::memory_order_relaxed);
-            continue;
-        }
+    const auto count = gPendingCount;
+    for (std::size_t i = 0U; i < count; ++i) batch[i] = gPending[i];
+    gPendingCount = 0U;
+    ReleaseSRWLockExclusive(&gStateLock);
+    for (std::size_t i = 0U; i < count; ++i) {
+        const auto entry = batch[i];
+        std::uint64_t generation{};
+        const bool active = ActiveGeneration(generation);
+        AcquireSRWLockExclusive(&gStateLock);
         if (entry.generation != generation) {
             gPendingDropped.fetch_add(1U, std::memory_order_relaxed);
-            continue;
+        } else if (!ContainsApplied(entry.entity, generation)) {
+            const auto result = active ? TryApply(entry.entity, generation) : TryResult::NotYet;
+            switch (result) {
+            case TryResult::Applied: gPendingApplied.fetch_add(1U, std::memory_order_relaxed); break;
+            case TryResult::Fault: gApplyFaults.fetch_add(1U, std::memory_order_relaxed); break;
+            case TryResult::NotYet:
+                if (!AddPending(entry.entity, generation)) gPendingDropped.fetch_add(1U, std::memory_order_relaxed);
+                break;
+            }
         }
-        if (ContainsApplied(entry.entity, generation)) continue;
-        switch (TryApply(entry.entity, generation)) {
-        case TryResult::Applied:
-            gPendingApplied.fetch_add(1U, std::memory_order_relaxed);
-            break;
-        case TryResult::Fault:
-            gApplyFaults.fetch_add(1U, std::memory_order_relaxed);
-            break;
-        case TryResult::NotYet:
-            gPending[kept++] = entry;
-            break;
-        }
+        ReleaseSRWLockExclusive(&gStateLock);
     }
-    gPendingCount = kept;
-    ReleaseSRWLockExclusive(&gStateLock);
 }
 
 const char* ApplyStatusCode(const ApplyStatus status) noexcept {
@@ -1133,7 +1397,7 @@ const char* ApplyStatusCode(const ApplyStatus status) noexcept {
 
 const char* ApplyStatusMessage(const ApplyStatus status) noexcept {
     switch (status) {
-    case ApplyStatus::Applied: return "Pickup removed through the pickup manager.";
+    case ApplyStatus::Applied: return "Pickup collection applied through the native pickup manager or completion graph.";
     case ApplyStatus::AlreadyApplied: return "Pickup was already removed or collected locally.";
     case ApplyStatus::Deferred: return "Pickup is not spawned locally yet; removal stays pending.";
     case ApplyStatus::Unavailable: return "No stable gameplay level or ItemSync is disabled.";
@@ -1157,12 +1421,17 @@ void LogDiagnostics(Diagnostics& diagnostics) {
     pending = gPendingCount;
     ReleaseSRWLockShared(&gStateLock);
     diagnostics.Log("info", "itemsync",
-        "World pickups: local collections are reported to the Host; pickups collected elsewhere are removed through the retail pickup manager.",
+        "World pickups: collections are reported to the Host; spawned pickups use retail removal and placed pickups replay native completion without granting inventory.",
         {{"installed", Diagnostics::Boolean(Installed()), true},
          {"enabled", Diagnostics::Boolean(gEnabled.load()), true},
          {"collectSeen", Diagnostics::Unsigned(gCollectSeen.load()), true},
          {"collectNoSlot", Diagnostics::Unsigned(gCollectNoSlot.load()), true},
          {"collectRecordMatched", Diagnostics::Unsigned(gCollectRecordMatched.load()), true},
+         {"placedMatched", Diagnostics::Unsigned(gPlacedMatched.load()), true},
+         {"placedContextRejected", Diagnostics::Unsigned(gPlacedContextRejected.load()), true},
+         {"placedIdentityRejected", Diagnostics::Unsigned(gPlacedIdentityRejected.load()), true},
+         {"placedLinkRejected", Diagnostics::Unsigned(gPlacedLinkRejected.load()), true},
+         {"placedApplied", Diagnostics::Unsigned(gPlacedApplied.load()), true},
          {"partialCollections", Diagnostics::Unsigned(gPartialCollections.load()), true},
          {"collectAmbiguous", Diagnostics::Unsigned(gCollectAmbiguous.load()), true},
          {"collectNoSpawnRef", Diagnostics::Unsigned(gCollectNoSpawnRef.load()), true},

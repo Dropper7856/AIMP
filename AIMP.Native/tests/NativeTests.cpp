@@ -244,6 +244,26 @@ void TestItemSyncKey() {
     // Foreign WorldEntityIds and owner-less pickups are never ItemSync keys.
     CHECK(!DecodeItemKey(aimp::WorldEntityId{0x1122334455667788ULL, 1U}, decoded));
     CHECK(!DecodeItemKey(aimp::WorldEntityId{kItemKeyTag, 0U}, decoded));
+    // Placed InventoryItem and its completion source share a static scope.
+    // No position or spawn owner is required; never decode it as a spawn key.
+    ItemKey placed{};
+    placed.kind = ItemKeyKind::Placed;
+    placed.ownerShortGuid = 0xF7A88FF5U;
+    placed.ownerInstance = 0xABCD1234U;
+    placed.sourceShortGuid = 0xE2835CFBU;
+    const auto placedId = EncodeItemKey(placed);
+    CHECK(placedId.high == 0x49504C43E2835CFBULL);
+    CHECK(placedId.low == 0xF7A88FF5ABCD1234ULL);
+    CHECK(DecodeItemKey(placedId, decoded));
+    CHECK(decoded.kind == ItemKeyKind::Placed);
+    CHECK(decoded.ownerShortGuid == placed.ownerShortGuid);
+    CHECK(decoded.ownerInstance == placed.ownerInstance);
+    CHECK(decoded.sourceShortGuid == placed.sourceShortGuid);
+    CHECK(!DecodeItemKey(aimp::WorldEntityId{kPlacedItemKeyTag, placedId.low}, decoded));
+    CHECK(!DecodeItemKey(aimp::WorldEntityId{placedId.high, 0U}, decoded));
+    CHECK(DecodeItemKey(id, decoded));
+    CHECK(decoded.kind == ItemKeyKind::Spawned && decoded.sourceShortGuid == 0U);
+
 }
 
 void TestCapabilities() {
