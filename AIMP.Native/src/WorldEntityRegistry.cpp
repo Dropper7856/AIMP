@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -43,6 +44,15 @@ using ExtractRuntimeKeyFn = void (__thiscall*)(
     const void* runtimeEntity,
     CathodeRuntimeKey* output);
 using AssignEntityRefFn = int* (__thiscall*)(void* destination, void** source);
+
+bool ManifestFileIdentity(HANDLE file, std::array<std::uint32_t, 7>& identity) noexcept {
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(file, &info)) return false;
+    identity = {info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow,
+        info.nFileSizeHigh, info.nFileSizeLow,
+        info.ftLastWriteTime.dwHighDateTime, info.ftLastWriteTime.dwLowDateTime};
+    return true;
+}
 
 bool ReadExact(std::ifstream& stream, void* destination, const std::size_t bytes) {
     stream.read(static_cast<char*>(destination), static_cast<std::streamsize>(bytes));
@@ -334,17 +344,145 @@ bool WorldEntityRegistry::Initialize(std::string& error) noexcept {
     }
 }
 
+bool WorldEntityRegistry::PrepareManifestRuntimeIndex(
+    const std::filesystem::path& path, std::string& error) noexcept {
+    try {
+        error.clear();
+        if (!initialized_) { error = "WorldEntityRegistry is not initialized"; return false; }
+        const auto canonical = std::filesystem::weakly_canonical(path);
+        std::lock_guard lock(preparationMutex_);
+        if (preparationWorker_.valid()) {
+            if (preparationWorker_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+                error = "WORLD_MANIFEST_PREPARING";
+                return false;
+            }
+            auto result = preparationWorker_.get();
+            preparedManifest_ = std::move(result.index);
+            preparationError_ = std::move(result.error);
+        }
+        if (preparationPath_ == canonical) {
+            if (preparedManifest_) return true;
+            if (!preparationError_.empty()) { error = preparationError_; return false; }
+        }
+        preparationPath_ = canonical;
+        preparationError_.clear();
+        // Destruction of replaced tables is performed by the worker as well.
+        auto retired = std::move(retiredManifest_);
+        auto previous = std::move(preparedManifest_);
+        preparationWorker_ = std::async(std::launch::async,
+            [canonical, retired = std::move(retired), previous = std::move(previous)]() mutable {
+                retired.reset();
+                previous.reset();
+                ManifestPreparation result;
+                auto parsed = std::make_shared<PreparedManifest>();
+                if (ParseManifestRuntimeIndex(canonical, *parsed, result.error))
+                    result.index = std::move(parsed);
+                return result;
+            });
+        error = "WORLD_MANIFEST_PREPARING";
+        return false;
+    } catch (...) { error = "WorldManifest background preparation failed"; return false; }
+}
+
 bool WorldEntityRegistry::LoadManifestRuntimeIndex(
+    const std::filesystem::path& path, const std::uint32_t levelGeneration,
+    std::string& error) noexcept {
+    try {
+        // Live generation is checked again at the exact activation boundary.
+        if (generations_ == nullptr || levelGeneration == 0U ||
+            generations_->CurrentGeneration() != levelGeneration) {
+            error = "WorldManifest activation generation is stale";
+            return false;
+        }
+        const auto canonical = std::filesystem::weakly_canonical(path);
+        {
+            std::lock_guard lock(mutex_);
+            // Poll/reconnect commands are idempotent within this exact world.
+            if (manifestLoaded_ && manifestGeneration_ == levelGeneration &&
+                captureReady_.load(std::memory_order_acquire) && activeManifestPath_ == canonical) {
+                const auto file = CreateFileW(canonical.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                std::array<std::uint32_t, 7> identity{};
+                const bool same = file != INVALID_HANDLE_VALUE &&
+                    ManifestFileIdentity(file, identity) && identity == activeManifestFileIdentity_;
+                if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+                if (same) { error.clear(); return true; }
+            }
+        }
+        if (!PrepareManifestRuntimeIndex(path, error)) return false;
+        std::lock_guard preparationLock(preparationMutex_);
+        if (canonical != preparationPath_ || !preparedManifest_) {
+            error = "WORLD_MANIFEST_PREPARING"; return false;
+        }
+        struct FileLock final {
+            HANDLE handle;
+            ~FileLock() { if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle); }
+        } file{CreateFileW(canonical.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
+        std::array<std::uint32_t, 7> identity{};
+        if (file.handle == INVALID_HANDLE_VALUE || !ManifestFileIdentity(file.handle, identity) ||
+            identity != preparedManifest_->fileIdentity) {
+            preparationError_ = "WorldManifest changed after preparation; prepare the current file again";
+            error = preparationError_;
+            return false;
+        }
+        std::lock_guard lock(mutex_);
+        if (generations_->CurrentGeneration() != levelGeneration) {
+            error = "WorldManifest activation generation changed"; return false;
+        }
+        captureReady_.store(false, std::memory_order_release);
+        std::swap(entries_, preparedManifest_->entries_);
+        std::swap(idsByRuntimeKey_, preparedManifest_->idsByRuntimeKey_);
+        std::swap(compositeInputDirect_, preparedManifest_->compositeInputDirect_);
+        std::swap(compositeInputReverse_, preparedManifest_->compositeInputReverse_);
+        std::swap(compositeInputRuntimeReverse_, preparedManifest_->compositeInputRuntimeReverse_);
+        std::swap(compositeInputOwnerScopeRuntimeReverse_, preparedManifest_->compositeInputOwnerScopeRuntimeReverse_);
+        std::swap(compositeInputCanonicalAnchors_, preparedManifest_->compositeInputCanonicalAnchors_);
+        std::swap(compositeInputInterfaceTargets_, preparedManifest_->compositeInputInterfaceTargets_);
+        std::swap(compositeInputForward_, preparedManifest_->compositeInputForward_);
+        std::swap(compositePublicRootAmbiguous_, preparedManifest_->compositePublicRootAmbiguous_);
+        std::swap(compositePublicRoots_, preparedManifest_->compositePublicRoots_);
+        std::swap(compositeInputForwardBridges_, preparedManifest_->compositeInputForwardBridges_);
+        std::swap(compositeInputCausalProfiles_, preparedManifest_->compositeInputCausalProfiles_);
+        std::swap(emittedOutputCausalProfiles_, preparedManifest_->emittedOutputCausalProfiles_);
+        std::swap(scheduledInputCausalProfiles_, preparedManifest_->scheduledInputCausalProfiles_);
+        std::swap(certifiedStateTransitionCarrierSemantics_, preparedManifest_->certifiedStateTransitionCarrierSemantics_);
+        std::swap(compositePublicInputShortGuids_, preparedManifest_->compositePublicInputShortGuids_);
+        std::swap(compositeInternalInputShortGuids_, preparedManifest_->compositeInternalInputShortGuids_);
+
+        loadedZones_.clear();
+        mapContentId_ = preparedManifest_->mapContentId;
+        manifestGeneration_ = levelGeneration;
+        manifestLoaded_ = true;
+        activeManifestPath_ = canonical;
+        activeManifestFileIdentity_ = identity;
+        retiredManifest_ = std::move(preparedManifest_);
+        preparationPath_.clear();
+        captureReady_.store(true, std::memory_order_release);
+        ++invalidations_;
+        diagnostics_->Log("info", "world_registry_manifest_loaded",
+            "WorldManifest index prepared on an isolated worker and activated by table swap; no runtime entity scan.",
+            {{"entities", Diagnostics::Unsigned(entries_.size()), true},
+             {"levelGeneration", Diagnostics::Unsigned(levelGeneration), true},
+             {"preparedOffEngineThread", "true", true}});
+        return true;
+    } catch (...) { error = "WorldManifest activation failed"; return false; }
+}
+
+bool WorldEntityRegistry::ParseManifestRuntimeIndex(
     const std::filesystem::path& path,
-    const std::uint32_t levelGeneration,
+    PreparedManifest& prepared,
     std::string& error) noexcept {
     try {
         error.clear();
-        // Fail closed while a new runtime index is being established. The
-        // scheduler detours remain strict pass-through until commit succeeds.
-        captureReady_.store(false, std::memory_order_release);
-        if (!initialized_) {
-            error = "WorldEntityRegistry is not initialized";
+        struct FileLock final {
+            HANDLE handle;
+            ~FileLock() { if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle); }
+        } file{CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
+        if (file.handle == INVALID_HANDLE_VALUE ||
+            !ManifestFileIdentity(file.handle, prepared.fileIdentity)) {
+            error = "unable to acquire stable WorldManifest file";
             return false;
         }
         std::ifstream stream(path, std::ios::binary);
@@ -823,50 +961,25 @@ bool WorldEntityRegistry::LoadManifestRuntimeIndex(
                     local(interfaceDomain) || local(targetDomain));
             }
         }
-        std::lock_guard lock(mutex_);
-        compositePublicRoots_ = std::move(publicRoots);
-        entries_ = std::move(entries);
-        idsByRuntimeKey_ = std::move(idsByRuntimeKey);
-        compositeInputDirect_ = std::move(compositeInputDirect);
-        compositeInputReverse_ = std::move(compositeInputReverse);
-        compositeInputRuntimeReverse_ = std::move(compositeInputRuntimeReverse);
-        compositeInputOwnerScopeRuntimeReverse_ =
-            std::move(compositeInputOwnerScopeRuntimeReverse);
-        compositeInputCanonicalAnchors_ = std::move(compositeInputCanonicalAnchors);
-        compositeInputInterfaceTargets_ = std::move(compositeInputInterfaceTargets);
-        compositeInputForward_ = std::move(compositeInputForward);
-        compositePublicRootAmbiguous_ = std::move(compositePublicRootAmbiguous);
-        compositeInputForwardBridges_ = std::move(compositeInputForwardBridges);
-        compositeInputCausalProfiles_ = std::move(compositeInputCausalProfiles);
-        emittedOutputCausalProfiles_ = std::move(emittedOutputCausalProfiles);
-        scheduledInputCausalProfiles_ = std::move(scheduledInputCausalProfiles);
-        certifiedStateTransitionCarrierSemantics_ =
-            std::move(certifiedStateTransitionCarrierSemantics);
-        compositePublicInputShortGuids_ = std::move(compositePublicInputShortGuids);
-        compositeInternalInputShortGuids_ = std::move(compositeInternalInputShortGuids);
-        loadedZones_.clear();
-        manifestLoaded_ = true;
-        manifestGeneration_ = levelGeneration;
-        mapContentId_ = map;
-        captureReady_.store(true, std::memory_order_release);
-        ++invalidations_;
-        diagnostics_->Log(
-            "info",
-            "world_registry_manifest_loaded",
-            "WorldSync 3 loaded the AIMPWM09 fixed-width runtime index plus compiler-derived replication-relevance and semantic-contract profiles. Patch 5.1/compiler 0x0010000D certifies high-level CompositeInput StateTransition carriers when all known relevant descendants converge on one exact semantic target/operation; non-truncated UnknownDependency side paths and cyclic routing may be admitted under the explicit relaxed-frontier evidence bit, while Patch 4 EmittedOutput carriers remain lower fallbacks. Runtime admission remains O(1) with no graph scan or gameplay-specific entity/GUID policy.",
-            {{"entities", Diagnostics::Unsigned(entries_.size()), true},
-             {"levelGeneration", Diagnostics::Unsigned(levelGeneration), true},
-             {"mapContentHigh", Diagnostics::Unsigned(map.high), true},
-             {"mapContentLow", Diagnostics::Unsigned(map.low), true},
-             {"compositePublicInputs", Diagnostics::Unsigned(compositeInputCount), true},
-             {"compositePublicInputRuntimeEdges",
-              Diagnostics::Unsigned(compositeInputRuntimeReverse_.size()), true},
-             {"compositePublicInputInterfaceTargets",
-              Diagnostics::Unsigned(compositeInputInterfaceTargets_.size()), true},
-             {"compositePublicInputOwnerScopeRuntimeEdges",
-              Diagnostics::Unsigned(compositeInputOwnerScopeRuntimeReverse_.size()), true},
-             {"compositePublicInputCanonicalAnchors", Diagnostics::Unsigned(canonicalAnchorCount), true},
-             {"compositePublicInputCausalProfiles", Diagnostics::Unsigned(causalProfileCount), true}});
+        prepared.entries_ = std::move(entries);
+        prepared.idsByRuntimeKey_ = std::move(idsByRuntimeKey);
+        prepared.compositeInputDirect_ = std::move(compositeInputDirect);
+        prepared.compositeInputReverse_ = std::move(compositeInputReverse);
+        prepared.compositeInputRuntimeReverse_ = std::move(compositeInputRuntimeReverse);
+        prepared.compositeInputOwnerScopeRuntimeReverse_ = std::move(compositeInputOwnerScopeRuntimeReverse);
+        prepared.compositeInputCanonicalAnchors_ = std::move(compositeInputCanonicalAnchors);
+        prepared.compositeInputInterfaceTargets_ = std::move(compositeInputInterfaceTargets);
+        prepared.compositeInputForward_ = std::move(compositeInputForward);
+        prepared.compositePublicRootAmbiguous_ = std::move(compositePublicRootAmbiguous);
+        prepared.compositePublicRoots_ = std::move(publicRoots);
+        prepared.compositeInputForwardBridges_ = std::move(compositeInputForwardBridges);
+        prepared.compositeInputCausalProfiles_ = std::move(compositeInputCausalProfiles);
+        prepared.emittedOutputCausalProfiles_ = std::move(emittedOutputCausalProfiles);
+        prepared.scheduledInputCausalProfiles_ = std::move(scheduledInputCausalProfiles);
+        prepared.certifiedStateTransitionCarrierSemantics_ = std::move(certifiedStateTransitionCarrierSemantics);
+        prepared.compositePublicInputShortGuids_ = std::move(compositePublicInputShortGuids);
+        prepared.compositeInternalInputShortGuids_ = std::move(compositeInternalInputShortGuids);
+        prepared.mapContentId = map;
         return true;
     } catch (...) {
         error = "WorldManifest runtime index load failed unexpectedly";

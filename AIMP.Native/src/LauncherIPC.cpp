@@ -14,6 +14,7 @@
 #include "aimp/InboundQueue.h"
 #include "aimp/ItemSync.h"
 #include "aimp/LevelGenerationTracker.h"
+#include "aimp/MultiplayerPause.h"
 #include "aimp/NetZDiscovery.h"
 #include "aimp/ReplicationCore.h"
 #include "aimp/RuntimeFeatureFlags.h"
@@ -1312,6 +1313,7 @@ bool LauncherIPC::TryConnect() {
 }
 
 void LauncherIPC::Disconnect(const std::string_view reason) noexcept {
+    multiplayer_pause::ClearLoadingHold();
     ai_sync::TransportLost();
     const auto pipe =
         pipe_.exchange(INVALID_HANDLE_VALUE, std::memory_order_acq_rel);
@@ -2573,7 +2575,8 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
         }
         const bool ws3Setting = request.command == "WORLD_WS3_EMPTY_CALLBACK_SET";
         const bool performanceSetting = request.command == "PERFORMANCE_ISOLATION_SET";
-        const bool processSetting = ws3Setting || performanceSetting;
+        const bool loadingSetting = request.command == "SESSION_LOADING_HOLD";
+        const bool processSetting = ws3Setting || performanceSetting || loadingSetting;
         if (processSetting && request.portableDummyId != localLauncherPlayerId_) return false;
         const auto currentGeneration = processSetting ? 0ULL : generations_->CurrentGeneration();
         if (!processSetting && request.levelGeneration == 0) {
@@ -2614,6 +2617,17 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
         // A runtime option changes only an atomic, so it is applied and
         // acknowledged on this authenticated IPC connection before engine
         // readiness/dispatcher gates. Reuse normal request reservation/replies.
+        if (loadingSetting) {
+            GameCommandExecutionResult result{};
+            result.executed = multiplayer_pause::SetLoadingHold(request.sessionLoadingActive,
+                request.sessionLoadingSessionId, request.sessionLoadingGeneration);
+            result.statusCode = result.executed ? "SESSION_LOADING_APPLIED" : "SESSION_LOADING_REJECTED";
+            result.message = result.executed ? "Session loading simulation hold updated." : "Loading token is obsolete or native simulation hold is unavailable.";
+            const auto payload = experimental::EncodeGameCommandResult(request, request.command, result);
+            return CompleteExperimentalRequest(request.requestId, reservation.epoch,
+                protocol::MessageType::GameCommandResult, frame.payload, payload);
+        }
+
         if (performanceSetting) {
             GameCommandExecutionResult result{};
             if (!runtime_features::SetByName(

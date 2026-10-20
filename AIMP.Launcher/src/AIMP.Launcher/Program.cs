@@ -34,6 +34,10 @@ public static class Program
 
         services.AddSingleton(_ => new LauncherDiagnostics());
         services.AddSingleton(_ => new LauncherSettingsStore());
+        services.AddSingleton(provider => new GamePreparationService(
+            provider.GetRequiredService<LauncherSettingsStore>(),
+            provider.GetRequiredService<LauncherDiagnostics>(),
+            provider.GetRequiredService<IHostApplicationLifetime>()));
         services.AddSingleton<NativeRuntimeController>(provider => new NativeRuntimeController(
             provider.GetRequiredService<LauncherDiagnostics>(),
             provider.GetRequiredService<LauncherSettingsStore>()));
@@ -44,21 +48,24 @@ public static class Program
             provider.GetRequiredService<NativeRuntimeController>(),
             provider.GetRequiredService<LauncherSettingsStore>(),
             provider.GetRequiredService<ScaleformBridgeListener>(),
-            provider.GetRequiredService<PerformanceIsolationState>()));
+            provider.GetRequiredService<PerformanceIsolationState>(),
+            provider.GetRequiredService<GamePreparationService>()));
         services.AddSingleton(provider => new UiPakInstaller(
             provider.GetRequiredService<LauncherDiagnostics>()));
         services.AddSingleton(provider => new GameLaunchCoordinator(
             provider.GetRequiredService<LauncherSettingsStore>(),
             provider.GetRequiredService<UiPakInstaller>(),
             provider.GetRequiredService<ScaleformBridgeListener>(),
-            provider.GetRequiredService<LauncherDiagnostics>()));
+            provider.GetRequiredService<LauncherDiagnostics>(),
+            provider.GetRequiredService<GamePreparationService>()));
         services.AddSingleton(provider => new LauncherRuntimeService(
             provider.GetRequiredService<NativeRuntimeController>(),
             provider.GetRequiredService<LauncherSettingsStore>(),
             provider.GetRequiredService<ScaleformBridgeListener>(),
             provider.GetRequiredService<GameLaunchCoordinator>(),
             provider.GetRequiredService<MultiplayerSessionCoordinator>(),
-            provider.GetRequiredService<PerformanceIsolationState>()));
+            provider.GetRequiredService<PerformanceIsolationState>(),
+            provider.GetRequiredService<GamePreparationService>()));
         services.AddHostedService(provider => provider.GetRequiredService<LauncherRuntimeService>());
         services.AddSingleton(provider => new WorldManifestService(
             provider.GetRequiredService<LauncherSettingsStore>(),

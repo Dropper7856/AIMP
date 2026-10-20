@@ -289,7 +289,10 @@ public sealed record LobbySnapshotPayload(
     string State,
     int Capacity,
     int LevelGeneration,
-    IReadOnlyList<LobbyPlayer> Players);
+    IReadOnlyList<LobbyPlayer> Players,
+    Guid PreparationToken = default,
+    IReadOnlyList<LobbyPreparationPayload>? Preparations = null,
+    bool WorldPreparationRequired = false);
 
 public sealed record DiscoveryAnnouncement(
     ushort ProtocolVersion,
@@ -307,3 +310,21 @@ public sealed record DiscoveredSession(
     DiscoveryAnnouncement Announcement,
     string Address,
     DateTimeOffset LastSeenUtc);
+
+
+// A report proves only portable compiled content, never live native readiness.
+public sealed record LobbyPreparationPayload(
+    Guid SessionId,
+    ulong PeerId,
+    string Level,
+    Guid PreparationToken,
+    WorldManifestIdentity? Manifest,
+    string ManifestSha256,
+    bool Ready,
+    string Error);
+
+// Sent only after world recovery, native binding and remote players are ready.
+public sealed record SessionPreparedPayload(Guid SessionId, ulong PeerId, int LevelGeneration);
+
+// Host-only permission to expose gameplay for this exact start generation.
+public sealed record SessionReleasePayload(Guid SessionId, int LevelGeneration);

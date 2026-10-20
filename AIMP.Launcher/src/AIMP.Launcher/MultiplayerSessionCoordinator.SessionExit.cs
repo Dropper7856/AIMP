@@ -54,6 +54,7 @@ internal sealed partial class MultiplayerSessionCoordinator
     // native movement mailboxes. Everything else matches StopNetworkAsync.
     private async Task LeaveGameFromPauseMenuAsync()
     {
+        await ReleaseSessionLoadingBestEffortAsync().ConfigureAwait(false);
         var stopState = BeginNetworkStop();
         if (stopState.Host is null && stopState.Client is null) return;
         DetachNetwork(stopState.Host, stopState.Client);

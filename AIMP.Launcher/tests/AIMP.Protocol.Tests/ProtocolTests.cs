@@ -140,7 +140,7 @@ internal static class ProtocolTests
         foreach (var raw in new ushort[] { 16, 17, 18, 28, 29, 111, 112, 113, 114, 124, 125, 126, 127 })
             AssertEx.True(Enum.IsDefined(typeof(MessageType), raw));
         AssertEx.False(Enum.IsDefined(typeof(MessageType), (ushort)30));
-        AssertEx.False(Enum.IsDefined(typeof(MessageType), (ushort)128));
+        AssertEx.False(Enum.IsDefined(typeof(MessageType), (ushort)131));
         AssertEx.False(Enum.IsDefined(typeof(MessageType), (ushort)217));
 
         // ItemSync: 32-hex item keys, never all-zero; identities are validated.

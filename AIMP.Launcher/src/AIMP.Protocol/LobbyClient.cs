@@ -10,7 +10,7 @@ public sealed record LobbyClientOptions(
     string DisplayName,
     CompatibilityInfo Compatibility);
 
-public sealed class LobbyClient : IAsyncDisposable
+public sealed partial class LobbyClient : IAsyncDisposable
 {
     private static readonly TimeSpan HeartbeatPeriod = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan HostTimeout = TimeSpan.FromSeconds(10);
@@ -403,6 +403,23 @@ public sealed class LobbyClient : IAsyncDisposable
                         }
 
                         Started?.Invoke(this, start);
+                        break;
+
+                    case MessageType.LobbyPreparation:
+                        var preparation = JsonPayload.Deserialize<LobbyPreparationPayload>(frame.Payload.Span);
+                        ModelValidation.Validate(preparation);
+                        if (preparation.SessionId != SessionId)
+                            throw new ProtocolException("The lobby preparation session is invalid.");
+                        LobbyPreparationReceived?.Invoke(this, preparation);
+                        break;
+
+                    case MessageType.SessionRelease:
+                        var release = JsonPayload.Deserialize<SessionReleasePayload>(frame.Payload.Span);
+                        ModelValidation.Validate(release);
+                        if (release.SessionId != SessionId)
+                            throw new ProtocolException("The session release identity is invalid.");
+                        if (release.LevelGeneration == Snapshot?.LevelGeneration)
+                            SessionReleased?.Invoke(this, release);
                         break;
 
                     case MessageType.GameplayReady:

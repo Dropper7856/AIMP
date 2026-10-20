@@ -390,8 +390,10 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         NativeRuntimeController controller,
         LauncherSettingsStore settingsStore,
         ScaleformBridgeListener bridge,
-        PerformanceIsolationState performanceIsolation)
+        PerformanceIsolationState performanceIsolation,
+        GamePreparationService? gamePreparation = null)
     {
+        _gamePreparation = gamePreparation;
         _controller = controller ?? throw new ArgumentNullException(nameof(controller));
         _settingsStore = settingsStore ?? throw new ArgumentNullException(nameof(settingsStore));
         _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
@@ -694,6 +696,15 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         if (Volatile.Read(ref _disposed) != 0) return;
         // Process on the reader before its EOF notification; never queue this
         // behind the command gate while a round return is waiting for the HUD.
+        if ((value.Message.Type.Equals("HELLO", StringComparison.OrdinalIgnoreCase)
+                || value.Message.Type.Equals("PICKUP_OVERLAY_LOADED", StringComparison.OrdinalIgnoreCase))
+            && value.Channel == "command" && value.ConnectionId != Guid.Empty
+            && value.Message.Get("source") == "pickup_overlay" && value.Message.Get("phase") == "gameplay")
+        {
+            lock (_stateGate) { _loadingOverlayConnection = value.ConnectionId; _loadingOverlayAcknowledged = false; }
+        }
+        if (value.Message.Type.Equals("SESSION_LOADING_ACK", StringComparison.OrdinalIgnoreCase))
+        { AcceptSessionLoadingAck(value); return; }
         if (value.Message.Type.Equals("ROUND_RETURN_READY", StringComparison.OrdinalIgnoreCase))
         { AcceptRoundReturnReady(value); return; }
         if (IsPauseMenuMessage(value.Message)) { _ = HandlePauseMenuMessageAsync(value); return; }
@@ -758,6 +769,9 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private async Task MarkGameplayUiLoadedAsync(ScaleformBridgeMessage message)
     {
         MarkGameplayUiLoaded(DateTimeOffset.UtcNow);
+        LobbyStartPayload? preparing;
+        lock (_stateGate) { preparing = _loadingHoldStart; _loadingOverlayAcknowledged = false; }
+        if (preparing is not null) await SendSessionLoadingAsync(preparing, true, "Preparing world and waiting for players...").ConfigureAwait(false);
         _diagnostics.Log("Multiplayer",
             "Gameplay UI loaded; waiting for a stable local player position.");
         await SendStatusAsync("Waiting for local player spawn").ConfigureAwait(false);
@@ -814,7 +828,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         settings.Port,
         ProtocolConstants.DefaultLobbyCapacity,
         ResolveLevel(message),
-        LobbyCompatibility.Create(settings));
+        LobbyCompatibility.Create(settings),
+        RequireWorldPreparation: true);
 
     private static string ResolveServerName(
         LauncherSettings settings,
@@ -874,6 +889,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         lock (_stateGate) host = _host;
         if (host is null) throw new InvalidOperationException("Only the lobby host can start the game.");
         host.SetLevel(ResolveLevel(message));
+        host.RefreshWorldPreparation();
+        await AwaitLobbyPreparationAsync(host).ConfigureAwait(false);
         if (!host.CanStart) throw new InvalidOperationException(
             "Every connected client must be Ready before the game can start.");
         await host.StartGameAsync(DateTimeOffset.UtcNow.AddMilliseconds(500))
@@ -2122,10 +2139,11 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 }
             }
             LobbyClient client;
+            LobbyStartPayload loadingStart;
             lock (_stateGate)
             {
                 client = _client ?? throw new InvalidOperationException("Client session is unavailable.");
-                _ = _start ?? throw new InvalidOperationException("Client session has not started.");
+                loadingStart = _start ?? throw new InvalidOperationException("Client session has not started.");
             }
             if (!hostContext.Ready)
             {
@@ -2172,19 +2190,13 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             var prepared = automaticMatchesHost
                 ? automaticPrepared!
                 : WorldManifestSessionLoader.LoadFromCache(hostContext);
-            var load = await _controller.ExecuteCommandAsync(
-                GameCommandNames.WorldManifestLoad,
-                new Dictionary<string, string>(StringComparer.Ordinal)
-                {
-                    ["manifestPath"] = prepared.Path
-                },
-                _lifetime.Token).ConfigureAwait(false);
-            if (!load.Executed)
-                throw new ProtocolException(
-                    $"Local WORLD_MANIFEST_LOAD failed: {load.StatusCode} - {load.Message}");
+            var nativeGeneration = _controller.Snapshot.LevelGeneration;
+            await EnsureNativeManifestLoadedAsync(prepared, loadingStart, nativeGeneration).ConfigureAwait(false);
+            EnsureManifestLoadContext(loadingStart, nativeGeneration);
             var local = hostContext with { PeerId = client.PeerId, Ready = true };
             lock (_stateGate)
             {
+                EnsureManifestLoadContext(loadingStart, nativeGeneration);
                 _localWorldContext = local;
                 _worldSessionGeneration = local.WorldGeneration;
                 _localWorldRuntimeGeneration = _controller.Snapshot.LevelGeneration;
@@ -2215,8 +2227,11 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         catch (Exception exception) when (exception is IOException or ProtocolException
             or InvalidOperationException or OperationCanceledException)
         {
-            if (!_lifetime.IsCancellationRequested)
+            if (!_lifetime.IsCancellationRequested && exception is not OperationCanceledException)
+            {
                 _diagnostics.Log("WorldSync", $"WorldContext compatibility failed: {exception.Message}");
+                await ShowPreparationFailureAsync(exception.Message).ConfigureAwait(false);
+            }
         }
     }
 
@@ -2372,6 +2387,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _aiSync.BindHost(host);
         host.SnapshotChanged += OnLobbySnapshot;
         host.Started += OnLobbyStarted;
+        host.SessionReleased += OnSessionReleased;
         host.GameplayReadyReceived += OnGameplayReady;
         host.RoundEnded += OnRoundEnded;
         host.ItemCollected += OnItemCollected;
@@ -2392,6 +2408,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _aiSync.UnbindHost(host);
         host.SnapshotChanged -= OnLobbySnapshot;
         host.Started -= OnLobbyStarted;
+        host.SessionReleased -= OnSessionReleased;
         host.GameplayReadyReceived -= OnGameplayReady;
         host.RoundEnded -= OnRoundEnded;
         host.ItemCollected -= OnItemCollected;
@@ -2412,6 +2429,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _aiSync.BindClient(client);
         client.SnapshotChanged += OnLobbySnapshot;
         client.Started += OnLobbyStarted;
+        client.SessionReleased += OnSessionReleased;
         client.GameplayReadyReceived += OnGameplayReady;
         client.RoundEnded += OnRoundEnded;
         client.ItemCollected += OnItemCollected;
@@ -2435,6 +2453,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _aiSync.UnbindClient(client);
         client.SnapshotChanged -= OnLobbySnapshot;
         client.Started -= OnLobbyStarted;
+        client.SessionReleased -= OnSessionReleased;
         client.GameplayReadyReceived -= OnGameplayReady;
         client.RoundEnded -= OnRoundEnded;
         client.ItemCollected -= OnItemCollected;
@@ -2479,7 +2498,11 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             if (!IsCurrentLobbySource(sender, value.SessionId)) return;
             latest = _lobby;
         }
-        if (latest is not null) await SendLobbyStateAsync(latest).ConfigureAwait(false);
+        if (latest is not null)
+        {
+            ScheduleLobbyPreparation(latest);
+            await SendLobbyStateAsync(latest).ConfigureAwait(false);
+        }
     }
 
     private uint[] UpdateLobbySnapshot(LobbySnapshotPayload value)
@@ -2564,6 +2587,16 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 client.SessionId, client.PeerId, false, value.LevelGeneration,
                 true, false, "lobby-start")
                 .ConfigureAwait(false);
+        await SetSessionLoadingHoldAsync(value, true, _lifetime.Token).ConfigureAwait(false);
+        lock (_stateGate)
+        {
+            if (_start?.SessionId != value.SessionId || _start.LevelGeneration != value.LevelGeneration)
+                throw new OperationCanceledException("Lobby changed while arming preparation hold.");
+            _loadingHoldStart = value;
+            _loadingOverlayAcknowledged = false;
+            _loadingOverlayConnection = Guid.Empty;
+            _sessionPreparedSending = _sessionPreparedSent = _sessionReleaseAuthorized = _sessionReleaseRunning = false;
+        }
         BeginRemoteEquipmentCatalogPreparation(value);
         if (worldSyncEnabled)
         {
@@ -3646,52 +3679,13 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     {
         lock (_stateGate)
         {
-            if (!_worldSyncEnabledForSession || _start?.Level != start.Level) return;
-        }
-        var settings = _settingsStore.Load();
-        var level = start.Level;
-        var runtimeExecutable = _controller.Snapshot.ExecutablePath;
-        var runtimeGameDirectory = ResolveRuntimeGameDirectory(runtimeExecutable);
-        var manifestGameDirectory = runtimeGameDirectory ?? settings.GameDirectory;
-        _diagnostics.Log("WorldSync",
-            $"Automatic manifest preparation started: level={level} gameRoot={manifestGameDirectory}.");
-        var task = Task.Run<PreparedWorldManifest?>(() =>
-        {
-            try
-            {
-                var source = WorldManifestAutoResolver.ResolveLevelSource(
-                    manifestGameDirectory, level);
-                var compiled = new WorldManifestCompiler().Compile(
-                    source, useCache: true);
-                var prepared = WorldManifestSessionLoader.Load(compiled.BinaryPath);
-                _diagnostics.Log("WorldSync",
-                    $"Automatic manifest source: level={level} gameRoot={manifestGameDirectory} " +
-                    $"source={source} pakPresent={(prepared.Manifest.Source.CommandsPakPresent ? 1 : 0)} " +
-                    $"pakSha256={prepared.Manifest.Source.CommandsPakSha256} " +
-                    $"binPresent={(prepared.Manifest.Source.CommandsBinPresent ? 1 : 0)} " +
-                    $"binSha256={prepared.Manifest.Source.CommandsBinSha256}.");
-                _diagnostics.Log("WorldSync",
-                    $"Automatic manifest ready: level={level} map={prepared.Identity.MapContentId} " +
-                    $"compiler=0x{prepared.Identity.CompilerVersion:X8} " +
-                    $"compatSha256={prepared.Sha256} binarySha256={prepared.BinarySha256} " +
-                    $"cacheHit={(compiled.CacheHit ? 1 : 0)}.");
-                return prepared;
-            }
-            catch (Exception exception) when (exception is not OutOfMemoryException)
-            {
-                if (!_lifetime.IsCancellationRequested)
-                    _diagnostics.Log("WorldSync",
-                        $"Automatic manifest preparation unavailable for '{level}': " +
-                        $"{exception.GetType().Name}: {exception.Message}");
-                return null;
-            }
-        }, _lifetime.Token);
-        lock (_stateGate)
-        {
-            if (_start?.Level == level)
-            {
-                _automaticWorldManifestPreparation = task;
-            }
+            if (!_worldSyncEnabledForSession || _start?.SessionId != start.SessionId
+                || _start.LevelGeneration != start.LevelGeneration) return;
+            // Preparation belongs to the lobby. Gameplay consumes its verified
+            // cache entry and never compiles level archives on the engine path.
+            _automaticWorldManifestPreparation = Task.FromResult(_preflightManifest);
+            if (_preflightManifest is null)
+                _diagnostics.Log("Preparation", "No verified lobby manifest is available; session remains held.");
         }
     }
 
@@ -3721,15 +3715,17 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     {
         if (!_performanceIsolation.IsEnabled(PerformanceIsolationModule.WorldSync)) return;
         LobbyHost? host;
+        LobbyStartPayload loadingStart;
         Task<PreparedWorldManifest?>? preparation;
         lock (_stateGate)
         {
             host = _host;
-            if (!_worldSyncEnabledForSession || host is null || _start is null || !_localGameplayReady || !_remoteGameplayReady
-                || (_lobby?.Players.Count ?? 0) < 2 || _localWorldContext is { Ready: true }
+            if (!_worldSyncEnabledForSession || host is null || _start is null || !_localGameplayReady
+                || _localWorldContext is { Ready: true }
                 || _worldActivationRunning || _worldActivationAttempted
                 || !runtime.IpcConnected || !runtime.EngineThreadReady || runtime.LevelGeneration <= 0)
                 return;
+            loadingStart = _start;
             preparation = _automaticWorldManifestPreparation;
             if (preparation is null) return;
             _worldActivationRunning = true;
@@ -3740,20 +3736,14 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         {
             var prepared = await preparation.ConfigureAwait(false);
             if (prepared is null) return;
-            var load = await _controller.ExecuteCommandAsync(
-                GameCommandNames.WorldManifestLoad,
-                new Dictionary<string, string>(StringComparer.Ordinal)
-                {
-                    ["manifestPath"] = prepared.Path
-                },
-                _lifetime.Token).ConfigureAwait(false);
-            if (!load.Executed)
-                throw new InvalidOperationException(
-                    $"Automatic WORLD_MANIFEST_LOAD failed: {load.StatusCode} - {load.Message}");
+            var nativeGeneration = runtime.LevelGeneration;
+            await EnsureNativeManifestLoadedAsync(prepared, loadingStart, nativeGeneration).ConfigureAwait(false);
+            EnsureManifestLoadContext(loadingStart, nativeGeneration);
 
             WorldNetworkContext context;
             lock (_stateGate)
             {
+                EnsureManifestLoadContext(loadingStart, nativeGeneration);
                 _worldSessionGeneration = checked(_worldSessionGeneration + 1);
                 context = new WorldNetworkContext(
                     host.SessionId,
@@ -3768,6 +3758,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             await host.SetHostWorldContextAsync(context, _lifetime.Token).ConfigureAwait(false);
             if (!await WaitForAutomaticWorldCompatibilityAsync(host, context).ConfigureAwait(false))
                 return;
+            EnsureManifestLoadContext(loadingStart, nativeGeneration);
             var nativeOpened = await SetNativeWorldSyncLifecycleAsync(
                 context.SessionId, host.HostPeerId, true, context.WorldGeneration,
                 true, true, "world-context-compatible").ConfigureAwait(false);
@@ -3780,14 +3771,16 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         }
         catch (Exception exception) when (exception is not OutOfMemoryException)
         {
-            if (!_lifetime.IsCancellationRequested)
-                _diagnostics.Log("WorldSync",
-                    "Automatic CATHODE world activation failed without affecting Character replication: " +
-                    $"{exception.GetType().Name}: {exception.Message}");
+            if (!_lifetime.IsCancellationRequested && exception is not OperationCanceledException)
+            {
+                _diagnostics.Log("WorldSync", $"World preparation remains held: {exception.Message}");
+                await ShowPreparationFailureAsync(exception.Message).ConfigureAwait(false);
+            }
         }
         finally
         {
-            lock (_stateGate) _worldActivationRunning = false;
+            lock (_stateGate)
+                if (_start?.SessionId == loadingStart.SessionId && _start.LevelGeneration == loadingStart.LevelGeneration) _worldActivationRunning = false;
         }
     }
 
@@ -3828,6 +3821,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
 
     private async Task TryAdvanceGameplayAsync(NativeRuntimeSnapshot runtime)
     {
+        _ = PreloadCurrentManifestAsync(runtime);
+        _ = TryCompleteSessionPreparationAsync();
         if (ShouldSendLocalReady(runtime))
             await SendLocalGameplayReadyAsync().ConfigureAwait(false);
         await TryActivateAutomaticWorldSyncAsync(runtime).ConfigureAwait(false);
@@ -4542,6 +4537,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
 
     private async Task StopNetworkAsync(string reason)
     {
+        await ReleaseSessionLoadingBestEffortAsync().ConfigureAwait(false);
         var stopState = BeginNetworkStop();
         DetachNetwork(stopState.Host, stopState.Client);
         await UnbindNativeWorldSyncAuthorityAsync($"network-stop:{reason}")
@@ -4605,6 +4601,10 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private void ClearSessionState()
     {
         ClearRoundLifecycleState();
+        _preflightToken = Guid.Empty;
+        _preflightTask = null;
+        _preflightManifest = null;
+        _loadedManifest = null;
         _host = null;
         _client = null;
         _lobby = null;

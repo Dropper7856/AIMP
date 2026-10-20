@@ -52,6 +52,9 @@ struct GameCommandRequest : RequestEnvelope {
     bool worldSync3EmptyCallbackEnabled{};
     std::string performanceIsolationModule;
     bool performanceIsolationEnabled{};
+    bool sessionLoadingActive{};
+    std::string sessionLoadingSessionId;
+    std::uint32_t sessionLoadingGeneration{};
     PopupMessageCommand popupMessage;
     SpawnCharacterCommand spawnCharacter;
     CharacterDirectMoveCommand characterDirectMove;

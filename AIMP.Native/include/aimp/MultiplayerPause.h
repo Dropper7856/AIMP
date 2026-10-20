@@ -19,6 +19,11 @@ bool Install(std::uintptr_t moduleBase, HookManager& hooks,
 // Logical shutdown restores retail query results immediately. HookManager owns
 // physical restoration; shim destinations and their immutable data stay alive.
 void Shutdown() noexcept;
+// Process-scoped loading token survives native level transitions. A stale release
+// cannot unblock a later lobby start. Never times out into playable gameplay.
+bool SetLoadingHold(bool active, const std::string& sessionId, std::uint32_t generation);
+void ClearLoadingHold() noexcept;
+[[nodiscard]] bool LoadingHeld() noexcept;
 void LogDiagnostics(Diagnostics& diagnostics);
 
 } // namespace multiplayer_pause

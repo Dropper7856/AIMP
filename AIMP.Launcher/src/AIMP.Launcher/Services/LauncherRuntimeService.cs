@@ -28,6 +28,7 @@ public sealed class LauncherRuntimeService : BackgroundService
     private readonly GameLaunchCoordinator _gameLauncher;
     private readonly MultiplayerSessionCoordinator _multiplayer;
     private readonly PerformanceIsolationState _performance;
+    private readonly GamePreparationService _preparation;
     private readonly LocalPlayerPositionReader _positionReader = new();
     private readonly SemaphoreSlim _runtimeOperationGate = new(1, 1);
     private readonly SemaphoreSlim _performanceGate = new(1, 1);
@@ -45,7 +46,8 @@ public sealed class LauncherRuntimeService : BackgroundService
         ScaleformBridgeListener bridge,
         GameLaunchCoordinator gameLauncher,
         MultiplayerSessionCoordinator multiplayer,
-        PerformanceIsolationState performance)
+        PerformanceIsolationState performance,
+        GamePreparationService preparation)
     {
         _controller = controller;
         _settings = settings;
@@ -53,6 +55,7 @@ public sealed class LauncherRuntimeService : BackgroundService
         _gameLauncher = gameLauncher;
         _multiplayer = multiplayer;
         _performance = performance;
+        _preparation = preparation;
         _bridge.StateChanged += OnBridgeStateChanged;
     }
 
@@ -102,6 +105,9 @@ public sealed class LauncherRuntimeService : BackgroundService
         if (!validation.Valid) throw new ArgumentException(validation.Error, nameof(request));
 
         var previous = LoadSettingsOrDefault();
+        if (_preparation.GetStatus().State == "Running"
+            && !string.Equals(previous.GameDirectory, validation.NormalizedGameDirectory, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Wait for preparation to finish before changing the installation.");
         var value = new LauncherSettings(
             validation.NormalizedGameDirectory!,
             validation.NormalizedPlayerName!,
@@ -111,6 +117,7 @@ public sealed class LauncherRuntimeService : BackgroundService
             request.WorldSyncEnabled,
             request.WorldSync3EmptyCallbackEnabled);
         _settings.Save(value);
+        _preparation.Start();
         WorldSync3LauncherOptions.ApplyProcessEnvironment(value);
         _controller.Diagnostics.Log(
             "Settings",

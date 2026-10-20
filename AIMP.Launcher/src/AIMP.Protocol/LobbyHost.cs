@@ -15,13 +15,14 @@ public sealed record LobbyHostOptions(
     int Capacity,
     string Level,
     CompatibilityInfo Compatibility,
-    bool OpaqueRelayEnabled = false);
+    bool OpaqueRelayEnabled = false,
+    bool RequireWorldPreparation = false);
 
 public readonly record struct WorldHostAcceptedMutation(
     WorldNetworkMutation Mutation,
     WorldAuthorityContextIdentity AuthorityContext);
 
-public sealed class LobbyHost : IAsyncDisposable
+public sealed partial class LobbyHost : IAsyncDisposable
 {
     private static readonly TimeSpan HeartbeatPeriod = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan PeerTimeout = TimeSpan.FromSeconds(10);
@@ -130,9 +131,11 @@ public sealed class LobbyHost : IAsyncDisposable
     {
         get
         {
-            var snapshot = CreateSnapshot();
-            return snapshot.Players.Count >= 2
-                && snapshot.Players.Where(player => !player.IsHost).All(player => player.Ready);
+            lock (_stateLock)
+                return string.Equals(_state, "Lobby", StringComparison.Ordinal)
+                    && _clients.Count >= 1
+                    && _clients.Values.All(client => client.IsReady)
+                    && (!_options.RequireWorldPreparation || AllLobbyPreparationsMatchLocked());
         }
     }
 
@@ -198,6 +201,12 @@ public sealed class LobbyHost : IAsyncDisposable
 
         lock (_stateLock)
         {
+            if (!string.Equals(_state, "Lobby", StringComparison.Ordinal))
+                throw new InvalidOperationException("The level cannot change after launch.");
+            if (!string.Equals(_level, level, StringComparison.OrdinalIgnoreCase)) {
+                _preparationToken = Guid.NewGuid();
+                _lobbyPreparations.Clear();
+            }
             _level = level;
         }
 
@@ -246,8 +255,13 @@ public sealed class LobbyHost : IAsyncDisposable
                         "At least one connected client is required and every client must be ready.");
                 }
 
+                if (_options.RequireWorldPreparation && !AllLobbyPreparationsMatchLocked())
+                    throw new InvalidOperationException(
+                        "Every participant must prepare the selected level with the same WorldManifest before launch.");
                 _state = "Starting";
                 _levelGeneration++;
+                _sessionPreparedPeers.Clear();
+                _sessionReleasedGeneration = 0;
                 _deadPeers.Clear();
                 _collectedItems.Clear();
                 ClearSpawnDecisionsLocked();
@@ -341,6 +355,8 @@ public sealed class LobbyHost : IAsyncDisposable
         if (!_deadPeers.Contains(HostPeerId)
             || _clients.Keys.Any(peerId => !_deadPeers.Contains(peerId))) return null;
         _state = "Lobby";
+        _sessionPreparedPeers.Clear();
+        _sessionReleasedGeneration = 0;
         _deadPeers.Clear();
         _collectedItems.Clear();
         ClearSpawnDecisionsLocked();
@@ -1130,6 +1146,11 @@ public sealed class LobbyHost : IAsyncDisposable
 
             if (state is not null && removed)
             {
+                lock (_stateLock) {
+                    _lobbyPreparations.Remove(state.PeerId);
+                    _sessionPreparedPeers.Remove(state.PeerId);
+                }
+                _ = EvaluateSessionReleaseAfterDepartureAsync();
                 _worldAuthority.RemovePeer(state.PeerId);
                 Log?.Invoke(this, $"{state.DisplayName} left the lobby.");
                 PublishSnapshot();
@@ -1185,6 +1206,16 @@ public sealed class LobbyHost : IAsyncDisposable
 
                     PublishSnapshot();
                     await BroadcastSnapshotAsync(cancellationToken).ConfigureAwait(false);
+                    break;
+
+                case MessageType.LobbyPreparation:
+                    await HandleLobbyPreparationAsync(state, frame.Payload, cancellationToken)
+                        .ConfigureAwait(false);
+                    break;
+
+                case MessageType.SessionPrepared:
+                    await HandleSessionPreparedAsync(state, frame.Payload, cancellationToken)
+                        .ConfigureAwait(false);
                     break;
 
                 case MessageType.GameplayReady:
@@ -1790,11 +1821,17 @@ public sealed class LobbyHost : IAsyncDisposable
         string level;
         string state;
         int levelGeneration;
+        Guid preparationToken;
+        LobbyPreparationPayload[] preparations;
         lock (_stateLock)
         {
             level = _level;
             state = _state;
             levelGeneration = _levelGeneration;
+            preparationToken = _preparationToken;
+            preparations = _lobbyPreparations.Values
+                .Where(value => value.PeerId == HostPeerId || _clients.ContainsKey(value.PeerId))
+                .OrderBy(value => value.PeerId).ToArray();
         }
 
         var players = new List<LobbyPlayer>(_clients.Count + 1)
@@ -1811,7 +1848,10 @@ public sealed class LobbyHost : IAsyncDisposable
             state,
             _options.Capacity,
             levelGeneration,
-            players);
+            players,
+            preparationToken,
+            preparations,
+            _options.RequireWorldPreparation);
         ModelValidation.Validate(snapshot);
         return snapshot;
     }

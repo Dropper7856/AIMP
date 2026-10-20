@@ -315,6 +315,36 @@ public static class ModelValidation
             throw new ProtocolException("The player-action event is invalid.");
     }
 
+    public static void Validate(LobbyPreparationPayload? value)
+    {
+        if (value is null || value.SessionId == Guid.Empty || value.PeerId == 0
+            || value.PreparationToken == Guid.Empty || !Bounded(value.Level, 1, 128)
+            || value.Error is null || value.Error.Length > 2048
+            || value.ManifestSha256 is null || value.ManifestSha256.Length > 64)
+            throw new ProtocolException("Lobby preparation is invalid.");
+        if (value.Ready)
+        {
+            if (value.Manifest is not { IsValid: true } || !HexDigest(value.ManifestSha256)
+                || value.Error.Length != 0)
+                throw new ProtocolException("Ready lobby preparation must provide valid manifest identity and digest.");
+        }
+        else if (value.Manifest is { } manifest && !manifest.IsValid)
+            throw new ProtocolException("Lobby preparation manifest identity is invalid.");
+    }
+
+    public static void Validate(SessionPreparedPayload? value)
+    {
+        if (value is null || value.SessionId == Guid.Empty || value.PeerId == 0
+            || value.LevelGeneration < 1)
+            throw new ProtocolException("Session preparation is invalid.");
+    }
+
+    public static void Validate(SessionReleasePayload? value)
+    {
+        if (value is null || value.SessionId == Guid.Empty || value.LevelGeneration < 1)
+            throw new ProtocolException("Session release is invalid.");
+    }
+
     public static void Validate(LobbyStartPayload? value)
     {
         if (value is null
@@ -341,6 +371,24 @@ public static class ModelValidation
             || value.Players.Count > value.Capacity)
         {
             throw new ProtocolException("The lobby snapshot is invalid.");
+        }
+
+        if (value.WorldPreparationRequired && value.PreparationToken == Guid.Empty)
+            throw new ProtocolException("The lobby preparation token is missing.");
+        if (value.Preparations is { } preparations)
+        {
+            if (preparations.Count > value.Capacity)
+                throw new ProtocolException("Too many lobby preparation reports.");
+            var reportedPeers = new HashSet<ulong>();
+            foreach (var preparation in preparations)
+            {
+                Validate(preparation);
+                if (preparation.SessionId != value.SessionId
+                    || preparation.PreparationToken != value.PreparationToken
+                    || !string.Equals(preparation.Level, value.Level, StringComparison.OrdinalIgnoreCase)
+                    || !reportedPeers.Add(preparation.PeerId))
+                    throw new ProtocolException("Lobby preparation report is stale or duplicated.");
+            }
         }
 
         var peerIds = new HashSet<ulong>();
@@ -790,6 +838,20 @@ public static class ModelValidation
         {
             if (value.Arguments.Count != 0)
                 throw new ProtocolException($"{value.Command} parameters are invalid.");
+            return;
+        }
+
+        if (string.Equals(value.Command, GameCommandNames.SessionLoadingHold,
+                StringComparison.Ordinal))
+        {
+            if (value.LevelGeneration != 0 || value.Arguments.Count != 3
+                || !value.Arguments.TryGetValue("active", out var active) || active is not ("0" or "1")
+                || !value.Arguments.TryGetValue("sessionId", out var sessionText)
+                || !Guid.TryParse(sessionText, out var sessionId) || sessionId == Guid.Empty
+                || !value.Arguments.TryGetValue("generation", out var generationText)
+                || !int.TryParse(generationText, NumberStyles.None,
+                    CultureInfo.InvariantCulture, out var generation) || generation < 1)
+                throw new ProtocolException("SESSION_LOADING_HOLD parameters are invalid.");
             return;
         }
 

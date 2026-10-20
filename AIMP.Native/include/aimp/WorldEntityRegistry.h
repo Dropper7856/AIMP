@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <future>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -247,6 +249,12 @@ public:
         Diagnostics& diagnostics) noexcept;
 
     [[nodiscard]] bool Initialize(std::string& error) noexcept;
+    // Starts/polls an isolated file/index worker. False + the exact
+    // WORLD_MANIFEST_PREPARING sentinel means retry; other errors are terminal.
+    // This never activates capture or binds the index to a live generation.
+    [[nodiscard]] bool PrepareManifestRuntimeIndex(
+        const std::filesystem::path& path,
+        std::string& error) noexcept;
     [[nodiscard]] bool LoadManifestRuntimeIndex(
         const std::filesystem::path& path,
         std::uint32_t levelGeneration,
@@ -545,6 +553,48 @@ private:
     std::unordered_set<std::uint32_t> compositePublicInputShortGuids_;
     std::unordered_set<std::uint32_t> compositeInternalInputShortGuids_;
     std::unordered_map<std::uint32_t, bool> loadedZones_;
+
+
+    struct PreparedManifest final {
+        WorldEntityId mapContentId{};
+        // Identity obtained from the same read-locked file used by the parser.
+        std::array<std::uint32_t, 7> fileIdentity{};
+        decltype(entries_) entries_;
+        decltype(idsByRuntimeKey_) idsByRuntimeKey_;
+        decltype(compositeInputDirect_) compositeInputDirect_;
+        decltype(compositeInputReverse_) compositeInputReverse_;
+        decltype(compositeInputRuntimeReverse_) compositeInputRuntimeReverse_;
+        decltype(compositeInputOwnerScopeRuntimeReverse_) compositeInputOwnerScopeRuntimeReverse_;
+        decltype(compositeInputCanonicalAnchors_) compositeInputCanonicalAnchors_;
+        decltype(compositeInputInterfaceTargets_) compositeInputInterfaceTargets_;
+        decltype(compositeInputForward_) compositeInputForward_;
+        decltype(compositePublicRootAmbiguous_) compositePublicRootAmbiguous_;
+        decltype(compositePublicRoots_) compositePublicRoots_;
+        decltype(compositeInputForwardBridges_) compositeInputForwardBridges_;
+        decltype(compositeInputCausalProfiles_) compositeInputCausalProfiles_;
+        decltype(emittedOutputCausalProfiles_) emittedOutputCausalProfiles_;
+        decltype(scheduledInputCausalProfiles_) scheduledInputCausalProfiles_;
+        decltype(certifiedStateTransitionCarrierSemantics_) certifiedStateTransitionCarrierSemantics_;
+        decltype(compositePublicInputShortGuids_) compositePublicInputShortGuids_;
+        decltype(compositeInternalInputShortGuids_) compositeInternalInputShortGuids_;
+    };
+    struct ManifestPreparation final {
+        std::shared_ptr<PreparedManifest> index;
+        std::string error;
+    };
+    [[nodiscard]] static bool ParseManifestRuntimeIndex(
+        const std::filesystem::path& path, PreparedManifest& prepared,
+        std::string& error) noexcept;
+    // Polling is serialized separately from live lookup/capture locks. The
+    // worker captures only values and never references this registry or engine.
+    std::mutex preparationMutex_;
+    std::future<ManifestPreparation> preparationWorker_;
+    std::filesystem::path preparationPath_;
+    std::shared_ptr<PreparedManifest> preparedManifest_;
+    std::shared_ptr<PreparedManifest> retiredManifest_;
+    std::string preparationError_;
+    std::filesystem::path activeManifestPath_;
+    std::array<std::uint32_t, 7> activeManifestFileIdentity_{};
 
     std::uint64_t resolveRequests_{};
     std::uint64_t resolveHits_{};

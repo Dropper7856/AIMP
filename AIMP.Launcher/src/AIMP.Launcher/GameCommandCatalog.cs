@@ -57,6 +57,14 @@ internal static class GameCommandCatalog
         new[]
         {
             new GameCommandDefinition(
+                "SESSION_LOADING_HOLD", "Multiplayer loading hold", "Session-owned preparation barrier. Internal launcher command.",
+                new[]
+                {
+                    new GameCommandParameterDefinition("active", "Active", GameCommandParameterKind.Boolean, "1", "Hold actor simulation while players prepare."),
+                    new GameCommandParameterDefinition("sessionId", "Session", GameCommandParameterKind.Text, string.Empty, "Session GUID.", MaximumUtf8Bytes: 36),
+                    new GameCommandParameterDefinition("generation", "Start generation", GameCommandParameterKind.Decimal, "1", "Lobby start generation.", 1M, 2147483647M)
+                }),
+            new GameCommandDefinition(
                 LauncherGameCommandNames.SpawnConnectedPlayers,
                 "Spawn Remote Player Characters (network)",
                 "Host-only network command. Every connected launcher spawns one local Character for each other player in the active session.",

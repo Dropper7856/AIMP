@@ -11,6 +11,8 @@
 #include <cstddef>
 #include <cstring>
 #include <initializer_list>
+#include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -36,6 +38,12 @@ std::uintptr_t gBase{};
 LevelGenerationTracker* gGenerations{};
 std::atomic<bool> gInstalled{};
 std::atomic<bool> gEnabled{};
+std::atomic<bool> gLoadingHold{};
+std::mutex gLoadingMutex;
+std::string gLoadingSession;
+std::uint32_t gLoadingGeneration{};
+bool gLoadingReleased{};
+std::unordered_map<std::string, std::uint32_t> gReleasedLoadingGenerations;
 std::atomic<std::uint64_t> gQueries{}, gFiltered{}, gSafetyPreserved{}, gReadFailures{};
 std::atomic<std::uint32_t> gLastMenuFlags{}, gLastRemainingReasons{};
 std::atomic<std::uint64_t> gPauseGameFiltered{}, gUiContextRejected{};
@@ -153,6 +161,13 @@ std::uint32_t __cdecl SimulationPauseBits(const std::uintptr_t pauseManager) noe
     return flags & FilterMask(pauseManager, flags, kRetailMask);
 }
 
+// This synthetic predicate never writes retail pause flags or starves loading work.
+std::uint32_t __cdecl LoadingSimulationPauseBits(const std::uintptr_t pauseManager) noexcept {
+    if (gEnabled.load(std::memory_order_acquire) && gLoadingHold.load(std::memory_order_acquire))
+        return kRetailMask;
+    return SimulationPauseBits(pauseManager);
+}
+
 std::uint32_t __cdecl SimulationPauseMask() noexcept {
     gQueries.fetch_add(1U, std::memory_order_relaxed);
     std::uint32_t mask{kRetailMask}, flags{};
@@ -243,6 +258,28 @@ __declspec(naked) void TestEcxShim() {
     AIMP_PAUSE_RESTORE_CONTEXT
 }
 
+__declspec(naked) void LoadingTestEaxShim() {
+    AIMP_PAUSE_SAVE_CONTEXT
+    __asm {
+        push [edi + 01Ch]
+        call LoadingSimulationPauseBits
+        add esp, 4
+    }
+    AIMP_PAUSE_TEST_FLAGS
+    AIMP_PAUSE_RESTORE_CONTEXT
+}
+
+__declspec(naked) void LoadingTestEcxShim() {
+    AIMP_PAUSE_SAVE_CONTEXT
+    __asm {
+        push [edi + 018h]
+        call LoadingSimulationPauseBits
+        add esp, 4
+    }
+    AIMP_PAUSE_TEST_FLAGS
+    AIMP_PAUSE_RESTORE_CONTEXT
+}
+
 __declspec(naked) void MaskEaxShim() {
     AIMP_PAUSE_SAVE_CONTEXT
     __asm {
@@ -322,6 +359,7 @@ __declspec(naked) void RenderEsiShim() {
 struct PredicateSite final {
     std::uintptr_t rva;
     bool ecx;
+    bool holdActors{true};
 };
 
 // Exact AI.exe SHA-256 is a prerequisite of HookManager::MutationAllowed.
@@ -333,20 +371,20 @@ constexpr std::array<PredicateSite, 21U> kPredicates{{
     {0x0037519CU, false}, // HAVOK_UPDATE_WORLD
     {0x003751C2U, true},  // HAVOK_UPDATE_WORLD second predicate
     {0x003751E5U, false}, // DYNAMIC_EFFECTS_UPDATE paused argument
-    {0x00375233U, true},  // COVER_PER_FRAME_UPDATE
-    {0x00375265U, false}, // PATHFINDING_PATH_QUEUE_UPDATE
+    {0x00375233U, true, false},  // COVER_PER_FRAME_UPDATE
+    {0x00375265U, false, false}, // PATHFINDING_PATH_QUEUE_UPDATE
     {0x003752A5U, false}, // EFFECT_MANAGER_UPDATE
-    {0x003834DCU, true},  // HAVOK_PROCESS_RAYCASTS
-    {0x003835ADU, false}, // ZONE_MANAGER
+    {0x003834DCU, true, false},  // HAVOK_PROCESS_RAYCASTS
+    {0x003835ADU, false, false}, // ZONE_MANAGER
     {0x0039F787U, false}, // AI_PROCESS_ACTIVITIES
     {0x003B418BU, false}, // AI_START_THINK
-    {0x003C9F38U, false}, // CHARACTER_BUILD_START_PRIMARY_ANIMATION
-    {0x003C9F78U, false}, // CHARACTER_BUILD_SECONDARY_ANIMATION
-    {0x003C9FE0U, false}, // CHARACTER_IK_AND_RAGDOLL
+    {0x003C9F38U, false, false}, // CHARACTER_BUILD_START_PRIMARY_ANIMATION
+    {0x003C9F78U, false, false}, // CHARACTER_BUILD_SECONDARY_ANIMATION
+    {0x003C9FE0U, false, false}, // CHARACTER_IK_AND_RAGDOLL
     {0x003CD667U, false}, // AI_CHARACTER_DISPLAY_ACTIONS
     {0x003CD6ACU, true},  // HAVOK_PRE_CHARACTER_UPDATE
     {0x003CD6FCU, true},  // HAVOK_POST_CHARACTER_UPDATE
-    {0x003CD770U, false}, // MAIN_THREAD_CHARACTER_PROCESSING
+    {0x003CD770U, false, false}, // MAIN_THREAD_CHARACTER_PROCESSING
     {0x003D4F90U, false}, // AI_COMBAT_MANAGER_MAIN
     {0x003D6347U, false}, // AI_CHARACTER_LOGIC_ACTIONS
 }};
@@ -408,7 +446,9 @@ bool Install(const std::uintptr_t moduleBase, HookManager& hooks,
         patches.push_back(CallPatch(site.rva,
             Bytes({0xF7, static_cast<unsigned char>(site.ecx ? 0x41 : 0x40),
                 0x04, 0xFF, 0x79, 0x01, 0x00}),
-            site.ecx ? &TestEcxShim : &TestEaxShim));
+            site.holdActors
+                ? (site.ecx ? &LoadingTestEcxShim : &LoadingTestEaxShim)
+                : (site.ecx ? &TestEcxShim : &TestEaxShim)));
     }
     // The following complete MOVs load the mask for short TEST instructions.
     // Replacing only the MOV keeps all following flags/register consumers and
@@ -450,7 +490,43 @@ bool Installed() noexcept {
     return gInstalled.load(std::memory_order_acquire);
 }
 
+bool SetLoadingHold(const bool active, const std::string& sessionId, const std::uint32_t generation) {
+    if (!Installed() || sessionId.empty() || generation == 0U) return false;
+    std::lock_guard lock(gLoadingMutex);
+    if (active) {
+        // Repeated arm is idempotent; an obsolete request cannot replace a hold.
+        const auto released = gReleasedLoadingGenerations.find(sessionId);
+        if ((released != gReleasedLoadingGenerations.end() && released->second >= generation) ||
+            (gLoadingHold.load(std::memory_order_acquire) && gLoadingSession != sessionId) ||
+            (gLoadingSession == sessionId && (gLoadingGeneration > generation ||
+                (gLoadingGeneration == generation && gLoadingReleased))))
+            return false;
+        gLoadingSession = sessionId;
+        gLoadingGeneration = generation;
+        gLoadingReleased = false;
+        gLoadingHold.store(true, std::memory_order_release);
+        return true;
+    }
+    if (gLoadingSession != sessionId || gLoadingGeneration != generation) return false;
+    gReleasedLoadingGenerations[sessionId] = generation;
+    gLoadingReleased = true;
+    gLoadingHold.store(false, std::memory_order_release);
+    return true;
+}
+
+void ClearLoadingHold() noexcept {
+    std::lock_guard lock(gLoadingMutex);
+    gLoadingHold.store(false, std::memory_order_release);
+    gLoadingSession.clear();
+    gLoadingGeneration = 0U;
+    gLoadingReleased = false;
+    gReleasedLoadingGenerations.clear();
+}
+
+bool LoadingHeld() noexcept { return gLoadingHold.load(std::memory_order_acquire); }
+
 void Shutdown() noexcept {
+    ClearLoadingHold();
     gEnabled.store(false, std::memory_order_release);
 }
 
@@ -460,6 +536,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
         {{"installed", Diagnostics::Boolean(Installed()), true},
          {"enabled", Diagnostics::Boolean(gEnabled.load()), true},
          {"sites", "42", true},
+         {"loadingHold", Diagnostics::Boolean(LoadingHeld()), true},
          {"menuReasonMask", Diagnostics::Unsigned(kMenuReasons), true},
          {"pauseGameReason", Diagnostics::Unsigned(kPauseGameReason), true},
          {"queries", Diagnostics::Unsigned(gQueries.load()), true},
