@@ -6,6 +6,19 @@ The IPC handler updates only an atomic and a mutex-protected session token. It m
 
 The existing SHA-256-certified MultiplayerPause patch transaction redirects 13 existing actor simulation predicates through a hold-aware shim. These include locomotion, Havok world/dynamic objects, AI activities/thinking/display/logic/combat. The shim returns the existing nonzero retail pause mask during preparation. Its x86 context/flags preservation is identical to the existing native-menu shim. No retail pause-manager state is changed.
 
+v213 separates arming from execution. Before an active, stable gameplay world and
+a registered THE_PLAYER with initialized equipment/presentation and a valid
+transform exist, these queries retain their retail behavior. The v211 unconditional
+synthetic pause could otherwise stop the startup work that the barrier itself
+waited for. New native counters distinguish startup passes from applied actor
+holds. This admission check reuses the PlayerSyncObserver/PlayerLifecycle field
+chain; no new function address or executable patch site is introduced.
+
+Launcher position sampling now resolves THE_PLAYER through the native local-player
+table, instead of treating the generic Character pool's first slot as the player.
+The native manifest preload does not depend on local position availability.
+Every five seconds a held session logs the remaining readiness conditions.
+
 Eight predicates retain existing behavior: cover update, path queue, raycasts, zone manager, primary/secondary animation building, IK/ragdoll and MAIN_THREAD_CHARACTER_PROCESSING. In particular, level streaming, native character creation/readiness and the GameThreadDispatcher callbacks must keep running. CATHODE message dispatch and manifest registration are not globally paused. Animation/streaming may therefore advance behind the opaque preparation UI; actor movement and decisions remain held. This deliberately is not a global game timer freeze.
 
 `SESSION_LOADING|active=1|sessionId=...|generation=...|message=...` displays a fully opaque PickupOverlay preparation layer and suppresses its native UI input handler. `active=0` removes it only for the same token. The movie responds with `SESSION_LOADING_ACK|source=pickup_overlay|phase=gameplay|active=...|sessionId=...|generation=...`. UI socket updates remain active. The Launcher must replay current preparation display when the gameplay overlay connects, await native hold acknowledgement before starting gameplay, and release only after every participant satisfies the lobby preparation barrier. Any failure remains blocked and offers disconnection through the Launcher.

@@ -575,13 +575,15 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         bool yawAvailable,
         float yaw,
         bool movementProfileAvailable,
-        LocalPlayerMovementProfile movementProfile)
+        LocalPlayerMovementProfile movementProfile,
+        string positionError = "")
     {
         var now = DateTimeOffset.UtcNow;
         InvalidateWorldContextForRuntimeGeneration(runtime.LevelGeneration);
         UpdateObservedTransform(
             now, positionAvailable, position, yawAvailable, yaw,
             movementProfileAvailable, movementProfile);
+        ReportSessionPreparationProgress(runtime, now, positionError);
         if (TryQueueLocalPosition(now)) _ = PumpLocalPositionsAsync();
         if (TryQueueLocalEquipment(now)) _ = PumpLocalPlayerSyncAsync();
         _ = TryAdvanceGameplayAsync(runtime);
@@ -2593,6 +2595,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             if (_start?.SessionId != value.SessionId || _start.LevelGeneration != value.LevelGeneration)
                 throw new OperationCanceledException("Lobby changed while arming preparation hold.");
             _loadingHoldStart = value;
+            _nextPreparationProgressUtc = DateTimeOffset.MinValue;
             _loadingOverlayAcknowledged = false;
             _loadingOverlayConnection = Guid.Empty;
             _sessionPreparedSending = _sessionPreparedSent = _sessionReleaseAuthorized = _sessionReleaseRunning = false;

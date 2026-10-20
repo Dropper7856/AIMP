@@ -21,6 +21,8 @@ internal static class Program
         new("Command result diagnostics", LauncherTests.CommandResultDiagnosticsAsync),
         new("Character movement tools", LauncherTests.CharacterMovementToolsAsync),
         new("Local player position tools", LauncherTests.LocalPlayerPositionToolsAsync),
+        new("Registered local player resolution", LocalPlayerResolverTests.ResolvesRegisteredPlayerAsync),
+        new("Local player bootstrap rejection", LocalPlayerResolverTests.RejectsBootstrapPoolSlotAsync),
         new("Launcher integration tools", LauncherTests.LauncherIntegrationToolsAsync),
         new("Generic native IPC", IpcTests.GenericHandshakeAndQueuedCommandAsync),
         new("AISync rejection preserves IPC", IpcTests.AISyncRejectionPreservesConnectionAsync),

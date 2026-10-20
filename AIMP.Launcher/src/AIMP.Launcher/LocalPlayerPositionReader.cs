@@ -48,6 +48,8 @@ internal static class LocalPlayerPositionMemoryLayout
 
 internal static class LocalPlayerYawMemoryLayout
 {
+    // Legacy pool-slot address retained for offline layout tools. It is not a
+    // THE_PLAYER resolver; live sampling uses LocalPlayerCharacterResolver.
     internal const int CharacterBasePointerOffset = 0x1307A48;
     internal const int YawOffset = 0x174;
     internal const int PointerSize = sizeof(uint);
@@ -204,6 +206,14 @@ internal sealed class LocalPlayerPositionReader : IDisposable
 
     private SafeProcessHandle? _handle;
     private int _processId;
+    private readonly Func<nint, nint?> _readLocalPointer;
+    private readonly Func<nint, int?> _readLocalInteger;
+
+    internal LocalPlayerPositionReader()
+    {
+        _readLocalPointer = ReadLocalPointer;
+        _readLocalInteger = ReadLocalInteger;
+    }
 
     internal string LastError { get; private set; } = string.Empty;
 
@@ -316,13 +326,16 @@ internal sealed class LocalPlayerPositionReader : IDisposable
     }
     private bool TryReadCharacterBase(nint moduleBase, out nint characterBase)
     {
-        var address = LocalPlayerYawMemoryLayout.ResolveCharacterBasePointer(moduleBase);
-        if (!ReadBlock(address, _pointerBytes)) { characterBase = default; return false; }
-        if (LocalPlayerYawMemoryLayout.TryDecodeCharacterBase(_pointerBytes, out characterBase))
-            return true;
-        LastError = "The local CharacterBase pointer read from AI.exe is invalid.";
+        if (LocalPlayerCharacterResolver.TryResolve(moduleBase, _readLocalPointer, _readLocalInteger, out characterBase)) return true;
+        LastError = "THE_PLAYER is not registered in the local-player table yet.";
         return false;
     }
+
+    private nint? ReadLocalPointer(nint address) => ReadBlock(address, _pointerBytes)
+        && LocalPlayerYawMemoryLayout.TryDecodeCharacterBase(_pointerBytes, out var value) ? value : null;
+
+    private int? ReadLocalInteger(nint address) => ReadBlock(address, _pointerBytes)
+        ? BitConverter.ToInt32(_pointerBytes) : null;
 
     private bool TryReadYaw(nint characterBase, out float yaw)
     {

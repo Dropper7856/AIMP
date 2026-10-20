@@ -464,11 +464,9 @@ public sealed class LauncherRuntimeService : BackgroundService
             return;
         }
 
-        if (_positionReader.TryRead(runtime, out var position))
+        if (_positionReader.TryReadFrame(runtime, out var position, out var yawAvailable, out var yaw,
+                out var movementAvailable, out var movement))
         {
-            var yawAvailable = _positionReader.TryReadYaw(runtime, out var yaw);
-            var movementAvailable =
-                _positionReader.TryReadMovementProfile(runtime, out var movement);
             Volatile.Write(ref _localPlayer, new LocalPlayerStatus(
                 true,
                 position.X,
@@ -494,10 +492,10 @@ public sealed class LauncherRuntimeService : BackgroundService
             null,
             null,
             null,
-            runtime.AiRunning ? "Position unavailable" : "Waiting for AI.exe",
+            runtime.AiRunning ? $"Position unavailable: {_positionReader.LastError}" : "Waiting for AI.exe",
             now));
         _multiplayer.UpdateLocalRuntime(
-            runtime, false, default, false, default, false, default);
+            runtime, false, default, false, default, false, default, _positionReader.LastError);
     }
 
     private void TryStartBridge()
