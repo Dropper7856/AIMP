@@ -1,7 +1,7 @@
 # Release preparation
 
-Branch: `feature/prepare-release`, in both the game/Launcher repository and
-`F:/Alien Isolation MP/frontend/ai-mp`. Launcher 0.8.4.211 and native DLL
+Integrated into `main` (Launcher) and `master` (frontend).
+Frontend: `F:/Alien Isolation MP/frontend/ai-mp`. Launcher 0.8.4.212 and native DLL
 0.11.4.211-prepare-release must be deployed together with the updated frontend.
 
 ## Installation
@@ -78,3 +78,24 @@ Runtime validation is still required for first preparation, retry/interruption,
 map change and mismatched peers, staggered loading, game-over return and a second
 round. In particular the selective native hold's interaction with every retail
 level's startup graph has not been demonstrated by a game session.
+
+## Reset launcher
+
+Settings and the preparation screen expose Reset launcher with an explicit
+confirmation. `POST /api/v1/settings/reset` requires
+`{"confirmation":"RESET_LAUNCHER"}`. AI.exe must be closed and all preparation
+and debug manifest compilation jobs must have finished. Launch and reset are
+serialized; configuration writes and compilation admission are guarded too.
+
+Reset removes the Launcher settings file (including persistent player ID), the
+WorldManifestCache, preparation receipts, and generated `.aimpwm` files and
+`WORLD_MANIFEST_*.json` exports under the selected installation's production
+levels, including former campaign exports. Each removal is constrained to an
+explicit data root, and filesystem links are rejected before deletion.
+
+The frontend then clears its onboarding and access markers and reloads into the
+first-launch flow. In-memory session, preparation and debug compilation state
+are cleared. Game assets, game saves, diagnostics and original-file recovery
+backups are retained; reset is not an uninstall of the asset import.
+
+Reset scope and outside-path rejection regression tests were added but not run.
