@@ -511,7 +511,11 @@ internal sealed class NativeRuntimeController : IDisposable
             PendingCommandCount = queued ? value.PendingCommandCount
                 : Math.Max(0, value.PendingCommandCount - 1),
             LastCommandResult = text,
-            LevelGeneration = result.LevelGeneration
+            // Process-level settings (SESSION_LOADING_HOLD, PERFORMANCE_ISOLATION_SET,
+            // WS3 options) carry generation 0: they say nothing about the level.
+            // Copying it made every loading release look like a level change,
+            // which closed the world bus and abandoned in-flight Character spawns.
+            LevelGeneration = result.LevelGeneration > 0 ? result.LevelGeneration : value.LevelGeneration
         });
         Log(text);
     }

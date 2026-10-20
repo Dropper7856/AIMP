@@ -65,6 +65,15 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         internal RemoteSpawnContextChangedException()
             : base("The Character spawn belongs to an ended session or native generation.") { }
     }
+    // A Character spawn the engine already accepted keeps loading even when
+    // the Launcher stops observing it. Its key is kept per remote peer so a
+    // later convergence resumes waiting for it instead of submitting another
+    // spawn (each extra submission became an orphan Character in the world).
+    private readonly record struct InFlightRemoteSpawn(
+        uint PreviousKey, uint? SpawnKey, Guid SessionId, int StartGeneration, int ProcessId,
+        DateTimeOffset SubmittedUtc);
+    private static readonly TimeSpan InFlightRemoteSpawnLifetime = TimeSpan.FromSeconds(90);
+    private readonly Dictionary<ulong, InFlightRemoteSpawn> _inFlightRemoteSpawns = new();
     private readonly Dictionary<ulong, int> _remoteSpawnRetryAttempts = new();
     private readonly Dictionary<ulong, DateTimeOffset> _remoteSpawnRetryNotBeforeUtc = new();
     private PlayerPositionSnapshotPayload? _pendingLocalPosition;
@@ -2650,6 +2659,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _remoteSpawnConvergenceRunning = false;
         _remoteSpawnRetryAttempts.Clear();
         _remoteSpawnRetryNotBeforeUtc.Clear();
+        _inFlightRemoteSpawns.Clear();
         _remoteGameplayReadyPeers.Clear();
         _remoteCharacters.Clear();
         _aiSync.ClearParticipants();
@@ -4178,6 +4188,15 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     {
         var initialRuntime = _controller.Snapshot;
         var context = CaptureRemoteSpawnContext(initialRuntime);
+        if (TryResumeInFlightSpawn(target.Player.PeerId, context, out var inFlight))
+        {
+            _diagnostics.Log("Multiplayer",
+                $"Resuming the accepted Character spawnKey={inFlight.SpawnKey?.ToString() ?? "pending"} " +
+                $"for {target.Player.DisplayName}; no new spawn is submitted.");
+            await CompleteRemoteSpawnAsync(target.Player, inFlight.PreviousKey, inFlight.SpawnKey, context)
+                .ConfigureAwait(false);
+            return;
+        }
         var previousKey = initialRuntime.RemoteCharacterSpawnKey;
         var arguments = RemoteSpawnPlanner.Create(target.Position);
         LogSpawnPosition(target.Player, target.Position);
@@ -4203,13 +4222,53 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             try { await submission.ConfigureAwait(false); } catch { }
             throw;
         }
-        EnsureRemoteSpawnContext(context, _controller.Snapshot);
         EnsureSpawnAccepted(result);
         var expectedSpawnKey = TryParseSpawnKey(result.Message);
-        var characterBase = await WaitForTrackedSpawnAsync(previousKey, expectedSpawnKey, context)
+        // Record before any context check: from here on the engine owns a
+        // Character for this peer, whatever happens to this observer.
+        lock (_stateGate)
+            _inFlightRemoteSpawns[target.Player.PeerId] = new InFlightRemoteSpawn(
+                previousKey, expectedSpawnKey, context.SessionId, context.WorldGeneration,
+                context.ProcessId, DateTimeOffset.UtcNow);
+        EnsureRemoteSpawnContext(context, _controller.Snapshot);
+        await CompleteRemoteSpawnAsync(target.Player, previousKey, expectedSpawnKey, context)
             .ConfigureAwait(false);
-        StoreRemoteCharacter(target.Player, characterBase, context);
-        await ShowPlayerJoinedMessageAsync(target.Player.DisplayName).ConfigureAwait(false);
+    }
+
+    private async Task CompleteRemoteSpawnAsync(
+        LobbyPlayer player, uint previousKey, uint? expectedSpawnKey, RemoteSpawnContext context)
+    {
+        uint characterBase;
+        try
+        {
+            characterBase = await WaitForTrackedSpawnAsync(previousKey, expectedSpawnKey, context)
+                .ConfigureAwait(false);
+        }
+        catch (InvalidOperationException)
+        {
+            // The tracker reported a failed spawn: nothing is left to resume.
+            lock (_stateGate) _inFlightRemoteSpawns.Remove(player.PeerId);
+            throw;
+        }
+        StoreRemoteCharacter(player, characterBase, context);
+        lock (_stateGate) _inFlightRemoteSpawns.Remove(player.PeerId);
+        await ShowPlayerJoinedMessageAsync(player.DisplayName).ConfigureAwait(false);
+    }
+
+    // Same session, launch generation and game process: the accepted spawn is
+    // still the engine's. Too old (never became ready) or another context: drop it.
+    private bool TryResumeInFlightSpawn(ulong peerId, RemoteSpawnContext context, out InFlightRemoteSpawn inFlight)
+    {
+        lock (_stateGate)
+        {
+            if (!_inFlightRemoteSpawns.TryGetValue(peerId, out inFlight)) return false;
+            if (inFlight.SessionId == context.SessionId && inFlight.StartGeneration == context.WorldGeneration
+                && inFlight.ProcessId == context.ProcessId
+                && DateTimeOffset.UtcNow - inFlight.SubmittedUtc < InFlightRemoteSpawnLifetime)
+                return true;
+            _inFlightRemoteSpawns.Remove(peerId);
+            return false;
+        }
     }
 
     private async Task<GameCommandResultPayload> ProvisionRemoteEquipmentManualAsync(

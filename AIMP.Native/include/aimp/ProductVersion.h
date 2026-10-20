@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.214-loading-barrier";
+    "0.11.4.215-spawn-inflight";
 
 } // namespace aimp
