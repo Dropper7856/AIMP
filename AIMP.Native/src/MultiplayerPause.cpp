@@ -46,6 +46,8 @@ std::uint32_t gLoadingGeneration{};
 bool gLoadingReleased{};
 std::unordered_map<std::string, std::uint32_t> gReleasedLoadingGenerations;
 std::atomic<std::uint64_t> gLoadingStartupPasses{}, gLoadingActorHolds{};
+std::atomic<std::uint64_t> gLoadingReadinessCalls{}, gLoadingReadinessFaults{};
+std::atomic<std::uint64_t> gLoadingReadinessFaultGeneration{};
 std::atomic<std::uint64_t> gQueries{}, gFiltered{}, gSafetyPreserved{}, gReadFailures{};
 std::atomic<std::uint32_t> gLastMenuFlags{}, gLastRemainingReasons{};
 std::atomic<std::uint64_t> gPauseGameFiltered{}, gUiContextRejected{};
@@ -558,6 +560,46 @@ void ClearLoadingHold() noexcept {
 
 bool LoadingHeld() noexcept { return gLoadingHold.load(std::memory_order_acquire); }
 
+void PumpLoadingCharacterReadiness(void* readinessProducer) noexcept {
+#if defined(_MSC_VER) && defined(_M_IX86)
+    if (!LoadingHeld() || readinessProducer == nullptr || gGenerations == nullptr) return;
+    const auto generation = gGenerations->CurrentGeneration();
+    if (!gGenerations->IsStableGeneration(generation) ||
+        gLoadingReadinessFaultGeneration.load(std::memory_order_acquire) == generation) return;
+    std::uintptr_t pause{}, root{}, manager{};
+    std::uint32_t count{};
+    if (!Read(gBase + kPauseManager, pause) || !LoadingWorldHasPlayer(pause) ||
+        !Read(gBase + kGlobalRoot, root) || root == 0U ||
+        !Read(root + 0x08U, manager) || manager == 0U ||
+        !Read(manager + 0x4370U, count) || count > 36U) return;
+    // FUN_007CC080 first visits this fixed queue, calling FUN_007A76E0 for
+    // each (spawnKey, recordIndex). Its remaining actor updates stay paused.
+    // 36 records of 0x1D0 bytes fill [manager+0x230, manager+0x4370).
+    // Never synthesize a Ready result or edit the native queue/record state.
+    using Producer = void(__thiscall*)(void*, std::uint32_t, void*);
+    for (std::uint32_t i = 0U; i < count; ++i) {
+        std::uint32_t key{}, index{};
+        std::uintptr_t currentRoot{}, currentManager{};
+        if (!LoadingHeld() || !gGenerations->IsStableGeneration(generation) ||
+            !Read(gBase + kGlobalRoot, currentRoot) || currentRoot != root ||
+            !Read(root + 0x08U, currentManager) || currentManager != manager ||
+            !Read(manager + 0x4374U + i * 8U, key) ||
+            !Read(manager + 0x4378U + i * 8U, index) || index >= 36U) return;
+        __try {
+            reinterpret_cast<Producer>(readinessProducer)(reinterpret_cast<void*>(manager), key,
+                reinterpret_cast<void*>(manager + 0x230U + index * 0x1D0U));
+            gLoadingReadinessCalls.fetch_add(1U, std::memory_order_relaxed);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            gLoadingReadinessFaults.fetch_add(1U, std::memory_order_relaxed);
+            gLoadingReadinessFaultGeneration.store(generation, std::memory_order_release);
+            return; // quarantine this generation; do not retry uncertain native state
+        }
+    }
+#else
+    (void)readinessProducer;
+#endif
+}
+
 void Shutdown() noexcept {
     ClearLoadingHold();
     gEnabled.store(false, std::memory_order_release);
@@ -572,6 +614,8 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"loadingHold", Diagnostics::Boolean(LoadingHeld()), true},
          {"loadingStartupPasses", Diagnostics::Unsigned(gLoadingStartupPasses.load()), true},
          {"loadingActorHolds", Diagnostics::Unsigned(gLoadingActorHolds.load()), true},
+         {"loadingReadinessCalls", Diagnostics::Unsigned(gLoadingReadinessCalls.load()), true},
+         {"loadingReadinessFaults", Diagnostics::Unsigned(gLoadingReadinessFaults.load()), true},
          {"menuReasonMask", Diagnostics::Unsigned(kMenuReasons), true},
          {"pauseGameReason", Diagnostics::Unsigned(kPauseGameReason), true},
          {"queries", Diagnostics::Unsigned(gQueries.load()), true},

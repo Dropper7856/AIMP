@@ -21,6 +21,31 @@ Every five seconds a held session logs the remaining readiness conditions.
 
 Eight predicates retain existing behavior: cover update, path queue, raycasts, zone manager, primary/secondary animation building, IK/ragdoll and MAIN_THREAD_CHARACTER_PROCESSING. In particular, level streaming, native character creation/readiness and the GameThreadDispatcher callbacks must keep running. CATHODE message dispatch and manifest registration are not globally paused. Animation/streaming may therefore advance behind the opaque preparation UI; actor movement and decisions remain held. This deliberately is not a global game timer freeze.
 
+v216 corrects the creation exception to that policy: the held
+HAVOK_PRE_CHARACTER_UPDATE callback also skips CharacterManagerUpdate's pending
+creation queue. MAIN_THREAD_CHARACTER_PROCESSING now polls only that queue through
+the existing certified CharacterReadinessProducer trampoline. The layout and
+iteration are the prefix of FUN_007CC080: count +0x4370, pairs of spawn key and
+record index at +0x4374, records +0x230 with stride 0x1D0 (36 slots). This does
+not run CharacterManagerUpdate's subsequent actor updates or synthesize Ready.
+The pump requires the current stable multiplayer world and THE_PLAYER, runs only
+while the matching loading hold is active, and quarantines native faults for the
+generation. No new executable hook or native function address is introduced.
+
+Spawns wait for local manifest registration before entering the engine queue.
+The release barrier again requires every peer's actual native Ready mapping,
+the current process/generation's loaded manifest, active world bus and no local
+in-flight world transaction/dispatch/intent. v214/v215 had removed the mapping
+condition to work around the paused creation queue and could display gameplay
+before the remote player was initialized.
+
+The supplied v215 Host log also has long gaps before IPC disconnect and a
+transaction timeout. Those logs do not identify the blocking Launcher stack or
+prove that the loading hold caused that later stall. v216 does not alter
+WorldSync replication, pipe write deadlines or heartbeat timeouts. Its native
+creation pump and release behavior still require Host/Client runtime validation;
+only source and executable-byte checks were performed, without a build.
+
 `SESSION_LOADING|active=1|sessionId=...|generation=...|message=...` displays a fully opaque PickupOverlay preparation layer and suppresses its native UI input handler. `active=0` removes it only for the same token. The movie responds with `SESSION_LOADING_ACK|source=pickup_overlay|phase=gameplay|active=...|sessionId=...|generation=...`. UI socket updates remain active. The Launcher must replay current preparation display when the gameplay overlay connects, await native hold acknowledgement before starting gameplay, and release only after every participant satisfies the lobby preparation barrier. Any failure remains blocked and offers disconnection through the Launcher.
 
 Evidence: predicate RVAs and original TEST instruction signatures are retained in `AIMP.Native/src/MultiplayerPause.cpp`, verified against the existing executable profile, and installed atomically through HookManager. Dispatcher progress is visible in `GameThreadObservationHooks.cpp`: the hooked MAIN_THREAD_CHARACTER_PROCESSING always drains queued work outside the original callback. This change adds no unverified native function call or new executable offset. Source/byte contract inspection is static evidence only; no Launcher/DLL build or game execution was performed. The modified GFX resource was regenerated with FFDec and its exported script was checked.

@@ -1,8 +1,8 @@
 # Release preparation
 
 Integrated into `main` (Launcher) and `master` (frontend).
-Frontend: `F:/Alien Isolation MP/frontend/ai-mp`. Launcher 0.8.4.213 and native DLL
-0.11.4.213-loading-startup must be deployed together with the updated frontend.
+Frontend: `F:/Alien Isolation MP/frontend/ai-mp`. Launcher 0.8.4.216 and native DLL
+0.11.4.216-loading-readiness must be deployed together with the updated frontend.
 
 ## Installation
 
