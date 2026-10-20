@@ -24,17 +24,17 @@ namespace {
 // Retail pickup manager ("PM", ctor FUN_007C0570). Slots are registered by
 // the spawned pickup's interactable; see analysis/itemsync/pickup_re.md.
 constexpr std::uintptr_t kPickupManager = 0x012F0DE8U;
-// AddToInventory "success" helper FUN_008D1BB0, thiscall(iface, entityRef*,
-// ctx, double delay) RET 10, single caller 005751A1 in AddToInventory. The
-// retail pickup_collected callback 007AFDC0 is registered but never invoked:
-// a collected pickup only hides itself by script and keeps its PM slot.
-// See analysis/itemsync/collect_path_re.md.
-constexpr std::uintptr_t kInventorySuccess = 0x004D1BB0U;
-constexpr std::uintptr_t kInventorySuccessCall = 0x001751A1U;
-constexpr std::uintptr_t kInventorySuccessReturn = 0x001751A6U;
-constexpr std::uintptr_t kEntityParentBlock = 0x08U;   // entity+8: parent composite shared block
-constexpr std::uintptr_t kSlotUiIconInstance = 0x5CU;  // registering UI_Icon key, instance half
-constexpr std::uint32_t kParentClimbLimit = 4U;
+// InventoryItem notification handler, FUN_0052A970, thiscall(iface,
+// entityRef*, messageRef*) RET 8. AddToInventory sends message 0 after a
+// complete grant, or 0x6A after a partial grant. Read the slot BEFORE retail
+// clears the InventoryItem; slot+7C is the exact record pointer also used by
+// FUN_007762C0. No composite-parent or last-used-item heuristic is needed.
+constexpr std::uintptr_t kInventoryMessage = 0x0012A970U;
+constexpr std::uintptr_t kInventoryMessageVtableSlot = 0x00E2E860U;
+constexpr std::uintptr_t kInventoryRecordGetter = 0x00123C80U;
+constexpr std::uintptr_t kInventoryRecord = 0x0CU;
+constexpr std::uintptr_t kSlotInventoryRecord = 0x7CU;
+constexpr std::uintptr_t kMessageType = 0x20U;
 constexpr std::uintptr_t kRemove = 0x003A3200U;         // FUN_007A3200 thiscall(PM+1C, key*) RET 4
 constexpr std::uintptr_t kExtractKey = 0x004C3360U;     // FUN_008C3360 thiscall(entity, out*) RET 4
 constexpr std::uintptr_t kSlotTable = 0x3CU;
@@ -55,7 +55,7 @@ constexpr std::uint64_t kPumpIntervalMs = 250U;
 constexpr float kMultipleMatchRadius = 1.5F;
 constexpr float kPositionMismatchRadius = 3.0F;
 
-using InventorySuccessFn = void(__thiscall*)(void* iface, int* entityRef, void* context, double delay);
+using InventoryMessageFn = std::uint32_t(__thiscall*)(void* iface, int* entityRef, int* messageRef);
 using RemoveFn = void(__thiscall*)(void* context, const std::uint32_t* compositeKey);
 using ExtractKeyFn = std::uint32_t*(__thiscall*)(void* entity, std::uint32_t* output);
 
@@ -71,8 +71,8 @@ struct Entry final {
 
 std::uintptr_t gBase{};
 LevelGenerationTracker* gGenerations{};
-void* gInventorySuccessTrampoline{};
-std::atomic<void*> gInventorySuccessOriginal{};
+void* gInventoryMessageTrampoline{};
+std::atomic<void*> gInventoryMessageOriginal{};
 std::atomic<bool> gInstalled{}, gEnabled{};
 
 SRWLOCK gObservedLock = SRWLOCK_INIT;
@@ -89,7 +89,8 @@ std::array<Entry, kAppliedCapacity> gApplied{};
 std::size_t gAppliedCount{}, gAppliedNext{};
 std::uint64_t gLastPumpTick{};
 
-std::atomic<std::uint64_t> gCollectSeen{}, gCollectNoSlot{}, gCollectFallback{}, gNoOwner{}, gReadFaults{};
+std::atomic<std::uint64_t> gCollectSeen{}, gCollectNoSlot{}, gCollectRecordMatched{}, gNoOwner{}, gReadFaults{};
+std::atomic<std::uint64_t> gPartialCollections{}, gCollectAmbiguous{}, gCollectNoSpawnRef{}, gDuplicateCollections{};
 std::atomic<std::uint64_t> gObservedOverflow{}, gObservedQueued{};
 std::atomic<std::uint64_t> gApplyRequests{}, gAppliedTotal{}, gAlreadyApplied{}, gDeferred{};
 std::atomic<std::uint64_t> gPendingApplied{}, gPendingDropped{}, gAmbiguous{};
@@ -126,62 +127,55 @@ bool ActiveGeneration(std::uint64_t& generation) noexcept {
     return generation != 0U && gGenerations->IsStableGeneration(generation);
 }
 
-enum class CollectSlot : std::uint8_t { Found, Fallback, None, Fault };
+enum class CollectSlot : std::uint8_t { Found, None, Ambiguous, NoSpawnRef, Fault };
+enum class CollectionMessage : std::uint8_t { Other, Complete, Partial, Fault };
 
-// In-use slot whose spawned composite object is `object`, or 0.
-std::uintptr_t SlotHoldingObject(const std::uintptr_t manager, const std::uintptr_t object) noexcept {
-    for (std::uint32_t i = 0U; i < kSlotCount; ++i) {
-        const auto slot = manager + kSlotTable + i * kSlotStride;
-        if ((*reinterpret_cast<const std::uint8_t*>(slot + kSlotFlags) & kSlotInUse) == 0U) continue;
-        const auto block = *reinterpret_cast<const std::uintptr_t*>(slot + kSlotRef);
-        if (block != 0U && *reinterpret_cast<const std::uintptr_t*>(block + kRefObject) == object)
-            return slot;
+CollectionMessage ClassifyCollectionMessage(const int* messageRef) noexcept {
+    __try {
+        if (messageRef == nullptr) return CollectionMessage::Other;
+        const auto message = *reinterpret_cast<const std::uintptr_t*>(messageRef);
+        if (message == 0U) return CollectionMessage::Other;
+        // The upper word contains routing flags (QueueMessage ORs
+        // 0x10000000). InventoryItem itself compares only the low word.
+        const auto type = *reinterpret_cast<const std::uint16_t*>(message + kMessageType);
+        if (type == 0U) return CollectionMessage::Complete;
+        if (type == 0x6AU) return CollectionMessage::Partial;
+        return CollectionMessage::Other;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return CollectionMessage::Fault;
     }
-    return 0U;
 }
 
-// Engine thread, AddToInventory success. The AddToInventory entity lives in
-// pickup_common, a child of the spawned Pickups\<item> composite held by the
-// PM slot: climb the parent chain until a slot holds the ancestor. Fallback:
-// the only spawned slot whose UI_Icon shares the entity's composite instance.
-// No slot: an AddToInventory that is not a world pickup (story give, crate).
-CollectSlot FindCollectedSlot(const std::uintptr_t manager, int* entityRef, Observed& output) noexcept {
+// Same relation as retail FUN_007762C0(PM, InventoryItem record). That
+// relation is written by UI_Icon activation FUN_0056B530 after resolving its
+// target_pickup_item. Restrict to one live slot, and snapshot before retail
+// clears record[0] and emits collect. Never retain a native pointer afterwards.
+CollectSlot FindCollectedSlot(const std::uintptr_t manager, const void* iface,
+    Observed& output) noexcept {
     __try {
-        const auto block = *reinterpret_cast<const std::uintptr_t*>(entityRef);
-        if (block == 0U) return CollectSlot::None;
-        const auto entity = *reinterpret_cast<const std::uintptr_t*>(block + kRefObject);
-        if (entity == 0U) return CollectSlot::None;
+        if (iface == nullptr) return CollectSlot::None;
+        const auto record = *reinterpret_cast<const std::uintptr_t*>(
+            reinterpret_cast<std::uintptr_t>(iface) + kInventoryRecord);
+        if (record == 0U || *reinterpret_cast<const std::uintptr_t*>(record) == 0U)
+            return CollectSlot::None;
         std::uintptr_t slot{};
-        auto current = entity;
-        for (std::uint32_t depth = 0U; depth < kParentClimbLimit && slot == 0U; ++depth) {
-            const auto parent = *reinterpret_cast<const std::uintptr_t*>(current + kEntityParentBlock);
-            if (parent == 0U) break;
-            current = *reinterpret_cast<const std::uintptr_t*>(parent + kRefObject);
-            if (current == 0U) break;
-            slot = SlotHoldingObject(manager, current);
+        for (std::uint32_t i = 0U; i < kSlotCount; ++i) {
+            const auto candidate = manager + kSlotTable + i * kSlotStride;
+            if ((*reinterpret_cast<const std::uint8_t*>(candidate + kSlotFlags) & kSlotInUse) == 0U ||
+                *reinterpret_cast<const std::uintptr_t*>(candidate + kSlotInventoryRecord) != record)
+                continue;
+            if (slot != 0U) return CollectSlot::Ambiguous;
+            slot = candidate;
         }
-        auto result = CollectSlot::Found;
-        if (slot == 0U) {
-            std::uint32_t key[2]{};
-            reinterpret_cast<ExtractKeyFn>(gBase + kExtractKey)(reinterpret_cast<void*>(entity), key);
-            std::uint32_t matches{};
-            for (std::uint32_t i = 0U; i < kSlotCount; ++i) {
-                const auto candidate = manager + kSlotTable + i * kSlotStride;
-                if ((*reinterpret_cast<const std::uint8_t*>(candidate + kSlotFlags) & kSlotInUse) == 0U ||
-                    *reinterpret_cast<const std::uintptr_t*>(candidate + kSlotRef) == 0U ||
-                    *reinterpret_cast<const std::uint32_t*>(candidate + kSlotUiIconInstance) != key[1])
-                    continue;
-                if (++matches == 1U) slot = candidate;
-            }
-            if (matches != 1U) return CollectSlot::None;
-            result = CollectSlot::Fallback;
-        }
+        if (slot == 0U) return CollectSlot::None;
+        if (*reinterpret_cast<const std::uintptr_t*>(slot + kSlotRef) == 0U)
+            return CollectSlot::NoSpawnRef;
         output.ownerShortGuid = *reinterpret_cast<const std::uint32_t*>(slot + kSlotOwner);
         output.ownerInstance = *reinterpret_cast<const std::uint32_t*>(slot + kSlotOwner + 4U);
         output.x = *reinterpret_cast<const float*>(slot + kSlotPosition);
         output.y = *reinterpret_cast<const float*>(slot + kSlotPosition + 4U);
         output.z = *reinterpret_cast<const float*>(slot + kSlotPosition + 8U);
-        return result;
+        return CollectSlot::Found;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return CollectSlot::Fault;
     }
@@ -211,57 +205,71 @@ void Publish(const Observed& observed, const std::uint64_t generation) noexcept 
     gLastLocal.store(entity.low, std::memory_order_relaxed);
 
     AcquireSRWLockExclusive(&gStateLock);
-    // The local player owns this pickup now. A late ItemCollected for the same
-    // key (simultaneous collection elsewhere) must not wait for a pickup that
-    // no longer exists here.
-    RememberApplied(entity, generation);
-    ReleaseSRWLockExclusive(&gStateLock);
-
+    // Native callbacks can repeat; one item/generation publishes once. Do
+    // not mark it collected if the outbound queue could not admit its event.
+    if (ContainsApplied(entity, generation)) {
+        ReleaseSRWLockExclusive(&gStateLock);
+        gDuplicateCollections.fetch_add(1U, std::memory_order_relaxed);
+        return;
+    }
     AcquireSRWLockExclusive(&gObservedLock);
     if (gObservedCount == kObservedCapacity) {
         ReleaseSRWLockExclusive(&gObservedLock);
+        ReleaseSRWLockExclusive(&gStateLock);
         gObservedOverflow.fetch_add(1U, std::memory_order_relaxed);
         return;
     }
+    RememberApplied(entity, generation);
     gObserved[(gObservedRead + gObservedCount) % kObservedCapacity] =
         PickupEvent{gNextSequence++, entity};
     ++gObservedCount;
     ReleaseSRWLockExclusive(&gObservedLock);
+    ReleaseSRWLockExclusive(&gStateLock);
     gObservedQueued.fetch_add(1U, std::memory_order_relaxed);
 }
 
-// Fires once when AddToInventory fully added its items (not on a partial
-// pickup, a refused add, a despawn or our remote removal).
-void __fastcall InventorySuccessDetour(void* iface, void*, int* entityRef, void* context,
-    const double delay) noexcept {
-    const auto original = reinterpret_cast<InventorySuccessFn>(
-        gInventorySuccessOriginal.load(std::memory_order_acquire));
-    if (original == nullptr) return;
-    original(iface, entityRef, context, delay);
-    const auto manager = PickupManager();
-    if (!gEnabled.load(std::memory_order_acquire) || entityRef == nullptr || manager == 0U) return;
-    gCollectSeen.fetch_add(1U, std::memory_order_relaxed);
+// Preserve the native return and both arguments on every path. Identification
+// happens before retail can clear the item data or dispatch graph callbacks;
+// publication happens only after the complete-collection handler succeeds.
+std::uint32_t __fastcall InventoryMessageDetour(void* iface, void*, int* entityRef,
+    int* messageRef) noexcept {
+    const auto original = reinterpret_cast<InventoryMessageFn>(
+        gInventoryMessageOriginal.load(std::memory_order_acquire));
+    if (original == nullptr) return 0U;
     Observed observed{};
     std::uint64_t generation{};
-    switch (FindCollectedSlot(manager, entityRef, observed)) {
-    case CollectSlot::Fault:
-        gReadFaults.fetch_add(1U, std::memory_order_relaxed);
-        return;
-    case CollectSlot::None:
-        gCollectNoSlot.fetch_add(1U, std::memory_order_relaxed);
-        return;
-    case CollectSlot::Fallback:
-        gCollectFallback.fetch_add(1U, std::memory_order_relaxed);
-        break;
-    case CollectSlot::Found:
-        break;
+    bool publish{};
+    if (gEnabled.load(std::memory_order_acquire) && world_actions::SessionAuthorityBound() &&
+        ActiveGeneration(generation)) {
+        const auto message = ClassifyCollectionMessage(messageRef);
+        if (message == CollectionMessage::Fault) {
+            gReadFaults.fetch_add(1U, std::memory_order_relaxed);
+        } else if (message == CollectionMessage::Partial) {
+            gPartialCollections.fetch_add(1U, std::memory_order_relaxed);
+        } else if (message == CollectionMessage::Complete) {
+            gCollectSeen.fetch_add(1U, std::memory_order_relaxed);
+            const auto manager = PickupManager();
+            const auto found = manager == 0U ? CollectSlot::None : FindCollectedSlot(manager, iface, observed);
+            switch (found) {
+            case CollectSlot::Fault: gReadFaults.fetch_add(1U, std::memory_order_relaxed); break;
+            case CollectSlot::None: gCollectNoSlot.fetch_add(1U, std::memory_order_relaxed); break;
+            case CollectSlot::Ambiguous: gCollectAmbiguous.fetch_add(1U, std::memory_order_relaxed); break;
+            case CollectSlot::NoSpawnRef: gCollectNoSpawnRef.fetch_add(1U, std::memory_order_relaxed); break;
+            case CollectSlot::Found:
+                gCollectRecordMatched.fetch_add(1U, std::memory_order_relaxed);
+                if (observed.ownerShortGuid == 0U && observed.ownerInstance == 0U)
+                    gNoOwner.fetch_add(1U, std::memory_order_relaxed);
+                else publish = true;
+                break;
+            }
+        }
     }
-    if (observed.ownerShortGuid == 0U && observed.ownerInstance == 0U) {
-        // Untagged player drop: no network identity.
-        gNoOwner.fetch_add(1U, std::memory_order_relaxed);
-    } else if (ActiveGeneration(generation)) {
-        Publish(observed, generation);
-    }
+    const auto result = original(iface, entityRef, messageRef);
+    std::uint64_t afterGeneration{};
+    if (publish && (result & 0xFFU) != 0U && gEnabled.load(std::memory_order_acquire) &&
+        world_actions::SessionAuthorityBound() && ActiveGeneration(afterGeneration) &&
+        afterGeneration == generation) Publish(observed, generation);
+    return result;
 }
 
 enum class FindResult : std::uint8_t { Found, NotFound, Ambiguous, Fault };
@@ -856,13 +864,14 @@ bool Install(const std::uintptr_t moduleBase, HookManager& hooks,
     }
 #if defined(_MSC_VER) && defined(_M_IX86)
     gBase = moduleBase;
-    // AddToInventory success helper and its single CALL at 005751A1.
-    std::int32_t successRelative{};
-    if (!Match(kInventorySuccess, {0x55,0x8B,0xEC,0xDD,0x45,0x10,0x8B,0x45,0x0C,0x8B,0x55,0x08}) ||
-        !Match(kInventorySuccess + 0x1FU, {0xC2,0x10,0x00}) ||
-        !Match(kInventorySuccessCall, {0xE8}) ||
-        !Read(gBase + kInventorySuccessCall + 1U, successRelative) ||
-        kInventorySuccessReturn + static_cast<std::uintptr_t>(successRelative) != kInventorySuccess ||
+    // InventoryItem message handler, exact virtual slot and both RET 8 exits.
+    std::uintptr_t messageHandler{};
+    if (!Match(kInventoryMessage, {0x83,0xEC,0x08,0x53,0x8B,0x5C,0x24,0x14,0x8B,0x03,0x66,0x83,0x78,0x20,0x6A}) ||
+        !Match(kInventoryRecordGetter, {0x8B,0x41,0x0C,0xC2,0x04,0x00}) ||
+        !Match(kInventoryMessage + 0x7BU, {0xC2,0x08,0x00}) ||
+        !Match(kInventoryMessage + 0xBEU, {0xC2,0x08,0x00}) ||
+        !Read(gBase + kInventoryMessageVtableSlot, messageHandler) ||
+        messageHandler != gBase + kInventoryMessage ||
         !Match(kRemove, {0x55,0x8B,0xEC,0x83,0xE4,0xC0,0x6A,0xFF}) ||
         !Match(kRemove + 0xD7U, {0xC2,0x04,0x00}) ||
         !Match(kExtractKey, {0x55,0x8B,0xEC,0x51,0x56,0x8B,0xF1})) {
@@ -907,11 +916,11 @@ bool Install(const std::uintptr_t moduleBase, HookManager& hooks,
         error = request.name + ": " + error;
         return false;
     };
-    // push ebp ; mov ebp,esp ; fld qword [ebp+10]  (6 bytes, no relative operand)
-    if (!install("itemsync_inventory_add_success", kInventorySuccess,
-            reinterpret_cast<void*>(&InventorySuccessDetour),
-            {0x55U,0x8BU,0xECU,0xDDU,0x45U,0x10U}, "xxxxxx",
-            &gInventorySuccessTrampoline, &gInventorySuccessOriginal) ||
+    // sub esp,8 ; push ebx ; mov ebx,[esp+14] (8 bytes, no relative operand)
+    if (!install("itemsync_inventory_item_collected", kInventoryMessage,
+            reinterpret_cast<void*>(&InventoryMessageDetour),
+            {0x83U,0xECU,0x08U,0x53U,0x8BU,0x5CU,0x24U,0x14U}, "xxxxxxxx",
+            &gInventoryMessageTrampoline, &gInventoryMessageOriginal) ||
         // sub esp,68 ; mov eax,[esp+6C]  (7 bytes)
         !install("itemsync_pickup_spawn_request", kSpawnRequest,
             reinterpret_cast<void*>(&SpawnRequestDetour),
@@ -1153,7 +1162,11 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"enabled", Diagnostics::Boolean(gEnabled.load()), true},
          {"collectSeen", Diagnostics::Unsigned(gCollectSeen.load()), true},
          {"collectNoSlot", Diagnostics::Unsigned(gCollectNoSlot.load()), true},
-         {"collectFallback", Diagnostics::Unsigned(gCollectFallback.load()), true},
+         {"collectRecordMatched", Diagnostics::Unsigned(gCollectRecordMatched.load()), true},
+         {"partialCollections", Diagnostics::Unsigned(gPartialCollections.load()), true},
+         {"collectAmbiguous", Diagnostics::Unsigned(gCollectAmbiguous.load()), true},
+         {"collectNoSpawnRef", Diagnostics::Unsigned(gCollectNoSpawnRef.load()), true},
+         {"duplicateCollections", Diagnostics::Unsigned(gDuplicateCollections.load()), true},
          {"noOwner", Diagnostics::Unsigned(gNoOwner.load()), true},
          {"readFaults", Diagnostics::Unsigned(gReadFaults.load()), true},
          {"observedQueued", Diagnostics::Unsigned(gObservedQueued.load()), true},
