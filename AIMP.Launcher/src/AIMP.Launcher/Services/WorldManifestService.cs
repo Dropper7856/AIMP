@@ -11,6 +11,7 @@ public sealed class WorldManifestService
     private readonly IHostApplicationLifetime _applicationLifetime;
     private readonly ConcurrentDictionary<Guid, CompilationJob> _jobs = new();
     private readonly object _startGate = new();
+    private int _resetEpoch;
 
     internal WorldManifestService(
         LauncherSettingsStore settings,
@@ -33,6 +34,7 @@ public sealed class WorldManifestService
         if (request.RelativePaths is not { Count: > 0 })
             throw new ArgumentException("Select at least one level.", nameof(request));
 
+        var epoch = Volatile.Read(ref _resetEpoch);
         var available = await DiscoverSourcesAsync(cancellationToken).ConfigureAwait(false);
         var byRelativePath = available.ToDictionary(
             level => level.RelativePath,
@@ -56,6 +58,8 @@ public sealed class WorldManifestService
         CompilationJob job;
         lock (_startGate)
         {
+            if (epoch != _resetEpoch)
+                throw new InvalidOperationException("Launcher settings changed. Select the levels again.");
             if (_jobs.Values.Any(value => value.IsActive))
                 throw new InvalidOperationException(
                     "A World Manifest compilation is already running.");
@@ -67,6 +71,19 @@ public sealed class WorldManifestService
 
         _ = Task.Run(() => RunCompilationAsync(job), CancellationToken.None);
         return job.Snapshot();
+    }
+
+    internal int Reset(Func<int> deleteData)
+    {
+        lock (_startGate)
+        {
+            if (_jobs.Values.Any(job => job.IsActive))
+                throw new InvalidOperationException("Wait for manifest compilation to finish before resetting the launcher.");
+            Interlocked.Increment(ref _resetEpoch);
+            var deleted = deleteData();
+            _jobs.Clear();
+            return deleted;
+        }
     }
 
     public WorldManifestCompilationJobResponse GetJob(Guid id) =>

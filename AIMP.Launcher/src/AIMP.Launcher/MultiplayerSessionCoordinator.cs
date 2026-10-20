@@ -4535,6 +4535,13 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             $"Spawning Character for {player.DisplayName} at that player's network position: " +
             $"X={position.X:0.000}, Y={position.Y:0.000}, Z={position.Z:0.000}.");
 
+    internal async Task ResetForLauncherAsync(CancellationToken cancellationToken)
+    {
+        await _commandGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try { await StopNetworkAsync("Launcher reset").ConfigureAwait(false); }
+        finally { _commandGate.Release(); }
+    }
+
     private async Task StopNetworkAsync(string reason)
     {
         await ReleaseSessionLoadingBestEffortAsync().ConfigureAwait(false);

@@ -28,4 +28,13 @@ public sealed class SettingsController : ControllerBase
     [ProducesResponseType<SettingsResponse>(StatusCodes.Status200OK)]
     public ActionResult<SettingsResponse> Update(UpdateSettingsRequest request) =>
         Ok(_runtime.SaveSettings(request));
+
+    [HttpPost("reset")]
+    public async Task<ActionResult<ResetLauncherResponse>> Reset(
+        ResetLauncherRequest request, CancellationToken cancellationToken)
+    {
+        if (request.Confirmation != "RESET_LAUNCHER")
+            throw new ArgumentException("Confirm the launcher reset before continuing.");
+        return Ok(await _runtime.ResetLauncherAsync(cancellationToken).ConfigureAwait(false));
+    }
 }

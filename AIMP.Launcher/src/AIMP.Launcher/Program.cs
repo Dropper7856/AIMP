@@ -65,7 +65,8 @@ public static class Program
             provider.GetRequiredService<GameLaunchCoordinator>(),
             provider.GetRequiredService<MultiplayerSessionCoordinator>(),
             provider.GetRequiredService<PerformanceIsolationState>(),
-            provider.GetRequiredService<GamePreparationService>()));
+            provider.GetRequiredService<GamePreparationService>(),
+            provider.GetRequiredService<WorldManifestService>()));
         services.AddHostedService(provider => provider.GetRequiredService<LauncherRuntimeService>());
         services.AddSingleton(provider => new WorldManifestService(
             provider.GetRequiredService<LauncherSettingsStore>(),

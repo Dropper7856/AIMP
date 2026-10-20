@@ -21,6 +21,7 @@ public sealed class GamePreparationService
     private readonly LauncherDiagnostics _diagnostics;
     private readonly CancellationToken _shutdown;
     private Task _job = Task.CompletedTask;
+    private int _configurationEpoch;
     private PreparationReceipt? _receipt;
     private GamePreparationDto _status = EmptyStatus(string.Empty);
 
@@ -41,9 +42,9 @@ public sealed class GamePreparationService
 
     internal GamePreparationDto Start(bool revalidate = false)
     {
-        var game = GameInstallation.Resolve(_settings.Load().GameDirectory);
         lock (_sync)
         {
+            var game = GameInstallation.Resolve(_settings.Load().GameDirectory);
             if (!_job.IsCompleted)
             {
                 if (!SameDirectory(game.GameDirectory, _status.GameDirectory))
@@ -58,6 +59,43 @@ public sealed class GamePreparationService
             var id = _status.JobId;
             _job = Task.Run(() => Run(game.GameDirectory, id), CancellationToken.None);
             return _status;
+        }
+    }
+
+    internal T WithConfigurationLock<T>(Func<T> operation)
+    {
+        var epoch = Volatile.Read(ref _configurationEpoch);
+        lock (_sync)
+        {
+            if (epoch != _configurationEpoch)
+                throw new InvalidOperationException("Launcher settings were reset. Restart setup before saving.");
+            return operation();
+        }
+    }
+
+    internal int Reset(Func<int> deleteData)
+    {
+        lock (_sync)
+            if (!_job.IsCompleted) throw new InvalidOperationException("Wait for game preparation to finish before resetting the launcher.");
+        lock (GamePreparationSynchronization.Gate)
+        lock (_sync)
+        {
+            if (!_job.IsCompleted) throw new InvalidOperationException("Wait for game preparation to finish before resetting the launcher.");
+            AssertGameStopped();
+            Interlocked.Increment(ref _configurationEpoch);
+            try
+            {
+                var deleted = deleteData();
+                _receipt = null;
+                _status = EmptyStatus(string.Empty);
+                return deleted;
+            }
+            catch
+            {
+                _receipt = null;
+                _status = _status with { State = "Failed", Error = "Launcher reset did not finish. Retry the reset before playing." };
+                throw;
+            }
         }
     }
 

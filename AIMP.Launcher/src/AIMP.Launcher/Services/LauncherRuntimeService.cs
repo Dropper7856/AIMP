@@ -29,6 +29,7 @@ public sealed class LauncherRuntimeService : BackgroundService
     private readonly MultiplayerSessionCoordinator _multiplayer;
     private readonly PerformanceIsolationState _performance;
     private readonly GamePreparationService _preparation;
+    private readonly WorldManifestService _manifests;
     private readonly LocalPlayerPositionReader _positionReader = new();
     private readonly SemaphoreSlim _runtimeOperationGate = new(1, 1);
     private readonly SemaphoreSlim _performanceGate = new(1, 1);
@@ -47,7 +48,8 @@ public sealed class LauncherRuntimeService : BackgroundService
         GameLaunchCoordinator gameLauncher,
         MultiplayerSessionCoordinator multiplayer,
         PerformanceIsolationState performance,
-        GamePreparationService preparation)
+        GamePreparationService preparation,
+        WorldManifestService manifests)
     {
         _controller = controller;
         _settings = settings;
@@ -56,6 +58,7 @@ public sealed class LauncherRuntimeService : BackgroundService
         _multiplayer = multiplayer;
         _performance = performance;
         _preparation = preparation;
+        _manifests = manifests;
         _bridge.StateChanged += OnBridgeStateChanged;
     }
 
@@ -100,6 +103,9 @@ public sealed class LauncherRuntimeService : BackgroundService
     }
 
     public SettingsResponse SaveSettings(UpdateSettingsRequest request)
+        => _preparation.WithConfigurationLock(() => SaveSettingsCore(request));
+
+    private SettingsResponse SaveSettingsCore(UpdateSettingsRequest request)
     {
         var validation = ValidateSettings(request);
         if (!validation.Valid) throw new ArgumentException(validation.Error, nameof(request));
@@ -125,6 +131,27 @@ public sealed class LauncherRuntimeService : BackgroundService
             $"WorldSync={(value.WorldSyncEnabled ? "enabled" : "disabled")}; " +
             $"WS3 ProbeDirect callback test={(value.WorldSync3EmptyCallbackEnabled ? "enabled" : "disabled")} for the next game session.");
         return MapSettings(value);
+    }
+
+    public async Task<ResetLauncherResponse> ResetLauncherAsync(CancellationToken cancellationToken)
+    {
+        await _runtimeOperationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            _controller.RefreshProcessStatus();
+            if (_controller.Snapshot.AiRunning)
+                throw new InvalidOperationException("Close Alien: Isolation before resetting the launcher.");
+            await _multiplayer.ResetForLauncherAsync(cancellationToken).ConfigureAwait(false);
+            await SetAllPerformanceModulesAsync(true, cancellationToken).ConfigureAwait(false);
+            var deleted = await Task.Run(() => _manifests.Reset(() => _preparation.Reset(() =>
+                LauncherResetFiles.DeleteGeneratedData(
+                    LauncherResetFiles.UserDataDirectory(),
+                    _settings.SettingsPath, LoadSettingsOrDefault().GameDirectory))), cancellationToken).ConfigureAwait(false);
+            WorldSync3LauncherOptions.ApplyProcessEnvironment(LauncherSettings.Empty);
+            _controller.Diagnostics.Log("Settings", $"Launcher reset completed; {deleted} manifest(s) removed.");
+            return new ResetLauncherResponse(deleted);
+        }
+        finally { _runtimeOperationGate.Release(); }
     }
 
     public async Task<GameLaunchResponse> LaunchGameAsync(CancellationToken cancellationToken)
