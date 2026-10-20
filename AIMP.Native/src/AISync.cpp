@@ -134,8 +134,8 @@ struct ParticipantProbe final {
     bool backstageReadable{};
     std::uint32_t backstageState{}, backstageKeyA{}, backstageKeyB{};
     std::uint8_t backstageEnabled{}, backstagePolicy{};
-    bool navigationCached{}, navigationGoalKnown{};
-    std::uint32_t navigationRouteCount{};
+    bool navigationCached{}, navigationGoalKnown{}, navigationQueryPending{}, navigationGoalDirty{};
+    std::uint32_t navigationRouteCount{}, navigationEmptyRouteRetries{};
 };
 // Engine-thread producer, serialized worker consumers. Samples hold values,
 // never pointers to Characters/records that a later worker might dereference.
@@ -481,6 +481,8 @@ struct ParticipantNavigation final {
     std::uintptr_t character{};
     std::uint32_t runtimeId{}, nativeGeneration{}, worldGeneration{};
     ULONGLONG lastUpdate{};
+    ParticipantRouteRetry emptyRouteRetry{};
+    std::uint32_t emptyRouteRetries{};
     float goal[3]{};
     bool goalApplied{};
     bool initialized{}, faulted{};
@@ -1045,7 +1047,7 @@ void PumpHostNavigationContext() noexcept {
     std::uint8_t enabled{};
     float objective[3]{};
     const auto player = LocalPlayer();
-    if (player != 0U && Read(player + 0x3500U, path) && path != 0U &&
+    if (LivingCharacter(player) && Read(player + 0x3500U, path) && path != 0U &&
         Read(path + 0x455U, enabled) && enabled != 0U &&
         Read(path + 0xCU, objective[0]) && Read(path + 0x10U, objective[1]) &&
         Read(path + 0x14U, objective[2]) && FiniteCoordinate(objective[0]) &&
@@ -1143,6 +1145,23 @@ bool UpdateParticipantNavigation(ParticipantNavigation& navigation, const std::u
         // 00721270: ECX=route cache, plain RET. Only updates/consumes the
         // native path request; does not run the participant's suppressed AI.
         reinterpret_cast<NavigationGoal>(gBase + 0x002C5D70U)(navigation.native.data(), goal);
+        // 00721270 caches an empty completed route if the mesh revision,
+        // participant position and goal do not change. Hiding participants may
+        // remain stationary indefinitely. Re-arm ONLY the route's native dirty
+        // flag (the same +454 producer field used by 006C5D70), preserving its
+        // endpoints and the native vent/candidate selection. Never replace or
+        // cancel an outstanding shared path request.
+        const auto address = reinterpret_cast<std::uintptr_t>(navigation.native.data());
+        std::uintptr_t query{};
+        std::uint32_t routeCount{};
+        std::uint8_t dirty{}, enabled{};
+        if (!Read(address, query) || !Read(address + 0x450U, routeCount) ||
+            !Read(address + 0x454U, dirty) || !Read(address + 0x455U, enabled)) return false;
+        if (navigation.emptyRouteRetry.Observe(enabled != 0U, query != 0U, dirty != 0U,
+                routeCount, SquaredDistance(goal, start) >= kMinimumSquared, now)) {
+            if (!Write(address + 0x454U, std::uint8_t{1U})) return false;
+            ++navigation.emptyRouteRetries;
+        }
         reinterpret_cast<NavigationUpdate>(gBase + 0x00321270U)(navigation.native.data());
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         navigation.faulted = true;
@@ -6223,8 +6242,12 @@ void SampleParticipantPerception(Actor& actor, const std::uintptr_t manager, con
             cached.sessionCookie != gCurrent.sessionCookie) continue;
         sample.navigationCached = true;
         const auto address = reinterpret_cast<std::uintptr_t>(cached.native.data());
-        std::uint8_t goalEnabled{};
+        std::uint8_t goalEnabled{}, dirty{};
+        std::uintptr_t query{};
         sample.navigationGoalKnown = Read(address + 0x455U, goalEnabled) && goalEnabled != 0U;
+        sample.navigationGoalDirty = Read(address + 0x454U, dirty) && dirty != 0U;
+        sample.navigationQueryPending = Read(address, query) && query != 0U;
+        sample.navigationEmptyRouteRetries = cached.emptyRouteRetries;
         static_cast<void>(Read(address + 0x450U, sample.navigationRouteCount));
         break;
     }
@@ -8789,6 +8812,9 @@ void LogDiagnostics(Diagnostics& diagnostics) {
              {"navigationCached", Diagnostics::Boolean(sample.navigationCached), true},
              {"navigationGoalKnown", Diagnostics::Boolean(sample.navigationGoalKnown), true},
              {"navigationRouteCount", Diagnostics::Unsigned(sample.navigationRouteCount), true},
+             {"navigationQueryPending", Diagnostics::Boolean(sample.navigationQueryPending), true},
+             {"navigationGoalDirty", Diagnostics::Boolean(sample.navigationGoalDirty), true},
+             {"navigationEmptyRouteRetries", Diagnostics::Unsigned(sample.navigationEmptyRouteRetries), true},
              {"signalRegistryReadable", Diagnostics::Boolean(sample.signalRegistryReadable), true},
              {"signalRegistryFound", Diagnostics::Boolean(sample.signalRegistryFound), true},
              {"signalRegistryMatches", Diagnostics::Boolean(sample.signalRegistryMatches), true},
