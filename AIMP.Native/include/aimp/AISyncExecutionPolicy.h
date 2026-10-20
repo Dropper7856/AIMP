@@ -81,6 +81,16 @@ constexpr bool HostSuspendsNavigation(const State& state) noexcept {
         state.executionCycleTypeRva == 0x00EABEC0U && state.executionCycleState == 0x3BU;
 }
 
+constexpr bool LifecycleBlocksMovementRecovery(const State& state,
+    const std::uint32_t completedLifecycleRevision) noexcept {
+    // Traversal owns movement for its whole action. SpatialDiscontinuity is
+    // instead an event retained in snapshots until the next lifecycle event:
+    // it stops recovery only until that exact placement has been applied.
+    return (state.lifecycleFlags & LifecycleTraversalAction) != 0U ||
+        ((state.lifecycleFlags & LifecycleSpatialDiscontinuity) != 0U &&
+            (state.lifecycleRevision == 0U || state.lifecycleRevision != completedLifecycleRevision));
+}
+
 constexpr bool HostPausesPointNavigation(const State& state) noexcept {
     // A live destination is not permission to keep moving while the Host's
     // ordinary Move executor is waiting/stopped. Turn/stance and root-motion

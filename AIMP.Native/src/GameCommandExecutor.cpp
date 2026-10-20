@@ -4019,6 +4019,11 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteReturnToFrontend() const 
     // Remote proxies are freed by the level unload. Drop every network
     // movement mailbox first so the engine-thread pump cannot write into
     // their memory while the frontend reuses the heap.
+    // Retail can reuse all global root addresses on a same-map restart. Revoke
+    // the old incarnation explicitly; pointer equality alone cannot preserve
+    // caches or queued commands across this unload. Bootstrap owns invalidation
+    // of every generation-bound registry on its next observation.
+    if (generations_ != nullptr) static_cast<void>(generations_->BeginTransition());
     character_direct_step_runtime::ForgetAll();
     if (!InvokeReturnToFrontend(returnToFrontendAddress_, reinterpret_cast<void*>(*manager))) {
         result.statusCode = "RETURN_TO_FRONTEND_NATIVE_FAULT";

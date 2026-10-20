@@ -515,7 +515,9 @@ internal sealed class NativeRuntimeController : IDisposable
             // WS3 options) carry generation 0: they say nothing about the level.
             // Copying it made every loading release look like a level change,
             // which closed the world bus and abandoned in-flight Character spawns.
-            LevelGeneration = result.LevelGeneration > 0 ? result.LevelGeneration : value.LevelGeneration
+            // A completion echoes the request's generation. RETURN_TO_FRONTEND
+            // can already have revoked it before this result reaches the pipe.
+            LevelGeneration = Math.Max(value.LevelGeneration, result.LevelGeneration)
         });
         Log(text);
     }

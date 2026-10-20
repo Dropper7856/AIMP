@@ -52,6 +52,33 @@ Evidence: predicate RVAs and original TEST instruction signatures are retained i
 
 ## Launcher barrier
 
+### Round restart (v217)
+
+The v216 diagnostics confirm a successful first release and both native kills.
+The second start uses lobby generation 2, but automatic world activation reused
+world generation 1. The Client requested recovery from sequence zero against the
+previous round's journal and received Unavailable/RecoveryRequired. In addition,
+Host-side player sequence windows survived the TCP connection while the Client
+reset its position/equipment/action sequences for the new launch. The Host only
+accepted the new position stream after it overtook the previous round's counter.
+
+The coordinator now allocates world generations from a session-lifetime counter,
+independent of per-round reset. Player stream windows are launch-generation scoped;
+AISync impact windows use a validated current world generation. Existing journal,
+recovery, compatibility and loading release checks are preserved.
+
+RETURN_TO_FRONTEND explicitly revokes the native generation before requesting
+unload. Bootstrap then invalidates its existing generation-bound registries even
+when retail reuses all root addresses. Command completions cannot roll the
+Launcher generation backwards by echoing an older request generation.
+
+Separately, AISync recovery used to reject a retained SpatialDiscontinuity marker
+forever. It now rejects that event only until completedLifecycleRevision matches;
+an active traversal remains excluded. This restores the existing native path
+convergence without changing its distance/grace thresholds or adding transform
+replication. Root-motion/traversal differences are not declared solved by this
+change. Regression test sources were added, without compiling or running them.
+
 Production lobbies require a portable `LobbyPreparation` report from every peer. Lobby snapshots carry a selection token so reports for a previous map cannot authorize a new one. The preparation service supplies a verified warmed cache entry; gameplay never cold-compiles level archives. Start waits for compatible manifests and ordinary Ready flags.
 
 The local native hold is acknowledged before sending the UI START_GAME. On the gameplay movie HELLO, the coordinator replays SESSION_LOADING and requires the acknowledgement from that exact command connection and start generation. Host and Client can register their local manifest concurrently as soon as their engine and gameplay context exist. A serialized load helper shares completed registration for the same session/start/native generation/binary hash; WORLD_MANIFEST_PREPARING is polled with a new request ID until final success. Old generation results cannot commit a WorldContext.

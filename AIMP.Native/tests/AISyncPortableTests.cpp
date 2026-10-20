@@ -10,6 +10,19 @@
 
 int main() {
     using namespace aimp::ai_sync;
+    State relocated{};
+    relocated.lifecycleFlags = LifecycleSpatialDiscontinuity;
+    relocated.lifecycleRevision = 7U;
+    assert(LifecycleBlocksMovementRecovery(relocated, 6U));
+    assert(!LifecycleBlocksMovementRecovery(relocated, 7U));
+    // Repeated snapshots retain the event flag after placement. A new event
+    // must block again; an ongoing traversal never grants route ownership.
+    relocated.lifecycleRevision = 8U;
+    assert(LifecycleBlocksMovementRecovery(relocated, 7U));
+    relocated.lifecycleFlags |= LifecycleTraversalAction;
+    assert(LifecycleBlocksMovementRecovery(relocated, 8U));
+    relocated.lifecycleFlags = 0U;
+    assert(!LifecycleBlocksMovementRecovery(relocated, 7U));
     for (const auto type : {1U, 2U, 3U, 4U, 6U, 7U, 9U}) assert(AICharacterClass(type));
     for (const auto type : {0U, 5U, 8U, 10U, 0xFFFFFFFFU}) assert(!AICharacterClass(type));
     // The same NPC has different local lifetime tokens on Host and Client.

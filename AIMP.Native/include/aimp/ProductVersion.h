@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.216-loading-readiness";
+    "0.11.4.217-round-restart";
 
 } // namespace aimp
