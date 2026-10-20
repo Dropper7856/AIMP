@@ -2912,7 +2912,16 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
                 !result.executed &&
                 pending->request.command == "REMOTE_EQUIPMENT_PROVISION" &&
                 nativeStatusCode.rfind("REMOTE_EQUIPMENT_", 0U) == 0U;
-            if (remoteEquipmentRetry || remoteEquipmentTerminal) {
+            // WORLD_MANIFEST_PREPARING is a retryable state (the manifest worker
+            // is still building its runtime index), and ItemSync statuses tell
+            // the Launcher whether to retry. Collapsing them into TASK_FAULT
+            // made the Launcher abandon WorldSync activation for good.
+            const bool preservedStatus =
+                !result.executed &&
+                ((pending->request.command == "WORLD_MANIFEST_LOAD" &&
+                  nativeStatusCode == "WORLD_MANIFEST_PREPARING") ||
+                 nativeStatusCode.rfind("ITEM_SYNC_", 0U) == 0U);
+            if (remoteEquipmentRetry || remoteEquipmentTerminal || preservedStatus) {
                 // Preserve the native equipment provisioning stage/status so
                 // the Launcher can distinguish convergence from terminal
                 // fail-closed errors without collapsing them into TASK_FAULT.
