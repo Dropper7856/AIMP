@@ -15,10 +15,10 @@ class LevelGenerationTracker;
 namespace item_sync {
 
 // ItemSync: world pickups collected by one participant disappear for everyone.
-// Detection hooks the pickup manager's collection request (FUN_007A2B30) only
-// when it comes from the "pickup_collected" output callback; removal on the
-// other peers calls the manager's own removal (FUN_007A3200), which destroys
-// the spawned pickup without giving the item.
+// Detection observes InventoryItem's complete-collection notification and
+// identifies its world slot through the native slot+7C record relation before
+// retail clears the record. Remote removal uses FUN_007A3200 without granting
+// an item. Partial collections and non-pickup inventory operations stay local.
 struct PickupEvent final {
     std::uint64_t sequence{};
     WorldEntityId entity{};
