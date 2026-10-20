@@ -35,7 +35,9 @@ internal sealed partial class MultiplayerSessionCoordinator
                 $"spawnStable={_gameplayReadiness.IsReady(now)}, localReady={_localGameplayReady}, remoteReady={_remoteGameplayReady}, " +
                 $"characters={_remoteCharacters.Count}/{Math.Max(0, (_lobby?.Players.Count ?? 1) - 1)}, " +
                 $"manifest={_loadedManifest is { } loaded && loaded.Native == runtime.LevelGeneration && loaded.Process == runtime.ProcessId}, " +
-                $"world={GetWorldBusLifecycleStateLocked()}, release={_sessionReleaseAuthorized}; {positionError}";
+                $"world={GetWorldBusLifecycleStateLocked()}, pendingWorld={_activeWorldTransaction is not null}, " +
+                $"dispatches={_worldResultDispatches.Count}, intents={Volatile.Read(ref _queuedWorldIntents)}, " +
+                $"release={_sessionReleaseAuthorized}; {positionError}";
         }
         _diagnostics.Log("Preparation", message);
     }
@@ -206,12 +208,20 @@ internal sealed partial class MultiplayerSessionCoordinator
             if (_loadingHoldStart is not { } current || _start?.SessionId != current.SessionId
                 || _start.LevelGeneration != current.LevelGeneration || !_loadingOverlayAcknowledged
                 || !_localGameplayReady || !_remoteGameplayReady || _lobby is null) return;
-            // Remote Characters are not a release condition: the native hold
-            // pauses the simulation once THE_PLAYER exists, and an accepted
-            // remote spawn only completes while the simulation runs. Waiting
-            // for them here deadlocked every session; they finish spawning
-            // right after the release.
+            // The native preparation pump advances only the Character creation
+            // queue while actor simulation stays held. A submitted spawn is not
+            // sufficient: keep the opaque screen until every mapping is Ready.
+            var localPeer = _host?.HostPeerId ?? _client?.PeerId ?? 0UL;
+            if (_lobby.Players.Any(player => player.PeerId != localPeer &&
+                (!_remoteCharacters.TryGetValue(player.PeerId, out var character) || character == 0U))) return;
+            var runtime = _controller.Snapshot;
+            if (!runtime.IpcConnected || !runtime.EngineThreadReady) return;
+            if (_worldSyncEnabledForSession && (_loadedManifest is not { } loaded
+                || loaded.Session != current.SessionId || loaded.Start != current.LevelGeneration
+                || loaded.Native != runtime.LevelGeneration || loaded.Process != runtime.ProcessId)) return;
             if (_worldSyncEnabledForSession && GetWorldBusLifecycleStateLocked() != WorldBusLifecycleState.Active) return;
+            if (_worldSyncEnabledForSession && (_activeWorldTransaction is not null
+                || _worldResultDispatches.Count != 0 || Volatile.Read(ref _queuedWorldIntents) != 0)) return;
             start = current; host = _host; client = _client;
             release = _sessionReleaseAuthorized;
             if (release)
@@ -300,7 +310,7 @@ internal sealed partial class MultiplayerSessionCoordinator
         {
             EnsureManifestLoadContext(start, generation, processId);
             var key = (start.SessionId, start.LevelGeneration, generation, processId, prepared.BinarySha256);
-            if (_loadedManifest == key) return;
+            lock (_stateGate) if (_loadedManifest == key) return;
             while (true)
             {
                 EnsureManifestLoadContext(start, generation, processId);
@@ -309,7 +319,15 @@ internal sealed partial class MultiplayerSessionCoordinator
                     new Dictionary<string, string>(StringComparer.Ordinal) { ["manifestPath"] = prepared.Path },
                     _lifetime.Token).ConfigureAwait(false);
                 EnsureManifestLoadContext(start, generation, processId);
-                if (result.Executed) { _loadedManifest = key; return; }
+                if (result.Executed)
+                {
+                    lock (_stateGate)
+                    {
+                        EnsureManifestLoadContext(start, generation, processId);
+                        _loadedManifest = key;
+                    }
+                    return;
+                }
                 if (result.StatusCode != "WORLD_MANIFEST_PREPARING")
                     throw new InvalidOperationException($"WORLD_MANIFEST_LOAD failed: {result.StatusCode} - {result.Message}");
                 await Task.Delay(75, _lifetime.Token).ConfigureAwait(false);

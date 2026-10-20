@@ -24,6 +24,9 @@ void Shutdown() noexcept;
 bool SetLoadingHold(bool active, const std::string& sessionId, std::uint32_t generation);
 void ClearLoadingHold() noexcept;
 [[nodiscard]] bool LoadingHeld() noexcept;
+// Called only by MAIN_THREAD_CHARACTER_PROCESSING, using the already certified
+// readiness-producer trampoline. Finishes native creation without actor ticks.
+void PumpLoadingCharacterReadiness(void* readinessProducer) noexcept;
 void LogDiagnostics(Diagnostics& diagnostics);
 
 } // namespace multiplayer_pause

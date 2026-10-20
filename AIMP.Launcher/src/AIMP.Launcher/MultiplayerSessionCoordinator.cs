@@ -4021,6 +4021,12 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         if (!runtime.IpcConnected || !runtime.EngineThreadReady
             || !runtime.CharacterCreateHookInstalled)
             return false;
+        // Manifest registration can occupy the engine thread for seconds.
+        // Do not queue short-lived spawn commands behind it during preparation.
+        if (_loadingHoldStart is not null && _worldSyncEnabledForSession
+            && (_loadedManifest is not { } loaded || loaded.Session != _start.SessionId
+                || loaded.Start != _start.LevelGeneration || loaded.Native != runtime.LevelGeneration
+                || loaded.Process != runtime.ProcessId)) return false;
 
         var localPeerId = LocalPeerId();
         foreach (var player in _lobby.Players

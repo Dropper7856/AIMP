@@ -10,6 +10,7 @@
 #include "aimp/LevelGenerationTracker.h"
 #include "aimp/NativeLimits.h"
 #include "aimp/PlayerSyncObserver.h"
+#include "aimp/MultiplayerPause.h"
 #include "aimp/RuntimeFeatureFlags.h"
 #include "aimp/ReplicationCore.h"
 #include "aimp/SignatureResolver.h"
@@ -221,6 +222,12 @@ std::uint32_t __cdecl MainThreadCharacterProcessingDetour() noexcept {
     const auto original = reinterpret_cast<MainThreadCallback>(
         gMainThreadTrampoline.load(std::memory_order_acquire));
     const auto result = original == nullptr ? 0U : original();
+
+    // The loading hold skips CharacterManagerUpdate, including its creation
+    // queue. Only advance that queue here; keep gameplay simulation held.
+    if (runtime_features::Enabled(runtime_features::Feature::GameThreadPumps))
+        multiplayer_pause::PumpLoadingCharacterReadiness(
+            gReadinessProducerTrampoline.load(std::memory_order_acquire));
 
     if (runtime_features::Enabled(runtime_features::Feature::GameThreadPumps)) {
         static_cast<void>(replication_core::PumpDeferredRemoteApplyOnEngineThread());
