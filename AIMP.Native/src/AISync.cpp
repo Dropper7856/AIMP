@@ -100,6 +100,9 @@ using TargetEligibility = std::uint32_t(__thiscall*)(void*);
 using RecordInvalid = std::uint8_t(__thiscall*)(void*);
 using BackstageUpdate = std::uint8_t(__thiscall*)(void*);
 using BackstageHoldUpdate = void(__thiscall*)(void*);
+// 007216A0: ECX=controller, no stack arguments. Both exits tail-call
+// 00414610, whose children read CharacterManager's first player directly.
+using BackstageControllerUpdate = void(__thiscall*)(void*);
 // FUN_006D85E0: ECX=Alien AI controller, no stack arguments, plain RET.
 // It is the native producer for sweep+0x51; feeding a transient request here
 // preserves its explicit Character restrictions instead of forcing the sweep.
@@ -134,6 +137,10 @@ struct ParticipantProbe final {
     bool backstageReadable{};
     std::uint32_t backstageState{}, backstageKeyA{}, backstageKeyB{};
     std::uint8_t backstageEnabled{}, backstagePolicy{};
+    bool backstageControllerReadable{}, backstageDistanceReadable{};
+    std::uint32_t backstageControllerState{};
+    std::uint8_t backstageRequestC{}, backstageRequestD{}, backstageRequestE{};
+    float backstageVentDistance{};
     bool navigationCached{}, navigationGoalKnown{}, navigationQueryPending{}, navigationGoalDirty{};
     std::uint32_t navigationRouteCount{}, navigationEmptyRouteRetries{};
 };
@@ -460,8 +467,8 @@ thread_local Actor* gUpdating{};
 // Only AI execution scopes set this. It prevents the multiplayer compatibility
 // resolver from changing THE_PLAYER for camera/UI/inventory/mission code.
 thread_local std::uintptr_t gAiPlayerQueryOwner{};
-std::atomic<void*> gBackstageUpdateOriginal{}, gBackstageHoldOriginal{};
-void* gBackstageUpdateTrampoline{}, *gBackstageHoldTrampoline{};
+std::atomic<void*> gBackstageUpdateOriginal{}, gBackstageHoldOriginal{}, gBackstageControllerOriginal{};
+void* gBackstageUpdateTrampoline{}, *gBackstageHoldTrampoline{}, *gBackstageControllerTrampoline{};
 void* gBackstageEligibilityTrampoline{}, *gBackstageEligibilityContinue{};
 std::atomic<void*> gBackstageEligibilityPublished{};
 void* gBackstageNavigationTrampoline{}, *gBackstageNavigationContinue{};
@@ -469,6 +476,7 @@ std::atomic<void*> gBackstageNavigationPublished{};
 std::atomic<std::uint64_t> gBackstageEligibilityOverrides{}, gBackstageNavigationPlans{};
 std::atomic<std::uint64_t> gBackstageNavigationUpdates{}, gBackstageNavigationRejected{};
 std::atomic<std::uint64_t> gBackstageDeadTargetsRejected{}, gBackstageHoldContexts{};
+std::atomic<std::uint64_t> gBackstageControllerContexts{};
 std::atomic<std::uint64_t> gBackstageSurvivorRearmAttempts{}, gBackstageSurvivorRearms{};
 std::atomic<std::uint64_t> gBackstageSurvivorRearmRestricted{}, gBackstageSurvivorRearmFailures{};
 std::atomic<std::uint64_t> gLastBackstageSurvivorPeer{};
@@ -1324,6 +1332,27 @@ std::uint8_t __fastcall BackstageUpdateDetour(void* sweep, void*) noexcept {
     { AiPlayerSlotScope context(owner); result = original(sweep); }
     gAiPlayerQueryOwner = previous;
     return result;
+}
+void __fastcall BackstageControllerDetour(void* controller, void*) noexcept {
+    const auto original = reinterpret_cast<BackstageControllerUpdate>(gBackstageControllerOriginal.load());
+    if (original == nullptr) return;
+    const auto address = reinterpret_cast<std::uintptr_t>(controller);
+    std::uintptr_t sweep{}, controllerOwner{};
+    auto owner = Read(address + 0x1CU, sweep) ? HostBackstageOwner(sweep) : 0U;
+    if (owner != 0U && (!Read(address + 4U, controllerOwner) || controllerOwner != owner)) owner = 0U;
+    const auto previous = gAiPlayerQueryOwner;
+    if (owner != 0U) {
+        gAiPlayerQueryOwner = owner;
+        gBackstageControllerContexts.fetch_add(1U, std::memory_order_relaxed);
+    }
+    // A scope around 0040C1C0 alone ends before this controller's tail call
+    // into 00414610. The exit planner's 00413F80/00414200 then use the dead
+    // Host position through the first-player array, independently of THE_PLAYER.
+    // Keep the same living-player context through the whole native update,
+    // including both tail-call paths. RAII restores the real slot on return;
+    // AiPlayerSlotScope leaves living Hosts, Clients and retail play untouched.
+    { AiPlayerSlotScope context(owner); original(controller); }
+    gAiPlayerQueryOwner = previous;
 }
 void __fastcall BackstageHoldDetour(void* cycle, void*) noexcept {
     const auto original = reinterpret_cast<BackstageHoldUpdate>(gBackstageHoldOriginal.load());
@@ -6236,6 +6265,20 @@ void SampleParticipantPerception(Actor& actor, const std::uintptr_t manager, con
         sweepOwner == actor.character && Read(sweep + 0x28U, sample.backstageState) &&
         Read(sweep + 0x2CU, sample.backstageKeyA) && Read(sweep + 0x30U, sample.backstageKeyB) &&
         Read(sweep + 0x51U, sample.backstageEnabled) && Read(sweep + 0x53U, sample.backstagePolicy);
+    if (sample.backstageReadable) {
+        sample.backstageControllerReadable = Read(backstageAdapter + 0x10U, sample.backstageControllerState) &&
+            Read(backstageAdapter + 0xCU, sample.backstageRequestC) &&
+            Read(backstageAdapter + 0xDU, sample.backstageRequestD) &&
+            Read(backstageAdapter + 0xEU, sample.backstageRequestE);
+        float position[3]{}, ventX{}, ventZ{};
+        if (sample.backstageKeyA != 0U && sample.backstageKeyB != 0U &&
+            ReadCharacterPosition(target, position) && Read(sweep + 0x34U, ventX) &&
+            Read(sweep + 0x3CU, ventZ) && FiniteCoordinate(ventX) && FiniteCoordinate(ventZ)) {
+            const auto dx = position[0] - ventX, dz = position[2] - ventZ;
+            sample.backstageVentDistance = std::sqrt(dx * dx + dz * dz);
+            sample.backstageDistanceReadable = std::isfinite(sample.backstageVentDistance);
+        }
+    }
     for (const auto& cached : gParticipantNavigation) {
         if (!cached.initialized || cached.faulted || cached.peer != peer || cached.character != target ||
             cached.nativeGeneration != gCurrent.nativeGeneration || cached.worldGeneration != gCurrent.worldGeneration ||
@@ -6905,6 +6948,7 @@ bool HookBackstageParticipantContext(HookManager& hooks, std::string& error) {
     // 0040C29F: ESI=sweep, EDI=chosen Character, skip only the solo FPS gate.
     // 0040BBFA: EBP=chosen Character, ECX=sweep; EDI is callee-saved already.
     // 004015E0: ECX=4D cycle; aligned native frame, ESI saved, plain RET.
+    // 007216A0: ECX=controller; ESI saved; both tails use controller+24.
     if (!MatchRetailBytes(0x0000C29FU,
             {0x8B,0x87,0x1C,0x03,0x00,0x00,0x85,0xC0,0x74,0x37,0x80,0x78,0x48,0x00,0x74,0x31}) ||
         !MatchRetailBytes(0x0000C2AFU, {0x83,0x7E,0x2C,0x00}) ||
@@ -6926,13 +6970,20 @@ bool HookBackstageParticipantContext(HookManager& hooks, std::string& error) {
         !MatchRetailBytes(0x002F58D0U, {0x56,0x8B,0x71,0x04,0xC7,0x41,0x04,0x00,0x00,0x00,0x00}) ||
         !MatchRetailBytes(0x002F5919U, {0x5E,0xC3}) ||
         !MatchRetailBytes(0x00001628U, {0x8B,0x48,0x08,0x52,0xE8,0x9F,0x82,0x37,0x00}) ||
-        !MatchRetailBytes(0x00001656U, {0x5E,0x8B,0xE5,0x5D,0xC3})) {
+        !MatchRetailBytes(0x00001656U, {0x5E,0x8B,0xE5,0x5D,0xC3}) ||
+        !MatchRetailBytes(0x003216A0U, {0x56,0x8B,0xF1,0x8B,0x46,0x10,0x89,0x46,0x14}) ||
+        !MatchRetailBytes(0x003216FCU, {0x8B,0x4E,0x24,0x5E,0xE9,0x0B,0x2F,0xCF,0xFF}) ||
+        !MatchRetailBytes(0x00321730U, {0x8B,0x4E,0x24,0x5E,0xE9,0xD7,0x2E,0xCF,0xFF}) ||
+        !MatchRetailBytes(0x00014610U, {0x56,0x8B,0xF1,0xE8,0x68,0xF9,0xFF,0xFF})) {
         error = "aisync backstage context: certified registers/stack/route-cache ABI mismatch";
         return false;
     }
     gBackstageEligibilityContinue = reinterpret_cast<void*>(gBase + 0x0000C2AFU);
     gBackstageNavigationContinue = reinterpret_cast<void*>(gBase + 0x0000BC00U);
-    if (!Hook(hooks, "aisync_backstage_participant_update", 0x0000C1C0U,
+    if (!Hook(hooks, "aisync_backstage_controller_player_context", 0x003216A0U,
+            reinterpret_cast<void*>(&BackstageControllerDetour), {0x56,0x8B,0xF1,0x8B,0x46,0x10},
+            &gBackstageControllerTrampoline, &gBackstageControllerOriginal, error) ||
+        !Hook(hooks, "aisync_backstage_participant_update", 0x0000C1C0U,
             reinterpret_cast<void*>(&BackstageUpdateDetour), {0x56,0x8B,0xF1,0x8B,0x4E,0x10},
             &gBackstageUpdateTrampoline, &gBackstageUpdateOriginal, error) ||
         !Hook(hooks, "aisync_backstage_participant_eligibility", 0x0000C29FU,
@@ -8498,6 +8549,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"backstageNavigationRejected", Diagnostics::Unsigned(gBackstageNavigationRejected.load(std::memory_order_relaxed)), true},
          {"backstageDeadTargetsRejected", Diagnostics::Unsigned(gBackstageDeadTargetsRejected.load(std::memory_order_relaxed)), true},
          {"backstageHoldContexts", Diagnostics::Unsigned(gBackstageHoldContexts.load(std::memory_order_relaxed)), true},
+         {"backstageControllerContexts", Diagnostics::Unsigned(gBackstageControllerContexts.load(std::memory_order_relaxed)), true},
          {"backstageSurvivorRearmAttempts", Diagnostics::Unsigned(gBackstageSurvivorRearmAttempts.load(std::memory_order_relaxed)), true},
          {"backstageSurvivorRearms", Diagnostics::Unsigned(gBackstageSurvivorRearms.load(std::memory_order_relaxed)), true},
          {"backstageSurvivorRearmRestricted", Diagnostics::Unsigned(gBackstageSurvivorRearmRestricted.load(std::memory_order_relaxed)), true},
@@ -8809,6 +8861,13 @@ void LogDiagnostics(Diagnostics& diagnostics) {
              {"backstageKeyB", Diagnostics::Unsigned(sample.backstageKeyB), true},
              {"backstageEnabled", Diagnostics::Unsigned(sample.backstageEnabled), true},
              {"backstagePolicy", Diagnostics::Unsigned(sample.backstagePolicy), true},
+             {"backstageControllerReadable", Diagnostics::Boolean(sample.backstageControllerReadable), true},
+             {"backstageControllerState", Diagnostics::Unsigned(sample.backstageControllerState), true},
+             {"backstageRequestC", Diagnostics::Unsigned(sample.backstageRequestC), true},
+             {"backstageRequestD", Diagnostics::Unsigned(sample.backstageRequestD), true},
+             {"backstageRequestE", Diagnostics::Unsigned(sample.backstageRequestE), true},
+             {"backstageDistanceReadable", Diagnostics::Boolean(sample.backstageDistanceReadable), true},
+             {"backstageVentDistance", std::to_string(sample.backstageDistanceReadable ? sample.backstageVentDistance : 0.0F), true},
              {"navigationCached", Diagnostics::Boolean(sample.navigationCached), true},
              {"navigationGoalKnown", Diagnostics::Boolean(sample.navigationGoalKnown), true},
              {"navigationRouteCount", Diagnostics::Unsigned(sample.navigationRouteCount), true},
