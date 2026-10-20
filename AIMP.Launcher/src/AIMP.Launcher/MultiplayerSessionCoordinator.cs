@@ -98,6 +98,9 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private Task<RemoteEquipmentCatalogSet?>? _remoteEquipmentCatalogPreparation;
     private bool _worldActivationRunning;
     private bool _worldActivationAttempted;
+    // A failed activation (manifest still preparing, peer context not ready)
+    // is retried during the loading hold instead of leaving WorldSync parked.
+    private DateTimeOffset _nextWorldActivationRetryUtc;
     private bool _worldSyncEnabledForSession = true;
     private TaskCompletionSource<WorldMutationResult>? _pendingWorldProbeResult;
     private TaskCompletionSource<IReadOnlyList<WorldNetworkMutationAck>>? _pendingWorldProbeAckResult;
@@ -2312,6 +2315,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _remoteEquipmentCatalogPreparation = null;
         _worldActivationRunning = false;
         _worldActivationAttempted = false;
+        _nextWorldActivationRetryUtc = DateTimeOffset.MinValue;
         ClearPendingWorldProbeState();
     }
 
@@ -3726,6 +3730,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             if (!_worldSyncEnabledForSession || host is null || _start is null || !_localGameplayReady
                 || _localWorldContext is { Ready: true }
                 || _worldActivationRunning || _worldActivationAttempted
+                || DateTimeOffset.UtcNow < _nextWorldActivationRetryUtc
                 || !runtime.IpcConnected || !runtime.EngineThreadReady || runtime.LevelGeneration <= 0)
                 return;
             loadingStart = _start;
@@ -3776,8 +3781,18 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         {
             if (!_lifetime.IsCancellationRequested && exception is not OperationCanceledException)
             {
-                _diagnostics.Log("WorldSync", $"World preparation remains held: {exception.Message}");
+                _diagnostics.Log("WorldSync",
+                    $"World preparation remains held, retrying in 2 s: {exception.Message}");
                 await ShowPreparationFailureAsync(exception.Message).ConfigureAwait(false);
+            }
+            lock (_stateGate)
+            {
+                if (_start?.SessionId == loadingStart.SessionId && _start.LevelGeneration == loadingStart.LevelGeneration
+                    && _localWorldContext is not { Ready: true })
+                {
+                    _worldActivationAttempted = false;
+                    _nextWorldActivationRetryUtc = DateTimeOffset.UtcNow.AddSeconds(2);
+                }
             }
         }
         finally

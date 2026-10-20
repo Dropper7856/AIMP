@@ -206,9 +206,11 @@ internal sealed partial class MultiplayerSessionCoordinator
             if (_loadingHoldStart is not { } current || _start?.SessionId != current.SessionId
                 || _start.LevelGeneration != current.LevelGeneration || !_loadingOverlayAcknowledged
                 || !_localGameplayReady || !_remoteGameplayReady || _lobby is null) return;
-            var localPeer = _host?.HostPeerId ?? _client?.PeerId ?? 0UL;
-            if (_lobby.Players.Any(player => player.PeerId != localPeer &&
-                (!_remoteCharacters.TryGetValue(player.PeerId, out var character) || character == 0U))) return;
+            // Remote Characters are not a release condition: the native hold
+            // pauses the simulation once THE_PLAYER exists, and an accepted
+            // remote spawn only completes while the simulation runs. Waiting
+            // for them here deadlocked every session; they finish spawning
+            // right after the release.
             if (_worldSyncEnabledForSession && GetWorldBusLifecycleStateLocked() != WorldBusLifecycleState.Active) return;
             start = current; host = _host; client = _client;
             release = _sessionReleaseAuthorized;

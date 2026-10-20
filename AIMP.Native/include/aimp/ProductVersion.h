@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.213-loading-startup";
+    "0.11.4.214-loading-barrier";
 
 } // namespace aimp
