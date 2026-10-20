@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <cmath>
 #include <cstring>
 #include <initializer_list>
 #include <mutex>
@@ -44,6 +45,7 @@ std::string gLoadingSession;
 std::uint32_t gLoadingGeneration{};
 bool gLoadingReleased{};
 std::unordered_map<std::string, std::uint32_t> gReleasedLoadingGenerations;
+std::atomic<std::uint64_t> gLoadingStartupPasses{}, gLoadingActorHolds{};
 std::atomic<std::uint64_t> gQueries{}, gFiltered{}, gSafetyPreserved{}, gReadFailures{};
 std::atomic<std::uint32_t> gLastMenuFlags{}, gLastRemainingReasons{};
 std::atomic<std::uint64_t> gPauseGameFiltered{}, gUiContextRejected{};
@@ -161,10 +163,41 @@ std::uint32_t __cdecl SimulationPauseBits(const std::uintptr_t pauseManager) noe
     return flags & FilterMask(pauseManager, flags, kRetailMask);
 }
 
-// This synthetic predicate never writes retail pause flags or starves loading work.
+bool LoadingWorldHasPlayer(const std::uintptr_t pauseManager) noexcept {
+    if (!ActiveMultiplayerWorld(pauseManager)) return false;
+    // Existing PlayerSyncObserver / PlayerLifecycle THE_PLAYER resolution. Do
+    // not stop the updates responsible for creating and registering that player.
+    std::uintptr_t root{}, context{}, players{}, player{}, equipment{}, presentation{};
+    std::uint32_t count{};
+    std::int32_t state{};
+    float x{}, y{}, z{};
+    if (!Read(gBase + kGlobalRoot, root) || root == 0U ||
+        !Read(root + 0x08U, context) || context == 0U ||
+        !Read(context + 0x84U, count) || count == 0U ||
+        !Read(context + 0x80U, players) || players == 0U ||
+        !Read(players, player) || player == 0U ||
+        !Read(player + 0x1100U, equipment) || equipment == 0U ||
+        !Read(equipment + 0x152CU, presentation) || presentation == 0U ||
+        !Read(presentation + 0x04U, state) || state < 0 || state > 64 ||
+        !Read(player + 0x70U, x) || !Read(player + 0x74U, y) || !Read(player + 0x78U, z))
+        return false;
+    std::uintptr_t currentRoot{};
+    return std::isfinite(x) && std::isfinite(y) && std::isfinite(z) &&
+        std::abs(x) < 100000.0F && std::abs(y) < 100000.0F && std::abs(z) < 100000.0F &&
+        Read(gBase + kGlobalRoot, currentRoot) && currentRoot == root &&
+        ActiveMultiplayerWorld(pauseManager);
+}
+
+// Arm survives transitions, but actor hold starts only in an initialized world.
+// Retail streaming/player creation must run to produce the readiness evidence.
 std::uint32_t __cdecl LoadingSimulationPauseBits(const std::uintptr_t pauseManager) noexcept {
-    if (gEnabled.load(std::memory_order_acquire) && gLoadingHold.load(std::memory_order_acquire))
-        return kRetailMask;
+    if (gEnabled.load(std::memory_order_acquire) && gLoadingHold.load(std::memory_order_acquire)) {
+        if (LoadingWorldHasPlayer(pauseManager)) {
+            gLoadingActorHolds.fetch_add(1U, std::memory_order_relaxed);
+            return kRetailMask;
+        }
+        gLoadingStartupPasses.fetch_add(1U, std::memory_order_relaxed);
+    }
     return SimulationPauseBits(pauseManager);
 }
 
@@ -537,6 +570,8 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"enabled", Diagnostics::Boolean(gEnabled.load()), true},
          {"sites", "42", true},
          {"loadingHold", Diagnostics::Boolean(LoadingHeld()), true},
+         {"loadingStartupPasses", Diagnostics::Unsigned(gLoadingStartupPasses.load()), true},
+         {"loadingActorHolds", Diagnostics::Unsigned(gLoadingActorHolds.load()), true},
          {"menuReasonMask", Diagnostics::Unsigned(kMenuReasons), true},
          {"pauseGameReason", Diagnostics::Unsigned(kPauseGameReason), true},
          {"queries", Diagnostics::Unsigned(gQueries.load()), true},

@@ -22,6 +22,23 @@ internal sealed partial class MultiplayerSessionCoordinator
     private DateTimeOffset _nextPreparedReportUtc;
     private DateTimeOffset _nextManifestPreloadUtc;
     private Guid _loadingOverlayConnection;
+    private DateTimeOffset _nextPreparationProgressUtc;
+
+    private void ReportSessionPreparationProgress(NativeRuntimeSnapshot runtime, DateTimeOffset now, string positionError)
+    {
+        string message;
+        lock (_stateGate)
+        {
+            if (_loadingHoldStart is null || now < _nextPreparationProgressUtc) return;
+            _nextPreparationProgressUtc = now.AddSeconds(5);
+            message = $"Loading barrier: overlay={_loadingOverlayAcknowledged}, position={_positionAvailable}, " +
+                $"spawnStable={_gameplayReadiness.IsReady(now)}, localReady={_localGameplayReady}, remoteReady={_remoteGameplayReady}, " +
+                $"characters={_remoteCharacters.Count}/{Math.Max(0, (_lobby?.Players.Count ?? 1) - 1)}, " +
+                $"manifest={_loadedManifest is { } loaded && loaded.Native == runtime.LevelGeneration && loaded.Process == runtime.ProcessId}, " +
+                $"world={GetWorldBusLifecycleStateLocked()}, release={_sessionReleaseAuthorized}; {positionError}";
+        }
+        _diagnostics.Log("Preparation", message);
+    }
 
     private void ScheduleLobbyPreparation(LobbySnapshotPayload lobby)
     {
@@ -305,7 +322,7 @@ internal sealed partial class MultiplayerSessionCoordinator
         LobbyStartPayload? start;
         lock (_stateGate)
         {
-            if (_manifestPreloadRunning || DateTimeOffset.UtcNow < _nextManifestPreloadUtc || !_worldSyncEnabledForSession || !_uiGameplayLoaded || !_positionAvailable
+            if (_manifestPreloadRunning || DateTimeOffset.UtcNow < _nextManifestPreloadUtc || !_worldSyncEnabledForSession || !_uiGameplayLoaded
                 || !runtime.IpcConnected || !runtime.EngineThreadReady || runtime.LevelGeneration <= 0) return;
             preparation = _automaticWorldManifestPreparation; start = _start;
             if (start is null || preparation is null) return;
