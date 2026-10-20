@@ -10,6 +10,8 @@ internal static class Program
         new("WS3 wire, authority and manifest", ProtocolTests.WorldPublicActionContractAsync),
         new("WS3 local effect boundary", WorldPublicActionTests.LocalEffectBoundaryAsync),
         new("Lobby lifecycle", ProtocolTests.LobbyLifecycleAsync),
+        new("Lobby manifest preflight", PreparationTests.LobbyManifestPreflightAsync),
+        new("Session loading barrier", PreparationTests.SessionReleaseBarrierAsync),
         new("AI process selection", LauncherTests.ProcessSelectionAsync),
         new("Native DLL priority", LauncherTests.NativeDllPriorityAsync),
         new("Native module matching", LauncherTests.NativeModuleMatchingAsync),

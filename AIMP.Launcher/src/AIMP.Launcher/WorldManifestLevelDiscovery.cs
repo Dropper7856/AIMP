@@ -15,19 +15,19 @@ internal static class WorldManifestLevelDiscovery
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(gameDirectory);
 
-        var installation = GameInstallation.Resolve(gameDirectory);
-        var production = Path.Combine(
-            installation.GameDirectory, "DATA", "ENV", "PRODUCTION");
-        if (!Directory.Exists(production))
+        var production = GetProductionDirectory(gameDirectory);
+        var dlc = GetDlcDirectory(gameDirectory);
+        if (!Directory.Exists(dlc))
         {
             throw new DirectoryNotFoundException(
-                $"Alien: Isolation production environment directory was not found: '{production}'.");
+                $"Alien: Isolation DLC directory was not found: '{dlc}'.");
         }
 
         var levels = new List<WorldManifestLevelSource>();
         var pending = new Stack<(string Directory, int Depth)>();
         var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        pending.Push((production, 0));
+        // Campaign support is disabled for this release. Never scan its levels.
+        pending.Push((dlc, 0));
 
         while (pending.Count != 0)
         {
@@ -61,6 +61,9 @@ internal static class WorldManifestLevelDiscovery
         var installation = GameInstallation.Resolve(gameDirectory);
         return Path.Combine(installation.GameDirectory, "DATA", "ENV", "PRODUCTION");
     }
+
+    internal static string GetDlcDirectory(string gameDirectory) =>
+        Path.Combine(GetProductionDirectory(gameDirectory), "DLC");
 
     private static WorldManifestLevelSource CreateLevelSource(
         string production,

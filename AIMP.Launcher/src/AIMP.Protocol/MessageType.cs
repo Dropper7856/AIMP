@@ -63,6 +63,10 @@ public enum MessageType : ushort
     ItemSpawnProposal = 126, // Client -> Host only; GCIP spawn result or player drop.
     ItemSpawnDecision = 127, // Host -> Clients only; first decision per owner, every drop.
 
+    LobbyPreparation = 128,
+    SessionPrepared = 129,
+    SessionRelease = 130,
+
     TestModeConfigure = 200,
     CapabilityQuery = 201,
     CapabilityState = 202,

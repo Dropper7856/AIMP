@@ -8,24 +8,33 @@ internal sealed class GameLaunchCoordinator
     private readonly UiPakInstaller _uiInstaller;
     private readonly ScaleformBridgeListener _bridge;
     private readonly LauncherDiagnostics _diagnostics;
+    private readonly GamePreparationService _preparation;
 
     internal GameLaunchCoordinator(
         LauncherSettingsStore settings,
         UiPakInstaller uiInstaller,
         ScaleformBridgeListener bridge,
-        LauncherDiagnostics diagnostics)
+        LauncherDiagnostics diagnostics,
+        GamePreparationService preparation)
     {
         _settings = settings ?? throw new ArgumentNullException(nameof(settings));
         _uiInstaller = uiInstaller ?? throw new ArgumentNullException(nameof(uiInstaller));
         _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
         _diagnostics = diagnostics ?? throw new ArgumentNullException(nameof(diagnostics));
+        _preparation = preparation;
     }
 
     internal async Task<int> LaunchAsync(CancellationToken cancellationToken = default)
     {
         var settings = _settings.Load();
-        WorldSync3LauncherOptions.ApplyProcessEnvironment(settings);
         var game = ResolveConfiguredGame(settings);
+        EnsureGameIsNotRunning();
+        await _preparation.EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+        var latestSettings = _settings.Load();
+        if (!string.Equals(settings.GameDirectory, latestSettings.GameDirectory, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("The installation changed during preparation. Launch again.");
+        settings = latestSettings;
+        WorldSync3LauncherOptions.ApplyProcessEnvironment(settings);
         EnsureGameIsNotRunning();
         _bridge.Start();
         return await Task.Run(() => InstallAndLaunch(game, settings), cancellationToken)

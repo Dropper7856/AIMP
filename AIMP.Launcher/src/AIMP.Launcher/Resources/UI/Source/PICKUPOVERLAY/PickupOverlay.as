@@ -125,6 +125,18 @@ package
       
       private var aimp_cathode_command_count:int = 0;
       
+      private var aimp_loading_layer:Sprite;
+
+      private var aimp_loading_text:TextField;
+
+      private var aimp_loading_session:String = "";
+
+      private var aimp_loading_generation:String = "";
+
+      // Preserve release tombstones when the visible layer is removed. A delayed
+      // status or HELLO replay must never cover an already released world again.
+      private var aimp_loading_released:Object = {};
+
       private var aimp_round_end_layer:Sprite;
       
       private var aimp_round_end_count_text:TextField;
@@ -559,6 +571,7 @@ package
          removeEventListener(Event.ENTER_FRAME,this.aimp_on_bridge_frame);
          this.aimp_bridge_init_pending = false;
          this.aimp_hide_round_end();
+         this.aimp_hide_loading();
          this.aimp_close_bridge();
          this.aimp_returning = false;
          this.aimp_round_return_pending = false;
@@ -739,6 +752,11 @@ package
          {
             return;
          }
+         if(param1.indexOf("SESSION_LOADING|") == 0)
+         {
+            this.aimp_update_loading(param1);
+            return;
+         }
          if(this.aimp_round_return_pending)
          {
             if(param1.indexOf("ROUND_RETURN_CLOSE|") == 0 &&
@@ -799,6 +817,68 @@ package
          }
       }
       
+      // Native actor simulation is held independently of this display. The movie
+      // keeps advancing and servicing its socket while native manifest work runs.
+      private function aimp_update_loading(param1:String) : void
+      {
+         var sessionId:String = this.aimp_get_bridge_value(param1,"sessionId");
+         var generation:String = this.aimp_get_bridge_value(param1,"generation");
+         var active:Boolean = this.aimp_get_bridge_value(param1,"active") == "1";
+         var message:String = this.aimp_get_bridge_value(param1,"message");
+         var width:Number = stage != null ? stage.stageWidth : 1280;
+         var height:Number = stage != null ? stage.stageHeight : 720;
+         var generationNumber:Number = Number(generation);
+         if(sessionId == "" || generation == "" || isNaN(generationNumber)
+            || generationNumber < 1 || generationNumber > 2147483647
+            || generationNumber != Math.floor(generationNumber)) return;
+         if(active && this.aimp_loading_released[sessionId] != undefined
+            && generationNumber <= Number(this.aimp_loading_released[sessionId])) return;
+         if(!active && (sessionId != this.aimp_loading_session || generation != this.aimp_loading_generation)
+            && (this.aimp_loading_released[sessionId] == undefined
+                || generationNumber != Number(this.aimp_loading_released[sessionId]))) return;
+         if(active && this.aimp_loading_session != "" &&
+            (sessionId != this.aimp_loading_session || Number(generation) < Number(this.aimp_loading_generation))) return;
+         if(active)
+         {
+            if(this.aimp_loading_layer == null)
+            {
+               this.aimp_loading_layer = new Sprite();
+               this.aimp_loading_layer.mouseEnabled = true;
+               this.aimp_loading_layer.mouseChildren = false;
+               this.aimp_loading_layer.graphics.beginFill(0,1);
+               this.aimp_loading_layer.graphics.drawRect(0,0,width,height);
+               this.aimp_loading_layer.graphics.endFill();
+               this.aimp_loading_layer.addChild(this.aimp_create_round_end_text("PREPARING MULTIPLAYER",42,width,height * 0.40));
+               this.aimp_loading_text = this.aimp_create_round_end_text("",26,width,height * 0.55);
+               this.aimp_loading_layer.addChild(this.aimp_loading_text);
+               addChild(this.aimp_loading_layer);
+            }
+            this.aimp_loading_session = sessionId;
+            this.aimp_loading_generation = generation;
+            this.aimp_loading_text.text = message == "" ? "Preparing world and waiting for players..." : message;
+            setChildIndex(this.aimp_loading_layer,numChildren - 1);
+         }
+         else
+         {
+            this.aimp_loading_released[sessionId] = generationNumber;
+            // An idempotent release for an older token must not remove a newer
+            // active loading layer, even though its own acknowledgement is valid.
+            if(sessionId == this.aimp_loading_session && generation == this.aimp_loading_generation)
+               this.aimp_hide_loading();
+         }
+         this.aimp_send_bridge_message("SESSION_LOADING_ACK|source=pickup_overlay|phase=gameplay|active=" + (active ? "1" : "0") + "|sessionId=" + this.aimp_encode_bridge_value(sessionId) + "|generation=" + this.aimp_encode_bridge_value(generation));
+      }
+
+      private function aimp_hide_loading() : void
+      {
+         if(this.aimp_loading_layer != null && this.aimp_loading_layer.parent != null)
+            this.aimp_loading_layer.parent.removeChild(this.aimp_loading_layer);
+         this.aimp_loading_layer = null;
+         this.aimp_loading_text = null;
+         this.aimp_loading_session = "";
+         this.aimp_loading_generation = "";
+      }
+
       private function aimp_show_round_end(param1:String) : void
       {
          var _loc2_:String = this.aimp_get_bridge_value(param1,"title");
@@ -1340,6 +1420,7 @@ package
       
       public function HandleInput(param1:*) : *
       {
+         if(this.aimp_loading_layer != null) return;
          switch(this.m_state)
          {
             case this.STATE_CONTAINER:

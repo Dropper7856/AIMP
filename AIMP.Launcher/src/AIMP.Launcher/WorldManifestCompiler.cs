@@ -57,6 +57,13 @@ internal sealed class WorldManifestCompiler
         bool useCache = true,
         IProgress<WorldManifestCompilerProgress>? progress = null)
     {
+        lock (GamePreparationSynchronization.Gate)
+            return CompileCore(levelOrWorldPath, outputPath, jsonPath, useCache, progress);
+    }
+
+    private WorldManifestCompilationResult CompileCore(string levelOrWorldPath, string? outputPath,
+        string? jsonPath, bool useCache, IProgress<WorldManifestCompilerProgress>? progress)
+    {
         ReportProgress(progress, 0, "Preparing manifest compilation...");
         ResetCompilationState();
 
@@ -2057,7 +2064,7 @@ internal sealed class WorldManifestCompiler
         return new string(buffer, 0, length);
     }
 
-    private static string ResolveWorldDirectory(string levelOrWorldPath)
+    internal static string ResolveWorldDirectory(string levelOrWorldPath)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(levelOrWorldPath);
         var fullPath = Path.GetFullPath(levelOrWorldPath);
@@ -2076,7 +2083,7 @@ internal sealed class WorldManifestCompiler
         if (!Directory.Exists(fullPath)) throw new DirectoryNotFoundException(fullPath);
         if (File.Exists(Path.Combine(fullPath, "COMMANDS.PAK")) || File.Exists(Path.Combine(fullPath, "COMMANDS.BIN"))) return fullPath;
 
-        var world = Path.Combine(fullPath, "WORLD");
+        var world = RipleyCharacterInstaller.ResolveWorldDirectory(fullPath);
         if (File.Exists(Path.Combine(world, "COMMANDS.PAK")) || File.Exists(Path.Combine(world, "COMMANDS.BIN"))) return world;
 
         throw new DirectoryNotFoundException($"'{fullPath}' does not contain WORLD/COMMANDS.PAK or WORLD/COMMANDS.BIN.");

@@ -244,6 +244,7 @@ internal sealed partial class MultiplayerSessionCoordinator
 
     private async Task RequestNativeFrontendAsync()
     {
+        await ReleaseSessionLoadingBestEffortAsync().ConfigureAwait(false);
         try
         {
             var result = await _controller.ExecuteCommandAsync(GameCommandNames.ReturnToFrontend,

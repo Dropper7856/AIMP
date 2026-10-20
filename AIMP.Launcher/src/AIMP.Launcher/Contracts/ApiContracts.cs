@@ -1,5 +1,9 @@
 namespace AIMP.Launcher.Contracts;
 
+public sealed record GamePreparationDto(string JobId, string GameDirectory, string State,
+    string Stage, int Percentage, int CompletedLevels, int TotalLevels, string CurrentLevel,
+    string Message, string Error, DateTimeOffset? StartedAtUtc, DateTimeOffset? CompletedAtUtc);
+
 public sealed record LauncherStatusResponse(
     string LauncherVersion,
     NativeRuntimeStatus Runtime,

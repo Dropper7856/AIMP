@@ -1579,7 +1579,8 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteWorldRegistryProbe(
             std::filesystem::path(command.manifestPath),
             static_cast<std::uint32_t>(generations_->CurrentGeneration()),
             error)) {
-        result.statusCode = "WORLD_MANIFEST_REJECTED";
+        result.statusCode = error == "WORLD_MANIFEST_PREPARING"
+            ? "WORLD_MANIFEST_PREPARING" : "WORLD_MANIFEST_REJECTED";
         result.message = error;
         return result;
     }
@@ -1887,7 +1888,8 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteWorldManifestLoad(
             std::filesystem::path(command.manifestPath),
             static_cast<std::uint32_t>(generations_->CurrentGeneration()),
             error)) {
-        result.statusCode = "WORLD_MANIFEST_REJECTED";
+        result.statusCode = error == "WORLD_MANIFEST_PREPARING"
+            ? "WORLD_MANIFEST_PREPARING" : "WORLD_MANIFEST_REJECTED";
         result.message = error;
         return result;
     }
