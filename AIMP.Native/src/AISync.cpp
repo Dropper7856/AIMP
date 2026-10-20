@@ -100,13 +100,8 @@ using TargetEligibility = std::uint32_t(__thiscall*)(void*);
 using RecordInvalid = std::uint8_t(__thiscall*)(void*);
 using BackstageUpdate = std::uint8_t(__thiscall*)(void*);
 using BackstageHoldUpdate = void(__thiscall*)(void*);
-// 007216A0: ECX=controller, no stack arguments. Both exits tail-call
-// 00414610, whose children read CharacterManager's first player directly.
-using BackstageControllerUpdate = void(__thiscall*)(void*);
-// FUN_006D85E0: ECX=Alien AI controller, no stack arguments, plain RET.
-// It is the native producer for sweep+0x51; feeding a transient request here
-// preserves its explicit Character restrictions instead of forcing the sweep.
-using BackstageActivationRefresh = void(__thiscall*)(void*);
+// 006EFD10: ECX=BT condition, owner and execution context on stack, RET 8.
+using TargetIsPlayer = std::uint32_t(__thiscall*)(void*, std::uintptr_t, std::uintptr_t);
 using NavigationGoal = void(__thiscall*)(void*, const float*);
 using NavigationUpdate = void(__thiscall*)(void*);
 // Owned shared path-query reference at +0/+4, ECX only, plain RET.
@@ -467,8 +462,16 @@ thread_local Actor* gUpdating{};
 // Only AI execution scopes set this. It prevents the multiplayer compatibility
 // resolver from changing THE_PLAYER for camera/UI/inventory/mission code.
 thread_local std::uintptr_t gAiPlayerQueryOwner{};
-std::atomic<void*> gBackstageUpdateOriginal{}, gBackstageHoldOriginal{}, gBackstageControllerOriginal{};
-void* gBackstageUpdateTrampoline{}, *gBackstageHoldTrampoline{}, *gBackstageControllerTrampoline{};
+std::atomic<void*> gBackstageUpdateOriginal{}, gBackstageHoldOriginal{}, gTargetIsPlayerOriginal{};
+void* gBackstageUpdateTrampoline{}, *gBackstageHoldTrampoline{}, *gTargetIsPlayerTrampoline{};
+void* gMenacePlayerTrampoline{}, *gMenacePlayerContinue{};
+std::atomic<void*> gMenacePlayerPublished{};
+void* gSoundSourceClassTrampoline{}, *gSoundSourceClassContinue{};
+void* gSoundBackstageClassTrampoline{}, *gSoundBackstageClassContinue{};
+void* gSoundThreatClassTrampoline{}, *gSoundThreatClassContinue{};
+void* gSoundLostClassTrampoline{}, *gSoundLostClassContinue{};
+std::atomic<void*> gSoundSourceClassPublished{}, gSoundBackstageClassPublished{};
+std::atomic<void*> gSoundThreatClassPublished{}, gSoundLostClassPublished{};
 void* gBackstageEligibilityTrampoline{}, *gBackstageEligibilityContinue{};
 std::atomic<void*> gBackstageEligibilityPublished{};
 void* gBackstageNavigationTrampoline{}, *gBackstageNavigationContinue{};
@@ -476,10 +479,7 @@ std::atomic<void*> gBackstageNavigationPublished{};
 std::atomic<std::uint64_t> gBackstageEligibilityOverrides{}, gBackstageNavigationPlans{};
 std::atomic<std::uint64_t> gBackstageNavigationUpdates{}, gBackstageNavigationRejected{};
 std::atomic<std::uint64_t> gBackstageDeadTargetsRejected{}, gBackstageHoldContexts{};
-std::atomic<std::uint64_t> gBackstageControllerContexts{};
-std::atomic<std::uint64_t> gBackstageSurvivorRearmAttempts{}, gBackstageSurvivorRearms{};
-std::atomic<std::uint64_t> gBackstageSurvivorRearmRestricted{}, gBackstageSurvivorRearmFailures{};
-std::atomic<std::uint64_t> gLastBackstageSurvivorPeer{};
+std::atomic<std::uint64_t> gTargetPlayerOverrides{}, gMenacePlayerOverrides{}, gSoundPlayerOverrides{};
 // Same data layout as the optional player route cache made by 006EE5B0.
 // Only AISync owns these buffers and their +0/+4 shared query references.
 // No player controller is fabricated or installed on a PlayerSync Character.
@@ -918,6 +918,50 @@ std::uint64_t PeerForParticipant(const std::uintptr_t character) noexcept {
     return 0U;
 }
 
+bool HostParticipantPlayerQuery(const std::uintptr_t owner, const std::uintptr_t target) noexcept {
+    std::uint32_t type{};
+    return gRole.load(std::memory_order_acquire) == Role::Host && EngineThread() && Stable() &&
+        owner != 0U && target != owner && Eligible(owner, type) &&
+        RegisteredPlayerRepresentation(target) && PeerForParticipant(target) != 0U && LivingCharacter(target);
+}
+std::uint32_t __fastcall TargetIsPlayerDetour(void* condition, void*,
+    const std::uintptr_t owner, const std::uintptr_t execution) noexcept {
+    const auto original = reinterpret_cast<TargetIsPlayer>(gTargetIsPlayerOriginal.load());
+    if (original == nullptr) return 0U;
+    const auto result = original(condition, owner, execution);
+    if (result != 0U || owner == 0U || gAiPlayerQueryOwner != owner) return result;
+    // Match the selected record and its native lifetime checks before adapting
+    // the final local-FPS test. Never create/promote a candidate here.
+    std::uintptr_t selection{}, manager{}, managerOwner{}, record{}, recordOwner{}, target{};
+    std::uint32_t recordedBirth{}, currentBirth{};
+    std::uint8_t nativeWorldReady{};
+    if (!Read(gBase + kInteractionManagerGlobalRva + 4U, nativeWorldReady) || nativeWorldReady == 0U ||
+        !Read(owner + 0x34A8U, selection) || selection == 0U ||
+        !Read(selection + 4U, manager) || manager == 0U ||
+        !Read(manager + 0x128U, managerOwner) || managerOwner != owner ||
+        !Read(selection + 0x10U, record) || record == 0U ||
+        !Read(record + 8U, recordOwner) || recordOwner != owner ||
+        !Read(record + 0x42CU, target) || !HostParticipantPlayerQuery(owner, target) ||
+        !Read(record + 0x430U, recordedBirth) || !Read(target + 0x50U, currentBirth) ||
+        recordedBirth != currentBirth) return result;
+    gTargetPlayerOverrides.fetch_add(1U, std::memory_order_relaxed);
+    return 1U;
+}
+std::uint32_t __cdecl MenaceParticipantPlayer(const std::uintptr_t menace,
+    const std::uintptr_t target) noexcept {
+    std::uintptr_t owner{}, ownedMenace{};
+    if (!Read(menace + 0x1D0U, owner) || gAiPlayerQueryOwner != owner ||
+        !HostParticipantPlayerQuery(owner, target) || !Read(owner + 0x34D0U, ownedMenace) ||
+        ownedMenace != menace) return 0U;
+    gMenacePlayerOverrides.fetch_add(1U, std::memory_order_relaxed);
+    return 1U;
+}
+std::uint32_t __cdecl SoundParticipantPlayer(const std::uintptr_t target) noexcept {
+    if (!HostParticipantPlayerQuery(gSenseEventOwner, target)) return 0U;
+    gSoundPlayerOverrides.fetch_add(1U, std::memory_order_relaxed);
+    return 1U;
+}
+
 std::uintptr_t LivingAiParticipant(const std::uintptr_t owner,
     std::uint64_t& peer) noexcept {
     peer = 0U;
@@ -1226,86 +1270,6 @@ std::uintptr_t __cdecl BackstageParticipantNavigation(
     return reinterpret_cast<std::uintptr_t>(found->native.data());
 }
 bool NativeVictimFlowRunning(std::uintptr_t source, std::uintptr_t victim) noexcept;
-bool HiddenBackstageCycle(const std::uintptr_t owner) noexcept {
-    std::uintptr_t cycle{}, cycleOwner{};
-    std::uint8_t state{};
-    return owner != 0U && Read(owner + 0x36CU, cycle) && cycle != 0U &&
-        Read(cycle + 4U, cycleOwner) && cycleOwner == owner &&
-        Read(cycle + 0x1AU, state) && state == 0x4DU;
-}
-bool RearmBackstageSearchForSurvivor(const std::uintptr_t owner,
-    const std::uintptr_t sweep) noexcept {
-    // Retail has only one human player. Once that Character is terminal-dead,
-    // its ordinary producers can leave controller +0C/+0D/+0E all clear after
-    // the Alien withdraws. The physical 4D cycle then keeps running, but
-    // FUN_006D85E0 continually leaves sweep+51 disabled and 0040C1C0 returns
-    // before AIMP's participant eligibility/navigation adaptations are reached.
-    //
-    // Adapt only that impossible-in-retail multiplayer state: an authoritative
-    // Host whose real local player is terminal-dead, an Alien already in its
-    // hidden 4D cycle, and at least one living registered participant. A
-    // transient +0D request is supplied only while the native producer runs;
-    // the controller field is restored immediately. The producer itself still
-    // owns sweep+51, so Character flag 0x1D and the native 0x18 policy remain
-    // authoritative and can refuse the re-arm.
-    if (owner == 0U || sweep == 0U || !HiddenBackstageCycle(owner)) return false;
-
-    const auto realLocal = LocalPlayer();
-    if (!TerminalDeadCharacter(realLocal) || NativeVictimFlowRunning(owner, realLocal)) return false;
-
-    std::uint64_t peer{};
-    if (LivingAiParticipant(owner, peer) == 0U || peer == 0U) return false;
-
-    std::uintptr_t controller{}, ownedSweep{};
-    std::uint8_t enabled{}, requestC{}, requestD{}, requestE{};
-    if (!Read(owner + 0x34F0U, controller) || controller == 0U ||
-        !Read(controller + 0x1CU, ownedSweep) || ownedSweep != sweep ||
-        !Read(sweep + 0x51U, enabled) ||
-        !Read(controller + 0x0CU, requestC) || !Read(controller + 0x0DU, requestD) ||
-        !Read(controller + 0x0EU, requestE) || enabled != 0U) return false;
-
-    // If retail already has a request but still disabled the sweep, an
-    // independent native restriction is active. Never override that state.
-    if (requestC != 0U || requestD != 0U || requestE != 0U) return false;
-
-    gBackstageSurvivorRearmAttempts.fetch_add(1U, std::memory_order_relaxed);
-    constexpr std::uint8_t kSurvivorRequest = 1U;
-    if (!Write(controller + 0x0DU, kSurvivorRequest)) {
-        gBackstageSurvivorRearmFailures.fetch_add(1U, std::memory_order_relaxed);
-        return false;
-    }
-
-    bool refreshed{};
-    __try {
-        reinterpret_cast<BackstageActivationRefresh>(gBase + 0x002D85E0U)(
-            reinterpret_cast<void*>(controller));
-        refreshed = true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        refreshed = false;
-    }
-
-    const bool restored = Write(controller + 0x0DU, requestD);
-    if (!refreshed || !restored) {
-        gBackstageSurvivorRearmFailures.fetch_add(1U, std::memory_order_relaxed);
-        return false;
-    }
-
-    std::uint8_t after{};
-    if (!Read(sweep + 0x51U, after)) {
-        gBackstageSurvivorRearmFailures.fetch_add(1U, std::memory_order_relaxed);
-        return false;
-    }
-    if (after == 0U) {
-        // Most importantly, this covers Character flag 0x1D: the native
-        // producer saw our request and still rejected the search.
-        gBackstageSurvivorRearmRestricted.fetch_add(1U, std::memory_order_relaxed);
-        return false;
-    }
-
-    gBackstageSurvivorRearms.fetch_add(1U, std::memory_order_relaxed);
-    gLastBackstageSurvivorPeer.store(peer, std::memory_order_relaxed);
-    return true;
-}
 std::uintptr_t __fastcall BackstageSelectedTargetDetour(void* selection, void*) noexcept {
     const auto target = reinterpret_cast<std::uintptr_t(__thiscall*)(void*)>(gBase + 0x0000A3D0U)(selection);
     const auto owner = gAiPlayerQueryOwner;
@@ -1323,36 +1287,11 @@ std::uint8_t __fastcall BackstageUpdateDetour(void* sweep, void*) noexcept {
     if (original == nullptr) return 0U;
     const auto owner = HostBackstageOwner(reinterpret_cast<std::uintptr_t>(sweep));
     const auto previous = gAiPlayerQueryOwner;
-    if (owner != 0U) {
-        gAiPlayerQueryOwner = owner;
-        static_cast<void>(RearmBackstageSearchForSurvivor(
-            owner, reinterpret_cast<std::uintptr_t>(sweep)));
-    }
+    if (owner != 0U) gAiPlayerQueryOwner = owner;
     std::uint8_t result{};
     { AiPlayerSlotScope context(owner); result = original(sweep); }
     gAiPlayerQueryOwner = previous;
     return result;
-}
-void __fastcall BackstageControllerDetour(void* controller, void*) noexcept {
-    const auto original = reinterpret_cast<BackstageControllerUpdate>(gBackstageControllerOriginal.load());
-    if (original == nullptr) return;
-    const auto address = reinterpret_cast<std::uintptr_t>(controller);
-    std::uintptr_t sweep{}, controllerOwner{};
-    auto owner = Read(address + 0x1CU, sweep) ? HostBackstageOwner(sweep) : 0U;
-    if (owner != 0U && (!Read(address + 4U, controllerOwner) || controllerOwner != owner)) owner = 0U;
-    const auto previous = gAiPlayerQueryOwner;
-    if (owner != 0U) {
-        gAiPlayerQueryOwner = owner;
-        gBackstageControllerContexts.fetch_add(1U, std::memory_order_relaxed);
-    }
-    // A scope around 0040C1C0 alone ends before this controller's tail call
-    // into 00414610. The exit planner's 00413F80/00414200 then use the dead
-    // Host position through the first-player array, independently of THE_PLAYER.
-    // Keep the same living-player context through the whole native update,
-    // including both tail-call paths. RAII restores the real slot on return;
-    // AiPlayerSlotScope leaves living Hosts, Clients and retail play untouched.
-    { AiPlayerSlotScope context(owner); original(controller); }
-    gAiPlayerQueryOwner = previous;
 }
 void __fastcall BackstageHoldDetour(void* cycle, void*) noexcept {
     const auto original = reinterpret_cast<BackstageHoldUpdate>(gBackstageHoldOriginal.load());
@@ -6943,12 +6882,195 @@ __declspec(naked) void BackstageNavigationShim() noexcept {
         jmp dword ptr [gBackstageNavigationContinue]
     }
 }
+// Preserve all incoming GPRs, flags and floating-point state around registry
+// queries. Sound shims replace only the source-kind result/comparison; native
+// event strength, flags, hostility, occlusion and subsequent dispatch are retained.
+__declspec(naked) void MenacePlayerShim() noexcept {
+    __asm {
+        pushfd
+        pushad
+        mov ebx, esp
+        sub esp, 528
+        and esp, 0FFFFFFF0h
+        fxsave [esp]
+        push edi
+        push esi
+        call MenaceParticipantPlayer
+        add esp, 8
+        test eax, eax
+        jnz participant
+        fxrstor [esp]
+        mov esp, ebx
+        popad
+        popfd
+        jmp dword ptr [gMenacePlayerTrampoline]
+    participant:
+        fxrstor [esp]
+        mov esp, ebx
+        popad
+        popfd
+        jmp dword ptr [gMenacePlayerContinue]
+    }
+}
+__declspec(naked) void SoundSourceClassShim() noexcept {
+    __asm {
+        pushfd
+        pushad
+        mov ebx, esp
+        sub esp, 528
+        and esp, 0FFFFFFF0h
+        fxsave [esp]
+        push edi
+        call SoundParticipantPlayer
+        add esp, 4
+        test eax, eax
+        jnz participant
+        fxrstor [esp]
+        mov esp, ebx
+        popad
+        popfd
+        jmp dword ptr [gSoundSourceClassTrampoline]
+    participant:
+        fxrstor [esp]
+        mov esp, ebx
+        popad
+        popfd
+        xor eax, eax
+        jmp dword ptr [gSoundSourceClassContinue]
+    }
+}
+__declspec(naked) void SoundBackstageClassShim() noexcept {
+    __asm {
+        pushfd
+        pushad
+        mov ebx, esp
+        sub esp, 528
+        and esp, 0FFFFFFF0h
+        fxsave [esp]
+        push edi
+        call SoundParticipantPlayer
+        add esp, 4
+        test eax, eax
+        jnz participant
+        fxrstor [esp]
+        mov esp, ebx
+        popad
+        popfd
+        jmp dword ptr [gSoundBackstageClassTrampoline]
+    participant:
+        fxrstor [esp]
+        mov esp, ebx
+        popad
+        popfd
+        mov ecx, [edi + 64h]
+        cmp eax, eax
+        jmp dword ptr [gSoundBackstageClassContinue]
+    }
+}
+__declspec(naked) void SoundThreatClassShim() noexcept {
+    __asm {
+        pushfd
+        pushad
+        mov ebx, esp
+        sub esp, 528
+        and esp, 0FFFFFFF0h
+        fxsave [esp]
+        push edi
+        call SoundParticipantPlayer
+        add esp, 4
+        test eax, eax
+        jnz participant
+        fxrstor [esp]
+        mov esp, ebx
+        popad
+        popfd
+        jmp dword ptr [gSoundThreatClassTrampoline]
+    participant:
+        fxrstor [esp]
+        mov esp, ebx
+        popad
+        popfd
+        mov edx, [edi + 64h]
+        cmp eax, eax
+        jmp dword ptr [gSoundThreatClassContinue]
+    }
+}
+__declspec(naked) void SoundLostClassShim() noexcept {
+    __asm {
+        pushfd
+        pushad
+        mov ebx, esp
+        sub esp, 528
+        and esp, 0FFFFFFF0h
+        fxsave [esp]
+        push edi
+        call SoundParticipantPlayer
+        add esp, 4
+        test eax, eax
+        jnz participant
+        fxrstor [esp]
+        mov esp, ebx
+        popad
+        popfd
+        jmp dword ptr [gSoundLostClassTrampoline]
+    participant:
+        fxrstor [esp]
+        mov esp, ebx
+        popad
+        popfd
+        mov eax, [edi + 64h]
+        cmp eax, eax
+        jmp dword ptr [gSoundLostClassContinue]
+    }
+}
+bool HookParticipantPlayerSemantics(HookManager& hooks, std::string& error) {
+    // The target predicate and menace producer both end with the solo
+    // Character+31C / control+48 test. The sound dispatcher tests source kind
+    // repeatedly, including the explicit exclusion of NPC sounds backstage.
+    // These are read-only query adaptations, not changes to NPC templates or
+    // the local player's FPS controller. Keep all native lifetime/target tests.
+    if (!MatchRetailBytes(0x002EFD10U, {0x8B,0x44,0x24,0x04,0x56,0x57,0x8B,0xB8,0xA8,0x34,0x00,0x00}) ||
+        !MatchRetailBytes(0x002EFD67U, {0x8B,0x80,0x1C,0x03,0x00,0x00,0x85,0xC0,0x74,0x10,0x80,0x78,0x48,0x00,0x74,0x0A}) ||
+        !MatchRetailBytes(0x002EFD77U, {0x5F,0xB8,0x01,0x00,0x00,0x00,0x5E,0xC2,0x08,0x00}) ||
+        !MatchRetailBytes(0x002EFD81U, {0x5F,0x33,0xC0,0x5E,0xC2,0x08,0x00}) ||
+        !MatchRetailBytes(0x002FBF5FU, {0x8B,0x87,0x1C,0x03,0x00,0x00,0x85,0xC0,0x0F,0x84,0x66,0x01,0x00,0x00,0x80,0x78,0x48,0x00,0x0F,0x84,0x5C,0x01,0x00,0x00}) ||
+        !MatchRetailBytes(0x002FBF77U, {0x0F,0x57,0xC0,0x8D,0x44,0x24,0x0C,0x50,0x57,0x8B,0xCE}) ||
+        !MatchRetailBytes(0x00330C97U, {0x8B,0x47,0x64,0x8B,0x40,0x04}) ||
+        !MatchRetailBytes(0x00330CFDU, {0x8B,0x4F,0x64,0x83,0x79,0x04,0x00,0x74,0x04}) ||
+        !MatchRetailBytes(0x00330D3CU, {0x8B,0x57,0x64,0x83,0x7A,0x04,0x00,0x75,0x0A}) ||
+        !MatchRetailBytes(0x00330F35U, {0x8B,0x47,0x64,0x83,0x78,0x04,0x00,0x75,0x04})) {
+        error = "aisync participant player semantics: certified predicate/menace/sound ABI mismatch";
+        return false;
+    }
+    gMenacePlayerContinue = reinterpret_cast<void*>(gBase + 0x002FBF77U);
+    gSoundSourceClassContinue = reinterpret_cast<void*>(gBase + 0x00330C9DU);
+    gSoundBackstageClassContinue = reinterpret_cast<void*>(gBase + 0x00330D04U);
+    gSoundThreatClassContinue = reinterpret_cast<void*>(gBase + 0x00330D43U);
+    gSoundLostClassContinue = reinterpret_cast<void*>(gBase + 0x00330F3CU);
+    return Hook(hooks, "aisync_target_is_participant_player", 0x002EFD10U,
+            reinterpret_cast<void*>(&TargetIsPlayerDetour), {0x8B,0x44,0x24,0x04,0x56},
+            &gTargetIsPlayerTrampoline, &gTargetIsPlayerOriginal, error) &&
+        Hook(hooks, "aisync_menace_participant_player", 0x002FBF5FU,
+            reinterpret_cast<void*>(&MenacePlayerShim), {0x8B,0x87,0x1C,0x03,0x00,0x00},
+            &gMenacePlayerTrampoline, &gMenacePlayerPublished, error) &&
+        Hook(hooks, "aisync_sound_participant_source", 0x00330C97U,
+            reinterpret_cast<void*>(&SoundSourceClassShim), {0x8B,0x47,0x64,0x8B,0x40,0x04},
+            &gSoundSourceClassTrampoline, &gSoundSourceClassPublished, error) &&
+        Hook(hooks, "aisync_sound_participant_backstage", 0x00330CFDU,
+            reinterpret_cast<void*>(&SoundBackstageClassShim), {0x8B,0x4F,0x64,0x83,0x79,0x04,0x00},
+            &gSoundBackstageClassTrampoline, &gSoundBackstageClassPublished, error) &&
+        Hook(hooks, "aisync_sound_participant_threat", 0x00330D3CU,
+            reinterpret_cast<void*>(&SoundThreatClassShim), {0x8B,0x57,0x64,0x83,0x7A,0x04,0x00},
+            &gSoundThreatClassTrampoline, &gSoundThreatClassPublished, error) &&
+        Hook(hooks, "aisync_sound_participant_lost", 0x00330F35U,
+            reinterpret_cast<void*>(&SoundLostClassShim), {0x8B,0x47,0x64,0x83,0x78,0x04,0x00},
+            &gSoundLostClassTrampoline, &gSoundLostClassPublished, error);
+}
 bool HookBackstageParticipantContext(HookManager& hooks, std::string& error) {
     // 0040C1C0: ECX=sweep context, no stack arguments, AL result, plain RET.
     // 0040C29F: ESI=sweep, EDI=chosen Character, skip only the solo FPS gate.
     // 0040BBFA: EBP=chosen Character, ECX=sweep; EDI is callee-saved already.
     // 004015E0: ECX=4D cycle; aligned native frame, ESI saved, plain RET.
-    // 007216A0: ECX=controller; ESI saved; both tails use controller+24.
     if (!MatchRetailBytes(0x0000C29FU,
             {0x8B,0x87,0x1C,0x03,0x00,0x00,0x85,0xC0,0x74,0x37,0x80,0x78,0x48,0x00,0x74,0x31}) ||
         !MatchRetailBytes(0x0000C2AFU, {0x83,0x7E,0x2C,0x00}) ||
@@ -6970,20 +7092,13 @@ bool HookBackstageParticipantContext(HookManager& hooks, std::string& error) {
         !MatchRetailBytes(0x002F58D0U, {0x56,0x8B,0x71,0x04,0xC7,0x41,0x04,0x00,0x00,0x00,0x00}) ||
         !MatchRetailBytes(0x002F5919U, {0x5E,0xC3}) ||
         !MatchRetailBytes(0x00001628U, {0x8B,0x48,0x08,0x52,0xE8,0x9F,0x82,0x37,0x00}) ||
-        !MatchRetailBytes(0x00001656U, {0x5E,0x8B,0xE5,0x5D,0xC3}) ||
-        !MatchRetailBytes(0x003216A0U, {0x56,0x8B,0xF1,0x8B,0x46,0x10,0x89,0x46,0x14}) ||
-        !MatchRetailBytes(0x003216FCU, {0x8B,0x4E,0x24,0x5E,0xE9,0x0B,0x2F,0xCF,0xFF}) ||
-        !MatchRetailBytes(0x00321730U, {0x8B,0x4E,0x24,0x5E,0xE9,0xD7,0x2E,0xCF,0xFF}) ||
-        !MatchRetailBytes(0x00014610U, {0x56,0x8B,0xF1,0xE8,0x68,0xF9,0xFF,0xFF})) {
+        !MatchRetailBytes(0x00001656U, {0x5E,0x8B,0xE5,0x5D,0xC3})) {
         error = "aisync backstage context: certified registers/stack/route-cache ABI mismatch";
         return false;
     }
     gBackstageEligibilityContinue = reinterpret_cast<void*>(gBase + 0x0000C2AFU);
     gBackstageNavigationContinue = reinterpret_cast<void*>(gBase + 0x0000BC00U);
-    if (!Hook(hooks, "aisync_backstage_controller_player_context", 0x003216A0U,
-            reinterpret_cast<void*>(&BackstageControllerDetour), {0x56,0x8B,0xF1,0x8B,0x46,0x10},
-            &gBackstageControllerTrampoline, &gBackstageControllerOriginal, error) ||
-        !Hook(hooks, "aisync_backstage_participant_update", 0x0000C1C0U,
+    if (!Hook(hooks, "aisync_backstage_participant_update", 0x0000C1C0U,
             reinterpret_cast<void*>(&BackstageUpdateDetour), {0x56,0x8B,0xF1,0x8B,0x4E,0x10},
             &gBackstageUpdateTrampoline, &gBackstageUpdateOriginal, error) ||
         !Hook(hooks, "aisync_backstage_participant_eligibility", 0x0000C29FU,
@@ -7515,6 +7630,7 @@ bool Install(const std::uintptr_t base, HookManager& hooks, LevelGenerationTrack
             reinterpret_cast<void*>(&NavigationSubmitDetour), {0x64,0xA1,0,0,0,0,0x6A,0xFF},
             &gNavigationSubmitTrampoline, &gNavigationSubmitOriginal, error) &&
         HookParticipantEligibility(hooks, error) &&
+        HookParticipantPlayerSemantics(hooks, error) &&
         HookPostDeathMeleeSelection(hooks, error) &&
         HookPairedPlayerClassification(hooks, error) &&
         HookBackstageParticipantContext(hooks, error) &&
@@ -8549,12 +8665,9 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"backstageNavigationRejected", Diagnostics::Unsigned(gBackstageNavigationRejected.load(std::memory_order_relaxed)), true},
          {"backstageDeadTargetsRejected", Diagnostics::Unsigned(gBackstageDeadTargetsRejected.load(std::memory_order_relaxed)), true},
          {"backstageHoldContexts", Diagnostics::Unsigned(gBackstageHoldContexts.load(std::memory_order_relaxed)), true},
-         {"backstageControllerContexts", Diagnostics::Unsigned(gBackstageControllerContexts.load(std::memory_order_relaxed)), true},
-         {"backstageSurvivorRearmAttempts", Diagnostics::Unsigned(gBackstageSurvivorRearmAttempts.load(std::memory_order_relaxed)), true},
-         {"backstageSurvivorRearms", Diagnostics::Unsigned(gBackstageSurvivorRearms.load(std::memory_order_relaxed)), true},
-         {"backstageSurvivorRearmRestricted", Diagnostics::Unsigned(gBackstageSurvivorRearmRestricted.load(std::memory_order_relaxed)), true},
-         {"backstageSurvivorRearmFailures", Diagnostics::Unsigned(gBackstageSurvivorRearmFailures.load(std::memory_order_relaxed)), true},
-         {"lastBackstageSurvivorPeer", Diagnostics::Unsigned(gLastBackstageSurvivorPeer.load(std::memory_order_relaxed)), true},
+         {"targetPlayerOverrides", Diagnostics::Unsigned(gTargetPlayerOverrides.load(std::memory_order_relaxed)), true},
+         {"menacePlayerOverrides", Diagnostics::Unsigned(gMenacePlayerOverrides.load(std::memory_order_relaxed)), true},
+         {"soundPlayerOverrides", Diagnostics::Unsigned(gSoundPlayerOverrides.load(std::memory_order_relaxed)), true},
          {"backstageGoalsObjective", Diagnostics::Unsigned(gBackstageGoalsObjective.load(std::memory_order_relaxed)), true},
          {"backstageGoalsOwner", Diagnostics::Unsigned(gBackstageGoalsOwner.load(std::memory_order_relaxed)), true},
          {"backstageGoalsDegenerate", Diagnostics::Unsigned(gBackstageGoalsDegenerate.load(std::memory_order_relaxed)), true},
