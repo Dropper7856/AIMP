@@ -4204,6 +4204,32 @@ bool Arm(const SignatureResolver& resolver, HookManager& hooks,
 bool Installed() noexcept { return gInstalled.load(std::memory_order_acquire); }
 bool Enabled() noexcept { return gEnabled.load(std::memory_order_acquire); }
 
+bool InvokeLocalActionNoCapture(void(*action)(void*) noexcept, void* context) noexcept {
+    if (action == nullptr) return false;
+    const auto previousOrigin = gPublicOrigin;
+    const auto previousEpoch = gPublicEpoch;
+    const auto previousCause = gPublicCause;
+    gPublicOrigin = Origin::RemoteRoot;
+    gPublicEpoch = gEpoch.load(std::memory_order_acquire);
+    gPublicCause = {};
+#if defined(_MSC_VER) && defined(_M_IX86)
+    __try {
+        __try { action(context); }
+        __finally {
+            gPublicOrigin = previousOrigin;
+            gPublicEpoch = previousEpoch;
+            gPublicCause = previousCause;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+#else
+    action(context);
+    gPublicOrigin = previousOrigin;
+    gPublicEpoch = previousEpoch;
+    gPublicCause = previousCause;
+#endif
+    return true;
+}
+
 LocalCompositeInputInvokeStatus InvokeLocalCompositeInputNoCapture(
     void* executionObject,
     void* sharedRef,

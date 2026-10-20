@@ -11,14 +11,16 @@ namespace aimp {
 class Diagnostics;
 class HookManager;
 class LevelGenerationTracker;
+class WorldEntityRegistry;
 
 namespace item_sync {
 
 // ItemSync: world pickups collected by one participant disappear for everyone.
 // Detection observes InventoryItem's complete-collection notification and
 // identifies its world slot through the native slot+7C record relation before
-// retail clears the record. Remote removal uses FUN_007A3200 without granting
-// an item. Partial collections and non-pickup inventory operations stay local.
+// retail clears the record. Spawned pickups use FUN_007A3200; placed pickups
+// replay InventoryItem collect + AddToInventory success without giving an item.
+// Partial collections and non-pickup inventory operations stay local.
 struct PickupEvent final {
     std::uint64_t sequence{};
     WorldEntityId entity{};
@@ -64,7 +66,7 @@ enum class ApplyStatus : std::uint8_t {
 };
 
 bool Install(std::uintptr_t moduleBase, HookManager& hooks,
-    LevelGenerationTracker& generations, std::string& error);
+    LevelGenerationTracker& generations, WorldEntityRegistry& registry, std::string& error);
 [[nodiscard]] bool Installed() noexcept;
 // Logical shutdown: the detour forwards to retail and nothing is applied.
 void Shutdown() noexcept;

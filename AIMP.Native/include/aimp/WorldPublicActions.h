@@ -450,6 +450,10 @@ enum class LocalCompositeInputInvokeStatus : std::uint8_t {
 [[nodiscard]] LocalCompositeInputInvokeStatus InvokeLocalCompositeInputNoCapture(
     void* executionObject, void* sharedRef, std::uint32_t publicInputShortGuid,
     std::uintptr_t* resolvedDispatchOut = nullptr) noexcept;
+// Execute a local module's native continuation under RemoteRoot lineage.
+// Descendant work keeps that origin, so it is not republished by WorldSync.
+// The caller owns validation and native-reference lifetimes.
+[[nodiscard]] bool InvokeLocalActionNoCapture(void(*action)(void*) noexcept, void* context) noexcept;
 // Launcher IPC owns this runtime setting after connection; safe before Arm.
 // Compatibility name: it enables only the ProbeDirect callback witness.
 void SetEmptyCallbackTest(bool enabled) noexcept;
