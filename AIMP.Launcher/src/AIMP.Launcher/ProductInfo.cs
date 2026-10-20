@@ -2,6 +2,6 @@ namespace AIMP.Launcher;
 
 internal static class ProductInfo
 {
-    internal const string LauncherVersion = "0.8.4.220";
-    internal const string ExpectedDllVersion = "0.11.4.220-native-player-queries";
+    internal const string LauncherVersion = "0.8.4.221";
+    internal const string ExpectedDllVersion = "0.11.4.221-survivor-target";
 }
