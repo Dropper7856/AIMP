@@ -470,6 +470,15 @@ void TestLevelGeneration() {
     CHECK(state.generation == 3);
     CHECK(state.stability == aimp::LevelStability::Transition);
     CHECK(tracker.CurrentGeneration() == 3);
+    // A same-map restart can reuse every global address. The explicit unload
+    // boundary must still produce a new incarnation and revoke old tokens.
+    CHECK(!tracker.IsStableGeneration(2));
+    tracker.Observe(changed);
+    tracker.Observe(changed);
+    state = tracker.Observe(changed);
+    CHECK(state.generation > 3);
+    CHECK(tracker.IsStableGeneration(state.generation));
+    CHECK(!tracker.IsStableGeneration(2));
 }
 
 void TestSpawnCharacterTracker() {

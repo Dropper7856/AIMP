@@ -1636,7 +1636,7 @@ public sealed partial class LobbyHost : IAsyncDisposable
         try { ValidatePlayerPosition(payload, state.PeerId); }
         catch (Exception exception) when (exception is ProtocolException
             or InvalidOperationException) { return false; }
-        return state.TryAcceptPositionSequence(payload.Sequence);
+        return state.TryAcceptPositionSequence(payload.LevelGeneration, payload.Sequence);
     }
 
     private async Task HandlePlayerEquipmentAsync(
@@ -1664,7 +1664,7 @@ public sealed partial class LobbyHost : IAsyncDisposable
         try { ValidatePlayerEquipment(payload, state.PeerId); }
         catch (Exception exception) when (exception is ProtocolException
             or InvalidOperationException) { return false; }
-        return state.TryAcceptEquipmentSequence(payload.Sequence);
+        return state.TryAcceptEquipmentSequence(payload.LevelGeneration, payload.Sequence);
     }
 
     private async Task HandlePlayerActionAsync(
@@ -1692,7 +1692,7 @@ public sealed partial class LobbyHost : IAsyncDisposable
         try { ValidatePlayerAction(payload, state.PeerId); }
         catch (Exception exception) when (exception is ProtocolException
             or InvalidOperationException) { return false; }
-        return state.TryAcceptActionSequence(payload.Sequence);
+        return state.TryAcceptActionSequence(payload.LevelGeneration, payload.Sequence);
     }
 
     private async Task HandleAISyncImpactAsync(
@@ -1703,8 +1703,10 @@ public sealed partial class LobbyHost : IAsyncDisposable
         try
         {
             var native = AISyncCodec.DecodeImpactNetwork(bytes, SessionId);
-            if (AISyncCodec.ImpactSourcePeer(native.Span) != state.PeerId
-                || !state.TryAcceptAISyncImpactSequence(AISyncCodec.ImpactSequence(native.Span)))
+            if (!_worldAuthority.TryGetAuthorityContextIdentity(out var context)
+                || !AISyncCodec.ImpactBelongsTo(native.Span, SessionId, context.WorldGeneration)
+                || AISyncCodec.ImpactSourcePeer(native.Span) != state.PeerId
+                || !state.TryAcceptAISyncImpactSequence(context.WorldGeneration, AISyncCodec.ImpactSequence(native.Span)))
                 throw new ProtocolException("AISync impact identity or sequence is invalid.");
             AISyncImpactReceived?.Invoke(this, native);
         }
@@ -2080,7 +2082,8 @@ public sealed partial class LobbyHost : IAsyncDisposable
         private ulong _lastPositionSequence;
         private ulong _lastEquipmentSequence;
         private ulong _lastActionSequence;
-        private uint _lastAISyncImpactSequence;
+        private ulong _lastAISyncImpactSequence;
+        private int _positionGeneration, _equipmentGeneration, _actionGeneration, _impactGeneration;
         private long _lastSeenTicks = Environment.TickCount64;
 
         public ClientState(
@@ -2115,31 +2118,27 @@ public sealed partial class LobbyHost : IAsyncDisposable
 
         public bool IsReady => Volatile.Read(ref _ready) != 0;
 
-        public bool TryAcceptPositionSequence(ulong sequence)
-        {
-            if (sequence <= _lastPositionSequence) return false;
-            _lastPositionSequence = sequence;
-            return true;
-        }
+        public bool TryAcceptPositionSequence(int generation, ulong sequence) =>
+            TryAcceptSequence(generation, sequence, ref _positionGeneration, ref _lastPositionSequence);
 
-        public bool TryAcceptEquipmentSequence(ulong sequence)
-        {
-            if (sequence <= _lastEquipmentSequence) return false;
-            _lastEquipmentSequence = sequence;
-            return true;
-        }
+        public bool TryAcceptEquipmentSequence(int generation, ulong sequence) =>
+            TryAcceptSequence(generation, sequence, ref _equipmentGeneration, ref _lastEquipmentSequence);
 
-        public bool TryAcceptActionSequence(ulong sequence)
-        {
-            if (sequence <= _lastActionSequence) return false;
-            _lastActionSequence = sequence;
-            return true;
-        }
+        public bool TryAcceptActionSequence(int generation, ulong sequence) =>
+            TryAcceptSequence(generation, sequence, ref _actionGeneration, ref _lastActionSequence);
 
-        public bool TryAcceptAISyncImpactSequence(uint sequence)
+        public bool TryAcceptAISyncImpactSequence(int generation, uint sequence) =>
+            TryAcceptSequence(generation, sequence, ref _impactGeneration, ref _lastAISyncImpactSequence);
+
+        // These windows belong to a launch/world generation, not the TCP
+        // connection. Only its ordered reader mutates them; an old packet must
+        // never roll a window back after the next round has begun.
+        private static bool TryAcceptSequence(int generation, ulong sequence, ref int currentGeneration, ref ulong last)
         {
-            if (sequence == 0 || sequence <= _lastAISyncImpactSequence) return false;
-            _lastAISyncImpactSequence = sequence;
+            if (generation < 1 || generation < currentGeneration || sequence == 0) return false;
+            if (generation != currentGeneration) { currentGeneration = generation; last = 0; }
+            if (sequence <= last) return false;
+            last = sequence;
             return true;
         }
 

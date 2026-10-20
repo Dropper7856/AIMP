@@ -12,6 +12,8 @@ internal static class Program
         new("Lobby lifecycle", ProtocolTests.LobbyLifecycleAsync),
         new("Lobby manifest preflight", PreparationTests.LobbyManifestPreflightAsync),
         new("Session loading barrier", PreparationTests.SessionReleaseBarrierAsync),
+        new("Round authority generations", RoundRestartTests.AuthorityGenerationsAsync),
+        new("Round gameplay sequence restart", RoundRestartTests.GameplaySequencesAsync),
         new("Launcher reset data scope", LauncherResetTests.GeneratedDataScopeAsync),
         new("Launcher reset path boundary", LauncherResetTests.RefusesOutsideSettingsPathAsync),
         new("AI process selection", LauncherTests.ProcessSelectionAsync),

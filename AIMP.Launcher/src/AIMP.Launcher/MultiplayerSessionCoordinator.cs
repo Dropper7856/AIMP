@@ -102,6 +102,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private DateTimeOffset _lastMovementFailureLoggedAt;
     private WorldNetworkContext? _localWorldContext;
     private int _worldSessionGeneration;
+    private readonly SessionWorldGenerationCounter _worldGenerations = new();
     private int _localWorldRuntimeGeneration;
     private Task<PreparedWorldManifest?>? _automaticWorldManifestPreparation;
     private Task<RemoteEquipmentCatalogSet?>? _remoteEquipmentCatalogPreparation;
@@ -978,7 +979,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 && string.Equals(current.ManifestSha256, prepared.Sha256,
                     StringComparison.OrdinalIgnoreCase);
             if (!sameWorld)
-                _worldSessionGeneration = checked(_worldSessionGeneration + 1);
+                _worldSessionGeneration = _worldGenerations.Next(host.SessionId);
             context = new WorldNetworkContext(
                 host.SessionId,
                 host.HostPeerId,
@@ -3762,7 +3763,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             lock (_stateGate)
             {
                 EnsureManifestLoadContext(loadingStart, nativeGeneration);
-                _worldSessionGeneration = checked(_worldSessionGeneration + 1);
+                _worldSessionGeneration = _worldGenerations.Next(host.SessionId);
                 context = new WorldNetworkContext(
                     host.SessionId,
                     host.HostPeerId,

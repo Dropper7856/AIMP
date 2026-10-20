@@ -5196,14 +5196,14 @@ void RememberPresentationPose(Actor& actor, const State& state, const ULONGLONG 
     sample.yaw = state.yaw; sample.velocityX = state.velocityX; sample.velocityZ = state.velocityZ;
     actor.poseRevision = state.revision;
 }
-bool NativeMoveConvergenceEligible(const State& state) noexcept {
+bool NativeMoveConvergenceEligible(const Actor& actor, const State& state) noexcept {
     const auto required = PoseValid | Moving | ExecutionValid;
     const bool point = (state.navigation.flags & navigation::kLiveGoal) != 0U &&
         navigation::LocalRequestKind(state.navigation) == navigation::kPointRequest;
     return (state.stateFlags & required) == required && (state.navigation.flags == 0U || point) &&
         state.executionCycleState == 0x38U && state.executionCycleTypeRva == 0x00EABF80U &&
         state.locomotionIntensity > 0.0F && !ProxyWithdrawn(state) &&
-        (state.lifecycleFlags & (LifecycleSpatialDiscontinuity | LifecycleTraversalAction)) == 0U;
+        !LifecycleBlocksMovementRecovery(state, actor.completedLifecycleRevision);
 }
 bool RecoverCatastrophicIntentDivergence(Actor& actor, const State& state,
     const ULONGLONG now) noexcept {
@@ -5214,9 +5214,9 @@ bool RecoverCatastrophicIntentDivergence(Actor& actor, const State& state,
     const bool navigationPendingOrOwned = state.navigation.flags != 0U &&
         (!navigationRejected || actor.movementOwner == MovementOwner::Navigation);
     if ((state.stateFlags & PoseValid) == 0U || ProxyWithdrawn(state) ||
-        (state.lifecycleFlags & (LifecycleSpatialDiscontinuity | LifecycleTraversalAction)) != 0U ||
+        LifecycleBlocksMovementRecovery(state, actor.completedLifecycleRevision) ||
         PairSourceBusy(actor.character) || actor.interactionOwnsCycle || hostTransitionOwnsMotion ||
-        actor.convergenceActive || NativeMoveConvergenceEligible(state) ||
+        actor.convergenceActive || NativeMoveConvergenceEligible(actor, state) ||
         navigationPendingOrOwned) {
         actor.intentDivergenceSince = 0U;
         return true;
@@ -5318,7 +5318,7 @@ bool ApplyAuthoritativeExecution(Actor& actor, const ULONGLONG now) noexcept {
 
 bool ApplyNativeNavigationConvergence(Actor& actor, const ULONGLONG now) noexcept {
     const auto& state = actor.desired;
-    const bool eligible = NativeMoveConvergenceEligible(state) && !actor.interactionOwnsCycle;
+    const bool eligible = NativeMoveConvergenceEligible(actor, state) && !actor.interactionOwnsCycle;
     float x{}, z{};
     const bool readable = Read(actor.character + kPositionOffset, x) &&
         Read(actor.character + kPositionOffset + 8U, z) && FiniteCoordinate(x) && FiniteCoordinate(z);
@@ -5432,7 +5432,7 @@ bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
         std::string idleError;
         return character_direct_step_runtime::HoldAIIntentIdle(actor.character, state.moveType, idleError);
     }
-    if (actor.convergenceActive && !NativeMoveConvergenceEligible(state)) {
+    if (actor.convergenceActive && !NativeMoveConvergenceEligible(actor, state)) {
         navigation::Cancel(actor.character);
         actor.convergenceActive = false; actor.convergenceDivergenceSince = 0U;
     }
