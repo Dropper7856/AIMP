@@ -4055,7 +4055,12 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteItemSyncSpawn(
     result.message = std::string(command.drop ? "Drop " : "Owner ") + ownerKey + ": " +
         (outcome == item_sync::ApplyStatus::Deferred
             ? "decision stored until the local owner runs."
-            : item_sync::ApplyStatusMessage(outcome));
+            : outcome == item_sync::ApplyStatus::Applied
+                ? (command.spawn ? "pickup spawn requested from the pickup manager."
+                                 : "nothing spawns for this owner.")
+                : outcome == item_sync::ApplyStatus::AlreadyApplied
+                    ? "decision already applied."
+                    : item_sync::ApplyStatusMessage(outcome));
     return result;
 }
 
