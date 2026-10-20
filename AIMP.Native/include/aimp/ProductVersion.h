@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.219-survivor-controller";
+    "0.11.4.220-native-player-queries";
 
 } // namespace aimp
