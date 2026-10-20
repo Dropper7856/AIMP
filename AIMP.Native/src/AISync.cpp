@@ -190,6 +190,7 @@ struct Actor {
     ULONGLONG lastPoseSample{}, lastProxyRefresh{}, lastInteractionAttempt{}, lastInteractionCapture{};
     ULONGLONG deadTargetSince{}, stationarySince{}, lastParticipantProbe{}, lastPresentationProbe{};
     ULONGLONG intentDivergenceSince{}, postDeathArbitrationSince{}, lastLivingParticipantSense{};
+    ULONGLONG lastSurvivorTargetAssignment{};
     std::uint64_t lastLivingParticipantSensePeer{};
     std::uint32_t postDeathArbitrationRevision{};
     std::uint64_t postDeathRetiredPeer{};
@@ -477,6 +478,7 @@ std::atomic<void*> gBackstageEligibilityPublished{};
 void* gBackstageNavigationTrampoline{}, *gBackstageNavigationContinue{};
 std::atomic<void*> gBackstageNavigationPublished{};
 std::atomic<std::uint64_t> gBackstageEligibilityOverrides{}, gBackstageNavigationPlans{};
+std::atomic<std::uint64_t> gSurvivorTargetsAssigned{}, gSurvivorTargetFaults{}, gLastSurvivorTargetPeer{};
 std::atomic<std::uint64_t> gBackstageNavigationUpdates{}, gBackstageNavigationRejected{};
 std::atomic<std::uint64_t> gBackstageDeadTargetsRejected{}, gBackstageHoldContexts{};
 std::atomic<std::uint64_t> gTargetPlayerOverrides{}, gMenacePlayerOverrides{}, gSoundPlayerOverrides{};
@@ -5088,6 +5090,59 @@ void RecoverDeadParticipantTarget(Actor& actor, const ULONGLONG now) noexcept {
     // The fallback reset is evaluated on subsequent manager frames only.
     gPostDeathArbitrationDeferrals.fetch_add(1U, std::memory_order_relaxed);
 }
+// Retail "set target" sequence of the CATHODE script method 005FBB40:
+// 0072AFB0 (ECX=selector [Alien+34A8], target on stack, RET 4) makes the
+// target's record the selector's forced, perceived target (+C, record+493);
+// 0072B880 (ECX=perception [Alien+34D8], char 0, RET 4) refreshes it.
+bool AssignNativeTarget(const std::uintptr_t selector, const std::uintptr_t perception,
+    const std::uintptr_t target) noexcept {
+    __try {
+        reinterpret_cast<void(__thiscall*)(void*, std::uintptr_t)>(gBase + 0x0032AFB0U)(
+            reinterpret_cast<void*>(selector), target);
+        reinterpret_cast<void(__thiscall*)(void*, std::uint32_t)>(gBase + 0x0032B880U)(
+            reinterpret_cast<void*>(perception), 0U);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+// Once the Host is terminally dead, retail drops his target record and an
+// unsensed survivor is never promoted: the selector stays empty and the
+// Alien's tree remains in its last-resort BACKSTAGE_ONLY sweep, whose hold
+// never ends without a target. In solo the player's record is never dropped
+// while he lives. Give the idle Alien the living participant through the
+// same native sequence level scripts use; pursuit, vent choice and emergence
+// stay native. Never during a kill or paired flow, never over a living
+// selected/pending target, never during the post-death arbitration window.
+void AssignSurvivorTargetWhenIdle(Actor& actor, const ULONGLONG now) noexcept {
+    constexpr ULONGLONG kSurvivorTargetPeriod = 3000U;
+    if (gRole.load(std::memory_order_acquire) != Role::Host || !EngineThread() || !Stable() ||
+        PairSourceBusy(actor.character) || actor.postDeathArbitrationRevision != 0U ||
+        now - actor.lastSurvivorTargetAssignment < kSurvivorTargetPeriod) return;
+    const auto realLocal = LocalPlayer();
+    if (!TerminalDeadCharacter(realLocal) || NativeVictimFlowRunning(actor.character, realLocal)) return;
+    TargetSelectionSnapshot selection{};
+    if (!ReadTargetSelectionSnapshot(actor, selection) || !TargetSelectionCertain(selection) ||
+        HasLivingSuccessor(selection)) return;
+    std::uintptr_t selector{}, perception{}, forced{};
+    if (!Read(actor.character + 0x34A8U, selector) || selector == 0U ||
+        !Read(actor.character + 0x34D8U, perception) || perception == 0U ||
+        !Read(selector + 0xCU, forced)) return;
+    std::uint64_t peer{};
+    const auto survivor = LivingAiParticipant(actor.character, peer);
+    if (survivor == 0U || peer == 0U || !LivingCharacter(survivor) ||
+        (HostilityDetour(reinterpret_cast<void*>(actor.character + 0x280U), nullptr, survivor) & 0xFFU) == 0U)
+        return;
+    std::uintptr_t forcedTarget{};
+    if (forced != 0U && Read(forced + 0x42CU, forcedTarget) && forcedTarget == survivor) return;
+    actor.lastSurvivorTargetAssignment = now;
+    if (!AssignNativeTarget(selector, perception, survivor)) {
+        gSurvivorTargetFaults.fetch_add(1U, std::memory_order_relaxed);
+        return;
+    }
+    gSurvivorTargetsAssigned.fetch_add(1U, std::memory_order_relaxed);
+    gLastSurvivorTargetPeer.store(peer, std::memory_order_relaxed);
+}
 
 // .174 observed 17,523 new pair attempts against the terminally dead Host,
 // after a successful BT reset and an Idle source. ActionMeleeAttack's start
@@ -6403,6 +6458,7 @@ void __fastcall UpdateDetour(void* manager, void*, std::uint32_t previousTime, f
         if (actor->blocked) gSuspended.fetch_add(1U, std::memory_order_relaxed);
         else {
             RecoverDeadParticipantTarget(*actor, GetTickCount64());
+            AssignSurvivorTargetWhenIdle(*actor, GetTickCount64());
             if (gRole.load(std::memory_order_acquire) == Role::Host &&
                 (traceTargetSuccession || actor->targetSelectionObserved || PostKillTargetTraceActive(*actor)))
                 TraceTargetSelection(*actor, TargetSuccessionPhase::PostRecovery, GetTickCount64(), false);
@@ -8660,6 +8716,9 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"pairedHostCycleWaits", Diagnostics::Unsigned(gPairedHostCycleWaits.load(std::memory_order_relaxed)), true},
          {"outcomeSnapshotsCoalesced", Diagnostics::Unsigned(gOutcomeSnapshotsCoalesced.load(std::memory_order_relaxed)), true},
          {"backstageEligibilityOverrides", Diagnostics::Unsigned(gBackstageEligibilityOverrides.load(std::memory_order_relaxed)), true},
+         {"survivorTargetsAssigned", Diagnostics::Unsigned(gSurvivorTargetsAssigned.load(std::memory_order_relaxed)), true},
+         {"survivorTargetFaults", Diagnostics::Unsigned(gSurvivorTargetFaults.load(std::memory_order_relaxed)), true},
+         {"lastSurvivorTargetPeer", Diagnostics::Unsigned(gLastSurvivorTargetPeer.load(std::memory_order_relaxed)), true},
          {"backstageNavigationPlans", Diagnostics::Unsigned(gBackstageNavigationPlans.load(std::memory_order_relaxed)), true},
          {"backstageNavigationUpdates", Diagnostics::Unsigned(gBackstageNavigationUpdates.load(std::memory_order_relaxed)), true},
          {"backstageNavigationRejected", Diagnostics::Unsigned(gBackstageNavigationRejected.load(std::memory_order_relaxed)), true},
