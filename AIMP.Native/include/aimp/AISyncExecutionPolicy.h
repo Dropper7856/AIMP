@@ -36,6 +36,21 @@ enum class MovementOwner : std::uint8_t {
     None, Intent, Navigation, Execution, Paired, Neutral, Consequence
 };
 
+struct ParticipantRouteRetry final {
+    std::uint64_t emptySince{};
+    bool Observe(const bool enabled, const bool queryPending, const bool dirty,
+        const std::uint32_t routeCount, const bool nondegenerate, const std::uint64_t now) noexcept {
+        if (!enabled || queryPending || dirty || routeCount != 0U || !nondegenerate) {
+            emptySince = 0U;
+            return false;
+        }
+        if (emptySince == 0U) emptySince = now;
+        if (now - emptySince < 2000ULL) return false;
+        emptySince = 0U;
+        return true;
+    }
+};
+
 constexpr bool AICharacterClass(const std::uint32_t type) noexcept {
     // Native template enum: 0 is PLAYER, 2/7 are ANDROID/ANDROID_HEAVY.
     // Fail closed for unadmitted families. The class describes appearance,

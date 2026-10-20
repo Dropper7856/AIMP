@@ -10,6 +10,19 @@
 
 int main() {
     using namespace aimp::ai_sync;
+    ParticipantRouteRetry routeRetry{};
+    assert(!routeRetry.Observe(true, false, false, 0U, true, 100U));
+    assert(!routeRetry.Observe(true, false, false, 0U, true, 2099U));
+    assert(routeRetry.Observe(true, false, false, 0U, true, 2100U));
+    // A long outstanding request must never be cancelled/restarted. Once it
+    // completes empty, the retry delay starts anew rather than expiring in flight.
+    assert(!routeRetry.Observe(true, true, false, 0U, true, 10000U));
+    assert(!routeRetry.Observe(true, false, false, 0U, true, 10001U));
+    assert(routeRetry.Observe(true, false, false, 0U, true, 12001U));
+    assert(!routeRetry.Observe(true, false, false, 12U, true, 15000U));
+    assert(!routeRetry.Observe(true, false, true, 0U, true, 20000U));
+    assert(!routeRetry.Observe(false, false, false, 0U, true, 25000U));
+    assert(!routeRetry.Observe(true, false, false, 0U, false, 30000U));
     State relocated{};
     relocated.lifecycleFlags = LifecycleSpatialDiscontinuity;
     relocated.lifecycleRevision = 7U;
