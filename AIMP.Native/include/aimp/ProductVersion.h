@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.218-survivor-route";
+    "0.11.4.219-survivor-controller";
 
 } // namespace aimp
