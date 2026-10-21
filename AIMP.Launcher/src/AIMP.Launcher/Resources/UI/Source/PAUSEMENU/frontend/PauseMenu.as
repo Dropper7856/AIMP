@@ -1,6 +1,7 @@
 package frontend
 {
    import flash.events.Event;
+   import flash.events.KeyboardEvent;
    import flash.events.IOErrorEvent;
    import flash.events.ProgressEvent;
    import flash.events.SecurityErrorEvent;
@@ -9,6 +10,8 @@ package frontend
    import frontend.enum.MenuPageId;
    import frontend.events.MenuItemEvent;
    import frontend.menu.MenuItem;
+   import frontend.menu.MenuItemExpandable;
+   import frontend.events.MenuPageEvent;
    import frontend.menu.MenuItemDataSequence;
    import frontend.menu.MenuPage;
 
@@ -38,6 +41,147 @@ package frontend
       private var _aimpExitRequested:Boolean = false;
       private var _aimpExitOnNextFrame:Boolean = false;
 
+      private var _voicePage:MenuItemExpandable;
+      private var _voiceEnabledItem:MenuItem;
+      private var _voiceModeItem:MenuItem;
+      private var _voiceMicItem:MenuItem;
+      private var _voiceKeyItem:MenuItem;
+      private var _voiceReady:Boolean = false;
+      private var _voiceEnabled:Boolean = true;
+      private var _voiceMode:String = "pushToTalk";
+      private var _voiceMic:String = "default";
+      private var _voiceKey:int = 86;
+      private var _voiceDevices:Array = [];
+      private var _voiceBinding:Boolean = false;
+
+      private function voiceInitialize() : void
+      {
+         this._voicePage = new MenuItemExpandable("Multiplayer",this.voiceOpened);
+         this._voiceEnabledItem = new MenuItem("Loading voice settings...",this.voiceToggle);
+         this._voiceModeItem = new MenuItem("Transmission mode",this.voiceModeChanged);
+         this._voiceMicItem = new MenuItem("Microphone",this.voiceMicChanged);
+         this._voiceKeyItem = new MenuItem("Push-to-talk key",this.voiceBind);
+         this._voicePage.page.addItem(this._voiceEnabledItem);
+         this._voicePage.page.addItem(this._voiceModeItem);
+         this._voicePage.page.addItem(this._voiceMicItem);
+         this._voicePage.page.addItem(this._voiceKeyItem);
+         this._voicePage.page.addItem(new MenuItem("Refresh microphones",this.voiceRefresh));
+         _optionsItem.page.addItem(this._voicePage);
+      }
+
+      private function voiceOpened(event:MenuPageEvent) : void
+      {
+         this.voiceSend("VOICE_GET_SETTINGS",{});
+      }
+
+      private function voiceRefresh(event:MenuItemEvent) : void
+      {
+         this.voiceSend("VOICE_GET_SETTINGS",{});
+      }
+
+      private function voiceSettings(values:Object) : void
+      {
+         this._voiceReady = true;
+         this._voiceEnabled = values["enabled"] == "1";
+         this._voiceMode = String(values["mode"]);
+         this._voiceMic = String(values["microphone"]);
+         this._voiceKey = int(values["key"]);
+         this._voiceDevices = [];
+         for(var i:int = 0; i < Math.min(64,int(values["count"])); i++)
+            this._voiceDevices.push({id:String(values["device" + i + "Id"]),name:String(values["device" + i + "Name"])});
+         this.voiceLabels();
+      }
+
+      private function voiceLabels() : void
+      {
+         if(this._voiceEnabledItem == null) return;
+         this._voiceEnabledItem.name = "Voice chat: " + (this._voiceEnabled ? "On" : "Off");
+         this._voiceModeItem.name = "Transmission: " + (this._voiceMode == "voiceActivity" ? "Voice activity" : "Push to talk");
+         var name:String = "Unavailable (select another)";
+         for each(var device:Object in this._voiceDevices)
+            if(device.id == this._voiceMic) name = String(device.name);
+         this._voiceMicItem.name = "Microphone: " + name;
+         this._voiceKeyItem.name = this._voiceBinding ? "Press a key (Escape to cancel)..." : "Push-to-talk key: " + this.voiceKeyName(this._voiceKey);
+         menu.refresh();
+      }
+
+      private function voiceKeyName(key:int) : String
+      {
+         if(key >= 65 && key <= 90 || key >= 48 && key <= 57) return String.fromCharCode(key);
+         if(key >= 112 && key <= 123) return "F" + (key - 111);
+         if(key == 32) return "Space";
+         if(key == 16) return "Shift";
+         if(key == 17) return "Ctrl";
+         if(key == 18) return "Alt";
+         return "VK " + key;
+      }
+
+      private function voiceToggle(event:MenuItemEvent) : void
+      {
+         if(!this._voiceReady) return;
+         this._voiceEnabled = !this._voiceEnabled;
+         this.voiceSave();
+      }
+
+      private function voiceModeChanged(event:MenuItemEvent) : void
+      {
+         if(!this._voiceReady) return;
+         this._voiceMode = this._voiceMode == "pushToTalk" ? "voiceActivity" : "pushToTalk";
+         this.voiceSave();
+      }
+
+      private function voiceMicChanged(event:MenuItemEvent) : void
+      {
+         if(!this._voiceReady || this._voiceDevices.length == 0) return;
+         var index:int = -1;
+         for(var i:int = 0; i < this._voiceDevices.length; i++)
+            if(this._voiceDevices[i].id == this._voiceMic) index = i;
+         this._voiceMic = String(this._voiceDevices[(index + 1) % this._voiceDevices.length].id);
+         this.voiceSave();
+      }
+
+      private function voiceBind(event:MenuItemEvent) : void
+      {
+         if(!this._voiceReady || stage == null) return;
+         this._voiceBinding = true;
+         stage.addEventListener(KeyboardEvent.KEY_DOWN,this.voiceKeyPressed,true,1000,true);
+         this.voiceLabels();
+      }
+
+      private function voiceKeyPressed(event:KeyboardEvent) : void
+      {
+         if(!this._voiceBinding) return;
+         event.stopImmediatePropagation();
+         event.preventDefault();
+         this.voiceCancelBinding();
+         if(event.keyCode != 27 && event.keyCode > 0 && event.keyCode < 255)
+         {
+            this._voiceKey = event.keyCode;
+            this.voiceSave();
+         }
+         this.voiceLabels();
+      }
+
+      private function voiceCancelBinding() : void
+      {
+         this._voiceBinding = false;
+         if(stage != null) stage.removeEventListener(KeyboardEvent.KEY_DOWN,this.voiceKeyPressed,true);
+      }
+
+      private function voiceSave() : void
+      {
+         this.voiceSend("VOICE_SAVE_SETTINGS",{enabled:this._voiceEnabled ? "1" : "0",mode:this._voiceMode,microphone:this._voiceMic,key:String(this._voiceKey)});
+         this.voiceLabels();
+      }
+
+      private function voiceSend(type:String, values:Object) : void
+      {
+         var line:String = type;
+         for(var key:String in values)
+            line += "|" + key + "=" + String(values[key]).split("%").join("%25").split("|").join("%7C").split("=").join("%3D").split("\n").join("%0A").split("\r").join("%0D");
+         this.aimpSend(line);
+      }
+
       public function PauseMenu()
       {
          this._debugMenuItem = new MenuItem("Debug Menu",this.debugMenuHandler);
@@ -49,6 +193,7 @@ package frontend
          _loc1_.addItem(this._resumeGameItem);
          _loc1_.addItem(_loadGameItem);
          _loc1_.addItem(_optionsItem);
+         this.voiceInitialize();
          _loc1_.addItem(_helpItem);
          _loc1_.addItem(_backToFrontendItem);
          _loc1_.addItem(_quitGameItem);
@@ -73,6 +218,8 @@ package frontend
 
       private function aimpRemovedFromStage(param1:Event) : void
       {
+         this.voiceCancelBinding();
+         this._voiceReady = false;
          removeEventListener(Event.ENTER_FRAME,this.aimpFrame);
          this._aimpDisconnectPending = false;
          this._aimpLeaveWhenKnown = false;
@@ -257,7 +404,17 @@ package frontend
 
       private function aimpHandleLine(param1:String) : void
       {
-         if(param1.indexOf("PAUSE_MENU_DISCONNECT_READY|") == 0)
+         if(param1.indexOf("VOICE_SETTINGS|") == 0)
+         {
+            var values:Object = {};
+            for each(var part:String in param1.split("|"))
+            {
+               var eq:int = part.indexOf("=");
+               if(eq > 0) values[part.substr(0,eq)] = part.substr(eq + 1).split("%0D").join("\r").split("%0A").join("\n").split("%3D").join("=").split("%7C").join("|").split("%25").join("%");
+            }
+            this.voiceSettings(values);
+         }
+         else if(param1.indexOf("PAUSE_MENU_DISCONNECT_READY|") == 0)
          {
             if(!this._aimpDisconnectPending || this.aimpGetValue(param1,"requestId") != String(this._aimpDisconnectRequest))
             {

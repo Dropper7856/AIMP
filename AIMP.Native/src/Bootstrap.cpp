@@ -1,4 +1,5 @@
 #include "aimp/AISync.h"
+#include "aimp/VoiceSync.h"
 #include "aimp/Bootstrap.h"
 
 #include "aimp/AuthorityController.h"
@@ -959,6 +960,13 @@ DWORD Bootstrap::RunImpl() {
                 : (aiError.empty() ? "AISync requires exact build, both destruction hooks and CharacterManagerUpdate." : aiError));
     }
 
+    if (validation.hashMatch && ai_sync::Installed()) {
+        std::string voiceError;
+        const auto installed = voice_sync::Install(moduleBase, *hooks, *levelGenerations, diagnostics, voiceError);
+        diagnostics.Log(installed ? "info" : "error", "voicesync_install",
+            installed ? "VoiceSync native audio installed; inactive until an authorized multiplayer session." : voiceError);
+    }
+
     const auto hashText = Sha256Hex(validation.actual.sha256);
     const bool staticProfileValidated = signaturesValid;
     const std::string selectedProfileId = signaturesValid
@@ -1539,6 +1547,7 @@ DWORD Bootstrap::RunImpl() {
         &state_,
         static_cast<LONG>(BootstrapState::ShuttingDown));
     ipc.Stop();
+    voice_sync::TransportLost();
     player_lifecycle::Shutdown();
     multiplayer_pause::Shutdown();
     item_sync::Shutdown();
@@ -1552,7 +1561,7 @@ DWORD Bootstrap::RunImpl() {
     const bool retainAISyncHooks = ai_sync::Installed();
     // The ItemSync detour runs on the engine thread like the pause shims: keep it for the process lifetime.
     const bool retainUiRuntime = ui_heap_guard::Installed() || multiplayer_pause::Installed() ||
-        item_sync::Installed();
+        item_sync::Installed() || voice_sync::Installed();
     ai_sync::BeginLogicalShutdown();
     const bool retainActionReleaseHook = character_action_runtime::BeginLogicalShutdown();
     character_action_probe::BeginLogicalShutdown();

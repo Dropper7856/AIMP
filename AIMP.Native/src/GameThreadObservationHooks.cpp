@@ -1,4 +1,5 @@
 #include "aimp/AISync.h"
+#include "aimp/VoiceSync.h"
 #include "aimp/GameThreadObservationHooks.h"
 
 #include "aimp/BuildProfile.h"
@@ -276,6 +277,7 @@ void __fastcall CharacterManagerUpdateDetour(
     }
 
     ai_sync::PumpOnEngineThread();
+    voice_sync::PumpOnEngineThread();
     item_sync::PumpOnEngineThread();
     const auto original = reinterpret_cast<ManagerUpdate>(
         gManagerUpdateTrampoline.load(std::memory_order_acquire));

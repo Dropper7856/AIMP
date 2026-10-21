@@ -80,6 +80,8 @@ bool IsKnownMessageType(const std::uint16_t raw) noexcept {
     case MessageType::PlayerLifecycleState:
     case MessageType::ItemSyncPickup:
     case MessageType::ItemSyncSpawn:
+    case MessageType::VoiceConfigure:
+    case MessageType::VoicePcmFrame:
     case MessageType::TestModeConfigure:
     case MessageType::CapabilityQuery:
     case MessageType::CapabilityState:

@@ -16,6 +16,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
 set(AIMP_CORE_SOURCES
+    src/VoiceSync.cpp
     src/AISync.cpp
     src/AISyncHealth.cpp
     src/AISyncAnimation.cpp

@@ -378,6 +378,9 @@ public sealed partial class LobbyClient : IAsyncDisposable
                 Interlocked.Exchange(ref _lastHostSeenTicks, Environment.TickCount64);
                 switch (frame.Type)
                 {
+                    case MessageType.VoiceFrame:
+                        HandleVoiceFrame(frame.Payload);
+                        break;
                     case MessageType.Heartbeat:
                         break;
 

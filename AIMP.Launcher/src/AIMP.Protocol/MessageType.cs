@@ -33,6 +33,8 @@ public enum MessageType : ushort
     PlayerLifecycleState = 27, // DLL -> launcher only: local THE_PLAYER death boundary.
     ItemSyncPickup = 28, // DLL -> launcher only: the local player collected a world pickup.
     ItemSyncSpawn = 29, // DLL -> launcher only: GCIP spawn proposal or local player drop.
+    VoiceConfigure = 30, // Launcher -> DLL voice session, local IPC only.
+    VoicePcmFrame = 31, // Launcher -> DLL decoded audio, local IPC only.
 
     LobbyJoin = 100,
     LobbyJoinAccepted = 101,
@@ -66,6 +68,7 @@ public enum MessageType : ushort
     LobbyPreparation = 128,
     SessionPrepared = 129,
     SessionRelease = 130,
+    VoiceFrame = 131, // Binary, independently decodable 20 ms mono IMA ADPCM.
 
     TestModeConfigure = 200,
     CapabilityQuery = 201,

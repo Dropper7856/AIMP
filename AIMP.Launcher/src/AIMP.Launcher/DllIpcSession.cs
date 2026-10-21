@@ -679,6 +679,23 @@ internal sealed class DllIpcSession : IAsyncDisposable
         return SendAsync(type, payload, token);
     }
 
+    internal async Task<bool> SendVoiceAsync(MessageType type, ReadOnlyMemory<byte> payload, CancellationToken token)
+    {
+        EnsureReady();
+        if (type is not (MessageType.VoiceConfigure or MessageType.VoicePcmFrame))
+            throw new ArgumentOutOfRangeException(nameof(type));
+        if (!await _writeLock.WaitAsync(0, token).ConfigureAwait(false)) return false;
+        try
+        {
+            // Once a shared-pipe frame starts, only pipe shutdown may cancel it.
+            // A voice timeout must never leave half a frame ahead of gameplay.
+            await FrameCodec.WriteAsync(_pipe, new AimpFrame(type, 0, NextProcessSequence(), payload),
+                _shutdown.Token).ConfigureAwait(false);
+            return true;
+        }
+        finally { _writeLock.Release(); }
+    }
+
     internal Task SendWorldSyncLifecycleAsync(
         WorldSyncLifecyclePayload lifecycle,
         CancellationToken cancellationToken = default)

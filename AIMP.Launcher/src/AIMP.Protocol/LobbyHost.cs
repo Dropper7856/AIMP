@@ -1233,6 +1233,11 @@ public sealed partial class LobbyHost : IAsyncDisposable
                         .ConfigureAwait(false);
                     break;
 
+                case MessageType.VoiceFrame:
+                    await HandleVoiceFrameAsync(state, frame.Payload, cancellationToken)
+                        .ConfigureAwait(false);
+                    break;
+
                 case MessageType.ItemPickupRequest:
                     await HandleItemPickupRequestAsync(state, frame.Payload, cancellationToken)
                         .ConfigureAwait(false);
@@ -2078,6 +2083,7 @@ public sealed partial class LobbyHost : IAsyncDisposable
 
     private sealed class ClientState
     {
+        public VoiceReceiveWindow VoiceWindow { get; } = new();
         private int _ready;
         private ulong _lastPositionSequence;
         private ulong _lastEquipmentSequence;

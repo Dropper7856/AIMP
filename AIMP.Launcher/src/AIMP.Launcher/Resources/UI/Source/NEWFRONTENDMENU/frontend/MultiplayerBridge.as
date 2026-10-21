@@ -28,6 +28,11 @@ package frontend
       private var _nextPoll:int = 0;
       private var _lastReady:int = 0;
 
+      public var onVoiceSettings:Function;
+      public function voiceCommand(type:String, values:Object) : void
+      {
+         if(type == "VOICE_GET_SETTINGS" || type == "VOICE_SAVE_SETTINGS") this.send(type,values);
+      }
       public var onReadiness:Function;
       public var onSessionClosed:Function;
       
@@ -318,7 +323,11 @@ package frontend
             }
             i++;
          }
-         if(type == "FRONTEND_STATE")
+         if(type == "VOICE_SETTINGS")
+         {
+            if(this.onVoiceSettings != null) this.onVoiceSettings(values);
+         }
+         else if(type == "FRONTEND_STATE")
          {
             this.setReadyState(values["ready"] == "1");
          }
