@@ -35,11 +35,23 @@ std::array<Queued, kCapacity> gQueue{};
 std::size_t gRead{}, gWrite{};
 SRWLOCK gQueueLock = SRWLOCK_INIT;
 std::atomic<std::uint64_t> gEpoch{1U};
+std::uintptr_t gBase{};
 std::atomic<Mode> gMode{Mode::Retail};
+std::atomic<std::uint64_t> gMissingMessageOwners{};
+// Message 0x14 in 54A240 queries the optional reference at handler+0xC.
+// The observed Client crash was ECX=0 at 524353. False already selects
+// the retail source-message fallback at 54A61D; do not skip the message.
+bool __fastcall MessageOwnerBound(void* owner, void*) noexcept {
+    const auto mode = gMode.load(std::memory_order_acquire);
+    if (owner == nullptr && (mode == Mode::Client || mode == Mode::FrozenClient)) {
+        gMissingMessageOwners.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+    return reinterpret_cast<bool(__fastcall*)(void*)>(gBase + 0x00124350U)(owner);
+}
 std::atomic<NpcPredicate> gNpc{};
 std::atomic<void*> gDecisionOriginal{};
 void* gDecisionTrampoline{};
-std::uintptr_t gBase{};
 std::atomic<std::uint64_t> gCaptured{}, gDropped{}, gDecisionsBlocked{}, gStateApplied{};
 std::atomic<std::uint64_t> gShotsApplied{}, gDeferred{}, gFailed{}, gAimSubmitted{}, gAimCancelled{};
 
@@ -394,7 +406,9 @@ ApplyResult Failed() noexcept { gFailed.fetch_add(1U, std::memory_order_relaxed)
 
 bool Initialize(const std::uintptr_t base, std::string& error) {
     gBase = base;
-    if (!Match(kShotDecision, {0x64,0xA1,0,0,0,0}) ||
+    if (!Match(0x00124350U, {0x56,0x8B,0xF1,0x8B,0x46,0x28,0x85,0xC0}) ||
+        !Match(0x0014A3B0U, {0x84,0xC0,0x0F,0x84,0x65,0x02,0,0}) ||
+        !Match(kShotDecision, {0x64,0xA1,0,0,0,0}) ||
         !Match(kInventoryItem, {0x8B,0x44,0x24,0x04,0x83,0x3C,0x81,0x00}) ||
         !Match(0x00374A24U, {0xC2,0x04,0x00}) ||
         !Match(kEquipmentTransition, {0x56,0x8B,0xF1,0x57,0x85,0xF6}) ||
@@ -427,6 +441,11 @@ bool Initialize(const std::uintptr_t base, std::string& error) {
 }
 bool Install(HookManager& hooks, std::string& error) {
     if (gBase == 0U) { error = "AISync combat is uninitialized"; return false; }
+    const auto checkpoint = hooks.InstalledCount();
+    if (!hooks.InstallCallRedirect({"aisync_client_message_owner",
+        reinterpret_cast<void*>(gBase + 0x0014A3ABU),
+        reinterpret_cast<void*>(gBase + 0x00124350U),
+        reinterpret_cast<void*>(&MessageOwnerBound)}, error)) return false;
     HookRequest request;
     request.name = "aisync_host_resolved_shot";
     request.target = reinterpret_cast<void*>(gBase + kShotDecision);
@@ -439,6 +458,8 @@ bool Install(HookManager& hooks, std::string& error) {
     request.publishedTrampolineOut = &gDecisionOriginal;
     if (hooks.Install(request, error)) return true;
     error = request.name + ": " + error;
+    std::string rollbackError;
+    if (!hooks.UninstallFrom(checkpoint, rollbackError)) error += "; rollback: " + rollbackError;
     return false;
 }
 void SetNpcPredicate(const NpcPredicate predicate) noexcept { gNpc.store(predicate, std::memory_order_release); }
@@ -577,6 +598,6 @@ Counters Snapshot() noexcept {
         gDecisionsBlocked.load(std::memory_order_relaxed), gStateApplied.load(std::memory_order_relaxed),
         gShotsApplied.load(std::memory_order_relaxed), gDeferred.load(std::memory_order_relaxed),
         gFailed.load(std::memory_order_relaxed), gAimSubmitted.load(std::memory_order_relaxed),
-        gAimCancelled.load(std::memory_order_relaxed)};
+        gAimCancelled.load(std::memory_order_relaxed), gMissingMessageOwners.load(std::memory_order_relaxed)};
 }
 } // namespace aimp::ai_sync::combat

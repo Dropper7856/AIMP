@@ -1104,7 +1104,7 @@ package frontend
          for(var i:int = 0; i < int(param1["developerLevelCount"]); i++)
          {
             var level:String = String(param1["developerLevel" + i]);
-            if(level.toUpperCase().indexOf("CHALLENGE") != 0 && level.toUpperCase().indexOf("BSP") != 0 && level.toUpperCase().indexOf("SALVAGE") != 0)
+            if(level.toUpperCase().indexOf("CHALLENGE") != 0 && level.toUpperCase().indexOf("BSPNOSTROMO_") != 0 && level.toUpperCase().indexOf("SALVAGE") != 0)
                this._campaignLevelIds.push(level);
          }
          this._serverModeItem.setItems(this._developerMode ? ["survival","campaign"] : ["survival"],this._developerMode ? ["Survival","Campaign (experimental)"] : ["Survival"]);
@@ -1582,7 +1582,7 @@ package frontend
          return "";
       }
       
-      private function mpBridgeGameStartHandler(mode:String, mapId:String = null, mapName:String = null, sessionId:String = null) : void
+      private function mpBridgeGameStartHandler(mode:String, mapId:String = null, mapName:String = null, sessionId:String = null, engineLevelPath:String = null) : void
       {
          this._mpPendingCommand = "start";
          this.mpUpdateControls();
@@ -1601,9 +1601,7 @@ package frontend
          }
          else
          {
-            this._mpPendingStartGame = false;
-            this._mpBridge.ackStartGame(this._mpPendingSessionId,"loading_campaign_level");
-            call("load_level",this._mpPendingStartMapId);
+            this.startPendingCampaignLevel(engineLevelPath);
          }
       }
       
@@ -1781,6 +1779,21 @@ package frontend
          return this.extractFirstString(data,["modelHint","ModelHint","model","Model","modelName","ModelName","asset","Asset","assetName","AssetName","texture","Texture","icon","Icon"]);
       }
       
+      private function startPendingCampaignLevel(engineLevelPath:String) : void
+      {
+         if(this._mpPendingStartMapId == null || this._mpPendingStartMapId.length == 0)
+         {
+            this.show_network_notification("No campaign level selected");
+            this._mpBridge.ackStartGame(this._mpPendingSessionId,"missing_campaign_level");
+            return;
+         }
+         if(engineLevelPath == null || engineLevelPath == "undefined" || engineLevelPath.length == 0)
+            engineLevelPath = "Production\\" + this._mpPendingStartMapId;
+         this._mpPendingStartGame = false;
+         this._mpBridge.ackStartGame(this._mpPendingSessionId,"loading_campaign_level:" + engineLevelPath);
+         call("load_level",engineLevelPath);
+      }
+
       private function startPendingSurvivorMap() : void
       {
          if(this._mpPendingStartMapId == null || this._mpPendingStartMapId.length == 0 || this._mpPendingStartMapId == "survival_auto")

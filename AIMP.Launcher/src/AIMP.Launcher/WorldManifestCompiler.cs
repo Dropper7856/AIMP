@@ -1884,7 +1884,7 @@ internal sealed class WorldManifestCompiler
     private static uint[] GetPathSteps(EntityPath path) =>
         (path.path ?? Array.Empty<ShortGuid>()).Select(static value => value.AsUInt32).ToArray();
 
-    private static WorldEntityId ComputeMapContentId(string pakHash, string binHash, bool pakPresent, bool binPresent)
+    internal static WorldEntityId ComputeMapContentId(string pakHash, string binHash, bool pakPresent, bool binPresent)
     {
         using var stream = new MemoryStream();
         using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
@@ -1892,8 +1892,10 @@ internal sealed class WorldManifestCompiler
         writer.Write(WorldManifestConstants.FormatVersion);
         writer.Write(pakPresent);
         writer.Write(binPresent);
-        writer.Write(pakHash);
-        writer.Write(binHash);
+        // Source digests are hexadecimal values. Preserve the compiler's historical
+        // lowercase encoding when callers supply uppercase SHA256 strings.
+        writer.Write(pakHash.ToLowerInvariant());
+        writer.Write(binHash.ToLowerInvariant());
         writer.Flush();
         return Hash128(stream.ToArray());
     }
@@ -2089,7 +2091,7 @@ internal sealed class WorldManifestCompiler
         throw new DirectoryNotFoundException($"'{fullPath}' does not contain WORLD/COMMANDS.PAK or WORLD/COMMANDS.BIN.");
     }
 
-    private static string GetDefaultCachePath(WorldEntityId mapContentId)
+    internal static string GetDefaultCachePath(WorldEntityId mapContentId)
     {
         var root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         return Path.Combine(root, "AIMP", "WorldManifestCache", $"{mapContentId}.aimpwm");

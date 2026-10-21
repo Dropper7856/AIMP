@@ -155,7 +155,6 @@ public sealed class WorldManifestService
                         }
                         result = new WorldManifestCompiler().Compile(source.LevelDirectory,
                             useCache: true, progress: progress);
-                        GamePreparationService.RegisterDebugManifest(job.GameDirectory, source.LevelDirectory, result);
                     }
                     job.CompleteItem(itemIndex, result);
                     _diagnostics.Log(

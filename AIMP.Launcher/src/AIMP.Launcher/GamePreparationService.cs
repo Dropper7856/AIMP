@@ -111,7 +111,7 @@ public sealed class GamePreparationService
     }
 
     // This path is intentionally read-only. No imports or cold compilation after launch.
-    internal Task<PreparedWorldManifest> PrepareLevelAsync(string level, CancellationToken cancellationToken) =>
+    internal Task<PreparedWorldManifest> PrepareLevelAsync(string level, CancellationToken cancellationToken, bool allowCampaign = false) =>
         Task.Run(() =>
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -124,10 +124,12 @@ public sealed class GamePreparationService
                     throw new InvalidOperationException("Prepare this installation in the Launcher before starting a multiplayer game.");
                 receipt = _receipt;
             }
-            var source = WorldManifestAutoResolver.ResolveLevelSource(game, level, settings.DeveloperMode);
-            var entry = receipt.Manifests.SingleOrDefault(m => SameDirectory(source, m.LevelDirectory))
-                ?? (settings.DeveloperMode ? ReadDebugManifest(game, source) : null)
-                ?? throw new InvalidOperationException("This level has no prepared world manifest. Close the game and prepare this map individually in Debug > WorldManifest, then relaunch.");
+            var source = WorldManifestAutoResolver.ResolveLevelSource(game, level, settings.DeveloperMode || allowCampaign);
+            var entry = receipt.Manifests.SingleOrDefault(m => SameDirectory(source, m.LevelDirectory));
+            if (entry == null && (settings.DeveloperMode || allowCampaign))
+                return LoadDeveloperManifest(source, cancellationToken);
+            if (entry == null)
+                throw new InvalidOperationException("This level has no prepared world manifest. Close the game and prepare this map individually in Debug > WorldManifest, then relaunch.");
             var world = ResolveWorldDirectory(source);
             if (HashIfPresent(Path.Combine(world, "COMMANDS.PAK")) != entry.CommandsPakSha256
                 || HashIfPresent(Path.Combine(world, "COMMANDS.BIN")) != entry.CommandsBinSha256)
@@ -139,33 +141,30 @@ public sealed class GamePreparationService
             return prepared;
         }, cancellationToken);
 
-    internal static void RegisterDebugManifest(string game, string level, WorldManifestCompilationResult result)
+    // Older Debug compilers produced the content-addressed cache without a preparation receipt.
+    // Resolve it from the current COMMANDS files; never compile or modify game assets here.
+    private static PreparedWorldManifest LoadDeveloperManifest(string level, CancellationToken cancellationToken)
     {
         var world = ResolveWorldDirectory(level);
-        var entry = new PreparedManifestReceipt(level, result.BinaryPath,
-            WorldReplicationCodec.ComputeManifestSha256(result.BinaryPath),
-            HashIfPresent(Path.Combine(world, "COMMANDS.PAK")),
-            HashIfPresent(Path.Combine(world, "COMMANDS.BIN")));
-        var path = DebugManifestPath(game, level);
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        var temporary = path + ".tmp";
-        File.WriteAllText(temporary, JsonSerializer.Serialize(entry));
-        File.Move(temporary, path, true);
-    }
-
-    private static PreparedManifestReceipt? ReadDebugManifest(string game, string level)
-    {
-        var path = DebugManifestPath(game, level);
-        if (!File.Exists(path)) return null;
-        var entry = JsonSerializer.Deserialize<PreparedManifestReceipt>(File.ReadAllText(path));
-        return entry != null && SameDirectory(entry.LevelDirectory, level) ? entry : null;
-    }
-
-    private static string DebugManifestPath(string game, string level)
-    {
-        var key = Path.GetFullPath(game).ToUpperInvariant() + "|" + Path.GetFullPath(level).ToUpperInvariant();
-        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "AIMP", "Preparation", "DebugLevels", Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key))) + ".json");
+        var pak = Path.Combine(world, "COMMANDS.PAK");
+        var bin = Path.Combine(world, "COMMANDS.BIN");
+        var pakHash = HashIfPresent(pak);
+        var binHash = HashIfPresent(bin);
+        var mapId = WorldManifestCompiler.ComputeMapContentId(pakHash, binHash, File.Exists(pak), File.Exists(bin));
+        var path = WorldManifestCompiler.GetDefaultCachePath(mapId);
+        if (!File.Exists(path))
+            throw new InvalidOperationException($"No current manifest exists for this map at '{path}' (level='{level}', map={mapId}). Prepare it in Debug > WorldManifest before creating the lobby.");
+        cancellationToken.ThrowIfCancellationRequested();
+        var prepared = WorldManifestSessionLoader.Load(path);
+        var manifest = prepared.Manifest;
+        if (manifest.MapContentId != mapId || manifest.CompilerVersion != WorldManifestConstants.CompilerVersion
+            || manifest.Source.CommandsPakPresent != File.Exists(pak)
+            || manifest.Source.CommandsBinPresent != File.Exists(bin)
+            || !string.Equals(manifest.Source.CommandsPakSha256, pakHash, StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(manifest.Source.CommandsBinSha256, binHash, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("The cached manifest is outdated for this map. Regenerate it in Debug > WorldManifest.");
+        cancellationToken.ThrowIfCancellationRequested();
+        return prepared;
     }
 
     private void Run(string game, string jobId)

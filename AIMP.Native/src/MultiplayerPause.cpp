@@ -400,11 +400,15 @@ struct PredicateSite final {
 // Exact AI.exe SHA-256 is a prerequisite of HookManager::MutationAllowed.
 // These are simulation boundaries, including callbacks omitted as LAB_... by
 // the C export. No camera, UI event, input-focus or pause-manager mutation.
+// Keep the native physics producer/consumer pipeline running under the loading
+// overlay. Holding Havok while animation/initialization queues transform commands
+// overflows FUN_007EC250's bounded queue (Host crash 230, capacity 10000).
+// AI decisions and action execution remain held until the session release.
 constexpr std::array<PredicateSite, 21U> kPredicates{{
-    {0x003750E7U, false}, // AI_CHARACTER_LOCO_PRE_HAVOK
-    {0x00375167U, false}, // HAVOK_UPDATE_DYNAMIC_OBJECTS
-    {0x0037519CU, false}, // HAVOK_UPDATE_WORLD
-    {0x003751C2U, true},  // HAVOK_UPDATE_WORLD second predicate
+    {0x003750E7U, false, false}, // AI_CHARACTER_LOCO_PRE_HAVOK
+    {0x00375167U, false, false}, // HAVOK_UPDATE_DYNAMIC_OBJECTS
+    {0x0037519CU, false, false}, // HAVOK_UPDATE_WORLD
+    {0x003751C2U, true, false},  // HAVOK_UPDATE_WORLD second predicate
     {0x003751E5U, false}, // DYNAMIC_EFFECTS_UPDATE paused argument
     {0x00375233U, true, false},  // COVER_PER_FRAME_UPDATE
     {0x00375265U, false, false}, // PATHFINDING_PATH_QUEUE_UPDATE
@@ -417,8 +421,8 @@ constexpr std::array<PredicateSite, 21U> kPredicates{{
     {0x003C9F78U, false, false}, // CHARACTER_BUILD_SECONDARY_ANIMATION
     {0x003C9FE0U, false, false}, // CHARACTER_IK_AND_RAGDOLL
     {0x003CD667U, false}, // AI_CHARACTER_DISPLAY_ACTIONS
-    {0x003CD6ACU, true},  // HAVOK_PRE_CHARACTER_UPDATE
-    {0x003CD6FCU, true},  // HAVOK_POST_CHARACTER_UPDATE
+    {0x003CD6ACU, true, false},  // HAVOK_PRE_CHARACTER_UPDATE
+    {0x003CD6FCU, true, false},  // HAVOK_POST_CHARACTER_UPDATE
     {0x003CD770U, false, false}, // MAIN_THREAD_CHARACTER_PROCESSING
     {0x003D4F90U, false}, // AI_COMBAT_MANAGER_MAIN
     {0x003D6347U, false}, // AI_CHARACTER_LOGIC_ACTIONS

@@ -31,6 +31,8 @@ internal static class Program
         new("Launcher integration tools", LauncherTests.LauncherIntegrationToolsAsync),
         new("Generic native IPC", IpcTests.GenericHandshakeAndQueuedCommandAsync),
         new("AISync rejection preserves IPC", IpcTests.AISyncRejectionPreservesConnectionAsync),
+        new("Manifest cache identity casing", LauncherTests.ManifestCacheIdentityAsync),
+        new("Lobby preparation status", LauncherTests.LobbyReadinessStatusAsync),
         new("Launcher body length", ArchitectureTests.LauncherBodiesAreShortAsync)
     };
 

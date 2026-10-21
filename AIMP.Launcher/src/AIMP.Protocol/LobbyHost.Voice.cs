@@ -10,21 +10,23 @@ public sealed partial class LobbyHost
 
     public event EventHandler<VoiceFramePayload>? VoiceFrameReceived;
 
-    public async Task SendVoiceFrameAsync(VoiceFramePayload frame, CancellationToken token = default)
+    // Returns whether the Host frame was admitted for relay to the clients.
+    public async Task<bool> SendVoiceFrameAsync(VoiceFramePayload frame, CancellationToken token = default)
     {
         var bytes = VoiceCodec.EncodeNetwork(frame);
         if (frame.SessionId != SessionId || frame.PeerId != HostPeerId)
             throw new InvalidOperationException("The host voice source identity is invalid.");
-        if (!await _hostVoiceSendGate.WaitAsync(0, token).ConfigureAwait(false)) return;
+        if (!await _hostVoiceSendGate.WaitAsync(0, token).ConfigureAwait(false)) return false;
         try
         {
             lock (_stateLock)
             {
                 if (!IsActiveVoiceSourceLocked(frame)
                     || !_hostVoiceWindow.TryAccept(frame.LevelGeneration, frame.Sequence, Environment.TickCount64))
-                    return;
+                    return false;
             }
             await RelayVoiceAsync(frame, bytes, token).ConfigureAwait(false);
+            return true;
         }
         finally { _hostVoiceSendGate.Release(); }
     }
@@ -60,7 +62,11 @@ public sealed partial class LobbyHost
         {
             if (destination.PeerId == frame.PeerId) continue;
             lock (_stateLock) { if (!IsActiveVoiceSourceLocked(frame)) return; }
-            try { await destination.Connection.TrySendVoiceAsync(bytes, token).ConfigureAwait(false); }
+            try
+            {
+                if (!await destination.Connection.TrySendVoiceAsync(bytes, token).ConfigureAwait(false))
+                    VoiceDropped("client connection busy");
+            }
             catch (Exception exception) when (exception is IOException or SocketException or ObjectDisposedException)
             {
                 VoiceDropped($"send failed: {exception.Message}");

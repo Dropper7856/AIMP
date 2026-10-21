@@ -24,7 +24,7 @@ internal sealed partial class MultiplayerSessionCoordinator
 
     private static string LevelGameMode(string level) =>
         level.StartsWith("Challenge", StringComparison.OrdinalIgnoreCase)
-        || level.StartsWith("BSP", StringComparison.OrdinalIgnoreCase)
+        || level.StartsWith("BSPNOSTROMO_", StringComparison.OrdinalIgnoreCase)
         || level.StartsWith("Salvage", StringComparison.OrdinalIgnoreCase) ? "Survival" : "Campaign";
 
     private static Dictionary<string, string> AddDeveloperLevels(

@@ -23,6 +23,9 @@ internal sealed class VoiceSyncSession : IDisposable
         Channel.CreateBounded<(VoiceSessionContext, VoiceFramePayload)>(new BoundedChannelOptions(12)
         { FullMode = BoundedChannelFullMode.DropOldest, SingleReader = true });
     private readonly Task _worker;
+    private readonly VoiceSyncStats _stats = new();
+    private string _reportedState = string.Empty;
+    private long _lastStatsAt;
     private VoiceSessionContext _context = new(Guid.Empty, 0, 0, 0, 0, false, false, null, null);
     private VoiceSettings _voice = new();
     private byte[]? _lastConfiguration;
@@ -45,6 +48,7 @@ internal sealed class VoiceSyncSession : IDisposable
         var context = Volatile.Read(ref _context);
         if (!context.Active || frame.SessionId != context.Session || frame.LevelGeneration != context.Round
             || frame.PeerId == context.LocalPeer || !ReferenceEquals(sender, context.Host ?? (object?)context.Client)) return;
+        _stats.Add(VoiceStat.Received);
         _received.Writer.TryWrite((context, frame));
     }
 
@@ -52,9 +56,12 @@ internal sealed class VoiceSyncSession : IDisposable
     {
         var context = Volatile.Read(ref _context);
         var voice = Volatile.Read(ref _voice);
-        if (!context.Active || !context.CanSpeak || !voice.Enabled || !GameFocused(context.ProcessId)) return;
-        if (voice.Mode == "pushToTalk" && (GetAsyncKeyState(voice.PushToTalkKey) & 0x8000) == 0) return;
-        _captured.Writer.TryWrite((context, pcm));
+        if (!context.Active || !context.CanSpeak || !voice.Enabled) return;
+        var gate = !GameFocused(context.ProcessId) ? VoiceStat.Unfocused
+            : voice.Mode == "pushToTalk" && (GetAsyncKeyState(voice.PushToTalkKey) & 0x8000) == 0
+                ? VoiceStat.PushToTalkIdle : VoiceStat.Captured;
+        _stats.Add(gate);
+        if (gate == VoiceStat.Captured) _captured.Writer.TryWrite((context, pcm));
     }
 
     private async Task RunAsync()
@@ -90,6 +97,7 @@ internal sealed class VoiceSyncSession : IDisposable
         var context = Volatile.Read(ref _context);
         var voice = Volatile.Read(ref _voice);
         var enabled = context.Active && voice.Enabled;
+        ReportState(context, voice, now);
         if (enabled && context.CanSpeak && GameFocused(context.ProcessId) && now >= _retryCaptureAt)
             _capture.Start(voice.MicrophoneId);
         else _capture.Stop();
@@ -103,8 +111,24 @@ internal sealed class VoiceSyncSession : IDisposable
     private void RefreshSettings(long now)
     {
         if (now - _lastSettingsRead < 500) return;
-        Volatile.Write(ref _voice, (_settings.Load().Voice ?? new VoiceSettings()).Normalize());
         _lastSettingsRead = now;
+        // A concurrent settings save must never stop the microphone; keep the last values.
+        try { Volatile.Write(ref _voice, (_settings.Load().Voice ?? new VoiceSettings()).Normalize()); }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+    }
+
+    private void ReportState(VoiceSessionContext context, VoiceSettings voice, long now)
+    {
+        var role = context.Host is not null ? "Host" : context.Client is not null ? "Client" : "none";
+        // Capture stops while the game window is not in the foreground (alt-tab, overlays).
+        var state = $"active={context.Active} canSpeak={context.CanSpeak} focused={GameFocused(context.ProcessId)} "
+            + $"enabled={voice.Enabled} mode={voice.Mode} "
+            + $"key={voice.PushToTalkKey} threshold={voice.ActivationThreshold} microphone={voice.MicrophoneId} "
+            + $"role={role} round={context.Round} native={context.NativeGeneration}";
+        if (state != _reportedState) { _reportedState = state; _controller.Diagnostics.Log("VoiceSync", state); }
+        if (!context.Active || now - _lastStatsAt < 5000) return;
+        _lastStatsAt = now;
+        if (_stats.TakeChanged() is { } stats) _controller.Diagnostics.Log("VoiceSync", $"Pipeline: {stats}");
     }
 
     private async Task<bool> ConfigureNativeAsync(VoiceSessionContext context, bool enabled, float volume)
@@ -129,22 +153,24 @@ internal sealed class VoiceSyncSession : IDisposable
             if (voice.Mode == "pushToTalk" && (GetAsyncKeyState(voice.PushToTalkKey) & 0x8000) == 0) continue;
             var pcm = item.Pcm;
             if (ApplyGain(pcm, voice.InputGain) >= voice.ActivationThreshold) _speechUntil = now + 250;
-            if (voice.Mode == "voiceActivity" && now > _speechUntil) continue;
-            await SendLocalAsync(context, pcm).ConfigureAwait(false);
+            if (voice.Mode == "voiceActivity" && now > _speechUntil) { _stats.Add(VoiceStat.BelowThreshold); continue; }
+            _stats.Add(await SendLocalAsync(context, pcm).ConfigureAwait(false)
+                ? VoiceStat.NetworkSent : VoiceStat.NetworkDropped);
         }
     }
 
-    private async Task SendLocalAsync(VoiceSessionContext context, short[] pcm)
+    private async Task<bool> SendLocalAsync(VoiceSessionContext context, short[] pcm)
     {
         var frame = new VoiceFramePayload(context.Session, context.LocalPeer, context.Round,
             ++_sequence, VoiceCodec.Encode(pcm));
         if (context.Host is not null)
         {
-            await context.Host.SendVoiceFrameAsync(frame, _stop.Token).ConfigureAwait(false);
+            var sent = await context.Host.SendVoiceFrameAsync(frame, _stop.Token).ConfigureAwait(false);
             await SendPcmAsync(context, frame, pcm, true).ConfigureAwait(false);
+            return sent;
         }
-        else if (context.Client is not null)
-            await context.Client.SendVoiceFrameAsync(frame, _stop.Token).ConfigureAwait(false);
+        return context.Client is not null
+            && await context.Client.SendVoiceFrameAsync(frame, _stop.Token).ConfigureAwait(false);
     }
 
     private static double ApplyGain(short[] pcm, float gain)
@@ -164,11 +190,12 @@ internal sealed class VoiceSyncSession : IDisposable
         for (var i = 0; i < 6 && _received.Reader.TryRead(out var item); i++)
         {
             if (!enabled || !SameRound(item.Context, context)) continue;
-            await SendPcmAsync(context, item.Frame, VoiceCodec.Decode(item.Frame.Audio), false).ConfigureAwait(false);
+            _stats.Add(await SendPcmAsync(context, item.Frame, VoiceCodec.Decode(item.Frame.Audio), false)
+                .ConfigureAwait(false) ? VoiceStat.ForwardedToGame : VoiceStat.GamePipeBusy);
         }
     }
 
-    private Task SendPcmAsync(VoiceSessionContext context, VoiceFramePayload frame, short[] pcm, bool local)
+    private Task<bool> SendPcmAsync(VoiceSessionContext context, VoiceFramePayload frame, short[] pcm, bool local)
     {
         var bytes = new byte[48 + VoiceCodec.SamplesPerFrame * 2];
         BinaryPrimitives.WriteUInt32LittleEndian(bytes, 0x31465641); // AVF1

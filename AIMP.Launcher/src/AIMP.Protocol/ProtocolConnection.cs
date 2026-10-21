@@ -6,6 +6,7 @@ internal sealed class ProtocolConnection : IAsyncDisposable
 {
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private long _sequence;
+    private static readonly TimeSpan VoiceWriteWait = TimeSpan.FromMilliseconds(10);
 
     public ProtocolConnection(TcpClient client)
     {
@@ -43,14 +44,16 @@ internal sealed class ProtocolConnection : IAsyncDisposable
 
     // Voice never queues behind other writes. A congested connection drops
     // the frame; reliable gameplay/control messages keep their existing path.
-    public async Task TrySendVoiceAsync(ReadOnlyMemory<byte> payload, CancellationToken token)
+    public async Task<bool> TrySendVoiceAsync(ReadOnlyMemory<byte> payload, CancellationToken token)
     {
-        if (!await _writeLock.WaitAsync(0, token).ConfigureAwait(false)) return;
+        // A short bounded wait rides out position/AI writes; a congested link still drops.
+        if (!await _writeLock.WaitAsync(VoiceWriteWait, token).ConfigureAwait(false)) return false;
         try
         {
             var sequence = unchecked((ulong)Interlocked.Increment(ref _sequence));
             await FrameCodec.WriteAsync(Stream,
                 new AimpFrame(MessageType.VoiceFrame, 0, sequence, payload), token).ConfigureAwait(false);
+            return true;
         }
         finally { _writeLock.Release(); }
     }

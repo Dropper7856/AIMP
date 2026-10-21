@@ -684,7 +684,8 @@ internal sealed class DllIpcSession : IAsyncDisposable
         EnsureReady();
         if (type is not (MessageType.VoiceConfigure or MessageType.VoicePcmFrame))
             throw new ArgumentOutOfRangeException(nameof(type));
-        if (!await _writeLock.WaitAsync(0, token).ConfigureAwait(false)) return false;
+        // Bounded: AISync/position frames hold the pipe briefly; never queue audio behind a stall.
+        if (!await _writeLock.WaitAsync(TimeSpan.FromMilliseconds(15), token).ConfigureAwait(false)) return false;
         try
         {
             // Once a shared-pipe frame starts, only pipe shutdown may cancel it.

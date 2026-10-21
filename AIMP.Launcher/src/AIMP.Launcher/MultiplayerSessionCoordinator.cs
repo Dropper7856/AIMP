@@ -417,6 +417,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _aiSync = new AISyncSession(controller, _performanceIsolation);
         _voiceSync = new VoiceSyncSession(controller, settingsStore);
         _bridge.MessageReceived += OnBridgeMessage;
+        _controller.StateChanged += OnGameRuntimeStateChanged;
         _bridge.ConnectionClosed += OnRoundBridgeConnectionClosed;
         _controller.WorldIntentProduced += OnNativeWorldIntentProduced;
         _controller.WorldMutationCompleted += OnNativeWorldMutationCompleted;
@@ -694,6 +695,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _aiSync.Dispose();
         _voiceSync.Dispose();
         _bridge.MessageReceived -= OnBridgeMessage;
+        _controller.StateChanged -= OnGameRuntimeStateChanged;
         _bridge.ConnectionClosed -= OnRoundBridgeConnectionClosed;
         _controller.WorldIntentProduced -= OnNativeWorldIntentProduced;
         _controller.WorldMutationCompleted -= OnNativeWorldMutationCompleted;
@@ -3672,7 +3674,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             try
             {
                 var source = WorldManifestAutoResolver.ResolveLevelSource(
-                    gameDirectory, level, settings.DeveloperMode);
+                    gameDirectory, level, settings.DeveloperMode || LevelGameMode(level) == "Campaign");
                 var catalogs = RemoteEquipmentCatalogCompiler.CompileAll(
                     source, out var diagnostic);
                 _diagnostics.Log("PlayerSync",
@@ -4633,11 +4635,16 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         await ReleaseSessionLoadingBestEffortAsync().ConfigureAwait(false);
         var stopState = BeginNetworkStop();
         DetachNetwork(stopState.Host, stopState.Client);
-        await UnbindNativeWorldSyncAuthorityAsync($"network-stop:{reason}")
-            .ConfigureAwait(false);
-        await StopRemoteCharactersBestEffortAsync(stopState.RemoteCharacters).ConfigureAwait(false);
-        lock (_stateGate) ClearSessionState();
-        await DisposeNetworkAsync(stopState.Host, stopState.Client).ConfigureAwait(false);
+        try
+        {
+            await UnbindNativeWorldSyncAuthorityAsync($"network-stop:{reason}").ConfigureAwait(false);
+            await StopRemoteCharactersBestEffortAsync(stopState.RemoteCharacters).ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_stateGate) ClearSessionState();
+            await DisposeNetworkAsync(stopState.Host, stopState.Client).ConfigureAwait(false);
+        }
         _diagnostics.Log("Multiplayer", reason);
         PublishState();
         if (stopState.Host is not null || stopState.Client is not null)
@@ -4755,7 +4762,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         return WithMenuLobbyControls(snapshot, new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["role"] = State.IsHost ? "host" : "client",
-            ["status"] = snapshot.State == "Starting" ? "Starting" : "Waiting for players",
+            ["status"] = LobbyReadiness.Status(snapshot),
             ["mode"] = LevelGameMode(snapshot.Level),
             ["mapId"] = snapshot.Level,
             ["mapName"] = snapshot.Level,
@@ -4789,6 +4796,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             ["mode"] = LevelGameMode(start.Level),
             ["mapId"] = start.Level,
             ["mapName"] = start.Level,
+            ["engineLevelPath"] = @"Production\" + start.Level,
             ["hostId"] = ResolveHostId(),
             ["status"] = "starting"
         };

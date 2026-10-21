@@ -8453,9 +8453,8 @@ bool OwnsAI() noexcept {
 }
 bool Installed() noexcept { return gInstalled.load(std::memory_order_acquire); }
 std::uintptr_t ResolveLivingParticipant(const std::uint64_t peer,
-    const std::uint32_t nativeGeneration, const std::uint32_t worldGeneration) noexcept {
-    if (!EngineThread() || !Stable() || gCurrent.nativeGeneration != nativeGeneration ||
-        gCurrent.worldGeneration != worldGeneration) return 0U;
+    const std::uint32_t nativeGeneration) noexcept {
+    if (!EngineThread() || !Stable() || gCurrent.nativeGeneration != nativeGeneration) return 0U;
     const auto character = ParticipantForPeer(peer);
     return LivingCharacter(character) ? character : 0U;
 }
@@ -8643,7 +8642,8 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"shotsApplied", Diagnostics::Unsigned(shots.shotsApplied), true},
          {"shotsDeferred", Diagnostics::Unsigned(shots.deferred), true},
          {"shotsFailed", Diagnostics::Unsigned(shots.failed), true},
-         {"shotDecisionsBlocked", Diagnostics::Unsigned(shots.decisionsBlocked), true}});
+         {"shotDecisionsBlocked", Diagnostics::Unsigned(shots.decisionsBlocked), true},
+         {"missingMessageOwners", Diagnostics::Unsigned(shots.missingMessageOwners), true}});
     diagnostics.Log("info", "aisync_native_animation", "Native paired updates and markers are observed, never ticked twice.",
         {{"sourceUpdates", Diagnostics::Unsigned(graph.sourceUpdates), true},
          {"coupledPlayerUpdates", Diagnostics::Unsigned(graph.coupledPlayerUpdates), true},

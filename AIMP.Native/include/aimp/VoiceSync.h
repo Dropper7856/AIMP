@@ -16,5 +16,9 @@ bool Configure(std::span<const std::byte> bytes, bool authorityHost) noexcept;
 bool QueueFrame(std::span<const std::byte> bytes) noexcept;
 void TransportLost() noexcept;
 void PumpOnEngineThread() noexcept;
+// IPC worker only: a frame arrived while the multiplayer world bus was closed.
+void NoteGatedFrame() noexcept;
+// Bootstrap/IPC workers only; logs when any counter changed.
+void LogDiagnostics(Diagnostics& diagnostics);
 }
 }
