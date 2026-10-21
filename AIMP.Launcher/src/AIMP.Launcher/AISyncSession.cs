@@ -31,6 +31,7 @@ internal sealed class AISyncSession : IDisposable
     private int _nativeGeneration;
     private long _epoch;
     private bool _isHost, _bound, _compatible;
+    private bool _alienEnabled = true;
     private bool _active, _sending, _impactSending, _disposed;
     private bool _availabilityWarningReported;
     private long _nativeProduced, _remoteReceived, _networkSent, _nativeSent, _lastTrafficLogTick;
@@ -72,7 +73,8 @@ internal sealed class AISyncSession : IDisposable
     }
 
     internal async Task ConfigureAsync(Guid session, bool isHost, int nativeGeneration,
-        int worldGeneration, bool bound, bool compatible, ulong localPeer, CancellationToken token)
+        int worldGeneration, bool bound, bool compatible, ulong localPeer, CancellationToken token,
+        bool alienEnabled = true)
     {
         await _configureGate.WaitAsync(token).ConfigureAwait(false);
         try
@@ -83,6 +85,7 @@ internal sealed class AISyncSession : IDisposable
                 _nativeGeneration = nativeGeneration;
                 _isHost = isHost; _bound = bound; _compatible = compatible;
                 _localPeer = localPeer;
+                _alienEnabled = alienEnabled;
             }
             await ApplyConfigurationAsync(Enabled, token).ConfigureAwait(false);
         }
@@ -187,7 +190,7 @@ internal sealed class AISyncSession : IDisposable
             if (enabled && bound && (worldGeneration <= 0 || nativeGeneration <= 0))
                 role = _isHost ? 0U : 3U;
             configuration = AISyncCodec.Configuration(role, Math.Max(nativeGeneration, 0),
-                Math.Max(worldGeneration, 0), session, _localPeer, _participants);
+                Math.Max(worldGeneration, 0), session, _localPeer, _participants, _alienEnabled);
             var snapshot = _controller.Snapshot;
             processId = snapshot.ProcessId;
             var desiredActive = enabled && bound && compatible && (role is 1 or 2) && !_disposed;

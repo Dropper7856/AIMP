@@ -411,7 +411,7 @@ public static class AISyncCodec
     }
 
     public static byte[] Configuration(uint role, int nativeGeneration, int worldGeneration, Guid session,
-        ulong localPeer, IReadOnlyDictionary<ulong, uint> participants)
+        ulong localPeer, IReadOnlyDictionary<ulong, uint> participants, bool alienEnabled = true)
     {
         if (role > 3 || nativeGeneration < 0 || worldGeneration < 0)
             throw new ArgumentOutOfRangeException(nameof(role));
@@ -428,6 +428,7 @@ public static class AISyncCodec
         BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(16), role == 0 ? 0 : SessionCookie(session));
         BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(24), localPeer);
         BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(32), (uint)participants.Count);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(36), role != 0 && !alienEnabled ? 1U : 0U);
         var offset = 40;
         var characters = new HashSet<uint>();
         foreach (var binding in participants.OrderBy(value => value.Key))

@@ -121,6 +121,7 @@ package frontend
       private var _serverModeItem:MenuItemOptionOptionStepper;
       
       private var _serverMapItem:MenuItemOptionOptionStepper;
+      private var _serverAlienItem:MenuItemOptionOptionStepper;
       
       private var _survivorMapIds:Array;
       
@@ -506,6 +507,8 @@ package frontend
          this._survivorMapDescriptions = ["Uses the first available survivor map until the game playlist data is loaded"];
          this._serverModeItem = new MenuItemOptionOptionStepper("Game Mode",["survival"],["Survival"],this.serverModeChangedHandler);
          this._serverMapItem = new MenuItemOptionOptionStepper("Survivor Map",this._survivorMapIds,this._survivorMapLabels,this.serverMapChangedHandler);
+         this._serverAlienItem = new MenuItemOptionOptionStepper("Alien",["1","0"],["Enabled","Disabled"]);
+         this._serverAlienItem.selectedIndex = 0;
          this._serverMaxPlayersItem = new MenuItemOptionOptionStepper("Max Players",[2,3,4],["2 Players","3 Players","4 Players"],this.serverMaxPlayersChangedHandler);
          this._serverVisibilityItem = new MenuItemOptionOptionStepper("Visibility",["public","private"],["Public","Private"],this.serverVisibilityChangedHandler);
          this._serverStartItem = new MenuItemExpandable("Create Lobby");
@@ -612,6 +615,7 @@ package frontend
          this._createServerItem.page.addItem(this._serverPasswordItem);
          this._createServerItem.page.addItem(this._serverModeItem);
          this._createServerItem.page.addItem(this._serverMapItem);
+         this._createServerItem.page.addItem(this._serverAlienItem);
          this._createServerItem.page.addItem(this._serverMaxPlayersItem);
          this._createServerItem.page.addItem(this._serverVisibilityItem);
          this._createServerItem.page.addItem(this._serverStartItem);
@@ -1021,7 +1025,7 @@ package frontend
       {
          if(!this.mpBeginCommand("create")) return;
          this.show_network_notification("Creating lobby");
-         this._mpBridge.createLobby(String(this._serverModeItem.selectedItem),int(this._serverMaxPlayersItem.selectedItem),String(this._serverVisibilityItem.selectedItem),this.getSelectedSurvivorMapId(),this.getSelectedSurvivorMapName());
+         this._mpBridge.createLobby(String(this._serverModeItem.selectedItem),int(this._serverMaxPlayersItem.selectedItem),String(this._serverVisibilityItem.selectedItem),this.getSelectedSurvivorMapId(),this.getSelectedSurvivorMapName(),String(this._serverAlienItem.selectedItem) != "0");
       }
       
       private function readyChangedHandler(param1:MenuItemEvent) : void
@@ -1202,6 +1206,7 @@ package frontend
          this._directIpJoinItem.enabled = idle && outsideLobby;
          this._serverStartItem.enabled = idle && outsideLobby;
          this._serverMapItem.enabled = idle && outsideLobby;
+         this._serverAlienItem.enabled = idle && outsideLobby;
          this._serverRefreshItem.enabled = idle && outsideLobby;
          this._mpResumeLobbyItem.visible = !outsideLobby;
          this._mpResumeLobbyItem.enabled = idle;
@@ -2095,6 +2100,7 @@ package frontend
          this._serverPasswordItem.description = "Configured in the launcher settings";
          this._serverModeItem.descriptions = ["Create a campaign server","Create a survival server"];
          this._serverMapItem.descriptions = this._survivorMapDescriptions;
+         this._serverAlienItem.descriptions = ["Normal Alien behavior","Disable the Alien to explore and test this level"];
          this._serverMaxPlayersItem.descriptions = ["Two player MVP","Three players experimental","Four players experimental"];
          this._serverVisibilityItem.descriptions = ["Visible in server list","Requires password or invite"];
          this._serverStartItem.description = "Create lobby and wait for players";

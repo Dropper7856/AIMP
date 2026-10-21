@@ -208,10 +208,11 @@ struct Configuration final {
     std::uint64_t sessionCookie{};
     // Launcher -> local DLL only. Never passed to the lobby transport.
     std::uint64_t localPeer{};
-    std::uint32_t participantCount{}, reserved{};
+    std::uint32_t participantCount{}, flags{}; // bit 0: suppress Alien (Host only)
     ParticipantBinding participants[32]{};
 };
 #pragma pack(pop)
+static_assert(offsetof(Configuration, flags) == 36U);
 static_assert(sizeof(NativeOutcome) == 48U);
 static_assert(offsetof(State, outcome) == 192U);
 static_assert(offsetof(State, executionRevision) == 240U);
