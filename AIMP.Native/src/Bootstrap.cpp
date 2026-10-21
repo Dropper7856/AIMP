@@ -38,6 +38,7 @@
 #include "aimp/PlayerSyncObserver.h"
 #include "aimp/PlayerLifecycle.h"
 #include "aimp/UIHeapGuard.h"
+#include "aimp/LoadingContextGuard.h"
 #include "aimp/MultiplayerPause.h"
 #include "aimp/ItemSync.h"
 #include "aimp/PeerManager.h"
@@ -636,6 +637,14 @@ DWORD Bootstrap::RunImpl() {
     }
 
     {
+        std::string contextError;
+        const bool installed = validation.hashMatch &&
+            loading_context_guard::Install(moduleBase, *hooks, contextError);
+        diagnostics.Log(installed ? "info" : "error", "loading_context_guard_initialized",
+            installed ? "Certified native loading context readiness guard installed." : contextError);
+    }
+
+    {
         std::string lifecycleError;
         const bool installed = signaturesValid && resolver != nullptr &&
             player_lifecycle::Install(profile, *resolver, *hooks,
@@ -1026,6 +1035,7 @@ DWORD Bootstrap::RunImpl() {
         player_lifecycle::DrainDiagnostics(diagnostics);
         if (GetTickCount64() - lastPauseCounterLogTick >= 5000ULL) {
             multiplayer_pause::LogDiagnostics(diagnostics);
+            loading_context_guard::LogDiagnostics(diagnostics);
             item_sync::LogDiagnostics(diagnostics);
             lastPauseCounterLogTick = GetTickCount64();
         }
@@ -1313,6 +1323,7 @@ DWORD Bootstrap::RunImpl() {
                 readinessLogTick - lastAISyncCounterLogTick >= 5000U)) {
             lastAISyncCounterLogTick = readinessLogTick;
             ai_sync::LogDiagnostics(diagnostics);
+            voice_sync::LogDiagnostics(diagnostics);
         }
         const bool readinessEventChanged =
             readiness.publisher.calls != lastLoggedReadinessPublisher ||
@@ -1561,7 +1572,7 @@ DWORD Bootstrap::RunImpl() {
     const bool retainAISyncHooks = ai_sync::Installed();
     // The ItemSync detour runs on the engine thread like the pause shims: keep it for the process lifetime.
     const bool retainUiRuntime = ui_heap_guard::Installed() || multiplayer_pause::Installed() ||
-        item_sync::Installed() || voice_sync::Installed();
+        item_sync::Installed() || voice_sync::Installed() || loading_context_guard::Installed();
     ai_sync::BeginLogicalShutdown();
     const bool retainActionReleaseHook = character_action_runtime::BeginLogicalShutdown();
     character_action_probe::BeginLogicalShutdown();

@@ -7,6 +7,40 @@ namespace AIMP.Protocol.Tests;
 
 internal static class LauncherTests
 {
+    internal static Task ManifestCacheIdentityAsync()
+    {
+        // TECH_COMMS: the compiler found this cache while lobby preflight searched
+        // a different name because its SHA256 text was uppercase.
+        const string pak = "b8f248e111e5ad956f5dede067b329f7eb81fda579f5db837cbc8579cd1c528a";
+        var lower = WorldManifestCompiler.ComputeMapContentId(pak, string.Empty, true, false);
+        var upper = WorldManifestCompiler.ComputeMapContentId(pak.ToUpperInvariant(), string.Empty, true, false);
+        AssertEx.Equal("42E90BA4BB09E8F281D7423B1B1DF7FD", lower.ToString());
+        AssertEx.Equal(lower, upper);
+        AssertEx.Equal(WorldManifestCompiler.GetDefaultCachePath(lower), WorldManifestCompiler.GetDefaultCachePath(upper));
+        AssertEx.True(lower != WorldManifestCompiler.ComputeMapContentId(new string('0', 64), string.Empty, true, false));
+        return Task.CompletedTask;
+    }
+
+    internal static Task LobbyReadinessStatusAsync()
+    {
+        var session = Guid.NewGuid();
+        var token = Guid.NewGuid();
+        var host = new LobbyPlayer(1, Guid.NewGuid(), "Host", true, true);
+        var client = new LobbyPlayer(2, Guid.NewGuid(), "Client", false, true);
+        var identity = new WorldManifestIdentity(WorldManifestConstants.FormatVersion, WorldManifestConstants.CompilerVersion, new WorldEntityId(1, 2));
+        var ready = new LobbyPreparationPayload(session, 1, "TECH_COMMS", token, identity, new string('a', 64), true, "");
+        var lobby = new LobbySnapshotPayload(session, "Test", "TECH_COMMS", "Lobby", 2, 0,
+            new[] { host, client }, token, new[] { ready }, true);
+        AssertEx.Equal("Verifying Client's level", LobbyReadiness.Status(lobby));
+        var peer = ready with { PeerId = 2 };
+        AssertEx.Equal("Ready to start", LobbyReadiness.Status(lobby with { Preparations = new[] { ready, peer } }));
+        AssertEx.Equal("Client: Missing manifest", LobbyReadiness.Status(lobby with
+            { Preparations = new[] { ready, peer with { Ready = false, Error = "Missing manifest" } } }));
+        AssertEx.Equal("Level manifest mismatch: Client", LobbyReadiness.Status(lobby with
+            { Preparations = new[] { ready, peer with { ManifestSha256 = new string('b', 64) } } }));
+        return Task.CompletedTask;
+    }
+
     internal static Task ProcessSelectionAsync()
     {
         var mainWindow = Target(10, 100, true);

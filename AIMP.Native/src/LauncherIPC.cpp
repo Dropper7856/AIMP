@@ -1,3 +1,4 @@
+#include "aimp/LoadingContextGuard.h"
 #include "aimp/AISync.h"
 #include "aimp/VoiceSync.h"
 #include "aimp/LauncherIPC.h"
@@ -1668,6 +1669,7 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
     case protocol::MessageType::VoicePcmFrame:
         if (sessionConfigured_.load(std::memory_order_acquire) && worldSyncAuthorityBound_ && worldSyncWorldBusActive_)
             static_cast<void>(voice_sync::QueueFrame(frame.payload));
+        else voice_sync::NoteGatedFrame();
         return true;
     case protocol::MessageType::WorldSyncLifecycle: {
         if (!sessionConfigured_.load(std::memory_order_acquire) ||
@@ -3064,7 +3066,9 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
     }
     case protocol::MessageType::DiagnosticSnapshotRequest: {
         ai_sync::LogDiagnostics(*diagnostics_);
+        voice_sync::LogDiagnostics(*diagnostics_);
         item_sync::LogDiagnostics(*diagnostics_);
+        loading_context_guard::LogDiagnostics(*diagnostics_);
         experimental::DiagnosticSnapshotRequest request;
         if (!sessionConfigured_.load(std::memory_order_acquire) ||
             !netzReadySent_.load(std::memory_order_acquire) ||

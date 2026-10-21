@@ -359,7 +359,7 @@ package frontend
          {
             if(this.onGameStart != null)
             {
-               this.onGameStart(String(values["mode"]),String(values["mapId"]),String(values["mapName"]),String(values["sessionId"]));
+               this.onGameStart(String(values["mode"]),String(values["mapId"]),String(values["mapName"]),String(values["sessionId"]),String(values["engineLevelPath"]));
             }
          }
          else if(type == "CONFIG")

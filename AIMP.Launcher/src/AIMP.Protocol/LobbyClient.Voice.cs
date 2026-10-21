@@ -11,24 +11,35 @@ public sealed partial class LobbyClient
 
     public event EventHandler<VoiceFramePayload>? VoiceFrameReceived;
 
-    public async Task SendVoiceFrameAsync(VoiceFramePayload frame, CancellationToken token = default)
+    // Returns whether the frame was written to the Host connection.
+    public async Task<bool> SendVoiceFrameAsync(VoiceFramePayload frame, CancellationToken token = default)
     {
         var bytes = VoiceCodec.EncodeNetwork(frame);
         if (frame.SessionId != SessionId || frame.PeerId != PeerId)
             throw new InvalidOperationException("The client voice source identity is invalid.");
-        if (!await _voiceSendGate.WaitAsync(0, token).ConfigureAwait(false)) return;
+        if (!await _voiceSendGate.WaitAsync(0, token).ConfigureAwait(false)) return false;
         try
         {
             var snapshot = Snapshot;
-            if (snapshot?.State != "Starting" || snapshot.LevelGeneration != frame.LevelGeneration
-                || !_outboundVoiceWindow.TryAccept(frame.LevelGeneration, frame.Sequence, Environment.TickCount64)) return;
-            try { await _connection.TrySendVoiceAsync(bytes, token).ConfigureAwait(false); }
-            catch (Exception exception) when (exception is IOException or SocketException or ObjectDisposedException)
+            if (snapshot?.State != "Starting" || snapshot.LevelGeneration != frame.LevelGeneration)
             {
-                VoiceDropped($"send failed: {exception.Message}");
+                VoiceDropped($"outbound round rejected: state={snapshot?.State} generation={snapshot?.LevelGeneration}/{frame.LevelGeneration}");
+                return false;
             }
+            return _outboundVoiceWindow.TryAccept(frame.LevelGeneration, frame.Sequence, Environment.TickCount64)
+                && await TrySendVoiceBytesAsync(bytes, token).ConfigureAwait(false);
         }
         finally { _voiceSendGate.Release(); }
+    }
+
+    private async Task<bool> TrySendVoiceBytesAsync(ReadOnlyMemory<byte> bytes, CancellationToken token)
+    {
+        try { return await _connection.TrySendVoiceAsync(bytes, token).ConfigureAwait(false); }
+        catch (Exception exception) when (exception is IOException or SocketException or ObjectDisposedException)
+        {
+            VoiceDropped($"send failed: {exception.Message}");
+            return false;
+        }
     }
 
     private void HandleVoiceFrame(ReadOnlyMemory<byte> bytes)

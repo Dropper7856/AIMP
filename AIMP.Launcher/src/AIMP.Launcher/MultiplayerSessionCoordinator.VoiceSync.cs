@@ -19,12 +19,23 @@ internal sealed partial class MultiplayerSessionCoordinator
     private void SuspendVoiceSession() => _voiceSync.Update(
         new VoiceSessionContext(Guid.Empty, 0, 0, 0, 0, false, false, null, null));
 
-    private Task HandleVoiceBridgeAsync(ScaleformBridgeMessage message) =>
+    private Task HandleVoiceBridgeAsync(ScaleformBridgeMessage message, Func<string, IReadOnlyDictionary<string, string>?, Task<bool>>? reply = null) =>
         string.Equals(message.Type.Trim(), "VOICE_SAVE_SETTINGS", StringComparison.OrdinalIgnoreCase)
-            ? SaveVoiceSettingsAsync(message)
-            : SendVoiceSettingsAsync();
+            ? SaveVoiceSettingsAsync(message, reply)
+            : SendVoiceSettingsAsync(reply);
 
-    private async Task SendVoiceSettingsAsync()
+    private static bool IsVoiceSettingsMessage(ScaleformBridgeMessage message) =>
+        message.Type.Trim().ToUpperInvariant() is "VOICE_GET_SETTINGS" or "VOICE_SAVE_SETTINGS";
+
+    // The in-game pause menu has its own event-channel socket: answer on it, not
+    // on the command channel, which belongs to the gameplay overlay.
+    private async Task HandlePauseVoiceMessageAsync(ScaleformBridgeEvent value)
+    {
+        try { await HandleVoiceBridgeAsync(value.Message, value.Reply).ConfigureAwait(false); }
+        catch (Exception exception) { _diagnostics.Log("VoiceSync", $"Pause menu voice settings failed: {exception.Message}"); }
+    }
+
+    private async Task SendVoiceSettingsAsync(Func<string, IReadOnlyDictionary<string, string>?, Task<bool>>? reply = null)
     {
         var settings = _settingsStore.Load();
         var voice = (settings.Voice ?? new VoiceSettings()).Normalize();
@@ -39,7 +50,8 @@ internal sealed partial class MultiplayerSessionCoordinator
             ["volume"] = voice.PlaybackVolume.ToString(CultureInfo.InvariantCulture)
         };
         AddMicrophoneDevices(values);
-        await _bridge.SendAsync("VOICE_SETTINGS", values).ConfigureAwait(false);
+        if (reply is not null) await reply("VOICE_SETTINGS", values).ConfigureAwait(false);
+        else await _bridge.SendAsync("VOICE_SETTINGS", values).ConfigureAwait(false);
     }
 
     private static float ReadVoiceLevel(ScaleformBridgeMessage message, string key, float fallback) =>
@@ -57,7 +69,7 @@ internal sealed partial class MultiplayerSessionCoordinator
         }
     }
 
-    private async Task SaveVoiceSettingsAsync(ScaleformBridgeMessage message)
+    private async Task SaveVoiceSettingsAsync(ScaleformBridgeMessage message, Func<string, IReadOnlyDictionary<string, string>?, Task<bool>>? reply = null)
     {
         var current = _settingsStore.Load();
         var voice = (current.Voice ?? new VoiceSettings()).Normalize();
@@ -71,6 +83,6 @@ internal sealed partial class MultiplayerSessionCoordinator
             PlaybackVolume = ReadVoiceLevel(message, "volume", voice.PlaybackVolume) };
         if (!next.TryValidate(out var error)) throw new InvalidOperationException(error);
         _settingsStore.Save(current with { Voice = next });
-        await SendVoiceSettingsAsync().ConfigureAwait(false);
+        await SendVoiceSettingsAsync(reply).ConfigureAwait(false);
     }
 }

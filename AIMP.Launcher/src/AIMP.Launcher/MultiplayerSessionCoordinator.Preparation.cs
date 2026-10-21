@@ -7,6 +7,7 @@ internal sealed partial class MultiplayerSessionCoordinator
 {
     private readonly GamePreparationService? _gamePreparation;
     private Guid _preflightToken;
+    private DateTimeOffset _nextPreflightRetryUtc;
     private Task<PreparedWorldManifest?>? _preflightTask;
     private PreparedWorldManifest? _preflightManifest;
     private CancellationTokenSource? _preflightCancellation;
@@ -48,7 +49,10 @@ internal sealed partial class MultiplayerSessionCoordinator
         {
             if (_start is not null || !lobby.WorldPreparationRequired || lobby.PreparationToken == Guid.Empty
                 || (_host is null && _client is null)) return;
-            if (_preflightToken == lobby.PreparationToken && _preflightTask is not null) return;
+            if (_preflightToken == lobby.PreparationToken && _preflightTask is not null
+                && (!_preflightTask.IsCompleted || _preflightManifest is not null
+                    || DateTimeOffset.UtcNow < _nextPreflightRetryUtc)) return;
+            _nextPreflightRetryUtc = DateTimeOffset.UtcNow.AddSeconds(10);
             _preflightCancellation?.Cancel();
             _preflightCancellation?.Dispose();
             _preflightCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
@@ -67,7 +71,8 @@ internal sealed partial class MultiplayerSessionCoordinator
         {
             await SendStatusAsync("Verifying level preparation...").ConfigureAwait(false);
             if (_gamePreparation is null) throw new InvalidOperationException("Game preparation is unavailable. Complete launcher setup first.");
-            prepared = await _gamePreparation.PrepareLevelAsync(lobby.Level, token).ConfigureAwait(false);
+            prepared = await _gamePreparation.PrepareLevelAsync(lobby.Level, token,
+                allowCampaign: LevelGameMode(lobby.Level) == "Campaign").ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { return null; }
         catch (Exception exception) when (exception is not OutOfMemoryException)
@@ -93,6 +98,7 @@ internal sealed partial class MultiplayerSessionCoordinator
         {
             if (host is not null) await host.SetHostPreparationAsync(report, token).ConfigureAwait(false);
             else if (client is not null) await client.SendLobbyPreparationAsync(report, token).ConfigureAwait(false);
+            _diagnostics.Log("Preparation", $"Lobby preflight: level={lobby.Level}, peer={peer}, ready={prepared is not null}, manifest={prepared?.Identity}, hash={prepared?.Sha256}, error={error}");
             await SendStatusAsync(prepared is not null ? "Level verified. Waiting for players." : "Level preparation failed. Check launcher setup.").ConfigureAwait(false);
         }
         catch (Exception exception) when (exception is IOException or OperationCanceledException or ProtocolException)

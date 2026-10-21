@@ -4,11 +4,18 @@ namespace AIMP.Launcher;
 
 internal sealed partial class MultiplayerSessionCoordinator
 {
-    private Task SendMenuReadyStateAsync() => _bridge.SendAsync(
-        "FRONTEND_STATE", new Dictionary<string, string>
+    private async Task SendMenuReadyStateAsync()
+    {
+        await _bridge.SendAsync("FRONTEND_STATE", new Dictionary<string, string>
         {
             ["ready"] = _controller.Snapshot.IpcConnected ? "1" : "0"
-        });
+        }).ConfigureAwait(false);
+        LobbySnapshotPayload? lobby;
+        lock (_stateGate) lobby = _start is null ? _lobby : null;
+        if (lobby is null) return;
+        ScheduleLobbyPreparation(lobby);
+        await SendLobbyStateAsync(lobby).ConfigureAwait(false);
+    }
 
     private void EnsureMenuConnectionAvailable()
     {
@@ -79,6 +86,8 @@ internal sealed partial class MultiplayerSessionCoordinator
     {
         if (value.Message.Type.Equals("MENU_STATE", StringComparison.OrdinalIgnoreCase))
         { _ = SendMenuReadyStateAsync(); return true; }
+        if (value.Reply is not null && value.Channel == "event" && IsVoiceSettingsMessage(value.Message))
+        { _ = HandlePauseVoiceMessageAsync(value); return true; }
         if (!IsPauseMenuMessage(value.Message)) return false;
         _ = HandlePauseMenuMessageAsync(value);
         return true;

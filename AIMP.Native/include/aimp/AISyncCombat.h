@@ -68,7 +68,7 @@ struct ReplayCursor final {
 };
 struct Counters final {
     std::uint64_t captured{}, dropped{}, decisionsBlocked{}, stateApplied{}, shotsApplied{};
-    std::uint64_t deferred{}, failed{}, aimSubmitted{}, aimCancelled{};
+    std::uint64_t deferred{}, failed{}, aimSubmitted{}, aimCancelled{}, missingMessageOwners{};
 };
 // This predicate must use generation/lifetime-safe published data; a retail
 // equipment update may run on a worker. Never consult the engine Actor array.

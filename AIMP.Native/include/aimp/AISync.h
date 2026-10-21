@@ -333,9 +333,9 @@ struct Counters final {
 };
 Counters DiagnosticsSnapshot() noexcept;
 // Engine-thread participant identity for source-attributed native subsystems.
-// Uses the same generation/lifetime proof as perception; never chooses a target.
-std::uintptr_t ResolveLivingParticipant(std::uint64_t peer, std::uint32_t nativeGeneration,
-    std::uint32_t worldGeneration) noexcept;
+// Uses the same native generation/lifetime proof as perception; never chooses a
+// target. The launcher's world generation is AISync-private and not compared.
+std::uintptr_t ResolveLivingParticipant(std::uint64_t peer, std::uint32_t nativeGeneration) noexcept;
 // Call only from IPC/bootstrap workers, never from an engine detour.
 void LogDiagnostics(Diagnostics& diagnostics);
 } // namespace ai_sync
