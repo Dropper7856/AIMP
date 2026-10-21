@@ -46,6 +46,12 @@ package frontend
       private var _voiceModeItem:MenuItem;
       private var _voiceMicItem:MenuItem;
       private var _voiceKeyItem:MenuItem;
+      private var _voiceThresholdItem:MenuItem;
+      private var _voiceGainItem:MenuItem;
+      private var _voiceVolumeItem:MenuItem;
+      private var _voiceThreshold:Number = 0.02;
+      private var _voiceGain:Number = 1;
+      private var _voiceVolume:Number = 1;
       private var _voiceReady:Boolean = false;
       private var _voiceEnabled:Boolean = true;
       private var _voiceMode:String = "pushToTalk";
@@ -61,10 +67,16 @@ package frontend
          this._voiceModeItem = new MenuItem("Transmission mode",this.voiceModeChanged);
          this._voiceMicItem = new MenuItem("Microphone",this.voiceMicChanged);
          this._voiceKeyItem = new MenuItem("Push-to-talk key",this.voiceBind);
+         this._voiceThresholdItem = new MenuItem("Voice activation threshold",this.voiceThresholdChanged);
+         this._voiceGainItem = new MenuItem("Microphone gain",this.voiceGainChanged);
+         this._voiceVolumeItem = new MenuItem("Voice volume",this.voiceVolumeChanged);
          this._voicePage.page.addItem(this._voiceEnabledItem);
          this._voicePage.page.addItem(this._voiceModeItem);
          this._voicePage.page.addItem(this._voiceMicItem);
          this._voicePage.page.addItem(this._voiceKeyItem);
+         this._voicePage.page.addItem(this._voiceThresholdItem);
+         this._voicePage.page.addItem(this._voiceGainItem);
+         this._voicePage.page.addItem(this._voiceVolumeItem);
          this._voicePage.page.addItem(new MenuItem("Refresh microphones",this.voiceRefresh));
          _optionsItem.page.addItem(this._voicePage);
       }
@@ -86,6 +98,9 @@ package frontend
          this._voiceMode = String(values["mode"]);
          this._voiceMic = String(values["microphone"]);
          this._voiceKey = int(values["key"]);
+         this._voiceThreshold = Number(values["threshold"]);
+         this._voiceGain = Number(values["gain"]);
+         this._voiceVolume = Number(values["volume"]);
          this._voiceDevices = [];
          for(var i:int = 0; i < Math.min(64,int(values["count"])); i++)
             this._voiceDevices.push({id:String(values["device" + i + "Id"]),name:String(values["device" + i + "Name"])});
@@ -101,6 +116,9 @@ package frontend
          for each(var device:Object in this._voiceDevices)
             if(device.id == this._voiceMic) name = String(device.name);
          this._voiceMicItem.name = "Microphone: " + name;
+         this._voiceThresholdItem.name = "Voice activation threshold: " + this.voicePercent(this._voiceThreshold);
+         this._voiceGainItem.name = "Microphone gain: " + this.voicePercent(this._voiceGain);
+         this._voiceVolumeItem.name = "Voice volume: " + this.voicePercent(this._voiceVolume);
          this._voiceKeyItem.name = this._voiceBinding ? "Press a key (Escape to cancel)..." : "Push-to-talk key: " + this.voiceKeyName(this._voiceKey);
          menu.refresh();
       }
@@ -120,6 +138,39 @@ package frontend
       {
          if(!this._voiceReady) return;
          this._voiceEnabled = !this._voiceEnabled;
+         this.voiceSave();
+      }
+
+      private function voicePercent(value:Number) : String
+      {
+         return Math.round(value * 100) + "%";
+      }
+
+      private function voiceNext(steps:Array, current:Number) : Number
+      {
+         for each(var step:Number in steps)
+            if(step > current + 0.0001) return step;
+         return Number(steps[0]);
+      }
+
+      private function voiceThresholdChanged(event:MenuItemEvent) : void
+      {
+         if(!this._voiceReady) return;
+         this._voiceThreshold = this.voiceNext([0.005,0.01,0.02,0.04,0.08],this._voiceThreshold);
+         this.voiceSave();
+      }
+
+      private function voiceGainChanged(event:MenuItemEvent) : void
+      {
+         if(!this._voiceReady) return;
+         this._voiceGain = this.voiceNext([0.5,0.75,1,1.5,2,3],this._voiceGain);
+         this.voiceSave();
+      }
+
+      private function voiceVolumeChanged(event:MenuItemEvent) : void
+      {
+         if(!this._voiceReady) return;
+         this._voiceVolume = this.voiceNext([0,0.25,0.5,0.75,1],this._voiceVolume);
          this.voiceSave();
       }
 
@@ -170,7 +221,7 @@ package frontend
 
       private function voiceSave() : void
       {
-         this.voiceSend("VOICE_SAVE_SETTINGS",{enabled:this._voiceEnabled ? "1" : "0",mode:this._voiceMode,microphone:this._voiceMic,key:String(this._voiceKey)});
+         this.voiceSend("VOICE_SAVE_SETTINGS",{enabled:this._voiceEnabled ? "1" : "0",mode:this._voiceMode,microphone:this._voiceMic,key:String(this._voiceKey),threshold:String(this._voiceThreshold),gain:String(this._voiceGain),volume:String(this._voiceVolume)});
          this.voiceLabels();
       }
 

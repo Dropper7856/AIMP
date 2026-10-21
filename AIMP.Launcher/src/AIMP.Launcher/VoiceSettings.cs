@@ -1,5 +1,3 @@
-using AIMP.Launcher.Contracts;
-
 namespace AIMP.Launcher;
 
 internal sealed record VoiceSettings(bool Enabled = true, string Mode = "pushToTalk",
@@ -29,10 +27,6 @@ internal sealed record VoiceSettings(bool Enabled = true, string Mode = "pushToT
         return error.Length == 0;
     }
 
-    internal static VoiceSettings FromDto(VoiceSettingsDto v) => new(v.Enabled, v.Mode,
-        v.MicrophoneId, v.PushToTalkKey, v.ActivationThreshold, v.InputGain, v.PlaybackVolume);
-    internal VoiceSettingsDto ToDto() => new(Enabled, Mode, MicrophoneId, PushToTalkKey,
-        ActivationThreshold, InputGain, PlaybackVolume);
     private static bool InRange(float v, float min, float max) => float.IsFinite(v) && v >= min && v <= max;
     private static float Clamp(float v, float min, float max, float fallback) => float.IsFinite(v) ? Math.Clamp(v, min, max) : fallback;
 }
