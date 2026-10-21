@@ -266,6 +266,9 @@ package frontend
       
       private var _leaderboard_spinner_visible:Boolean;
       
+      private var _campaignLevelIds:Array = [];
+      private var _developerMode:Boolean = false;
+      private var _developerItem:MenuItem;
       private var _voicePage:MenuItemExpandable;
       private var _voiceEnabledItem:MenuItem;
       private var _voiceModeItem:MenuItem;
@@ -295,6 +298,9 @@ package frontend
          this._voiceThresholdItem = new MenuItem("Voice activation threshold",this.voiceThresholdChanged);
          this._voiceGainItem = new MenuItem("Microphone gain",this.voiceGainChanged);
          this._voiceVolumeItem = new MenuItem("Voice volume",this.voiceVolumeChanged);
+         this._developerItem = new MenuItem("Developer mode: Off",this.developerToggle);
+         this._developerItem.description = "Experimental game mode and level selection. Campaign levels require game preparation after restarting the game.";
+         this._voicePage.page.addItem(this._developerItem);
          this._voicePage.page.addItem(this._voiceEnabledItem);
          this._voicePage.page.addItem(this._voiceModeItem);
          this._voicePage.page.addItem(this._voiceMicItem);
@@ -304,6 +310,12 @@ package frontend
          this._voicePage.page.addItem(this._voiceVolumeItem);
          this._voicePage.page.addItem(new MenuItem("Refresh microphones",this.voiceRefresh));
          _optionsItem.page.addItem(this._voicePage);
+      }
+
+      private function developerToggle(event:MenuItemEvent) : void
+      {
+         if(!this._voiceReady) return;
+         this.voiceSend("DEVELOPER_MODE",{enabled:this._developerMode ? "0" : "1"});
       }
 
       private function voiceOpened(event:MenuPageEvent) : void
@@ -319,6 +331,8 @@ package frontend
       private function voiceSettings(values:Object) : void
       {
          this._voiceReady = true;
+         this._developerMode = values["developerMode"] == "1";
+         this._developerItem.name = "Developer mode: " + (this._developerMode ? "On" : "Off");
          this._voiceEnabled = values["enabled"] == "1";
          this._voiceMode = String(values["mode"]);
          this._voiceMic = String(values["microphone"]);
@@ -538,11 +552,11 @@ package frontend
          this._multiplayerItem.enabled = false;
          this._mpResumeLobbyItem = new MenuItem("Return to Lobby",this.mpResumeLobbyHandler);
          this._mpResumeLobbyItem.visible = false;
-         this._directIpJoinItem.autoExpand = false;
-         this._serverStartItem.autoExpand = false;
-         this._serverLanItem.autoExpand = false;
-         this._serverCampaignItem.autoExpand = false;
-         this._serverSurvivalItem.autoExpand = false;
+
+
+
+
+
          this._twoTeamsNoviceDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_NOVICE",this.twoTeamsNoviceDifficultyHandler);
          this._twoTeamsEasyDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_EASY",this.twoTeamsEasyDifficultyHandler);
          this._twoTeamsMediumDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_MEDIUM",this.twoTeamsMediumDifficultyHandler);
@@ -945,7 +959,7 @@ package frontend
       
       private function serverModeChangedHandler(param1:MenuItemEvent) : void
       {
-         this.updateServerMapVisibility();
+         this.refreshSurvivorMapOptions();
       }
       
       private function serverMapChangedHandler(param1:MenuItemEvent) : void
@@ -1085,6 +1099,17 @@ package frontend
          {
             this._directJoinPortValue = _loc5_;
          }
+         this._developerMode = param1["developerMode"] == "1";
+         this._campaignLevelIds = [];
+         for(var i:int = 0; i < int(param1["developerLevelCount"]); i++)
+         {
+            var level:String = String(param1["developerLevel" + i]);
+            if(level.toUpperCase().indexOf("CHALLENGE") != 0 && level.toUpperCase().indexOf("BSP") != 0 && level.toUpperCase().indexOf("SALVAGE") != 0)
+               this._campaignLevelIds.push(level);
+         }
+         this._serverModeItem.setItems(this._developerMode ? ["survival","campaign"] : ["survival"],this._developerMode ? ["Survival","Campaign (experimental)"] : ["Survival"]);
+         this._serverModeItem.selectedIndex = 0;
+         this.refreshSurvivorMapOptions();
          this.mpRefreshServerConfigItems();
       }
       
@@ -1473,7 +1498,10 @@ package frontend
       {
          if(this._serverMapItem != null)
          {
-            this._serverMapItem.setItems(this._survivorMapIds,this._survivorMapLabels,this._survivorMapDescriptions);
+            if(this._developerMode && String(this._serverModeItem.selectedItem) == "campaign")
+               this._serverMapItem.setItems(this._campaignLevelIds,this._campaignLevelIds);
+            else
+               this._serverMapItem.setItems(this._survivorMapIds,this._survivorMapLabels,this._survivorMapDescriptions);
             this._serverMapItem.selectedIndex = 0;
          }
          this.updateServerMapVisibility();
@@ -1484,15 +1512,17 @@ package frontend
       {
          if(this._serverMapItem != null && this._serverModeItem != null)
          {
-            this._serverMapItem.visible = String(this._serverModeItem.selectedItem) == "survival";
+            this._serverModeItem.visible = this._developerMode;
+            this._serverMapItem.visible = this._developerMode;
+            this._serverMapItem.name = String(this._serverModeItem.selectedItem) == "campaign" ? "Campaign Level" : "Survivor Map";
          }
       }
       
       private function getSelectedSurvivorMapId() : String
       {
-         if(String(this._serverModeItem.selectedItem) != "survival")
+         if(String(this._serverModeItem.selectedItem) == "campaign")
          {
-            return "";
+            return this._serverMapItem.selectedItem == null ? "" : String(this._serverMapItem.selectedItem);
          }
          if(this._serverMapItem == null || this._serverMapItem.selectedItem == null)
          {
@@ -1503,9 +1533,9 @@ package frontend
       
       private function getSelectedSurvivorMapName() : String
       {
-         if(String(this._serverModeItem.selectedItem) != "survival")
+         if(String(this._serverModeItem.selectedItem) == "campaign")
          {
-            return "";
+            return this._serverMapItem.selectedItem == null ? "" : String(this._serverMapItem.selectedItem);
          }
          if(this._serverMapItem == null)
          {
@@ -1571,8 +1601,9 @@ package frontend
          }
          else
          {
-            this.show_network_notification("Campaign MP start not implemented yet");
-            this._mpBridge.ackStartGame(this._mpPendingSessionId,"campaign_not_implemented");
+            this._mpPendingStartGame = false;
+            this._mpBridge.ackStartGame(this._mpPendingSessionId,"loading_campaign_level");
+            call("load_level",this._mpPendingStartMapId);
          }
       }
       
@@ -2099,9 +2130,10 @@ package frontend
          this._twoTeamsItem.visible = true;
          this._ripleyItem.visible = true;
          this._selectLevelItem.visible = true;
+         this.updateServerMapVisibility();
          this._playGameItem.visible = false;
          this._joinServerItem.visible = false;
-         this._serverModeItem.visible = false;
+         this._serverModeItem.visible = this._developerMode;
          this._serverMaxPlayersItem.visible = false;
          this._serverVisibilityItem.visible = false;
          this.mpUpdateControls();

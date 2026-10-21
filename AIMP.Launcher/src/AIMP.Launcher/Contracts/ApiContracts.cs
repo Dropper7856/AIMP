@@ -168,7 +168,8 @@ public sealed record WorldLevelListResponse(
     string ProductionDirectory,
     IReadOnlyList<WorldLevelResponse> Levels);
 
-public sealed record StartWorldManifestCompilationRequest(IReadOnlyList<string>? RelativePaths);
+public sealed record StartWorldManifestCompilationRequest(
+    IReadOnlyList<string>? RelativePaths, bool ImportAssets = false);
 
 public sealed record WorldManifestCompilationJobResponse(
     Guid Id,

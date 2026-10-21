@@ -743,6 +743,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         {
             "HELLO" => HandleHelloAsync(message),
             "VOICE_GET_SETTINGS" or "VOICE_SAVE_SETTINGS" => HandleVoiceBridgeAsync(message),
+            "DEVELOPER_MODE" => SetDeveloperModeAsync(message),
             "PICKUP_OVERLAY_LOADED" => MarkGameplayUiLoadedAsync(message),
             "CREATE_LOBBY" => CreateLobbyAsync(message),
             "JOIN_DIRECT_IP" => JoinDirectAsync(),
@@ -803,6 +804,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         EnsureMenuConnectionAvailable();
         await StopNetworkAsync("Creating a new lobby").ConfigureAwait(false);
         var settings = _settingsStore.Load();
+        ValidateDeveloperLobby(settings, message);
         var options = CreateHostOptions(settings, message);
         var host = await StartMenuHostAsync(options).ConfigureAwait(false);
         _diagnostics.Log("Multiplayer", $"Lobby hosted on port {host.BoundPort}.");
@@ -3670,7 +3672,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             try
             {
                 var source = WorldManifestAutoResolver.ResolveLevelSource(
-                    gameDirectory, level);
+                    gameDirectory, level, settings.DeveloperMode);
                 var catalogs = RemoteEquipmentCatalogCompiler.CompileAll(
                     source, out var diagnostic);
                 _diagnostics.Log("PlayerSync",
@@ -4721,7 +4723,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     }
 
     private IReadOnlyDictionary<string, string> BuildConfigValues(LauncherSettings settings) =>
-        new Dictionary<string, string>(StringComparer.Ordinal)
+        AddDeveloperLevels(settings, new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["mode"] = State.IsHost ? "Host" : "Client",
             ["playerName"] = settings.PlayerName,
@@ -4734,7 +4736,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             ["visibility"] = "Private",
             ["survivorMapId"] = "ChallengeMap16",
             ["survivorMapName"] = "ChallengeMap16"
-        };
+        });
 
     private async Task SendCurrentLobbyAsync()
     {
@@ -4754,7 +4756,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         {
             ["role"] = State.IsHost ? "host" : "client",
             ["status"] = snapshot.State == "Starting" ? "Starting" : "Waiting for players",
-            ["mode"] = "Survival",
+            ["mode"] = LevelGameMode(snapshot.Level),
             ["mapId"] = snapshot.Level,
             ["mapName"] = snapshot.Level,
             ["p1"] = FormatPlayer(players, 0, 1),
@@ -4784,7 +4786,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             ["sessionGeneration"] = start.LevelGeneration.ToString(CultureInfo.InvariantCulture),
             ["lobbyId"] = start.SessionId.ToString("N"),
             ["syncProtocol"] = ProtocolConstants.Version.ToString(CultureInfo.InvariantCulture),
-            ["mode"] = "Survival",
+            ["mode"] = LevelGameMode(start.Level),
             ["mapId"] = start.Level,
             ["mapName"] = start.Level,
             ["hostId"] = ResolveHostId(),

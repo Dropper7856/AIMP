@@ -26,9 +26,11 @@ internal sealed partial class MultiplayerSessionCoordinator
 
     private async Task SendVoiceSettingsAsync()
     {
-        var voice = (_settingsStore.Load().Voice ?? new VoiceSettings()).Normalize();
+        var settings = _settingsStore.Load();
+        var voice = (settings.Voice ?? new VoiceSettings()).Normalize();
         var values = new Dictionary<string, string>
         {
+            ["developerMode"] = settings.DeveloperMode ? "1" : "0",
             ["enabled"] = voice.Enabled ? "1" : "0", ["mode"] = voice.Mode,
             ["key"] = voice.PushToTalkKey.ToString(CultureInfo.InvariantCulture),
             ["microphone"] = voice.MicrophoneId,

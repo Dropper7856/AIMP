@@ -11,7 +11,8 @@ internal sealed record LauncherSettings(
     Guid PlayerId = default,
     bool WorldSyncEnabled = true,
     bool WorldSync3EmptyCallbackEnabled = false,
-    VoiceSettings? Voice = null)
+    VoiceSettings? Voice = null,
+    bool DeveloperMode = false)
 {
     internal static LauncherSettings Empty { get; } = new(string.Empty);
 

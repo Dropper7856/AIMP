@@ -31,7 +31,7 @@ package frontend
       public var onVoiceSettings:Function;
       public function voiceCommand(type:String, values:Object) : void
       {
-         if(type == "VOICE_GET_SETTINGS" || type == "VOICE_SAVE_SETTINGS") this.send(type,values);
+         if(type == "VOICE_GET_SETTINGS" || type == "VOICE_SAVE_SETTINGS" || type == "DEVELOPER_MODE") this.send(type,values);
       }
       public var onReadiness:Function;
       public var onSessionClosed:Function;
@@ -140,7 +140,8 @@ package frontend
          this.releaseSocket();
          this._connecting = true;
          this._socket = new Socket();
-         this._socket.timeout = 3000;
+         // Do not assign Socket.timeout: the game runtime may expose a sealed Socket
+         // without this property, causing ReferenceError #1056 during menu startup.
          this._socket.addEventListener(Event.CONNECT,this.connectedHandler,false,0,true);
          this._socket.addEventListener(Event.CLOSE,this.closeHandler,false,0,true);
          this._socket.addEventListener(ProgressEvent.SOCKET_DATA,this.socketDataHandler,false,0,true);

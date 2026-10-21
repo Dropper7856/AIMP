@@ -15,7 +15,7 @@ internal static class GamePreparationSynchronization
 
 public sealed class GamePreparationService
 {
-    private const int RecipeVersion = 2; // DLC-only preparation; invalidate campaign-inclusive receipts.
+    private const int RecipeVersion = 2; // Automatic preparation covers DLC levels only; Debug prepares other maps individually.
     private readonly object _sync = new();
     private readonly LauncherSettingsStore _settings;
     private readonly LauncherDiagnostics _diagnostics;
@@ -116,16 +116,18 @@ public sealed class GamePreparationService
         {
             cancellationToken.ThrowIfCancellationRequested();
             PreparationReceipt receipt;
-            var game = _settings.Load().GameDirectory;
+            var settings = _settings.Load();
+            var game = settings.GameDirectory;
             lock (_sync)
             {
                 if (_status.State != "Ready" || !SameDirectory(game, _status.GameDirectory) || _receipt == null)
                     throw new InvalidOperationException("Prepare this installation in the Launcher before starting a multiplayer game.");
                 receipt = _receipt;
             }
-            var source = WorldManifestAutoResolver.ResolveLevelSource(game, level);
+            var source = WorldManifestAutoResolver.ResolveLevelSource(game, level, settings.DeveloperMode);
             var entry = receipt.Manifests.SingleOrDefault(m => SameDirectory(source, m.LevelDirectory))
-                ?? throw new InvalidOperationException("This level has no prepared world manifest. Close the game and prepare the installation again.");
+                ?? (settings.DeveloperMode ? ReadDebugManifest(game, source) : null)
+                ?? throw new InvalidOperationException("This level has no prepared world manifest. Close the game and prepare this map individually in Debug > WorldManifest, then relaunch.");
             var world = ResolveWorldDirectory(source);
             if (HashIfPresent(Path.Combine(world, "COMMANDS.PAK")) != entry.CommandsPakSha256
                 || HashIfPresent(Path.Combine(world, "COMMANDS.BIN")) != entry.CommandsBinSha256)
@@ -136,6 +138,35 @@ public sealed class GamePreparationService
                 throw new InvalidOperationException("The prepared world manifest changed. Close the game and prepare the installation again.");
             return prepared;
         }, cancellationToken);
+
+    internal static void RegisterDebugManifest(string game, string level, WorldManifestCompilationResult result)
+    {
+        var world = ResolveWorldDirectory(level);
+        var entry = new PreparedManifestReceipt(level, result.BinaryPath,
+            WorldReplicationCodec.ComputeManifestSha256(result.BinaryPath),
+            HashIfPresent(Path.Combine(world, "COMMANDS.PAK")),
+            HashIfPresent(Path.Combine(world, "COMMANDS.BIN")));
+        var path = DebugManifestPath(game, level);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var temporary = path + ".tmp";
+        File.WriteAllText(temporary, JsonSerializer.Serialize(entry));
+        File.Move(temporary, path, true);
+    }
+
+    private static PreparedManifestReceipt? ReadDebugManifest(string game, string level)
+    {
+        var path = DebugManifestPath(game, level);
+        if (!File.Exists(path)) return null;
+        var entry = JsonSerializer.Deserialize<PreparedManifestReceipt>(File.ReadAllText(path));
+        return entry != null && SameDirectory(entry.LevelDirectory, level) ? entry : null;
+    }
+
+    private static string DebugManifestPath(string game, string level)
+    {
+        var key = Path.GetFullPath(game).ToUpperInvariant() + "|" + Path.GetFullPath(level).ToUpperInvariant();
+        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "AIMP", "Preparation", "DebugLevels", Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key))) + ".json");
+    }
 
     private void Run(string game, string jobId)
     {

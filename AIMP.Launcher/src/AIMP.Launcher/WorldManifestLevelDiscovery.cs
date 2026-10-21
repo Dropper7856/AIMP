@@ -11,23 +11,24 @@ internal static class WorldManifestLevelDiscovery
 {
     private const int MaxDiscoveryDepth = 16;
 
-    internal static IReadOnlyList<WorldManifestLevelSource> Discover(string gameDirectory)
+    internal static IReadOnlyList<WorldManifestLevelSource> Discover(string gameDirectory, bool includeCampaign = false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(gameDirectory);
 
         var production = GetProductionDirectory(gameDirectory);
         var dlc = GetDlcDirectory(gameDirectory);
-        if (!Directory.Exists(dlc))
+        var discoveryRoot = includeCampaign ? production : dlc;
+        if (!Directory.Exists(discoveryRoot))
         {
             throw new DirectoryNotFoundException(
-                $"Alien: Isolation DLC directory was not found: '{dlc}'.");
+                $"Alien: Isolation level directory was not found: '{discoveryRoot}'.");
         }
 
         var levels = new List<WorldManifestLevelSource>();
         var pending = new Stack<(string Directory, int Depth)>();
         var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        // Campaign support is disabled for this release. Never scan its levels.
-        pending.Push((dlc, 0));
+        // Developer sessions may opt into experimental campaign levels.
+        pending.Push((discoveryRoot, 0));
 
         while (pending.Count != 0)
         {

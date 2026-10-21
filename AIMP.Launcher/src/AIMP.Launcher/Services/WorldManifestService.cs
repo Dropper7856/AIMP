@@ -35,7 +35,8 @@ public sealed class WorldManifestService
             throw new ArgumentException("Select at least one level.", nameof(request));
 
         var epoch = Volatile.Read(ref _resetEpoch);
-        var available = await DiscoverSourcesAsync(cancellationToken).ConfigureAwait(false);
+        var gameDirectory = _settings.Load().GameDirectory;
+        var available = await DiscoverSourcesAsync(gameDirectory, cancellationToken).ConfigureAwait(false);
         var byRelativePath = available.ToDictionary(
             level => level.RelativePath,
             StringComparer.OrdinalIgnoreCase);
@@ -64,7 +65,7 @@ public sealed class WorldManifestService
                 throw new InvalidOperationException(
                     "A World Manifest compilation is already running.");
             PruneCompletedJobs();
-            job = new CompilationJob(selected);
+            job = new CompilationJob(selected, gameDirectory, request.ImportAssets);
             if (!_jobs.TryAdd(job.Id, job))
                 throw new InvalidOperationException("The compilation job could not be created.");
         }
@@ -103,7 +104,7 @@ public sealed class WorldManifestService
         if (!GameInstallation.TryResolve(settings.GameDirectory, out var game, out var error))
             throw new InvalidOperationException(error);
         var production = WorldManifestLevelDiscovery.GetProductionDirectory(game.GameDirectory);
-        var levels = WorldManifestLevelDiscovery.Discover(game.GameDirectory);
+        var levels = WorldManifestLevelDiscovery.Discover(game.GameDirectory, includeCampaign: true);
         _diagnostics.Log(
             "World Manifest",
             $"Level discovery found {levels.Count} level(s) under {production}; " +
@@ -114,12 +115,11 @@ public sealed class WorldManifestService
     }
 
     private Task<IReadOnlyList<WorldManifestLevelSource>> DiscoverSourcesAsync(
-        CancellationToken cancellationToken) => Task.Run(() =>
+        string gameDirectory, CancellationToken cancellationToken) => Task.Run(() =>
     {
-        var settings = _settings.Load();
-        if (!GameInstallation.TryResolve(settings.GameDirectory, out var game, out var error))
+        if (!GameInstallation.TryResolve(gameDirectory, out var game, out var error))
             throw new InvalidOperationException(error);
-        return WorldManifestLevelDiscovery.Discover(game.GameDirectory);
+        return WorldManifestLevelDiscovery.Discover(game.GameDirectory, includeCampaign: true);
     }, cancellationToken);
 
     private Task RunCompilationAsync(CompilationJob job)
@@ -142,18 +142,32 @@ public sealed class WorldManifestService
                     job.UpdateItem(itemIndex, value.Stage, value.Percentage, value.Stage));
                 try
                 {
-                    var result = new WorldManifestCompiler().Compile(
-                        source.LevelDirectory,
-                        outputPath: null,
-                        jsonPath: null,
-                        useCache: true,
-                        progress: progress);
+                    WorldManifestCompilationResult result;
+                    lock (GamePreparationSynchronization.Gate)
+                    {
+                        if (job.ImportAssets)
+                        {
+                            job.UpdateItem(itemIndex, "Importing", 0, "Preparing E_RIPLEY character assets...");
+                            RipleyCharacterInstaller.InstallLevel(job.GameDirectory, source.LevelDirectory,
+                                new InlineProgress<RipleyInstallProgress>(value =>
+                                    job.UpdateItem(itemIndex, "Importing", 0, value.Message)),
+                                _applicationLifetime.ApplicationStopping);
+                        }
+                        result = new WorldManifestCompiler().Compile(source.LevelDirectory,
+                            useCache: true, progress: progress);
+                        GamePreparationService.RegisterDebugManifest(job.GameDirectory, source.LevelDirectory, result);
+                    }
                     job.CompleteItem(itemIndex, result);
                     _diagnostics.Log(
                         "World Manifest",
                         $"Batch {(result.CacheHit ? "cache hit" : "compiled")} for " +
                         $"{source.DisplayName}; map={result.Manifest.MapContentId}; " +
                         $"output={result.BinaryPath}; entities={result.Manifest.Entities.Count}.");
+                }
+                catch (OperationCanceledException) when (_applicationLifetime.ApplicationStopping.IsCancellationRequested)
+                {
+                    job.MarkCanceled();
+                    return Task.CompletedTask;
                 }
                 catch (Exception exception)
                 {
@@ -203,12 +217,16 @@ public sealed class WorldManifestService
         private int _failed;
         private DateTimeOffset? _completedAtUtc;
 
-        internal CompilationJob(IReadOnlyList<WorldManifestLevelSource> sources)
+        internal CompilationJob(IReadOnlyList<WorldManifestLevelSource> sources, string gameDirectory, bool importAssets)
         {
             Sources = sources;
+            GameDirectory = gameDirectory;
+            ImportAssets = importAssets;
             _items = sources.Select(source => new MutableItem(source)).ToArray();
         }
 
+        internal string GameDirectory { get; }
+        internal bool ImportAssets { get; }
         internal Guid Id { get; } = Guid.NewGuid();
         internal DateTimeOffset CreatedAtUtc { get; } = DateTimeOffset.UtcNow;
         internal IReadOnlyList<WorldManifestLevelSource> Sources { get; }
