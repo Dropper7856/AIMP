@@ -150,3 +150,32 @@ item.onPress();
 assert.equal(expansions, 1, 'Normal expandable menu entries retain their behavior');
 assert.ok(!menuSource.includes('_loc1_.addItem(this._playGameItem)'));
 console.log(`Menu behavior checks passed (${fileURLToPath(base)}).`);
+
+// Developer options stay hidden by default and reset campaign choices when disabled.
+const dev = {
+  _developerMode: false, _campaignLevelIds: ['M01_TEST'],
+  _survivorMapIds: ['ChallengeMap16'], _survivorMapLabels: ['The Basement'],
+  _survivorMapDescriptions: ['Survival'],
+  _serverModeItem: { selectedItem: 'survival' },
+  _serverMapItem: { setItems(ids) { this.ids = ids; } },
+  refreshNetworkMenuRenderers() {},
+  updateServerMapVisibility: method(menuSource, 'updateServerMapVisibility'),
+  refreshSurvivorMapOptions: method(menuSource, 'refreshSurvivorMapOptions')
+};
+dev.refreshSurvivorMapOptions();
+assert.equal(dev._serverModeItem.visible, false);
+assert.equal(dev._serverMapItem.visible, false);
+dev._developerMode = true;
+dev._serverModeItem.selectedItem = 'campaign';
+dev.refreshSurvivorMapOptions();
+assert.equal(dev._serverModeItem.visible, true);
+assert.equal(dev._serverMapItem.visible, true);
+assert.deepEqual(dev._serverMapItem.ids, ['M01_TEST']);
+dev._serverMapItem.selectedItem = 'M01_TEST';
+assert.equal(method(menuSource, 'getSelectedSurvivorMapId').call(dev), 'M01_TEST');
+dev._developerMode = false;
+dev._serverModeItem.selectedItem = 'survival';
+dev.refreshSurvivorMapOptions();
+assert.equal(dev._serverMapItem.visible, false);
+assert.deepEqual(dev._serverMapItem.ids, ['ChallengeMap16']);
+console.log('Developer mode menu checks passed.');

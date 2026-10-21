@@ -122,7 +122,7 @@ public sealed class LauncherRuntimeService : BackgroundService
             previous.PlayerId == Guid.Empty ? Guid.NewGuid() : previous.PlayerId,
             request.WorldSyncEnabled,
             request.WorldSync3EmptyCallbackEnabled,
-            previous.Voice); // Voice is edited in game only.
+            previous.Voice, previous.DeveloperMode); // Multiplayer options are edited in game.
         _settings.Save(value);
         _preparation.Start();
         WorldSync3LauncherOptions.ApplyProcessEnvironment(value);

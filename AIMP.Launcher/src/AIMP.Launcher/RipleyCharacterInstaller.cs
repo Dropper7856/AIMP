@@ -33,14 +33,23 @@ internal static class RipleyCharacterInstaller
     }
 
     internal static RipleyInstallResult Install(string gameDirectory,
+        IProgress<RipleyInstallProgress>? progress, CancellationToken cancellationToken, bool includeCampaign = false)
+    {
+        lock (GamePreparationSynchronization.Gate)
+            return InstallCore(gameDirectory, progress, cancellationToken, includeCampaign);
+    }
+
+    internal static RipleyInstallResult InstallLevel(string gameDirectory, string levelDirectory,
         IProgress<RipleyInstallProgress>? progress, CancellationToken cancellationToken)
     {
         lock (GamePreparationSynchronization.Gate)
-            return InstallCore(gameDirectory, progress, cancellationToken);
+            return InstallCore(gameDirectory, progress, cancellationToken,
+                includeCampaign: true, selectedLevel: Path.GetFullPath(levelDirectory));
     }
 
     private static RipleyInstallResult InstallCore(string gameDirectory,
-        IProgress<RipleyInstallProgress>? progress, CancellationToken cancellationToken)
+        IProgress<RipleyInstallProgress>? progress, CancellationToken cancellationToken, bool includeCampaign = false,
+        string? selectedLevel = null)
     {
         var game = Path.GetFullPath(gameDirectory);
         AssertGameStopped();
@@ -59,12 +68,15 @@ internal static class RipleyCharacterInstaller
         var closure = DiscoverClosure(source.Commands, roots);
         ValidateClosure(source, closure);
 
-        var levels = WorldManifestLevelDiscovery.Discover(game)
+        var levels = WorldManifestLevelDiscovery.Discover(game, includeCampaign)
             .Where(level => level.CanCompile)
             .Select(level => level.LevelDirectory)
             .Where(p => !p.EndsWith("_PATCH", StringComparison.OrdinalIgnoreCase))
+            .Where(p => selectedLevel == null || string.Equals(Path.GetFullPath(p), selectedLevel, StringComparison.OrdinalIgnoreCase))
             .OrderBy(p => Path.GetRelativePath(env, p), StringComparer.OrdinalIgnoreCase).ToArray();
-        if (levels.Length == 0) throw new InvalidDataException("No playable DLC level assets were found.");
+        if (levels.Length == 0) throw new InvalidDataException(selectedLevel == null
+            ? "No playable level assets were found."
+            : "The selected level cannot receive character assets. For a patch level, select its original level instead.");
         var imported = 0;
         var present = 0;
         for (var i = 0; i < levels.Length; i++)
@@ -484,7 +496,7 @@ internal static class RipleyCharacterInstaller
             var transaction = JsonSerializer.Deserialize<Transaction>(File.ReadAllText(journal))
                 ?? throw new InvalidDataException($"Invalid character preparation journal: {journal}.");
             ValidateJournal(transaction);
-            var dlcPrefix = Path.GetFullPath(WorldManifestLevelDiscovery.GetDlcDirectory(game))
+            var dlcPrefix = Path.GetFullPath(WorldManifestLevelDiscovery.GetProductionDirectory(game))
                 .TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
             if (!SafePath(game, transaction.LevelRelativePath).StartsWith(dlcPrefix, StringComparison.OrdinalIgnoreCase))
                 continue;

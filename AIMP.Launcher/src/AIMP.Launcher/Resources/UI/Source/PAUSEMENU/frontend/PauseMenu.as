@@ -41,6 +41,8 @@ package frontend
       private var _aimpExitRequested:Boolean = false;
       private var _aimpExitOnNextFrame:Boolean = false;
 
+      private var _developerMode:Boolean = false;
+      private var _developerItem:MenuItem;
       private var _voicePage:MenuItemExpandable;
       private var _voiceEnabledItem:MenuItem;
       private var _voiceModeItem:MenuItem;
@@ -70,6 +72,9 @@ package frontend
          this._voiceThresholdItem = new MenuItem("Voice activation threshold",this.voiceThresholdChanged);
          this._voiceGainItem = new MenuItem("Microphone gain",this.voiceGainChanged);
          this._voiceVolumeItem = new MenuItem("Voice volume",this.voiceVolumeChanged);
+         this._developerItem = new MenuItem("Developer mode: Off",this.developerToggle);
+         this._developerItem.description = "Experimental game mode and level selection. Campaign levels require game preparation after restarting the game.";
+         this._voicePage.page.addItem(this._developerItem);
          this._voicePage.page.addItem(this._voiceEnabledItem);
          this._voicePage.page.addItem(this._voiceModeItem);
          this._voicePage.page.addItem(this._voiceMicItem);
@@ -79,6 +84,12 @@ package frontend
          this._voicePage.page.addItem(this._voiceVolumeItem);
          this._voicePage.page.addItem(new MenuItem("Refresh microphones",this.voiceRefresh));
          _optionsItem.page.addItem(this._voicePage);
+      }
+
+      private function developerToggle(event:MenuItemEvent) : void
+      {
+         if(!this._voiceReady) return;
+         this.voiceSend("DEVELOPER_MODE",{enabled:this._developerMode ? "0" : "1"});
       }
 
       private function voiceOpened(event:MenuPageEvent) : void
@@ -94,6 +105,8 @@ package frontend
       private function voiceSettings(values:Object) : void
       {
          this._voiceReady = true;
+         this._developerMode = values["developerMode"] == "1";
+         this._developerItem.name = "Developer mode: " + (this._developerMode ? "On" : "Off");
          this._voiceEnabled = values["enabled"] == "1";
          this._voiceMode = String(values["mode"]);
          this._voiceMic = String(values["microphone"]);
