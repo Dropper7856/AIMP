@@ -264,7 +264,8 @@ internal sealed partial class MultiplayerSessionCoordinator
     // to reopen the lobby page instead of leaving the player on the root menu.
     private async Task SendFrontendReadyAsync()
     {
-        await SendStatusAsync("Launcher bridge ready").ConfigureAwait(false);
+        await SendMenuReadyStateAsync().ConfigureAwait(false);
+        await SendStatusAsync("Launcher ready").ConfigureAwait(false);
         string? role;
         lock (_stateGate)
         {

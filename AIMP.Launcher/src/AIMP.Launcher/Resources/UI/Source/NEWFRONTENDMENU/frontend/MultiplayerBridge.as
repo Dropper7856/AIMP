@@ -5,6 +5,7 @@ package frontend
    import flash.events.ProgressEvent;
    import flash.events.SecurityErrorEvent;
    import flash.net.Socket;
+   import flash.utils.getTimer;
    
    public class MultiplayerBridge
    {
@@ -20,7 +21,15 @@ package frontend
       
       private var _buffer:String;
       
-      private var _queue:Array;
+      private var _connecting:Boolean = false;
+      private var _active:Boolean = true;
+      private var _lastConnectionError:String = "";
+      private var _launcherReady:Boolean = false;
+      private var _nextPoll:int = 0;
+      private var _lastReady:int = 0;
+
+      public var onReadiness:Function;
+      public var onSessionClosed:Function;
       
       private var _connected:Boolean;
       
@@ -37,12 +46,12 @@ package frontend
       public var onError:Function;
       
       public var onLobbyReturn:Function;
+      public var onLobbyOpened:Function;
       
       public function MultiplayerBridge()
       {
          super();
          this._buffer = "";
-         this._queue = [];
          this._connected = false;
          this.connect();
       }
@@ -90,21 +99,84 @@ package frontend
          return value;
       }
       
+      public function update() : void
+      {
+         if(!this._active) return;
+         var now:int = getTimer();
+         if(this._launcherReady && now - this._lastReady > 10000)
+         {
+            this.setReadyState(false);
+            this.invokeError("Launcher is not responding. Waiting for it to be ready...");
+         }
+         if(now < this._nextPoll) return;
+         this._nextPoll = now + 2000;
+         if(!this._connected) this.connect();
+         else this.send(this._launcherReady ? "MENU_STATE" : "HELLO",{"client":"gfx","version":PROTOCOL_VERSION});
+      }
+
+      public function suspend() : void
+      {
+         this._active = false;
+         this._connecting = false;
+         this._connected = false;
+         this.setReadyState(false);
+         this.releaseSocket();
+      }
+
+      public function resume() : void
+      {
+         this._active = true;
+         this._nextPoll = 0;
+      }
+
       public function connect() : void
       {
-         if(this._socket != null && this._socket.connected)
-         {
-            return;
-         }
+         if(this._connecting || this._connected) return;
+         this.releaseSocket();
+         this._connecting = true;
          this._socket = new Socket();
+         this._socket.timeout = 3000;
          this._socket.addEventListener(Event.CONNECT,this.connectedHandler,false,0,true);
          this._socket.addEventListener(Event.CLOSE,this.closeHandler,false,0,true);
          this._socket.addEventListener(ProgressEvent.SOCKET_DATA,this.socketDataHandler,false,0,true);
          this._socket.addEventListener(IOErrorEvent.IO_ERROR,this.ioErrorHandler,false,0,true);
          this._socket.addEventListener(SecurityErrorEvent.SECURITY_ERROR,this.securityErrorHandler,false,0,true);
-         this._socket.connect(HOST,PORT);
+         try { this._socket.connect(HOST,PORT); }
+         catch(error:Error) { this.failConnection("Unable to connect to the launcher"); }
       }
-      
+
+      private function setReadyState(ready:Boolean) : void
+      {
+         if(ready) this._lastReady = getTimer();
+         if(this._launcherReady == ready) return;
+         this._launcherReady = ready;
+         if(this.onReadiness != null) this.onReadiness(ready);
+      }
+
+      private function releaseSocket() : void
+      {
+         if(this._socket == null) return;
+         this._socket.removeEventListener(Event.CONNECT,this.connectedHandler);
+         this._socket.removeEventListener(Event.CLOSE,this.closeHandler);
+         this._socket.removeEventListener(ProgressEvent.SOCKET_DATA,this.socketDataHandler);
+         this._socket.removeEventListener(IOErrorEvent.IO_ERROR,this.ioErrorHandler);
+         this._socket.removeEventListener(SecurityErrorEvent.SECURITY_ERROR,this.securityErrorHandler);
+         try { this._socket.close(); } catch(error:Error) { }
+         this._socket = null;
+         this._buffer = "";
+      }
+
+      private function failConnection(message:String) : void
+      {
+         this._connected = false;
+         this._connecting = false;
+         this.setReadyState(false);
+         this.releaseSocket();
+         this._nextPoll = getTimer() + 2000;
+         if(this._lastConnectionError != message) this.invokeError(message);
+         this._lastConnectionError = message;
+      }
+
       public function createLobby(mode:String, maxPlayers:int, visibility:String, mapId:String, mapName:String) : void
       {
          var values:Object = {};
@@ -185,31 +257,30 @@ package frontend
       
       private function connectedHandler(event:Event) : void
       {
+         this._lastConnectionError = "";
+         this._connecting = false;
          this._connected = true;
          this.invokeStatus("Bridge connected");
          this.send("HELLO",{
             "client":"gfx",
             "version":PROTOCOL_VERSION
          });
-         this.flushQueue();
+         this._nextPoll = getTimer() + 2000;
       }
       
       private function closeHandler(event:Event) : void
       {
-         this._connected = false;
-         this.invokeStatus("Bridge disconnected");
+         this.failConnection("Launcher disconnected");
       }
       
       private function ioErrorHandler(event:IOErrorEvent) : void
       {
-         this._connected = false;
-         this.invokeError("Bridge IO error: " + event.text);
+         this.failConnection("Unable to reach the launcher");
       }
       
       private function securityErrorHandler(event:SecurityErrorEvent) : void
       {
-         this._connected = false;
-         this.invokeError("Bridge security error: " + event.text);
+         this.failConnection("Launcher connection was blocked");
       }
       
       private function socketDataHandler(event:ProgressEvent) : void
@@ -247,7 +318,15 @@ package frontend
             }
             i++;
          }
-         if(type == "STATUS")
+         if(type == "FRONTEND_STATE")
+         {
+            this.setReadyState(values["ready"] == "1");
+         }
+         else if(type == "SESSION_CLOSED")
+         {
+            if(this.onSessionClosed != null) this.onSessionClosed(String(values["reason"]));
+         }
+         else if(type == "STATUS")
          {
             this.invokeStatus(String(values["message"]));
          }
@@ -263,7 +342,7 @@ package frontend
          {
             if(this.onLobbyState != null)
             {
-               this.onLobbyState(String(values["role"]),String(values["status"]),String(values["p1"]),String(values["p2"]),String(values["p3"]),String(values["p4"]));
+               this.onLobbyState(values);
             }
          }
          else if(type == "START_GAME")
@@ -279,6 +358,10 @@ package frontend
             {
                this.onConfig(values);
             }
+         }
+         else if(type == "LOBBY_OPENED")
+         {
+            if(this.onLobbyOpened != null) this.onLobbyOpened(String(values["role"]));
          }
          else if(type == "LOBBY_RETURN")
          {
@@ -325,26 +408,17 @@ package frontend
          line += "\n";
          if(!this._connected || this._socket == null || !this._socket.connected)
          {
-            this._queue.push(line);
-            this.connect();
+            this.invokeError("Wait for the launcher to be ready before trying again");
             return;
          }
-         this._socket.writeUTFBytes(line);
-         this._socket.flush();
-      }
-      
-      private function flushQueue() : void
-      {
-         while(this._queue.length > 0 && this._socket != null && this._socket.connected)
+         try
          {
-            this._socket.writeUTFBytes(String(this._queue.shift()));
-         }
-         if(this._socket != null && this._socket.connected)
-         {
+            this._socket.writeUTFBytes(line);
             this._socket.flush();
          }
+         catch(error:Error) { this.failConnection("Launcher connection was lost"); }
       }
-      
+
       private function invokeStatus(message:String) : void
       {
          if(this.onStatus != null)

@@ -55,6 +55,13 @@ package frontend
       private var _state:NewFrontendMenuState;
       
       private var _mpBridge:MultiplayerBridge;
+
+      private var _mpLauncherReady:Boolean = false;
+      private var _mpPendingCommand:String = "";
+      private var _mpLobbyRole:String = "";
+      private var _mpCanStart:Boolean = false;
+      private var _mpLocalReady:Boolean = false;
+      private var _mpResumeLobbyItem:MenuItem;
       
       private var _playGameItem:MenuItemExpandable;
       
@@ -262,12 +269,15 @@ package frontend
       {
          this._state = NewFrontendMenuState.SPLASH;
          this._mpBridge = new MultiplayerBridge();
+         this._mpBridge.onReadiness = this.mpReadinessHandler;
+         this._mpBridge.onSessionClosed = this.mpSessionClosedHandler;
          this._mpBridge.onStatus = this.mpBridgeStatusHandler;
          this._mpBridge.onError = this.mpBridgeErrorHandler;
          this._mpBridge.onServerList = this.mpBridgeServerListHandler;
          this._mpBridge.onLobbyState = this.mpBridgeLobbyStateHandler;
          this._mpBridge.onGameStart = this.mpBridgeGameStartHandler;
          this._mpBridge.onConfig = this.mpBridgeConfigHandler;
+         this._mpBridge.onLobbyOpened = this.mpBridgeLobbyOpenedHandler;
          this._mpBridge.onLobbyReturn = this.mpBridgeLobbyReturnHandler;
          this._playGameItem = new MenuItemExpandable("AI_UI_FRONTEND_PLAY_GAME");
          this._extrasItem = new MenuItemExpandable("AI_UI_FRONTEND_EXTRAS");
@@ -289,7 +299,7 @@ package frontend
          this._survivorMapIds = ["survival_auto"];
          this._survivorMapLabels = ["Auto Survivor Map"];
          this._survivorMapDescriptions = ["Uses the first available survivor map until the game playlist data is loaded"];
-         this._serverModeItem = new MenuItemOptionOptionStepper("Game Mode",["campaign","survival"],["Campaign","Survival"],this.serverModeChangedHandler);
+         this._serverModeItem = new MenuItemOptionOptionStepper("Game Mode",["survival"],["Survival"],this.serverModeChangedHandler);
          this._serverMapItem = new MenuItemOptionOptionStepper("Survivor Map",this._survivorMapIds,this._survivorMapLabels,this.serverMapChangedHandler);
          this._serverMaxPlayersItem = new MenuItemOptionOptionStepper("Max Players",[2,3,4],["2 Players","3 Players","4 Players"],this.serverMaxPlayersChangedHandler);
          this._serverVisibilityItem = new MenuItemOptionOptionStepper("Visibility",["public","private"],["Public","Private"],this.serverVisibilityChangedHandler);
@@ -334,6 +344,14 @@ package frontend
          this._continueOnlineGameItem = new MenuItem("AI_UI_FRONTEND_CONTINUE_GAME",this.continueOnlineGameHandler);
          this._selectLevelItem = new MenuItemExpandable("Select Level");
          this._multiplayerItem = new MenuItemExpandable("Multiplayer");
+         this._multiplayerItem.enabled = false;
+         this._mpResumeLobbyItem = new MenuItem("Return to Lobby",this.mpResumeLobbyHandler);
+         this._mpResumeLobbyItem.visible = false;
+         this._directIpJoinItem.autoExpand = false;
+         this._serverStartItem.autoExpand = false;
+         this._serverLanItem.autoExpand = false;
+         this._serverCampaignItem.autoExpand = false;
+         this._serverSurvivalItem.autoExpand = false;
          this._twoTeamsNoviceDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_NOVICE",this.twoTeamsNoviceDifficultyHandler);
          this._twoTeamsEasyDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_EASY",this.twoTeamsEasyDifficultyHandler);
          this._twoTeamsMediumDifficultyItem = new MenuItem("AI_UI_MENU_DIFF_MEDIUM",this.twoTeamsMediumDifficultyHandler);
@@ -368,7 +386,6 @@ package frontend
          super("fe_");
          var _loc1_:MenuPage = new MenuPage();
          _loc1_.id = MenuPageId.ROOT;
-         _loc1_.addItem(this._playGameItem);
          _loc1_.addItem(this._multiplayerItem);
          _loc1_.addItem(_optionsItem);
          _loc1_.addItem(this._extrasItem);
@@ -380,6 +397,7 @@ package frontend
          this._playGameItem.page.addItem(this._twoTeamsItem);
          this._playGameItem.page.addItem(this._ripleyItem);
          this._playGameItem.page.addItem(this._survivorItem);
+         this._multiplayerItem.page.addItem(this._mpResumeLobbyItem);
          this._multiplayerItem.page.addItem(this._createServerItem);
          this._multiplayerItem.page.addItem(this._joinServerItem);
          this._multiplayerItem.page.addItem(this._directIpJoinItem);
@@ -466,6 +484,9 @@ package frontend
          menu.addEventListener(MenuEvent.INACTIVITY,this.menuInactivityHandler);
          addEventListener(MovieClipExEvent.STOP,this.movieStopHandler);
          addEventListener(Event.ENTER_FRAME,this.mpCharacterSelectionFrameHandler,false,0,true);
+         addEventListener(Event.ENTER_FRAME,this.mpNetworkFrameHandler,false,0,true);
+         addEventListener(Event.ADDED_TO_STAGE,this.mpNetworkAddedHandler,false,0,true);
+         addEventListener(Event.REMOVED_FROM_STAGE,this.mpNetworkRemovedHandler,false,0,true);
          if(Extensions.isGFxPlayer)
          {
             stage.addEventListener(InputEvent.INPUT,this.startInputHandler,false,0,true);
@@ -766,6 +787,7 @@ package frontend
       
       private function joinServerEntryHandler(param1:MenuItemEvent) : void
       {
+         if(!this.mpBeginCommand("join")) return;
          var serverId:String = "";
          if(param1 != null && param1.item != null && param1.item.data != null)
          {
@@ -773,6 +795,8 @@ package frontend
          }
          if(serverId == null || serverId.length == 0)
          {
+            this._mpPendingCommand = "";
+            this.mpUpdateControls();
             this.show_network_notification("No lobby selected");
             return;
          }
@@ -782,35 +806,41 @@ package frontend
       
       private function joinDirectIpHandler(param1:MenuItemEvent) : void
       {
+         if(!this.mpBeginCommand("join")) return;
          this.show_network_notification("Joining " + this.mpGetDirectJoinAddressLabel());
          this._mpBridge.joinDirectIp();
       }
       
       private function startServerHandler(param1:MenuItemEvent) : void
       {
+         if(!this.mpBeginCommand("create")) return;
          this.show_network_notification("Creating lobby");
          this._mpBridge.createLobby(String(this._serverModeItem.selectedItem),int(this._serverMaxPlayersItem.selectedItem),String(this._serverVisibilityItem.selectedItem),this.getSelectedSurvivorMapId(),this.getSelectedSurvivorMapName());
       }
       
       private function readyChangedHandler(param1:MenuItemEvent) : void
       {
+         if(!this.mpBeginCommand("ready")) return;
          this._mpBridge.setReady(Boolean(this._clientLobbyReadyItem.selected));
       }
       
       private function kickLobbyPlayerHandler(param1:MenuItemEvent) : void
       {
+         if(!this.mpBeginCommand("kick")) return;
          this.show_network_notification("Kick requested");
          this._mpBridge.kickPlayer(String(param1.item.data));
       }
       
       private function startLobbyGameHandler(param1:MenuItemEvent) : void
       {
+         if(!this.mpBeginCommand("start")) return;
          this.show_network_notification("Starting game");
          this._mpBridge.startGame(String(this._serverModeItem.selectedItem),this.getSelectedSurvivorMapId(),this.getSelectedSurvivorMapName());
       }
       
       private function leaveLobbyHandler(param1:MenuItemEvent) : void
       {
+         if(!this.mpBeginCommand("leave")) return;
          this.show_network_notification("Leaving lobby");
          this._mpBridge.leaveLobby();
       }
@@ -923,6 +953,76 @@ package frontend
          return _loc2_;
       }
       
+      private function mpNetworkFrameHandler(event:Event) : void
+      {
+         if(stage != null) this._mpBridge.update();
+      }
+
+      private function mpNetworkAddedHandler(event:Event) : void
+      {
+         if(event.target == this) this._mpBridge.resume();
+      }
+
+      private function mpNetworkRemovedHandler(event:Event) : void
+      {
+         if(event.target == this) this._mpBridge.suspend();
+      }
+
+      private function mpReadinessHandler(ready:Boolean) : void
+      {
+         this._mpLauncherReady = ready;
+         if(!ready) this._mpPendingCommand = "";
+         this.mpUpdateControls();
+      }
+
+      private function mpUpdateControls() : void
+      {
+         var idle:Boolean = this._mpLauncherReady && this._mpPendingCommand == "";
+         var outsideLobby:Boolean = this._mpLobbyRole == "";
+         this._multiplayerItem.enabled = this._mpLauncherReady;
+         this._multiplayerItem.description = this._mpLauncherReady ? "Play Alien: Isolation with friends" : "Waiting for the launcher to be ready";
+         this._createServerItem.enabled = idle && outsideLobby;
+         this._directIpJoinItem.enabled = idle && outsideLobby;
+         this._serverStartItem.enabled = idle && outsideLobby;
+         this._serverMapItem.enabled = idle && outsideLobby;
+         this._serverRefreshItem.enabled = idle && outsideLobby;
+         this._mpResumeLobbyItem.visible = !outsideLobby;
+         this._mpResumeLobbyItem.enabled = idle;
+         this._hostLobbyStartGameItem.enabled = idle && this._mpLobbyRole == "host" && this._mpCanStart;
+         this._hostLobbyKick2Item.visible = false;
+         this._clientLobbyReadyItem.enabled = idle && this._mpLobbyRole == "client";
+         this._hostLobbyLeaveItem.enabled = idle && this._mpLobbyRole == "host";
+         this._clientLobbyLeaveItem.enabled = idle && this._mpLobbyRole == "client";
+         this.refreshNetworkMenuRenderers();
+      }
+
+      private function mpBeginCommand(command:String) : Boolean
+      {
+         if(!this._mpLauncherReady || this._mpPendingCommand != "") return false;
+         this._mpPendingCommand = command;
+         this.mpUpdateControls();
+         return true;
+      }
+
+      private function mpResumeLobbyHandler(event:MenuItemEvent) : void
+      {
+         if(this._mpLauncherReady && this._mpLobbyRole != "") this.mpOpenLobbyPage(this._mpLobbyRole);
+      }
+
+      private function mpSessionClosedHandler(reason:String) : void
+      {
+         var hadLobby:Boolean = this._mpLobbyRole != "" && this._mpPendingCommand != "create" && this._mpPendingCommand != "join";
+         this._mpLobbyRole = "";
+         this._mpCanStart = false;
+         this._mpPendingCommand = "";
+         this._mpLocalReady = false;
+         this._clientLobbyReadyItem.selected = false;
+         this.mpStopLobbyReturn();
+         this.mpUpdateControls();
+         if(hadLobby && NewFrontendMenuState.MENU.equals(this._state)) this.menu.setCurrentPage(MenuPageId.ROOT.value,0);
+         this.show_network_notification(reason);
+      }
+
       private function mpBridgeStatusHandler(param1:String) : void
       {
          this.show_network_notification(param1);
@@ -933,6 +1033,9 @@ package frontend
       
       private function mpBridgeErrorHandler(param1:String) : void
       {
+         this._clientLobbyReadyItem.selected = this._mpLocalReady;
+         this._mpPendingCommand = "";
+         this.mpUpdateControls();
          this.show_network_notification(param1);
          this._hostLobbyStatusItem.name = "Error: " + param1;
          this._clientLobbyStatusItem.name = "Error: " + param1;
@@ -996,8 +1099,23 @@ package frontend
          return fallback == null ? "" : fallback;
       }
       
-      private function mpBridgeLobbyStateHandler(param1:String, param2:String, param3:String, param4:String, param5:String, param6:String) : void
+      private function mpBridgeLobbyStateHandler(values:Object) : void
       {
+         var param1:String = String(values["role"]);
+         var param2:String = String(values["status"]);
+         var param3:String = String(values["p1"]);
+         var param4:String = String(values["p2"]);
+         var param5:String = String(values["p3"]);
+         var param6:String = String(values["p4"]);
+         this._mpLobbyRole = param1;
+         this._mpCanStart = values["canStart"] == "1";
+         this._mpLocalReady = values["localReady"] == "1";
+         this._clientLobbyReadyItem.selected = this._mpLocalReady;
+         if(this._mpPendingCommand == "ready" || this._mpPendingCommand == "kick")
+         {
+            this._mpPendingCommand = "";
+         }
+         this.mpUpdateControls();
          this._hostLobbyStatusItem.name = "Status: " + param2;
          this._clientLobbyStatusItem.name = "Status: " + param2;
          this._hostLobbyPlayer1Item.name = param3;
@@ -1009,6 +1127,14 @@ package frontend
          this.refreshNetworkMenuRenderers();
       }
       
+      private function mpBridgeLobbyOpenedHandler(role:String) : void
+      {
+         this._mpPendingCommand = "";
+         this._mpLobbyRole = role;
+         this.mpUpdateControls();
+         this.mpBridgeLobbyReturnHandler(role);
+      }
+
       private function mpBridgeLobbyReturnHandler(param1:String) : void
       {
          this._mpLobbyReturnRole = param1 == "host" ? "host" : "client";
@@ -1052,7 +1178,7 @@ package frontend
          {
             menu.rebuildPageMap();
             menu.setCurrentPage(_loc2_.id.value,0);
-            this.show_network_notification("Returning to lobby");
+            this.show_network_notification("Lobby ready");
          }
          catch(error:Error)
          {
@@ -1236,6 +1362,8 @@ package frontend
       
       private function mpBridgeGameStartHandler(mode:String, mapId:String = null, mapName:String = null, sessionId:String = null) : void
       {
+         this._mpPendingCommand = "start";
+         this.mpUpdateControls();
          this._mpPendingStartGame = true;
          this._mpPendingStartMode = mode == null ? "" : mode.toLowerCase();
          this._mpPendingStartMapId = mapId == null ? "" : mapId;
@@ -1589,6 +1717,7 @@ package frontend
       
       private function menuInactivityHandler(param1:MenuEvent) : void
       {
+         if(this._mpLobbyRole != "" || this._mpPendingCommand != "") return;
          requestState(NewFrontendMenuState.ATTRACT);
       }
       
@@ -1720,11 +1849,13 @@ package frontend
          this._movementDetectionOnItem.visualsName = "MovementDetectionDiagram";
          this._noiseDetectionOnItem.visualsName = "NoiseDetectionDiagram";
          this._mementoMoriOnItem.visualsName = "MementoMoriDiagram";
-         this._multiplayerItem.description = "Experimental multiplayer";
+         this._multiplayerItem.description = this._mpLauncherReady ? "Play Alien: Isolation with friends" : "Waiting for the launcher to be ready";
          this._createServerItem.description = "Configure a new server";
          this._joinServerItem.description = "Browse available servers";
          this._directIpJoinItem.description = "Connect directly to the Host IP and Port configured in the launcher";
-         this._serverNameItem.description = "Configured in the launcher settings";
+         this._serverNameItem.description = "Change your player name in launcher settings";
+         this._serverNameItem.enabled = false;
+         this._serverPasswordItem.visible = false;
          this._serverPasswordItem.description = "Configured in the launcher settings";
          this._serverModeItem.descriptions = ["Create a campaign server","Create a survival server"];
          this._serverMapItem.descriptions = this._survivorMapDescriptions;
@@ -1736,12 +1867,22 @@ package frontend
          this._serverLanItem.description = "Available lobby";
          this._serverCampaignItem.description = "Available lobby";
          this._serverSurvivalItem.description = "Available lobby";
-         this._hostLobbyStatusItem.description = "Host-authoritative lobby state";
+         this._hostLobbyStatusItem.description = "Waiting for players and level verification";
+         this._hostLobbyStatusItem.enabled = false;
+         this._hostLobbyPlayer1Item.enabled = false;
+         this._hostLobbyPlayer2Item.enabled = false;
+         this._clientLobbyStatusItem.enabled = false;
+         this._clientLobbyPlayer1Item.enabled = false;
+         this._clientLobbyPlayer2Item.enabled = false;
          this._hostLobbyPlayer1Item.description = "Local owner slot";
          this._hostLobbyPlayer2Item.description = "Remote player slot";
          this._hostLobbyPlayer3Item.description = "Future player slot";
-         this._hostLobbyPlayer4Item.description = "Future player slot";
-         this._hostLobbyKick2Item.description = "Owner only kick action";
+         this._hostLobbyPlayer4Item.description = "Remote player slot";
+         this._hostLobbyPlayer3Item.visible = false;
+         this._hostLobbyPlayer4Item.visible = false;
+         this._hostLobbyKick3Item.visible = false;
+         this._hostLobbyKick4Item.visible = false;
+         this._hostLobbyKick2Item.description = "Remove the other player from this lobby";
          this._hostLobbyKick3Item.description = "Owner only kick action";
          this._hostLobbyKick4Item.description = "Owner only kick action";
          this._hostLobbyStartGameItem.description = "Owner only start action";
@@ -1766,7 +1907,12 @@ package frontend
          this._twoTeamsItem.visible = true;
          this._ripleyItem.visible = true;
          this._selectLevelItem.visible = true;
-         this._playGameItem.visible = true;
+         this._playGameItem.visible = false;
+         this._joinServerItem.visible = false;
+         this._serverModeItem.visible = false;
+         this._serverMaxPlayersItem.visible = false;
+         this._serverVisibilityItem.visible = false;
+         this.mpUpdateControls();
          this._extrasItem.visible = true;
          this._storeItem.visible = true;
          this.applyServerFilter("all");

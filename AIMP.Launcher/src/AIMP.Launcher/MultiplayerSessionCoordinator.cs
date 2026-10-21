@@ -722,7 +722,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         { AcceptSessionLoadingAck(value); return; }
         if (value.Message.Type.Equals("ROUND_RETURN_READY", StringComparison.OrdinalIgnoreCase))
         { AcceptRoundReturnReady(value); return; }
-        if (IsPauseMenuMessage(value.Message)) { _ = HandlePauseMenuMessageAsync(value); return; }
+        if (TryHandleImmediateMenuMessage(value)) return;
         _ = HandleBridgeMessageAsync(value.Message);
     }
 
@@ -757,18 +757,9 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
 
     private async Task HandleHelloAsync(ScaleformBridgeMessage message)
     {
-        // The first frontend connection triggers injection. Complete its UI
-        // handshake only after the native HELLO certifies synchronized heaps.
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(30);
-        while (!_controller.Snapshot.IpcConnected)
-        {
-            if (DateTimeOffset.UtcNow >= deadline)
-            {
-                _diagnostics.Log("UI Bridge", "UI initialization deferred: native heap synchronization handshake is not ready.");
-                return;
-            }
-            await Task.Delay(100, _lifetime.Token).ConfigureAwait(false);
-        }
+        // The frontend retries HELLO until native heap synchronization is ready.
+        // Never hold the command gate for injection or queue user actions here.
+        if (!await AwaitMenuHelloReadyAsync(message).ConfigureAwait(false)) return;
         await SendConfigAsync().ConfigureAwait(false);
         await SendCurrentLobbyAsync().ConfigureAwait(false);
         var source = message.Get("source", "frontend");
@@ -804,11 +795,13 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
 
     private async Task CreateLobbyAsync(ScaleformBridgeMessage message)
     {
+        EnsureMenuConnectionAvailable();
         await StopNetworkAsync("Creating a new lobby").ConfigureAwait(false);
         var settings = _settingsStore.Load();
         var options = CreateHostOptions(settings, message);
-        var host = await StartHostAsync(options).ConfigureAwait(false);
+        var host = await StartMenuHostAsync(options).ConfigureAwait(false);
         _diagnostics.Log("Multiplayer", $"Lobby hosted on port {host.BoundPort}.");
+        await SendMenuLobbyOpenedAsync("host").ConfigureAwait(false);
         await SendStatusAsync("Lobby created").ConfigureAwait(false);
     }
 
@@ -866,18 +859,14 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
 
     private async Task JoinDirectAsync()
     {
+        EnsureMenuConnectionAvailable();
         await StopNetworkAsync("Joining a direct lobby").ConfigureAwait(false);
         var settings = _settingsStore.Load();
         var options = new LobbyClientOptions(settings.HostAddress, settings.Port,
             settings.PlayerId, settings.PlayerName, LobbyCompatibility.Create(settings));
         var client = await LobbyClient.ConnectAsync(options).ConfigureAwait(false);
-        AttachClient(client);
-        lock (_stateGate) { _client = client; _lobby = client.Snapshot; }
-        client.Start();
-        await SetNativeWorldSyncLifecycleAsync(
-            client.SessionId, client.PeerId, false, 0, true, false, "lobby-client-joined")
-            .ConfigureAwait(false);
-        await PublishLobbyAsync(client, client.Snapshot).ConfigureAwait(false);
+        await CompleteMenuJoinAsync(client).ConfigureAwait(false);
+        await SendMenuLobbyOpenedAsync("client").ConfigureAwait(false);
         await SendStatusAsync($"Connected to {settings.HostAddress}:{settings.Port}")
             .ConfigureAwait(false);
     }
@@ -4638,7 +4627,11 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         await DisposeNetworkAsync(stopState.Host, stopState.Client).ConfigureAwait(false);
         _diagnostics.Log("Multiplayer", reason);
         PublishState();
-        await SendStatusAsync("Lobby disconnected").ConfigureAwait(false);
+        if (stopState.Host is not null || stopState.Client is not null)
+        {
+            await SendMenuSessionClosedAsync(reason).ConfigureAwait(false);
+            await SendStatusAsync("Lobby disconnected").ConfigureAwait(false);
+        }
     }
 
     private (LobbyHost? Host, LobbyClient? Client, uint[] RemoteCharacters) BeginNetworkStop()
@@ -4746,7 +4739,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     {
         var players = snapshot.Players.OrderByDescending(value => value.IsHost)
             .ThenBy(value => value.PeerId).ToArray();
-        return new Dictionary<string, string>(StringComparer.Ordinal)
+        return WithMenuLobbyControls(snapshot, new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["role"] = State.IsHost ? "host" : "client",
             ["status"] = snapshot.State == "Starting" ? "Starting" : "Waiting for players",
@@ -4757,7 +4750,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             ["p2"] = FormatPlayer(players, 1, 2),
             ["p3"] = "3  Empty",
             ["p4"] = "4  Empty"
-        };
+        });
     }
 
     private static string FormatPlayer(
