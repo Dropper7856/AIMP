@@ -34,7 +34,8 @@ __pycache__/
 *.lnk
 *.zip
 *.ps1
-*.md
+AIMP.Native/*.md
+AIMP.Launcher/*.md
 *.bat
 
 tools/
