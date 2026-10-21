@@ -10,6 +10,11 @@
 
 int main() {
     using namespace aimp::ai_sync;
+    static_assert(!AlienSuppressionRequested(Role::Host, 0U));
+    static_assert(AlienSuppressionRequested(Role::Host, kDisableAlien));
+    static_assert(!AlienSuppressionRequested(Role::Retail, kDisableAlien));
+    static_assert(!AlienSuppressionRequested(Role::Client, kDisableAlien));
+    static_assert(!AlienSuppressionRequested(Role::FrozenClient, kDisableAlien));
     ParticipantRouteRetry routeRetry{};
     assert(!routeRetry.Observe(true, false, false, 0U, true, 100U));
     assert(!routeRetry.Observe(true, false, false, 0U, true, 2099U));

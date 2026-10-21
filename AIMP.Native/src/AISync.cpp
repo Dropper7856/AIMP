@@ -265,6 +265,8 @@ struct Actor {
     bool traversalAction{}, hostDormant{}, withdrawKnown{};
     bool backstageKnown{}, backstage{}, placementPending{}, roleTaskCleanupPending{};
     std::uint32_t withdrawState{};
+    bool alienSuppressed{};
+    std::uint32_t originalAlienWithdraw{};
     // Client presentation only; bounded, engine-thread owned, no native pointers.
     std::array<PoseSample, kPoseHistory> poses{};
     std::size_t poseCount{};
@@ -397,6 +399,7 @@ std::array<ULONGLONG, kActors> gIncomingAt{};
 std::array<ULONGLONG, kActors> gNextIdentityProbe{};
 Configuration gCurrent{}; // engine thread only
 std::atomic<Role> gRole{Role::Retail};
+std::atomic<bool> gAlienSuppressed{};
 std::atomic<bool> gInstalled{}, gStopping{};
 std::atomic<void*> gUpdateOriginal{}, gCoordinatorOriginal{}, gInteractionOriginal{};
 std::atomic<void*> gPairedTransitionAOriginal{}, gPairedTransitionBOriginal{};
@@ -655,6 +658,7 @@ bool FiniteCoordinate(const float value) noexcept {
     return std::isfinite(value) && std::abs(value) <= 100000.0F;
 }
 bool CertifiedExecutionCycle(std::uint32_t typeRva, std::uint32_t state) noexcept;
+bool SuppressedAlien(std::uintptr_t character) noexcept;
 bool Valid(const State& s) noexcept {
     if (!navigation::ValidGoal(s.navigation) || !health::Valid(s.health) || !health::Valid(s.damage)) return false;
     const auto& cause = s.healthSource;
@@ -1288,6 +1292,7 @@ std::uint8_t __fastcall BackstageUpdateDetour(void* sweep, void*) noexcept {
     const auto original = reinterpret_cast<BackstageUpdate>(gBackstageUpdateOriginal.load());
     if (original == nullptr) return 0U;
     const auto owner = HostBackstageOwner(reinterpret_cast<std::uintptr_t>(sweep));
+    if (SuppressedAlien(owner)) return 0U;
     const auto previous = gAiPlayerQueryOwner;
     if (owner != 0U) gAiPlayerQueryOwner = owner;
     std::uint8_t result{};
@@ -1303,6 +1308,7 @@ void __fastcall BackstageHoldDetour(void* cycle, void*) noexcept {
     if (gRole.load(std::memory_order_acquire) != Role::Host || !EngineThread() || !Stable() ||
         !Read(reinterpret_cast<std::uintptr_t>(cycle) + 4U, owner) || !Eligible(owner, type) ||
         !Read(owner + 0x36CU, currentCycle) || currentCycle != reinterpret_cast<std::uintptr_t>(cycle)) owner = 0U;
+    if (SuppressedAlien(owner)) return;
     const auto previous = gAiPlayerQueryOwner;
     if (owner != 0U) { gAiPlayerQueryOwner = owner; gBackstageHoldContexts.fetch_add(1U, std::memory_order_relaxed); }
     // The 4D physical update runs outside BehaviourManager. Its closest-player
@@ -2084,6 +2090,17 @@ bool ResolveAlienWithdrawContext(const std::uintptr_t character,
     return true;
 }
 
+bool SuppressedAlien(const std::uintptr_t character) noexcept {
+    if (!gAlienSuppressed.load(std::memory_order_acquire) ||
+        gRole.load(std::memory_order_acquire) != Role::Host || gGenerations == nullptr ||
+        !gGenerations->IsStableGeneration(gActiveNativeGeneration.load(std::memory_order_acquire))) return false;
+    std::uintptr_t context{};
+    std::uint32_t state{}, type{};
+    // Template class 1 is the retail Alien; other NPC families keep their AI.
+    return Eligible(character, type) && type == 1U &&
+        ResolveAlienWithdrawContext(character, context, state);
+}
+
 void CaptureWithdrawState(Actor& actor) noexcept {
     std::uintptr_t context{};
     std::uint32_t state{};
@@ -2202,6 +2219,32 @@ bool QuiesceProxyExecution(Actor& actor) noexcept {
     actor.lastProxyRefresh = 0U;
     gExecutionBarriers.fetch_add(1U, std::memory_order_relaxed);
     return tree && task;
+}
+
+void ApplyAlienSuppression(Actor& actor) noexcept {
+    std::uintptr_t context{};
+    std::uint32_t state{};
+    if (!ResolveAlienWithdrawContext(actor.character, context, state)) return;
+    if (!actor.alienSuppressed) {
+        actor.originalAlienWithdraw = state;
+        static_cast<void>(QuiesceProxyExecution(actor));
+        actor.alienSuppressed = true;
+    }
+    // Use the same retail withdrawal path as native backstage/replica state.
+    if (state != 1U && !ApplyAlienWithdrawEntry(context, 1U)) {
+        gFaults.fetch_add(1U, std::memory_order_relaxed);
+        return;
+    }
+    CaptureWithdrawState(actor);
+}
+
+void RestoreAlienSuppression(Actor& actor) noexcept {
+    if (!actor.alienSuppressed) return;
+    std::uintptr_t context{};
+    std::uint32_t state{};
+    if (ResolveAlienWithdrawContext(actor.character, context, state))
+        static_cast<void>(ApplyAlienWithdrawEntry(context, actor.originalAlienWithdraw));
+    actor.alienSuppressed = false;
 }
 
 bool CharacterAtPlacement(const std::uintptr_t character, const float* coordinates) noexcept {
@@ -4220,6 +4263,7 @@ bool CharacterReady(const Actor& actor) noexcept {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 bool Release(Actor& actor) noexcept {
+    RestoreAlienSuppression(actor);
     if (PairSourceBusy(actor.character)) return true;
     combat::Cancel(actor.character);
     navigation::Cancel(actor.character);
@@ -6174,7 +6218,7 @@ int __cdecl BypassBranch(const std::uintptr_t manager) noexcept {
     // ESI is the retail manager on every native thread. This decision reads
     // only generation-bound ownership atomics and native owner/class fields.
     return Read(manager + 0x128U, owner) &&
-        (PairSourceBusy(owner) || PlayerRepresentation(owner) ||
+        (PairSourceBusy(owner) || PlayerRepresentation(owner) || SuppressedAlien(owner) ||
             (Client() && Eligible(owner, type))) ? 1 : 0;
 }
 __declspec(naked) void BranchDetour() {
@@ -6443,7 +6487,8 @@ void __fastcall UpdateDetour(void* manager, void*, std::uint32_t previousTime, f
     bool traceTargetSuccession{};
     gUpdating = actor;
     if (actor != nullptr) {
-        actor->blocked = Client();
+        actor->blocked = Client() || SuppressedAlien(c);
+        if (!Client() && actor->blocked) ApplyAlienSuppression(*actor);
         if (gRole.load(std::memory_order_acquire) == Role::Host) {
             gAiPlayerQueryOwner = actor->character;
             // Preserve the retail player's pre-death alliance before a kill can
@@ -7751,7 +7796,7 @@ bool Configure(const std::span<const std::byte> payload) noexcept {
     Configuration value{};
     if (payload.size() != sizeof(value) || !Installed()) return false;
     std::memcpy(&value, payload.data(), sizeof(value));
-    if (value.version != 2U || value.participantCount > kParticipants || value.reserved != 0U ||
+    if (value.version != 2U || value.participantCount > kParticipants || (value.flags & ~kDisableAlien) != 0U ||
         static_cast<std::uint32_t>(value.role) > 3U ||
         (value.role != Role::Retail && value.sessionCookie == 0U) ||
         (value.role != Role::Retail && value.localPeer == 0U) ||
@@ -8001,6 +8046,7 @@ void PumpOnEngineThread() noexcept {
         gActiveNativeGeneration.store(gCurrent.nativeGeneration, std::memory_order_relaxed);
         gActiveWorldGeneration.store(gCurrent.worldGeneration, std::memory_order_relaxed);
         gRole.store(gCurrent.role, std::memory_order_release);
+        gAlienSuppressed.store(AlienSuppressionRequested(gCurrent.role, gCurrent.flags), std::memory_order_release);
         combat::SetMode(static_cast<combat::Mode>(gCurrent.role));
         health::SetObservingHost(gCurrent.role == Role::Host);
     }

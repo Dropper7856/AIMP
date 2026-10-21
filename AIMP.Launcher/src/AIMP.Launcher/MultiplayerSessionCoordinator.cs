@@ -218,9 +218,14 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             await _controller.SendWorldSyncLifecycleAsync(payload, _lifetime.Token)
                 .ConfigureAwait(false);
             int aiWorldGeneration;
-            lock (_stateGate) aiWorldGeneration = _localWorldContext?.WorldGeneration ?? 0;
+            bool alienEnabled;
+            lock (_stateGate)
+            {
+                aiWorldGeneration = _localWorldContext?.WorldGeneration ?? 0;
+                alienEnabled = _start?.AlienEnabled ?? _lobby?.AlienEnabled ?? true;
+            }
             await _aiSync.ConfigureAsync(sessionId, isHost, _controller.Snapshot.LevelGeneration,
-                aiWorldGeneration, authorityBound, payload.WorldBusActive, peerId, _lifetime.Token)
+                aiWorldGeneration, authorityBound, payload.WorldBusActive, peerId, _lifetime.Token, alienEnabled)
                 .ConfigureAwait(false);
             lock (_stateGate)
             {
@@ -809,7 +814,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         ValidateDeveloperLobby(settings, message);
         var options = CreateHostOptions(settings, message);
         var host = await StartMenuHostAsync(options).ConfigureAwait(false);
-        _diagnostics.Log("Multiplayer", $"Lobby hosted on port {host.BoundPort}.");
+        _diagnostics.Log("Multiplayer", $"Lobby hosted on port {host.BoundPort}. Alien enabled={options.AlienEnabled}.");
         await SendMenuLobbyOpenedAsync("host").ConfigureAwait(false);
         await SendStatusAsync("Lobby created").ConfigureAwait(false);
     }
@@ -846,7 +851,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         ProtocolConstants.DefaultLobbyCapacity,
         ResolveLevel(message),
         LobbyCompatibility.Create(settings),
-        RequireWorldPreparation: true);
+        RequireWorldPreparation: true,
+        AlienEnabled: ReadLobbyAlienEnabled(message));
 
     private static string ResolveServerName(
         LauncherSettings settings,

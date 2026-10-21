@@ -183,7 +183,7 @@ package frontend
          this._lastConnectionError = message;
       }
 
-      public function createLobby(mode:String, maxPlayers:int, visibility:String, mapId:String, mapName:String) : void
+      public function createLobby(mode:String, maxPlayers:int, visibility:String, mapId:String, mapName:String, alienEnabled:Boolean = true) : void
       {
          var values:Object = {};
          values["mode"] = mode;
@@ -191,6 +191,7 @@ package frontend
          values["visibility"] = visibility;
          values["mapId"] = mapId;
          values["mapName"] = mapName;
+         values["alienEnabled"] = alienEnabled ? "1" : "0";
          this.send("CREATE_LOBBY",values);
       }
       

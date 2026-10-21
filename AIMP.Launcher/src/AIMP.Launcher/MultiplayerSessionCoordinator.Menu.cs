@@ -4,6 +4,14 @@ namespace AIMP.Launcher;
 
 internal sealed partial class MultiplayerSessionCoordinator
 {
+    private static bool ReadLobbyAlienEnabled(ScaleformBridgeMessage message) =>
+        message.Get("alienEnabled", "1") switch
+        {
+            "1" => true,
+            "0" => false,
+            _ => throw new InvalidOperationException("Invalid Alien setting.")
+        };
+
     private async Task SendMenuReadyStateAsync()
     {
         await _bridge.SendAsync("FRONTEND_STATE", new Dictionary<string, string>

@@ -16,7 +16,8 @@ public sealed record LobbyHostOptions(
     string Level,
     CompatibilityInfo Compatibility,
     bool OpaqueRelayEnabled = false,
-    bool RequireWorldPreparation = false);
+    bool RequireWorldPreparation = false,
+    bool AlienEnabled = true);
 
 public readonly record struct WorldHostAcceptedMutation(
     WorldNetworkMutation Mutation,
@@ -269,7 +270,8 @@ public sealed partial class LobbyHost : IAsyncDisposable
                     SessionId,
                     startAtUtc.ToUnixTimeMilliseconds(),
                     _level,
-                    _levelGeneration);
+                    _levelGeneration,
+                    _options.AlienEnabled);
             }
         }
         finally
@@ -1858,7 +1860,8 @@ public sealed partial class LobbyHost : IAsyncDisposable
             players,
             preparationToken,
             preparations,
-            _options.RequireWorldPreparation);
+            _options.RequireWorldPreparation,
+            _options.AlienEnabled);
         ModelValidation.Validate(snapshot);
         return snapshot;
     }

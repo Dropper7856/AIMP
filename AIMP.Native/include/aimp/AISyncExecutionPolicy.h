@@ -6,6 +6,11 @@
 
 namespace aimp::ai_sync {
 
+inline constexpr std::uint32_t kDisableAlien = 1U;
+constexpr bool AlienSuppressionRequested(const Role role, const std::uint32_t flags) noexcept {
+    return role == Role::Host && (flags & kDisableAlien) != 0U;
+}
+
 struct ExecutionTransitionEntry final {
     std::uint32_t state, typeRva, entryRva;
     bool ignoredStackArgument{};
