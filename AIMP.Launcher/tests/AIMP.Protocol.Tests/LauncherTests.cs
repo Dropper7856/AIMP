@@ -492,6 +492,21 @@ internal static class LauncherTests
         AssertEx.Equal(28015, loaded.Port);
         AssertEx.Equal(playerId, loaded.PlayerId);
         AssertEx.False(loaded.WorldSyncEnabled);
+        AssertEx.Equal(new VoiceSettings(), loaded.Voice!);
+        var voice = new VoiceSettings(false, "voiceActivity", "persistent-interface", 0xA3, 0.1f, 1.5f, 0.4f);
+        store.Save(loaded with { Voice = voice, WorldSync3EmptyCallbackEnabled = true });
+        loaded = store.Load();
+        AssertEx.Equal(voice, loaded.Voice!);
+        AssertEx.False(loaded.WorldSyncEnabled);
+        AssertEx.True(loaded.WorldSync3EmptyCallbackEnabled);
+        AssertEx.True(voice.TryValidate(out _));
+        foreach (var invalid in new[]
+        {
+            voice with { Mode = "unknown" }, voice with { MicrophoneId = "" },
+            voice with { PushToTalkKey = 256 }, voice with { ActivationThreshold = float.NaN },
+            voice with { InputGain = 4.1f }, voice with { PlaybackVolume = -1 }
+        }) AssertEx.False(invalid.TryValidate(out _));
+        AssertEx.Equal(0.02f, (voice with { ActivationThreshold = float.NaN }).Normalize().ActivationThreshold);
 
         File.WriteAllText(temporary.Combine("legacy-settings.json"),
             JsonSerializer.Serialize(new
@@ -503,6 +518,7 @@ internal static class LauncherTests
                 PlayerId = playerId
             }));
         var legacyStore = new LauncherSettingsStore(temporary.Combine("legacy-settings.json"));
+        AssertEx.Equal(new VoiceSettings(), legacyStore.Load().Voice!);
         AssertEx.True(legacyStore.Load().WorldSyncEnabled,
             "WorldSync must remain enabled for settings files created before the checkbox existed.");
     }

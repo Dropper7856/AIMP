@@ -43,6 +43,8 @@ enum class MessageType : std::uint16_t {
     PlayerLifecycleState = 27, // Native -> Launcher local THE_PLAYER death boundary.
     ItemSyncPickup = 28, // Native -> Launcher: the local player collected a world pickup.
     ItemSyncSpawn = 29, // Native -> Launcher: GCIP spawn proposal or local player drop.
+    VoiceConfigure = 30,
+    VoicePcmFrame = 31,
     TestModeConfigure = 200,
     CapabilityQuery = 201,
     CapabilityState = 202,

@@ -1,4 +1,5 @@
 #include "aimp/AISync.h"
+#include "aimp/VoiceSync.h"
 #include "aimp/LauncherIPC.h"
 
 #include "aimp/BuildProfile.h"
@@ -1313,6 +1314,7 @@ bool LauncherIPC::TryConnect() {
 }
 
 void LauncherIPC::Disconnect(const std::string_view reason) noexcept {
+    voice_sync::TransportLost();
     multiplayer_pause::ClearLoadingHold();
     ai_sync::TransportLost();
     const auto pipe =
@@ -1655,6 +1657,18 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
     case protocol::MessageType::AISyncState:
     case protocol::MessageType::AISyncImpact:
         return HandleAISyncFrame(frame);
+    case protocol::MessageType::VoiceConfigure:
+        if (!sessionConfigured_.load(std::memory_order_acquire)) return true;
+        if (frame.payload.size() == 48U) {
+            const auto flags = std::to_integer<unsigned int>(frame.payload[12]);
+            if ((flags & 1U) == 0U || (worldSyncAuthorityBound_ && worldSyncWorldBusActive_))
+                static_cast<void>(voice_sync::Configure(frame.payload, worldSyncAuthorityHost_));
+        }
+        return true; // Malformed/dropped audio never tears down the shared pipe.
+    case protocol::MessageType::VoicePcmFrame:
+        if (sessionConfigured_.load(std::memory_order_acquire) && worldSyncAuthorityBound_ && worldSyncWorldBusActive_)
+            static_cast<void>(voice_sync::QueueFrame(frame.payload));
+        return true;
     case protocol::MessageType::WorldSyncLifecycle: {
         if (!sessionConfigured_.load(std::memory_order_acquire) ||
             frame.payload.empty() || frame.payload.size() > 16U * 1024U) {

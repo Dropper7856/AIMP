@@ -332,6 +332,10 @@ struct Counters final {
     bool stable{};
 };
 Counters DiagnosticsSnapshot() noexcept;
+// Engine-thread participant identity for source-attributed native subsystems.
+// Uses the same generation/lifetime proof as perception; never chooses a target.
+std::uintptr_t ResolveLivingParticipant(std::uint64_t peer, std::uint32_t nativeGeneration,
+    std::uint32_t worldGeneration) noexcept;
 // Call only from IPC/bootstrap workers, never from an engine detour.
 void LogDiagnostics(Diagnostics& diagnostics);
 } // namespace ai_sync

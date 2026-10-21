@@ -21,6 +21,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
 {
     private readonly NativeRuntimeController _controller;
     private readonly AISyncSession _aiSync;
+    private readonly VoiceSyncSession _voiceSync;
     private readonly LauncherSettingsStore _settingsStore;
     private readonly ScaleformBridgeListener _bridge;
     private readonly LauncherDiagnostics _diagnostics;
@@ -414,6 +415,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _performanceIsolation = performanceIsolation ?? throw new ArgumentNullException(nameof(performanceIsolation));
         _diagnostics = controller.Diagnostics;
         _aiSync = new AISyncSession(controller, _performanceIsolation);
+        _voiceSync = new VoiceSyncSession(controller, settingsStore);
         _bridge.MessageReceived += OnBridgeMessage;
         _bridge.ConnectionClosed += OnRoundBridgeConnectionClosed;
         _controller.WorldIntentProduced += OnNativeWorldIntentProduced;
@@ -602,6 +604,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _ = TryAdvanceGameplayAsync(runtime);
         _ = TryConvergeRemoteCharactersAsync(runtime, now);
         _ = TryAdvanceRemoteMovementAsync(runtime, now);
+        UpdateVoiceSession(runtime);
     }
 
     private void UpdateObservedTransform(
@@ -689,6 +692,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _lifetime.Cancel();
         _aiSync.Dispose();
+        _voiceSync.Dispose();
         _bridge.MessageReceived -= OnBridgeMessage;
         _bridge.ConnectionClosed -= OnRoundBridgeConnectionClosed;
         _controller.WorldIntentProduced -= OnNativeWorldIntentProduced;
@@ -738,6 +742,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         message.Type.Trim().ToUpperInvariant() switch
         {
             "HELLO" => HandleHelloAsync(message),
+            "VOICE_GET_SETTINGS" or "VOICE_SAVE_SETTINGS" => HandleVoiceBridgeAsync(message),
             "PICKUP_OVERLAY_LOADED" => MarkGameplayUiLoadedAsync(message),
             "CREATE_LOBBY" => CreateLobbyAsync(message),
             "JOIN_DIRECT_IP" => JoinDirectAsync(),
@@ -2390,6 +2395,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private void AttachHost(LobbyHost host)
     {
         _aiSync.BindHost(host);
+        host.VoiceFrameReceived += _voiceSync.Receive;
         host.SnapshotChanged += OnLobbySnapshot;
         host.Started += OnLobbyStarted;
         host.SessionReleased += OnSessionReleased;
@@ -2411,6 +2417,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private void DetachHost(LobbyHost host)
     {
         _aiSync.UnbindHost(host);
+        host.VoiceFrameReceived -= _voiceSync.Receive;
+        SuspendVoiceSession();
         host.SnapshotChanged -= OnLobbySnapshot;
         host.Started -= OnLobbyStarted;
         host.SessionReleased -= OnSessionReleased;
@@ -2432,6 +2440,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private void AttachClient(LobbyClient client)
     {
         _aiSync.BindClient(client);
+        client.VoiceFrameReceived += _voiceSync.Receive;
         client.SnapshotChanged += OnLobbySnapshot;
         client.Started += OnLobbyStarted;
         client.SessionReleased += OnSessionReleased;
@@ -2456,6 +2465,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private void DetachClient(LobbyClient client)
     {
         _aiSync.UnbindClient(client);
+        client.VoiceFrameReceived -= _voiceSync.Receive;
+        SuspendVoiceSession();
         client.SnapshotChanged -= OnLobbySnapshot;
         client.Started -= OnLobbyStarted;
         client.SessionReleased -= OnSessionReleased;

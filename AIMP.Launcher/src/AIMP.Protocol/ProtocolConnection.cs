@@ -41,6 +41,20 @@ internal sealed class ProtocolConnection : IAsyncDisposable
     public ValueTask<AimpFrame> ReadAsync(CancellationToken cancellationToken) =>
         FrameCodec.ReadAsync(Stream, cancellationToken);
 
+    // Voice never queues behind other writes. A congested connection drops
+    // the frame; reliable gameplay/control messages keep their existing path.
+    public async Task TrySendVoiceAsync(ReadOnlyMemory<byte> payload, CancellationToken token)
+    {
+        if (!await _writeLock.WaitAsync(0, token).ConfigureAwait(false)) return;
+        try
+        {
+            var sequence = unchecked((ulong)Interlocked.Increment(ref _sequence));
+            await FrameCodec.WriteAsync(Stream,
+                new AimpFrame(MessageType.VoiceFrame, 0, sequence, payload), token).ConfigureAwait(false);
+        }
+        finally { _writeLock.Release(); }
+    }
+
     public ValueTask DisposeAsync()
     {
         Client.Dispose();

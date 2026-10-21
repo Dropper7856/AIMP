@@ -8452,6 +8452,14 @@ bool OwnsAI() noexcept {
     return Installed() && role != Role::Retail;
 }
 bool Installed() noexcept { return gInstalled.load(std::memory_order_acquire); }
+std::uintptr_t ResolveLivingParticipant(const std::uint64_t peer,
+    const std::uint32_t nativeGeneration, const std::uint32_t worldGeneration) noexcept {
+    if (!EngineThread() || !Stable() || gCurrent.nativeGeneration != nativeGeneration ||
+        gCurrent.worldGeneration != worldGeneration) return 0U;
+    const auto character = ParticipantForPeer(peer);
+    return LivingCharacter(character) ? character : 0U;
+}
+
 Counters DiagnosticsSnapshot() noexcept {
     Counters value{gObserved.load(), gApplied.load(), gDropped.load(), gRefused.load(),
         gSuspended.load(), gFaults.load(), gMissing.load()};

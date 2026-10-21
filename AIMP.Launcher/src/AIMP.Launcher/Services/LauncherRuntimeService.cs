@@ -92,6 +92,8 @@ public sealed class LauncherRuntimeService : BackgroundService
     public SettingsValidationResponse ValidateSettings(UpdateSettingsRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
+        if (request.Voice is not null && !VoiceSettings.FromDto(request.Voice).TryValidate(out var voiceError))
+            return new SettingsValidationResponse(false, voiceError, null, null, null, null);
         if (!GameInstallation.TryResolve(request.GameDirectory, out var game, out var error))
             return new SettingsValidationResponse(false, error, null, null, null, null);
         if (!MultiplayerSettingsValidation.TryValidate(
@@ -121,7 +123,8 @@ public sealed class LauncherRuntimeService : BackgroundService
             validation.NormalizedPort!.Value,
             previous.PlayerId == Guid.Empty ? Guid.NewGuid() : previous.PlayerId,
             request.WorldSyncEnabled,
-            request.WorldSync3EmptyCallbackEnabled);
+            request.WorldSync3EmptyCallbackEnabled,
+            request.Voice is null ? previous.Voice : VoiceSettings.FromDto(request.Voice));
         _settings.Save(value);
         _preparation.Start();
         WorldSync3LauncherOptions.ApplyProcessEnvironment(value);
@@ -573,7 +576,8 @@ public sealed class LauncherRuntimeService : BackgroundService
         value.PlayerId,
         value.WorldSyncEnabled,
         value.WorldSync3EmptyCallbackEnabled,
-        _settings.SettingsPath);
+        _settings.SettingsPath,
+        (value.Voice ?? new VoiceSettings()).Normalize().ToDto());
 
     private LauncherSettings LoadSettingsOrDefault()
     {

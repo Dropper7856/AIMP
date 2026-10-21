@@ -392,6 +392,9 @@ internal sealed class NativeRuntimeController : IDisposable
     internal Task SendAISyncImpactAsync(ReadOnlyMemory<byte> payload, CancellationToken token) =>
         GetCommandSession().SendAISyncAsync(MessageType.AISyncImpact, payload, token);
 
+    internal Task<bool> SendVoiceAsync(MessageType type, ReadOnlyMemory<byte> payload, CancellationToken token) =>
+        GetCommandSession().SendVoiceAsync(type, payload, token);
+
     internal Task SendWorldSyncLifecycleAsync(
         WorldSyncLifecyclePayload lifecycle,
         CancellationToken cancellationToken = default)

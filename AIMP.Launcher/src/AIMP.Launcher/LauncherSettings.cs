@@ -10,12 +10,14 @@ internal sealed record LauncherSettings(
     int Port = ProtocolConstants.DefaultGamePort,
     Guid PlayerId = default,
     bool WorldSyncEnabled = true,
-    bool WorldSync3EmptyCallbackEnabled = false)
+    bool WorldSync3EmptyCallbackEnabled = false,
+    VoiceSettings? Voice = null)
 {
     internal static LauncherSettings Empty { get; } = new(string.Empty);
 
     internal LauncherSettings Normalize() => this with
     {
+        Voice = (Voice ?? new VoiceSettings()).Normalize(),
         PlayerName = NormalizeName(PlayerName),
         HostAddress = NormalizeHost(HostAddress),
         Port = Port is >= 1 and <= 65535 ? Port : ProtocolConstants.DefaultGamePort,
