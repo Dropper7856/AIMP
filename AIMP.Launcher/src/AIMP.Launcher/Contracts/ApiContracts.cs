@@ -84,8 +84,7 @@ public sealed record SettingsResponse(
     Guid PlayerId,
     bool WorldSyncEnabled,
     bool WorldSync3EmptyCallbackEnabled,
-    string SettingsPath,
-    VoiceSettingsDto? Voice = null);
+    string SettingsPath);
 
 public sealed record UpdateSettingsRequest(
     string? GameDirectory,
@@ -93,14 +92,7 @@ public sealed record UpdateSettingsRequest(
     string? HostAddress,
     int Port,
     bool WorldSyncEnabled = true,
-    bool WorldSync3EmptyCallbackEnabled = false,
-    VoiceSettingsDto? Voice = null);
-
-public sealed record VoiceSettingsDto(bool Enabled = true, string Mode = "pushToTalk",
-    string MicrophoneId = "default", int PushToTalkKey = 0x56, float ActivationThreshold = 0.02f,
-    float InputGain = 1f, float PlaybackVolume = 1f);
-
-public sealed record VoiceMicrophoneDeviceDto(string Id, string Name, bool IsDefault);
+    bool WorldSync3EmptyCallbackEnabled = false);
 
 public sealed record SettingsValidationResponse(
     bool Valid,

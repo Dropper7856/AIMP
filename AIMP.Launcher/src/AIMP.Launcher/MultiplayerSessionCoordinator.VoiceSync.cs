@@ -32,11 +32,17 @@ internal sealed partial class MultiplayerSessionCoordinator
             ["enabled"] = voice.Enabled ? "1" : "0", ["mode"] = voice.Mode,
             ["key"] = voice.PushToTalkKey.ToString(CultureInfo.InvariantCulture),
             ["microphone"] = voice.MicrophoneId,
-            ["threshold"] = voice.ActivationThreshold.ToString(CultureInfo.InvariantCulture)
+            ["threshold"] = voice.ActivationThreshold.ToString(CultureInfo.InvariantCulture),
+            ["gain"] = voice.InputGain.ToString(CultureInfo.InvariantCulture),
+            ["volume"] = voice.PlaybackVolume.ToString(CultureInfo.InvariantCulture)
         };
         AddMicrophoneDevices(values);
         await _bridge.SendAsync("VOICE_SETTINGS", values).ConfigureAwait(false);
     }
+
+    private static float ReadVoiceLevel(ScaleformBridgeMessage message, string key, float fallback) =>
+        float.TryParse(message.Get(key, string.Empty), NumberStyles.Float, CultureInfo.InvariantCulture, out var value)
+            ? value : fallback;
 
     private static void AddMicrophoneDevices(Dictionary<string, string> values)
     {
@@ -53,13 +59,14 @@ internal sealed partial class MultiplayerSessionCoordinator
     {
         var current = _settingsStore.Load();
         var voice = (current.Voice ?? new VoiceSettings()).Normalize();
-        var mode = message.Get("mode", voice.Mode);
-        var mic = message.Get("microphone", voice.MicrophoneId);
         var keyText = message.Get("key", voice.PushToTalkKey.ToString(CultureInfo.InvariantCulture));
         if (!int.TryParse(keyText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var key))
             throw new InvalidOperationException("Invalid push-to-talk key.");
         var next = voice with { Enabled = message.Get("enabled", voice.Enabled ? "1" : "0") == "1",
-            Mode = mode, MicrophoneId = mic, PushToTalkKey = key };
+            Mode = message.Get("mode", voice.Mode), MicrophoneId = message.Get("microphone", voice.MicrophoneId),
+            PushToTalkKey = key, ActivationThreshold = ReadVoiceLevel(message, "threshold", voice.ActivationThreshold),
+            InputGain = ReadVoiceLevel(message, "gain", voice.InputGain),
+            PlaybackVolume = ReadVoiceLevel(message, "volume", voice.PlaybackVolume) };
         if (!next.TryValidate(out var error)) throw new InvalidOperationException(error);
         _settingsStore.Save(current with { Voice = next });
         await SendVoiceSettingsAsync().ConfigureAwait(false);

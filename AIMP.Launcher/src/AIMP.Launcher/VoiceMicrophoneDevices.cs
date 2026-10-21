@@ -1,13 +1,13 @@
 using System.Runtime.InteropServices;
-using AIMP.Launcher.Contracts;
-
 namespace AIMP.Launcher;
+
+internal sealed record VoiceMicrophoneDevice(string Id, string Name, bool IsDefault);
 
 internal static class VoiceMicrophoneDevices
 {
-    internal static IReadOnlyList<VoiceMicrophoneDeviceDto> Enumerate()
+    internal static IReadOnlyList<VoiceMicrophoneDevice> Enumerate()
     {
-        var devices = new List<VoiceMicrophoneDeviceDto>
+        var devices = new List<VoiceMicrophoneDevice>
         {
             new("default", "Default communications microphone", true)
         };
