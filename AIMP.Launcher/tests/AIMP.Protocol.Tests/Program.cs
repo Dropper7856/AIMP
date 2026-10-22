@@ -4,8 +4,22 @@ internal static class Program
 {
     private static readonly TestCase[] Tests =
     {
+        new("MissionSync authored completion frontier", MissionFrontierTests.SelectionAsync),
+        new("MissionSync canonical native configuration", MissionFrontierTests.BinaryAsync),
+        new("MissionSync catalog loading barrier", PreparationTests.MissionCatalogBarrierAsync),
+        new("MissionSync signal model", MissionSyncTests.ModelAsync),
+        new("MissionSync ordered Host commits", MissionSyncTests.LobbyAsync),
         new("Protocol frames", ProtocolTests.FrameRoundTripAndValidationAsync),
         new("Protocol models", ProtocolTests.ModelValidationAsync),
+        new("PlayerSync posture wire and revisions", PlayerPostureTests.WireAsync),
+        new("PlayerSync posture stationary and edges", PlayerPostureTests.MovementAsync),
+        new("PlayerSync posture coherent memory capture", PlayerPostureTests.CaptureAsync),
+        new("PlayerSync torch wire", PlayerTorchTests.WireAsync),
+        new("PlayerSync torch effective capture", PlayerTorchTests.CaptureAsync),
+        new("PlayerSync torch IPC validation", PlayerTorchTests.CommandValidationAsync),
+        new("PlayerSync torch stationary and moving", PlayerTorchTests.MovementAsync),
+        new("PlayerSync torch edges and binding", PlayerTorchTests.EdgesAndBindingAsync),
+        new("PlayerSync torch local coalescing and lifecycle", PlayerTorchTests.CoordinatorAsync),
         new("AISync authority codec", AISyncCodecTests.AuthorityStateRoundTripAsync),
         new("Alien option configuration", AlienOptionTests.ConfigurationAsync),
         new("Alien option payload defaults", AlienOptionTests.PayloadDefaultsAsync),

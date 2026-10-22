@@ -6,10 +6,13 @@ public sealed partial class LobbyHost
     private readonly Dictionary<ulong, LobbyPreparationPayload> _lobbyPreparations = new();
     private readonly HashSet<ulong> _sessionPreparedPeers = new();
     private int _sessionReleasedGeneration;
+    private int _missionPreparationGeneration;
+    private readonly Dictionary<ulong, string> _missionPreparationHashes = new();
 
     public event EventHandler<LobbyPreparationPayload>? LobbyPreparationReceived;
     public event EventHandler<SessionPreparedPayload>? SessionPreparedReceived;
     public event EventHandler<SessionReleasePayload>? SessionReleased;
+    public event EventHandler<ErrorPayload>? MissionPreparationFailed;
 
     // Explicit Start preflight: even an unchanged level must be checked again
     // after files may have changed since opening the lobby or the previous round.
@@ -45,8 +48,8 @@ public sealed partial class LobbyHost
     }
 
     public Task SetHostSessionPreparedAsync(
-        int levelGeneration, CancellationToken cancellationToken = default) =>
-        AcceptSessionPreparedAsync(new SessionPreparedPayload(SessionId, HostPeerId, levelGeneration),
+        int levelGeneration, CancellationToken cancellationToken = default, string missionSha256 = "") =>
+        AcceptSessionPreparedAsync(new SessionPreparedPayload(SessionId, HostPeerId, levelGeneration, missionSha256),
             null, cancellationToken);
 
     // Called under the same state lock as StartGameAsync's final admission check.
@@ -106,18 +109,35 @@ public sealed partial class LobbyHost
         ModelValidation.Validate(prepared);
         SessionReleasePayload? release = null;
         var replayRelease = false;
+        var missionMismatch = false;
         lock (_stateLock)
         {
             if (prepared.SessionId != SessionId || prepared.LevelGeneration != _levelGeneration
                 || !string.Equals(_state, "Starting", StringComparison.Ordinal)
                 || (prepared.PeerId != HostPeerId && !_clients.ContainsKey(prepared.PeerId))) return;
+            if (_missionPreparationGeneration != _levelGeneration)
+            {
+                _missionPreparationGeneration = _levelGeneration;
+                _missionPreparationHashes.Clear();
+            }
+            _missionPreparationHashes[prepared.PeerId] = prepared.MissionSha256;
             _sessionPreparedPeers.Add(prepared.PeerId);
-            if (_sessionReleasedGeneration == _levelGeneration)
-                replayRelease = true;
-            else
-                release = TryReleaseSessionLocked();
+            missionMismatch = !MissionPreparationsMatchLocked();
+            if (!missionMismatch)
+            {
+                if (_sessionReleasedGeneration == _levelGeneration) replayRelease = true;
+                else release = TryReleaseSessionLocked();
+            }
         }
         SessionPreparedReceived?.Invoke(this, prepared);
+        if (missionMismatch)
+        {
+            var error = new ErrorPayload("MISSION_CATALOG_MISMATCH",
+                "Players have different mission catalogs. Prepare the same level files on every installation.");
+            MissionPreparationFailed?.Invoke(this, error);
+            await BroadcastAsync(MessageType.Error, JsonPayload.Serialize(error), cancellationToken).ConfigureAwait(false);
+            return;
+        }
         if (release is not null)
             await PublishSessionReleaseAsync(release, cancellationToken).ConfigureAwait(false);
         else if (replayRelease)
@@ -144,9 +164,17 @@ public sealed partial class LobbyHost
         if (!string.Equals(_state, "Starting", StringComparison.Ordinal)
             || _levelGeneration < 1 || _sessionReleasedGeneration == _levelGeneration
             || !_sessionPreparedPeers.Contains(HostPeerId)
-            || _clients.Keys.Any(peerId => !_sessionPreparedPeers.Contains(peerId))) return null;
+            || _clients.Keys.Any(peerId => !_sessionPreparedPeers.Contains(peerId))
+            || !MissionPreparationsMatchLocked()) return null;
         _sessionReleasedGeneration = _levelGeneration;
         return new SessionReleasePayload(SessionId, _levelGeneration);
+    }
+
+    private bool MissionPreparationsMatchLocked()
+    {
+        if (!_missionPreparationHashes.TryGetValue(HostPeerId, out var hostHash)) return true;
+        return _clients.Keys.All(peer => !_missionPreparationHashes.TryGetValue(peer, out var hash)
+            || string.Equals(hash, hostHash, StringComparison.OrdinalIgnoreCase));
     }
 
     private async Task PublishSessionReleaseAsync(

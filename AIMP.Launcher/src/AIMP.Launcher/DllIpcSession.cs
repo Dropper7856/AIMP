@@ -64,6 +64,8 @@ internal sealed class DllIpcSession : IAsyncDisposable
 
     internal event EventHandler<NativePlayerLifecycleStatePayload>? PlayerLifecycleStateChanged;
 
+    internal event EventHandler<NativeMissionSignalPayload>? MissionSignalProduced;
+
     internal event EventHandler<NativeItemSyncPickupPayload>? ItemSyncPickupProduced;
 
     internal event EventHandler<NativeItemSyncSpawnPayload>? ItemSyncSpawnProduced;
@@ -453,6 +455,7 @@ internal sealed class DllIpcSession : IAsyncDisposable
             case MessageType.PlayerSyncState: HandlePlayerSyncState(frame); return true;
             case MessageType.PlayerSyncAction: HandlePlayerSyncAction(frame); return true;
             case MessageType.PlayerLifecycleState: HandlePlayerLifecycleState(frame); return true;
+            case MessageType.MissionSignalProduced: HandleMissionSignal(frame); return true;
             case MessageType.ItemSyncPickup: HandleItemSyncPickup(frame); return true;
             case MessageType.ItemSyncSpawn: HandleItemSyncSpawn(frame); return true;
             case MessageType.AISyncState:
@@ -543,6 +546,15 @@ internal sealed class DllIpcSession : IAsyncDisposable
         var value = JsonPayload.Deserialize<NativePlayerLifecycleStatePayload>(frame.Payload.Span);
         ModelValidation.Validate(value);
         PlayerLifecycleStateChanged?.Invoke(this, value);
+    }
+
+    private void HandleMissionSignal(AimpFrame frame)
+    {
+        var value = JsonPayload.Deserialize<NativeMissionSignalPayload>(frame.Payload.Span);
+        if (value.LevelGeneration <= 0 || value.Sequence == 0 || value.Signal == 0
+            || value.InterfaceSelector is not (1 or 2) || !ModelValidation.IsWorldEntityIdText(value.EntityId))
+            throw new ProtocolException("Invalid native mission signal.");
+        MissionSignalProduced?.Invoke(this, value);
     }
 
     private void HandleItemSyncPickup(AimpFrame frame)

@@ -17,6 +17,7 @@ public sealed partial class LobbyClient : IAsyncDisposable
 
     private readonly ProtocolConnection _connection;
     private readonly CancellationTokenSource _shutdown = new();
+    private readonly Dictionary<ulong, PlayerPositionReceiveWindow> _positionWindows = new();
     private readonly long _connectionGeneration;
     private Task? _readLoop;
     private Task? _heartbeatLoop;
@@ -381,6 +382,9 @@ public sealed partial class LobbyClient : IAsyncDisposable
                     case MessageType.VoiceFrame:
                         HandleVoiceFrame(frame.Payload);
                         break;
+                    case MessageType.MissionSignalCommitted:
+                        HandleMissionSignalCommitted(frame.Payload);
+                        break;
                     case MessageType.Heartbeat:
                         break;
 
@@ -456,6 +460,7 @@ public sealed partial class LobbyClient : IAsyncDisposable
                         var position = JsonPayload.Deserialize<PlayerPositionSnapshotPayload>(
                             frame.Payload.Span);
                         ValidatePlayerPosition(position);
+                        if (!AcceptPlayerPosition(position)) break;
                         PlayerPositionReceived?.Invoke(this, position);
                         break;
 
@@ -600,6 +605,13 @@ public sealed partial class LobbyClient : IAsyncDisposable
         var known = Snapshot?.Players.Any(player => player.PeerId == payload.PeerId) == true;
         if (payload.SessionId != SessionId || !known || payload.PeerId == PeerId)
             throw new ProtocolException("The player-position snapshot identity is invalid.");
+    }
+
+    private bool AcceptPlayerPosition(PlayerPositionSnapshotPayload value)
+    {
+        if (!_positionWindows.TryGetValue(value.PeerId, out var window))
+            _positionWindows[value.PeerId] = window = new PlayerPositionReceiveWindow();
+        return window.TryAccept(value);
     }
 
     private void ValidatePlayerEquipment(PlayerEquipmentSnapshotPayload payload)

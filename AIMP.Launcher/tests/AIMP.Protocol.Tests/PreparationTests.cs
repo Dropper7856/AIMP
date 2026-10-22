@@ -134,6 +134,38 @@ internal static class PreparationTests
             .ConfigureAwait(false);
     }
 
+    internal static async Task MissionCatalogBarrierAsync()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        await using var host = CreateHost(3);
+        host.Start();
+        await using var first = await ConnectAsync(host, "Dallas", timeout.Token).ConfigureAwait(false);
+        first.Start();
+        await using var second = await ConnectAsync(host, "Lambert", timeout.Token).ConfigureAwait(false);
+        second.Start();
+        var releases = 0;
+        var failures = 0;
+        var peerErrors = 0;
+        host.SessionReleased += (_, _) => Interlocked.Increment(ref releases);
+        host.MissionPreparationFailed += (_, _) => Interlocked.Increment(ref failures);
+        first.ErrorReceived += (_, error) => { if (error.Code == "MISSION_CATALOG_MISMATCH") Interlocked.Increment(ref peerErrors); };
+        await PrepareEveryoneAsync(host, first, second, timeout.Token).ConfigureAwait(false);
+        var round = await host.StartGameAsync(DateTimeOffset.UtcNow, timeout.Token).ConfigureAwait(false);
+        await WaitUntilAsync(() => first.Snapshot?.LevelGeneration == round.LevelGeneration
+            && second.Snapshot?.LevelGeneration == round.LevelGeneration).ConfigureAwait(false);
+        var hash = new string('A', 64);
+        // A Client may finish first. Comparison begins when the Host reports its own catalog.
+        await first.SendSessionPreparedAsync(round.LevelGeneration, timeout.Token, new string('B', 64)).ConfigureAwait(false);
+        await second.SendSessionPreparedAsync(round.LevelGeneration, timeout.Token, hash).ConfigureAwait(false);
+        await FlushClientFramesAsync(host, first, round.LevelGeneration, timeout.Token).ConfigureAwait(false);
+        await FlushClientFramesAsync(host, second, round.LevelGeneration, timeout.Token).ConfigureAwait(false);
+        await host.SetHostSessionPreparedAsync(round.LevelGeneration, timeout.Token, hash).ConfigureAwait(false);
+        await WaitUntilAsync(() => Volatile.Read(ref failures) > 0 && Volatile.Read(ref peerErrors) > 0).ConfigureAwait(false);
+        AssertEx.Equal(0, Volatile.Read(ref releases), "A different mission graph must keep every player behind the loading barrier.");
+        await first.SendSessionPreparedAsync(round.LevelGeneration, timeout.Token, hash).ConfigureAwait(false);
+        await WaitUntilAsync(() => Volatile.Read(ref releases) == 1).ConfigureAwait(false);
+    }
+
     private static LobbyHost CreateHost(int capacity) => new(new LobbyHostOptions(
         "Preparation test", "Ripley", Guid.NewGuid(), 0, capacity, "TestLevel", Compatibility(),
         RequireWorldPreparation: true));

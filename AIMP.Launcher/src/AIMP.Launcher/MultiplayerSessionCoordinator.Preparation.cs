@@ -255,8 +255,10 @@ internal sealed partial class MultiplayerSessionCoordinator
             }
             else
             {
-                if (host is not null) await host.SetHostSessionPreparedAsync(start.LevelGeneration, _lifetime.Token).ConfigureAwait(false);
-                else if (client is not null) await client.SendSessionPreparedAsync(start.LevelGeneration, _lifetime.Token).ConfigureAwait(false);
+                string missionHash;
+                lock (_stateGate) missionHash = _missionCatalogSha256;
+                if (host is not null) await host.SetHostSessionPreparedAsync(start.LevelGeneration, _lifetime.Token, missionHash).ConfigureAwait(false);
+                else if (client is not null) await client.SendSessionPreparedAsync(start.LevelGeneration, _lifetime.Token, missionHash).ConfigureAwait(false);
                 lock (_stateGate)
                     if (_start?.SessionId == start.SessionId && _start.LevelGeneration == start.LevelGeneration) _sessionPreparedSent = true;
             }
@@ -327,6 +329,7 @@ internal sealed partial class MultiplayerSessionCoordinator
                 EnsureManifestLoadContext(start, generation, processId);
                 if (result.Executed)
                 {
+                    await ConfigureMissionSyncAsync(prepared, start, generation).ConfigureAwait(false);
                     lock (_stateGate)
                     {
                         EnsureManifestLoadContext(start, generation, processId);

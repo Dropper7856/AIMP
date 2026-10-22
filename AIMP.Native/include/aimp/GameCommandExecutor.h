@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include "aimp/PlayerPostureRuntime.h"
 
 namespace aimp {
 
@@ -47,6 +48,10 @@ struct CharacterDirectMoveCommand {
     float replicationYaw{};
     bool hasMoveType{};
     std::uint32_t moveType{1U};
+    bool hasPlayerPosture{};
+    player_posture::State playerPosture{};
+    bool hasPlayerTorch{};
+    bool playerTorchEnabled{};
 };
 
 struct CharacterDirectStepCommand {
@@ -105,6 +110,12 @@ struct WorldNetProbeCommand {
 struct ItemSyncApplyCommand {
     std::uint64_t entityHigh{};
     std::uint64_t entityLow{};
+};
+struct MissionSyncCommand {
+    std::string path, role;
+    std::uint64_t sequence{}, entityHigh{}, entityLow{};
+    std::uint32_t signal{};
+    std::uint8_t selector{};
 };
 
 struct ItemSyncSpawnCommand {
@@ -174,6 +185,9 @@ public:
         const ItemSyncApplyCommand&) const {
         return {false, "ITEM_SYNC_UNAVAILABLE", "ItemSync is not supported by this executor."};
     }
+    [[nodiscard]] virtual GameCommandExecutionResult ExecuteMissionSync(const MissionSyncCommand&, bool) const {
+        return {false, "MISSION_SYNC_UNAVAILABLE", "MissionSync is not supported by this executor."};
+    }
     [[nodiscard]] virtual GameCommandExecutionResult ExecuteItemSyncSpawn(
         const ItemSyncSpawnCommand&) const {
         return {false, "ITEM_SYNC_UNAVAILABLE", "ItemSync is not supported by this executor."};
@@ -224,6 +238,8 @@ public:
     [[nodiscard]] GameCommandExecutionResult ExecuteReturnToFrontend() const override;
     [[nodiscard]] GameCommandExecutionResult ExecuteItemSyncApply(
         const ItemSyncApplyCommand& command) const override;
+    [[nodiscard]] GameCommandExecutionResult ExecuteMissionSync(
+        const MissionSyncCommand& command, bool configure) const override;
     [[nodiscard]] GameCommandExecutionResult ExecuteItemSyncSpawn(
         const ItemSyncSpawnCommand& command) const override;
 

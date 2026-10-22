@@ -1,5 +1,7 @@
 #include "aimp/CharacterDirectStepRuntime.h"
 #include "aimp/AISyncExecutionPolicy.h"
+#include "aimp/PlayerPostureRuntime.h"
+#include "aimp/PlayerTorchRuntime.h"
 
 #include "aimp/CrashGuard.h"
 #include "aimp/HookManager.h"
@@ -533,6 +535,8 @@ MovementSlot* FindOrAllocateSlot(
 }
 
 void ReleaseSlot(MovementSlot& slot) noexcept {
+    player_posture::Forget(slot.characterAddress.load(std::memory_order_acquire));
+    player_torch::Forget(slot.characterAddress.load(std::memory_order_acquire));
     slot.remainingFrames.store(0U, std::memory_order_release);
     slot.leaseExpiresAtTickMs.store(0U, std::memory_order_release);
     slot.nativeStateActive.store(false, std::memory_order_release);
@@ -678,7 +682,7 @@ bool RetailOwnsPhysicalCycle(const std::uintptr_t characterAddress) noexcept {
     // entry marks the victim +297; PlayerSync must respect that same ownership.
     if (GuardedReadValue(characterAddress + 0x297U, grappled) && grappled != 0U) return true;
     if (ReadNativeCycle(characterAddress, cycle, state) &&
-        (state == 0x42U || state == 0x4EU || state == 0x4FU || state == 0x47U)) return true;
+        (state == 0x16U || state == 0x42U || state == 0x4EU || state == 0x4FU || state == 0x47U)) return true;
     return GuardedReadValue(characterAddress + 0x32CU, health) && health >= 3U;
 }
 
@@ -1073,6 +1077,8 @@ bool LoadNetworkTarget(
     float& y,
     float& z) noexcept {
     if (!slot.hasNetworkTransform.load(std::memory_order_acquire)) return false;
+    if (player_posture::ApproachTarget(slot.characterAddress.load(std::memory_order_acquire), x, y, z))
+        return true;
     x = LoadFloat(slot.networkXBits);
     y = LoadFloat(slot.networkYBits);
     z = LoadFloat(slot.networkZBits);
@@ -1083,6 +1089,8 @@ bool ApplyHardNetworkResync(
     MovementSlot& slot,
     const std::uintptr_t characterAddress) noexcept {
     if (slot.initialPlacementPending.load(std::memory_order_acquire)) return false;
+    float approachX{}, approachY{}, approachZ{};
+    if (player_posture::ApproachTarget(characterAddress, approachX, approachY, approachZ)) return false;
 
     const auto now = GetTickCount64();
     const auto lease = slot.leaseExpiresAtTickMs.load(std::memory_order_acquire);
@@ -1172,7 +1180,9 @@ bool BuildFollowerDemand(
 
     const auto lease = slot.leaseExpiresAtTickMs.load(std::memory_order_acquire);
     const auto stale = lease != 0U && GetTickCount64() >= lease;
-    if (stale) {
+    float approachX{}, approachY{}, approachZ{};
+    const auto approaching = player_posture::ApproachTarget(characterAddress, approachX, approachY, approachZ);
+    if (stale || approaching) {
         inputX = 0.0F;
         inputZ = 0.0F;
     }
@@ -2072,6 +2082,31 @@ void PumpSlotOnEngineThread(
         slot.characterAddress.load(std::memory_order_acquire);
     if (characterAddress == 0U || characterAddress == kReservedSlot) return;
 
+    // Lighting follows the actor even while traversal/paired cycles own motion.
+    if (phase == EnginePumpPhase::PostCharacterManager)
+        player_torch::PumpOnEngineThread(characterAddress);
+
+    if (phase == EnginePumpPhase::PreCharacterManager &&
+        player_posture::PumpOnEngineThread(characterAddress)) {
+        if (slot.stopPending.load(std::memory_order_acquire)) {
+            ReleaseSlot(slot); // drop ownership without interrupting retail traversal cleanup
+            return;
+        }
+        slot.initialPlacementPending.store(false, std::memory_order_release);
+        slot.nativeStateActive.store(false, std::memory_order_release);
+        slot.moveActive.store(false, std::memory_order_release);
+        slot.driveRequested.store(false, std::memory_order_release);
+        slot.certifiedCycleAddress.store(0U, std::memory_order_release);
+        slot.preparedTargetRevision.store(0U, std::memory_order_release);
+        return;
+    }
+
+    float approachX{}, approachY{}, approachZ{};
+    if (player_posture::ApproachTarget(characterAddress, approachX, approachY, approachZ)) {
+        slot.idleConverged.store(false, std::memory_order_release);
+        slot.initialPlacementPending.store(false, std::memory_order_release);
+    }
+
     // Network locomotion must not reacquire Move/Idle, teleport or rewrite yaw
     // over an admitted paired attack or a real death. Incoming commands may
     // update their mailbox, but the retail cycle keeps physical ownership.
@@ -2296,6 +2331,8 @@ void PumpSlotOnEngineThread(
 
 RuntimeSnapshot SnapshotSlot(const MovementSlot& slot) noexcept {
     RuntimeSnapshot result{};
+    result.posture = player_posture::Snapshot(slot.characterAddress.load(std::memory_order_acquire));
+    result.torch = player_torch::Snapshot(slot.characterAddress.load(std::memory_order_acquire));
     result.characterAddress =
         slot.characterAddress.load(std::memory_order_acquire);
     result.remainingFrames =
@@ -2614,6 +2651,8 @@ bool Install(
     // Removing it eliminates a full XMM/GPR save/restore on every retail NPC
     // locomotion submission without changing the native submission itself.
 
+    player_posture::Initialize(moduleBase);
+    player_torch::Initialize(moduleBase);
     gInstalled.store(true, std::memory_order_release);
     return true;
 #endif
@@ -2991,9 +3030,15 @@ void Stop() noexcept {
 
 void ForgetCharacter(const std::uintptr_t characterAddress) noexcept {
     if (auto* slot = FindSlot(characterAddress); slot != nullptr) ReleaseSlot(*slot);
+    else {
+        player_posture::Forget(characterAddress);
+        player_torch::Forget(characterAddress);
+    }
 }
 
 void ForgetAll() noexcept {
+    player_posture::ForgetAll();
+    player_torch::ForgetAll();
     for (auto& slot : gSlots) {
         const auto character =
             slot.characterAddress.load(std::memory_order_acquire);

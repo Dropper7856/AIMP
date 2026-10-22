@@ -78,6 +78,11 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private readonly Dictionary<ulong, int> _remoteSpawnRetryAttempts = new();
     private readonly Dictionary<ulong, DateTimeOffset> _remoteSpawnRetryNotBeforeUtc = new();
     private PlayerPositionSnapshotPayload? _pendingLocalPosition;
+    private readonly Queue<PlayerPositionSnapshotPayload> _pendingLocalPostureEdges = new();
+    private PlayerPostureSnapshot? _posture;
+    private PlayerPostureSnapshot? _lastQueuedPosture;
+    private PlayerTorchSnapshot? _torch;
+    private PlayerTorchSnapshot? _lastQueuedTorch;
     private bool _positionSendRunning;
     private ulong _localPositionSequence;
     private NativePlayerEquipmentStatePayload? _localEquipmentState;
@@ -429,6 +434,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _controller.PlayerSyncStateProduced += OnNativePlayerSyncStateProduced;
         _controller.PlayerSyncActionProduced += OnNativePlayerSyncActionProduced;
         _controller.PlayerLifecycleStateChanged += OnNativePlayerLifecycleStateChanged;
+        InitializeMissionSync();
+        _controller.MissionSignalProduced += OnNativeMissionSignalProduced;
         _controller.ItemSyncPickupProduced += OnNativeItemSyncPickupProduced;
         _controller.ItemSyncSpawnProduced += OnNativeItemSyncSpawnProduced;
     }
@@ -446,7 +453,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 _performanceIsolation.SetEnabled(module, enabled);
                 if (!enabled)
                 {
-                    lock (_stateGate) _pendingLocalPosition = null;
+                    lock (_stateGate) ClearPendingLocalPositions();
                 }
                 return;
 
@@ -625,6 +632,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         lock (_stateGate)
         {
             _positionAvailable = positionAvailable;
+            _posture = positionAvailable ? movementProfile.Posture : null;
+            _torch = positionAvailable ? movementProfile.Torch : null;
             if (positionAvailable)
             {
                 UpdateLocalMovementSpeed(now, position);
@@ -707,9 +716,11 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _controller.PlayerSyncStateProduced -= OnNativePlayerSyncStateProduced;
         _controller.PlayerSyncActionProduced -= OnNativePlayerSyncActionProduced;
         _controller.PlayerLifecycleStateChanged -= OnNativePlayerLifecycleStateChanged;
+        _controller.MissionSignalProduced -= OnNativeMissionSignalProduced;
         _controller.ItemSyncPickupProduced -= OnNativeItemSyncPickupProduced;
         _controller.ItemSyncSpawnProduced -= OnNativeItemSyncSpawnProduced;
         StopNetworkAsync("Launcher closed").GetAwaiter().GetResult();
+        Task.WhenAll(_missionReportTask, _missionApplyTask).GetAwaiter().GetResult();
         _commandGate.Dispose();
         _spawnGate.Dispose();
         _remoteEquipmentProvisionGate.Dispose();
@@ -2411,6 +2422,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         host.SessionReleased += OnSessionReleased;
         host.GameplayReadyReceived += OnGameplayReady;
         host.RoundEnded += OnRoundEnded;
+        host.MissionSignalCommitted += OnMissionSignalCommitted;
+        host.MissionPreparationFailed += OnNetworkError;
         host.ItemCollected += OnItemCollected;
         host.ItemSpawnDecided += OnItemSpawnDecided;
         host.SpawnRemotePlayersRequested += OnSpawnRemotePlayersRequested;
@@ -2434,6 +2447,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         host.SessionReleased -= OnSessionReleased;
         host.GameplayReadyReceived -= OnGameplayReady;
         host.RoundEnded -= OnRoundEnded;
+        host.MissionSignalCommitted -= OnMissionSignalCommitted;
+        host.MissionPreparationFailed -= OnNetworkError;
         host.ItemCollected -= OnItemCollected;
         host.ItemSpawnDecided -= OnItemSpawnDecided;
         host.SpawnRemotePlayersRequested -= OnSpawnRemotePlayersRequested;
@@ -2456,6 +2471,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         client.SessionReleased += OnSessionReleased;
         client.GameplayReadyReceived += OnGameplayReady;
         client.RoundEnded += OnRoundEnded;
+        client.MissionSignalCommitted += OnMissionSignalCommitted;
         client.ItemCollected += OnItemCollected;
         client.ItemSpawnDecided += OnItemSpawnDecided;
         client.SpawnPositionRequested += OnSpawnPositionRequested;
@@ -2482,6 +2498,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         client.SessionReleased -= OnSessionReleased;
         client.GameplayReadyReceived -= OnGameplayReady;
         client.RoundEnded -= OnRoundEnded;
+        client.MissionSignalCommitted -= OnMissionSignalCommitted;
         client.ItemCollected -= OnItemCollected;
         client.ItemSpawnDecided -= OnItemSpawnDecided;
         client.SpawnPositionRequested -= OnSpawnPositionRequested;
@@ -2647,6 +2664,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
 
     private void ResetGameplayState(LobbyStartPayload start)
     {
+        ResetMissionSync();
         ClearRoundLifecycleState();
         _start = start;
         _uiGameplayLoaded = false;
@@ -2677,6 +2695,9 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _remotePositions.Clear();
         _processedSpawnRequests.Clear();
         _pendingLocalPosition = null;
+        _pendingLocalPostureEdges.Clear();
+        _lastQueuedPosture = null;
+        _lastQueuedTorch = null;
         _positionSendRunning = false;
         _localPositionSequence = 0;
         // Native PlayerSync state belongs to the AI.exe runtime, not to a lobby
@@ -2971,7 +2992,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             if (peerId == 0 || (_host is null && _client is null)) return false;
             _pendingLocalPosition = new PlayerPositionSnapshotPayload(_start.SessionId, peerId,
                 _start.LevelGeneration, ++_localPositionSequence, now.ToUnixTimeMilliseconds(),
-                _position.X, _position.Y, _position.Z, _yaw, _moveType, _nativeMoveSpeed);
+                _position.X, _position.Y, _position.Z, _yaw, _moveType, _nativeMoveSpeed, _posture, _torch);
+            QueueLocalPostureEdge(_pendingLocalPosition);
             if (_positionSendRunning) return false;
             _positionSendRunning = true;
             return true;
@@ -2989,7 +3011,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         catch (Exception exception)
         {
             _diagnostics.Log("Network", $"Position publishing stopped: {exception.Message}");
-            lock (_stateGate) { _pendingLocalPosition = null; _positionSendRunning = false; }
+            lock (_stateGate) { ClearPendingLocalPositions(); _positionSendRunning = false; }
         }
     }
 
@@ -2997,11 +3019,36 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     {
         lock (_stateGate)
         {
+            if (_pendingLocalPostureEdges.TryDequeue(out var edge))
+            {
+                if (_pendingLocalPosition?.Sequence == edge.Sequence) _pendingLocalPosition = null;
+                return edge;
+            }
             var value = _pendingLocalPosition;
             _pendingLocalPosition = null;
             if (value is null) _positionSendRunning = false;
             return value;
         }
+    }
+
+    private void QueueLocalPostureEdge(PlayerPositionSnapshotPayload value)
+    {
+        var posture = value.Posture ?? _lastQueuedPosture;
+        var torch = value.Torch ?? _lastQueuedTorch;
+        if (posture == _lastQueuedPosture && torch == _lastQueuedTorch) return;
+        _lastQueuedPosture = posture;
+        _lastQueuedTorch = torch;
+        if (_pendingLocalPostureEdges.Count == PlayerPostureDispatchQueue.Capacity)
+            _pendingLocalPostureEdges.Dequeue();
+        _pendingLocalPostureEdges.Enqueue(value with { Posture = posture, Torch = torch });
+    }
+
+    private void ClearPendingLocalPositions()
+    {
+        _pendingLocalPosition = null;
+        _pendingLocalPostureEdges.Clear();
+        _lastQueuedPosture = null;
+        _lastQueuedTorch = null;
     }
 
     private Task SendLocalPositionAsync(PlayerPositionSnapshotPayload value)
@@ -3572,6 +3619,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         foreach (var pair in _remoteCharacters.OrderBy(value => value.Key))
         {
             if (!_remotePositions.TryGetValue(pair.Key, out var track)) continue;
+            track.BindCharacter(pair.Value);
             var snapshot = track.Snapshot();
             if (snapshot is not null)
                 targets.Add(new RemoteMovementTarget(
@@ -3641,8 +3689,11 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             ? $"Remote Character 0x{target.CharacterBase:X8} started replicating PeerId {target.PeerId}; authoritativePosition=({plan.PositionX:0.000},{plan.PositionY:0.000},{plan.PositionZ:0.000}), sourceStep={plan.RemoteStepDistance:0.000}, moveType={plan.MoveType}, nativeMoveSpeed={plan.NativeMoveSpeed:0.000}. The engine thread drives the native locomotion cycle; no GoTo destination is created."
             : $"Remote Character 0x{target.CharacterBase:X8} stopped for PeerId {target.PeerId}.");
 
-    private void OnNetworkError(object? sender, ErrorPayload value) =>
+    private void OnNetworkError(object? sender, ErrorPayload value)
+    {
         _ = SendErrorAsync($"{value.Code}: {value.Message}");
+        if (value.Code == "MISSION_CATALOG_MISMATCH") _ = ShowPreparationFailureAsync(value.Message);
+    }
 
     private void OnClientDisconnected(object? sender, EventArgs value) =>
         _ = HandleClientDisconnectedAsync(sender as LobbyClient);
@@ -4667,6 +4718,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             ++_networkStopVersion;
             _localGameplayReady = false;
             var characters = _remoteCharacters.Values.Distinct().ToArray();
+            ResetMissionSync();
             _start = null;
             return (_host, _client, characters);
         }
@@ -4710,6 +4762,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
 
     private void ClearSessionState()
     {
+        ResetMissionSync();
         ClearRoundLifecycleState();
         _preflightToken = Guid.Empty;
         _preflightTask = null;

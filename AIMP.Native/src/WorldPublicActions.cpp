@@ -9,6 +9,7 @@
 #include "aimp/SignatureResolver.h"
 #include "aimp/WorldActionLineage.h"
 #include "aimp/WorldAnimatedAdapters.h"
+#include "aimp/MissionSync.h"
 
 #include <Windows.h>
 #include <array>
@@ -2757,6 +2758,32 @@ void OutputCapture(void* self, void** instance, const std::uint32_t* input,
     const auto original = reinterpret_cast<PublicFn>(gOutputTrampoline.load(std::memory_order_acquire));
     if (original == nullptr) return;
     ObserveLocalEmittedOutput(instance, input);
+    // MissionSync owns only graph-compiled mission ingress ports. Its commits
+    // replay the complete native fan-out under RemoteRoot, so WorldSync does
+    // not also publish every consequence of the same mission decision.
+    if (CurrentOrigin() == Origin::None && !replication_core::RemoteApplyActive()) {
+        void* missionExecution{}; void* missionCallback{};
+        std::uint32_t missionPort{}; bool payloadless{};
+        if (ReadPublicArguments(instance, input, callback, missionExecution, missionPort,
+                missionCallback, payloadless) && mission_sync::Candidate(missionExecution, missionPort)) {
+            // The compiler admits a frontier only when every authored target is a
+            // control input, so the commit replays the decision without the
+            // sender-local data reference or delay (interaction outputs such as
+            // "used" carry the interacting Character). Only an output whose
+            // base interface cannot be named portably stays local.
+            bool captured = false;
+            for (std::uint8_t selector = 1U; selector <= 2U; ++selector) {
+                void* definition{};
+                if (OutputDefinition(missionExecution, selector, definition) && definition == self) {
+                    captured = mission_sync::Capture(missionExecution, missionPort, selector);
+                    if (captured) mission_sync::NoteCapturedShape(!payloadless, delay != 0.0, tail != 0U);
+                    break;
+                }
+            }
+            if (captured) return;
+            mission_sync::Unsupported();
+        }
+    }
     if (!runtime_features::Enabled(runtime_features::Feature::WorldSyncHooks)) {
         original(self, instance, input, callback, delay, tail);
         return;
@@ -4228,6 +4255,31 @@ bool InvokeLocalActionNoCapture(void(*action)(void*) noexcept, void* context) no
     gPublicCause = previousCause;
 #endif
     return true;
+}
+
+bool MissionOutputReady() noexcept {
+    return gOutputTrampoline.load(std::memory_order_acquire) != nullptr && gModule != 0U;
+}
+
+LocalCompositeInputInvokeStatus InvokeMissionOutputNoCapture(
+    const WorldEntityLease& lease, const std::uint32_t port, const std::uint8_t selector) noexcept {
+    auto* sharedRef = WorldPublicActionLeaseAccess::SharedRef(lease);
+    void* definition{};
+    if (!lease || sharedRef == nullptr || port == 0U ||
+        !OutputDefinition(lease.Get(), selector, definition))
+        return LocalCompositeInputInvokeStatus::InvalidBoundary;
+    const auto original = reinterpret_cast<PublicFn>(gOutputTrampoline.load(std::memory_order_acquire));
+    if (original == nullptr) return LocalCompositeInputInvokeStatus::RuntimeUnavailable;
+    void* callback{};
+#if defined(_MSC_VER) && defined(_M_IX86)
+    __try {
+#endif
+        InvokePublicScoped(original, Origin::RemoteRoot, gEpoch.load(std::memory_order_relaxed),
+            definition, &sharedRef, &port, &callback, 0.0, 0U);
+        return LocalCompositeInputInvokeStatus::Invoked;
+#if defined(_MSC_VER) && defined(_M_IX86)
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return LocalCompositeInputInvokeStatus::NativeFault; }
+#endif
 }
 
 LocalCompositeInputInvokeStatus InvokeLocalCompositeInputNoCapture(

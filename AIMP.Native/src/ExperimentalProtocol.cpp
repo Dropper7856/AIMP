@@ -977,6 +977,41 @@ bool DecodeGameCommand(
             return true;
         }
 
+        if (command->stringValue == "MISSION_SYNC_CONFIG") {
+            if (arguments->objectValue.size() != 2U) return false;
+            const auto* path = Field(*arguments, "path", JsonType::String);
+            const auto* role = Field(*arguments, "role", JsonType::String);
+            if (path == nullptr || role == nullptr || path->stringValue.size() > 1024U ||
+                path->stringValue.find('\0') != std::string::npos ||
+                (role->stringValue != "host" && role->stringValue != "client" && role->stringValue != "off") ||
+                (role->stringValue != "off" && path->stringValue.empty())) return false;
+            output.command = command->stringValue;
+            output.missionSync.path = path->stringValue; output.missionSync.role = role->stringValue;
+            return true;
+        }
+        if (command->stringValue == "MISSION_SYNC_APPLY") {
+            if (arguments->objectValue.size() != 4U) return false;
+            const auto* entity = Field(*arguments, "entityId", JsonType::String);
+            const auto* port = Field(*arguments, "signal", JsonType::String);
+            const auto* selector = Field(*arguments, "selector", JsonType::String);
+            const auto* sequence = Field(*arguments, "sequence", JsonType::String);
+            if (entity == nullptr || entity->stringValue.size() != 32U || port == nullptr ||
+                selector == nullptr || sequence == nullptr) return false;
+            const auto parse = []<typename T>(std::string_view text, T& value, int base) {
+                const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value, base);
+                return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
+            };
+            auto& value = output.missionSync;
+            if (!parse(std::string_view(entity->stringValue).substr(0, 16), value.entityHigh, 16) ||
+                !parse(std::string_view(entity->stringValue).substr(16), value.entityLow, 16) ||
+                (value.entityHigh == 0U && value.entityLow == 0U) ||
+                !parse(port->stringValue, value.signal, 10) || value.signal == 0U ||
+                !parse(sequence->stringValue, value.sequence, 10) || value.sequence == 0U ||
+                (selector->stringValue != "1" && selector->stringValue != "2")) return false;
+            value.selector = selector->stringValue == "1" ? 1U : 2U;
+            output.command = command->stringValue;
+            return true;
+        }
         if (command->stringValue == "ITEM_SYNC_APPLY") {
             if (arguments->objectValue.size() != 1U) return false;
             const auto* entityId = Field(*arguments, "entityId", JsonType::String);
@@ -1108,14 +1143,14 @@ bool DecodeGameCommand(
 
         if (command->stringValue == "CHARACTER_DIRECT_MOVE") {
             const auto argumentCount = arguments->objectValue.size();
-            if (argumentCount < 5U || argumentCount > 11U) {
+            if (argumentCount < 5U || argumentCount > 13U) {
                 return false;
             }
-            constexpr std::array<std::string_view, 11> allowedArguments{
+            constexpr std::array<std::string_view, 13> allowedArguments{
                 "characterAddress", "directionX", "directionZ", "intensity",
                 "frameCount", "directionSpace", "replicationPositionX",
                 "replicationPositionY", "replicationPositionZ", "replicationYaw",
-                "moveType"};
+                "moveType", "playerPosture", "playerTorch"};
             if (std::any_of(
                     arguments->objectValue.begin(),
                     arguments->objectValue.end(),
@@ -1287,6 +1322,20 @@ bool DecodeGameCommand(
             }
 
             output.characterDirectMove.characterAddress = parsedAddress;
+            if (const auto* torch = Field(*arguments, "playerTorch", JsonType::String)) {
+                if (!hasReplicationPosition || !hasReplicationYaw || moveType == nullptr ||
+                    (torch->stringValue != "0" && torch->stringValue != "1")) return false;
+                output.characterDirectMove.hasPlayerTorch = true;
+                output.characterDirectMove.playerTorchEnabled = torch->stringValue == "1";
+            } else if (arguments->objectValue.contains("playerTorch")) return false;
+            if (const auto* posture = Field(*arguments, "playerPosture", JsonType::String)) {
+                if (!hasReplicationPosition || !hasReplicationYaw || moveType == nullptr ||
+                    !player_posture::Decode(posture->stringValue, output.characterDirectMove.playerPosture))
+                    return false;
+                output.characterDirectMove.hasPlayerPosture = true;
+            } else if (arguments->objectValue.contains("playerPosture")) {
+                return false;
+            }
             output.characterDirectMove.frameCount = parsedFrameCount;
             output.characterDirectMove.hasReplicationPosition = hasReplicationPosition;
             output.characterDirectMove.hasReplicationYaw = hasReplicationYaw;

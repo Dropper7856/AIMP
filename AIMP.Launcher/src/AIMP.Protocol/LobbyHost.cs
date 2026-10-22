@@ -44,6 +44,7 @@ public sealed partial class LobbyHost : IAsyncDisposable
     private readonly ConcurrentDictionary<ulong, ClientState> _clients = new();
     private readonly CancellationTokenSource _shutdown = new();
     private readonly object _stateLock = new();
+    private readonly PlayerPositionReceiveWindow _hostPositionWindow = new();
     private readonly object _snapshotPublishLock = new();
     private readonly SemaphoreSlim _admissionGate = new(1, 1);
     private readonly SemaphoreSlim _snapshotBroadcastGate = new(1, 1);
@@ -511,6 +512,9 @@ public sealed partial class LobbyHost : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         ValidatePlayerPosition(payload, HostPeerId);
+        lock (_stateLock)
+            if (!_hostPositionWindow.TryAccept(payload))
+                throw new ProtocolException("The host player-position snapshot is stale.");
         await BroadcastAsync(MessageType.PlayerPositionSnapshot, JsonPayload.Serialize(payload),
             cancellationToken).ConfigureAwait(false);
         PlayerPositionReceived?.Invoke(this, payload);
@@ -1240,6 +1244,11 @@ public sealed partial class LobbyHost : IAsyncDisposable
                         .ConfigureAwait(false);
                     break;
 
+                case MessageType.MissionSignalProposal:
+                    await HandleMissionSignalAsync(state, frame.Payload, cancellationToken)
+                        .ConfigureAwait(false);
+                    break;
+
                 case MessageType.ItemPickupRequest:
                     await HandleItemPickupRequestAsync(state, frame.Payload, cancellationToken)
                         .ConfigureAwait(false);
@@ -1643,7 +1652,7 @@ public sealed partial class LobbyHost : IAsyncDisposable
         try { ValidatePlayerPosition(payload, state.PeerId); }
         catch (Exception exception) when (exception is ProtocolException
             or InvalidOperationException) { return false; }
-        return state.TryAcceptPositionSequence(payload.LevelGeneration, payload.Sequence);
+        return state.PositionWindow.TryAccept(payload);
     }
 
     private async Task HandlePlayerEquipmentAsync(
@@ -2087,12 +2096,12 @@ public sealed partial class LobbyHost : IAsyncDisposable
     private sealed class ClientState
     {
         public VoiceReceiveWindow VoiceWindow { get; } = new();
+        public PlayerPositionReceiveWindow PositionWindow { get; } = new();
         private int _ready;
-        private ulong _lastPositionSequence;
         private ulong _lastEquipmentSequence;
         private ulong _lastActionSequence;
         private ulong _lastAISyncImpactSequence;
-        private int _positionGeneration, _equipmentGeneration, _actionGeneration, _impactGeneration;
+        private int _equipmentGeneration, _actionGeneration, _impactGeneration;
         private long _lastSeenTicks = Environment.TickCount64;
 
         public ClientState(
@@ -2126,9 +2135,6 @@ public sealed partial class LobbyHost : IAsyncDisposable
         public void SetReady(bool ready) => Interlocked.Exchange(ref _ready, ready ? 1 : 0);
 
         public bool IsReady => Volatile.Read(ref _ready) != 0;
-
-        public bool TryAcceptPositionSequence(int generation, ulong sequence) =>
-            TryAcceptSequence(generation, sequence, ref _positionGeneration, ref _lastPositionSequence);
 
         public bool TryAcceptEquipmentSequence(int generation, ulong sequence) =>
             TryAcceptSequence(generation, sequence, ref _equipmentGeneration, ref _lastEquipmentSequence);

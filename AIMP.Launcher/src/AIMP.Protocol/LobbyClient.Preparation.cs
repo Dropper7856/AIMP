@@ -16,9 +16,9 @@ public sealed partial class LobbyClient
     }
 
     public Task SendSessionPreparedAsync(
-        int levelGeneration, CancellationToken cancellationToken = default)
+        int levelGeneration, CancellationToken cancellationToken = default, string missionSha256 = "")
     {
-        var preparation = new SessionPreparedPayload(SessionId, PeerId, levelGeneration);
+        var preparation = new SessionPreparedPayload(SessionId, PeerId, levelGeneration, missionSha256);
         ModelValidation.Validate(preparation);
         return _connection.SendAsync(MessageType.SessionPrepared,
             JsonPayload.Serialize(preparation), cancellationToken).AsTask();
