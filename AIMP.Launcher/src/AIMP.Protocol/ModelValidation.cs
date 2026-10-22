@@ -271,6 +271,20 @@ public static class ModelValidation
             || !float.IsFinite(value.NativeMoveSpeed)
             || value.NativeMoveSpeed is < 0.05F or > 8.0F)
             throw new ProtocolException("The player-position snapshot is invalid.");
+        if (value.Posture is not null) Validate(value.Posture);
+        if (value.Torch is not null) Validate(value.Torch);
+    }
+
+    public static void Validate(PlayerTorchSnapshot? value)
+    {
+        if (value is null)
+            throw new ProtocolException("The player-torch snapshot is invalid.");
+    }
+
+    public static void Validate(PlayerPostureSnapshot? value)
+    {
+        if (value is null || !PlayerPostureCodec.IsValid(value))
+            throw new ProtocolException("The player-posture snapshot is invalid.");
     }
 
     public static void Validate(NativePlayerEquipmentStatePayload? value)
@@ -335,7 +349,8 @@ public static class ModelValidation
     public static void Validate(SessionPreparedPayload? value)
     {
         if (value is null || value.SessionId == Guid.Empty || value.PeerId == 0
-            || value.LevelGeneration < 1)
+            || value.LevelGeneration < 1 || value.MissionSha256 is null
+            || (value.MissionSha256.Length != 0 && !HexDigest(value.MissionSha256)))
             throw new ProtocolException("Session preparation is invalid.");
     }
 
@@ -910,6 +925,26 @@ public static class ModelValidation
             return;
         }
 
+        if (value.Command == GameCommandNames.MissionSyncConfigure)
+        {
+            if (value.Arguments.Count != 2 || !value.Arguments.TryGetValue("role", out var role)
+                || role is not ("host" or "client" or "off")
+                || !value.Arguments.TryGetValue("path", out var path) || path.Length > 1024
+                || path.Contains('\0') || (role != "off" && string.IsNullOrWhiteSpace(path)))
+                throw new ProtocolException("MISSION_SYNC_CONFIG parameters are invalid.");
+            return;
+        }
+        if (value.Command == GameCommandNames.MissionSyncApply)
+        {
+            if (value.Arguments.Count != 4 || !value.Arguments.TryGetValue("entityId", out var entity)
+                || !IsWorldEntityIdText(entity) || !value.Arguments.TryGetValue("signal", out var port)
+                || !uint.TryParse(port, NumberStyles.None, CultureInfo.InvariantCulture, out var signal) || signal == 0
+                || !value.Arguments.TryGetValue("sequence", out var text)
+                || !ulong.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var sequence) || sequence == 0
+                || !value.Arguments.TryGetValue("selector", out var selector) || selector is not ("1" or "2"))
+                throw new ProtocolException("MISSION_SYNC_APPLY parameters are invalid.");
+            return;
+        }
         if (string.Equals(
                 value.Command,
                 GameCommandNames.ItemSyncSpawn,
@@ -1035,7 +1070,7 @@ public static class ModelValidation
                 "directionSpace", "replicationPositionX", "replicationPositionY",
                 "replicationPositionZ",
                 "replicationYaw",
-                "moveType"
+                "moveType", "playerPosture", "playerTorch"
             };
             var hasDirectionSpace = value.Arguments.TryGetValue(
                 "directionSpace", out var directionSpaceText);
@@ -1051,7 +1086,9 @@ public static class ModelValidation
                 "moveType", out var moveTypeText);
             var hasReplicationPosition = hasReplicationPositionX
                 && hasReplicationPositionY && hasReplicationPositionZ;
-            var validCount = value.Arguments.Count is >= 5 and <= 11;
+            var hasPosture = value.Arguments.TryGetValue("playerPosture", out var postureText);
+            var hasTorch = value.Arguments.TryGetValue("playerTorch", out var torchText);
+            var validCount = value.Arguments.Count is >= 5 and <= 13;
             if (!validCount
                 || value.Arguments.Keys.Any(key => !allowed.Contains(key))
                 || required.Any(key => !value.Arguments.ContainsKey(key))
@@ -1103,6 +1140,9 @@ public static class ModelValidation
                             CultureInfo.InvariantCulture, out var moveType)
                         || moveType is < 0 or > 3))
                 || (hasReplicationPosition && !hasMoveType)
+                || (hasPosture && (!hasReplicationPosition
+                    || !PlayerPostureCodec.TryDecode(postureText, out _)))
+                || (hasTorch && (!hasReplicationPosition || torchText is not ("0" or "1")))
                 || (hasReplicationYaw
                     && (!string.Equals(directionSpaceText, "world", StringComparison.Ordinal)
                         || !float.TryParse(replicationYawText, NumberStyles.Float,

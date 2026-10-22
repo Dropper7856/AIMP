@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include "aimp/PlayerPostureRuntime.h"
+#include "aimp/PlayerTorchRuntime.h"
 
 namespace aimp {
 
@@ -27,6 +29,8 @@ using NativeAITransitionGuard = bool(*)(std::uintptr_t characterAddress,
     std::uintptr_t cycleAddress, std::uint32_t requestedState) noexcept;
 
 struct RuntimeSnapshot {
+    player_posture::DiagnosticsSnapshot posture{};
+    player_torch::DiagnosticsSnapshot torch{};
     std::uintptr_t characterAddress{};
     std::uint32_t remainingFrames{};
     std::uint64_t activationAttempts{};

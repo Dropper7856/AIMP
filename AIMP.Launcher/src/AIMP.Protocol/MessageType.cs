@@ -69,6 +69,9 @@ public enum MessageType : ushort
     SessionPrepared = 129,
     SessionRelease = 130,
     VoiceFrame = 131, // Binary, independently decodable 20 ms mono IMA ADPCM.
+    MissionSignalProposal = 132, // Client -> Host; authored mission-graph ingress.
+    MissionSignalCommitted = 133, // Host -> everyone; ordered mission progression.
+    MissionSignalProduced = 134, // Native -> Launcher, local authored mission ingress.
 
     TestModeConfigure = 200,
     CapabilityQuery = 201,

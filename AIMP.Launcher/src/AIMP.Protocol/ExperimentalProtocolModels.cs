@@ -169,6 +169,8 @@ public static class GameCommandNames
     public const string ItemSyncApply = "ITEM_SYNC_APPLY";
     // Internal ItemSync: spawn a Host-decided GCIP pickup or a remote player drop.
     public const string ItemSyncSpawn = "ITEM_SYNC_SPAWN";
+    public const string MissionSyncConfigure = "MISSION_SYNC_CONFIG";
+    public const string MissionSyncApply = "MISSION_SYNC_APPLY";
 
     public static readonly IReadOnlySet<string> All = new HashSet<string>(
         new[]
@@ -194,7 +196,9 @@ public static class GameCommandNames
             ReturnToFrontend,
             SessionLoadingHold,
             ItemSyncApply,
-            ItemSyncSpawn
+            ItemSyncSpawn,
+            MissionSyncConfigure,
+            MissionSyncApply
         },
         StringComparer.Ordinal);
 }

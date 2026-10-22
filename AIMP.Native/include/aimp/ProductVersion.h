@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.245-alien-option";
+    "0.11.4.250-missionsync";
 
 } // namespace aimp

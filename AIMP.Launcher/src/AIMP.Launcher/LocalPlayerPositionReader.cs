@@ -88,7 +88,9 @@ internal readonly record struct LocalPlayerMovementProfile(
     float SlowWalkSpeed,
     float WalkSpeed,
     float FastWalkSpeed,
-    float RunSpeed)
+    float RunSpeed,
+    PlayerPostureSnapshot? Posture = null,
+    PlayerTorchSnapshot? Torch = null)
 {
     internal float SpeedFor(PlayerMoveType moveType) => moveType switch
     {
@@ -208,11 +210,15 @@ internal sealed class LocalPlayerPositionReader : IDisposable
     private int _processId;
     private readonly Func<nint, nint?> _readLocalPointer;
     private readonly Func<nint, int?> _readLocalInteger;
+    private readonly LocalPlayerPostureReader _postureReader;
+    private readonly LocalPlayerTorchReader _torchReader;
 
     internal LocalPlayerPositionReader()
     {
         _readLocalPointer = ReadLocalPointer;
         _readLocalInteger = ReadLocalInteger;
+        _postureReader = new LocalPlayerPostureReader(ReadBlock);
+        _torchReader = new LocalPlayerTorchReader(ReadBlock);
     }
 
     internal string LastError { get; private set; } = string.Empty;
@@ -244,6 +250,11 @@ internal sealed class LocalPlayerPositionReader : IDisposable
 
         yawAvailable = TryReadYaw(characterBase, out yaw);
         movementProfileAvailable = TryReadMovementProfile(characterBase, out movementProfile);
+        _postureReader.TryCapture(runtime.ModuleBase, characterBase, runtime.LevelGeneration, out var posture,
+            () => TryReadCharacterBase(runtime.ModuleBase, out var after) && after == characterBase);
+        _torchReader.TryCapture(characterBase, out var torch);
+        if (!TryReadCharacterBase(runtime.ModuleBase, out var current) || current != characterBase) return false;
+        movementProfile = movementProfile with { Posture = posture, Torch = torch };
         return true;
     }
 
@@ -424,10 +435,12 @@ internal sealed class LocalPlayerPositionReader : IDisposable
         _handle?.Dispose();
         _handle = null;
         _processId = 0;
+        _postureReader.Reset();
         LastError = error;
     }
 
     public void Dispose() => Reset(string.Empty);
+
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern SafeProcessHandle OpenProcess(

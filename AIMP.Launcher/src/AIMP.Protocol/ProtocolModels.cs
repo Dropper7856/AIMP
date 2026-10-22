@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace AIMP.Protocol;
 
 public sealed record CompatibilityInfo(
@@ -186,6 +188,21 @@ public enum PlayerMoveType
     Run = 3
 }
 
+public sealed record PlayerPostureSnapshot(
+    [property: JsonRequired] bool Crouched,
+    [property: JsonRequired] bool DeepCrouched,
+    [property: JsonRequired] bool InVent,
+    [property: JsonRequired] uint VentIdA,
+    [property: JsonRequired] uint VentIdB,
+    [property: JsonRequired] ulong TraversalRevision,
+    [property: JsonRequired] ushort TraversalIndex,
+    [property: JsonRequired] byte TraversalType,
+    [property: JsonRequired] uint TraversalOwner,
+    [property: JsonRequired] bool TraversalActive);
+
+// Effective emitted beam state; retail battery/reload logic remains authoritative.
+public sealed record PlayerTorchSnapshot([property: JsonRequired] bool Enabled);
+
 public sealed record PlayerPositionSnapshotPayload(
     Guid SessionId,
     ulong PeerId,
@@ -197,7 +214,9 @@ public sealed record PlayerPositionSnapshotPayload(
     float Z,
     float Yaw,
     PlayerMoveType MoveType,
-    float NativeMoveSpeed);
+    float NativeMoveSpeed,
+    PlayerPostureSnapshot? Posture = null,
+    PlayerTorchSnapshot? Torch = null);
 
 public enum PlayerActionKind
 {
@@ -326,7 +345,7 @@ public sealed record LobbyPreparationPayload(
     string Error);
 
 // Sent only after world recovery, native binding and remote players are ready.
-public sealed record SessionPreparedPayload(Guid SessionId, ulong PeerId, int LevelGeneration);
+public sealed record SessionPreparedPayload(Guid SessionId, ulong PeerId, int LevelGeneration, string MissionSha256 = "");
 
 // Host-only permission to expose gameplay for this exact start generation.
 public sealed record SessionReleasePayload(Guid SessionId, int LevelGeneration);

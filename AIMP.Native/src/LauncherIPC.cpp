@@ -15,6 +15,7 @@
 #include "aimp/GameCommandExecutor.h"
 #include "aimp/InboundQueue.h"
 #include "aimp/ItemSync.h"
+#include "aimp/MissionSync.h"
 #include "aimp/LevelGenerationTracker.h"
 #include "aimp/MultiplayerPause.h"
 #include "aimp/NetZDiscovery.h"
@@ -700,6 +701,22 @@ void LauncherIPC::PublishPlayerLifecycleTraffic() {
     }
 }
 
+void LauncherIPC::PublishMissionSyncTraffic() {
+    mission_sync::Signal signal{};
+    for (std::size_t i = 0U; i < 16U && mission_sync::TryPeek(signal); ++i) {
+        if (!sessionConfigured_.load(std::memory_order_acquire)) break;
+        std::ostringstream json;
+        json << "{\"levelGeneration\":" << signal.generation
+             << ",\"sequence\":" << signal.sequence
+             << ",\"entityId\":\"" << item_sync::EntityIdHex(signal.entity) << '"'
+             << ",\"signal\":" << signal.port
+             << ",\"interfaceSelector\":" << static_cast<unsigned>(signal.selector) << '}';
+        if (!Queue(protocol::MessageType::MissionSignalProduced, 0,
+                localSequence_.fetch_add(1U, std::memory_order_relaxed), JsonBytes(json.str()))) break;
+        mission_sync::Pop();
+    }
+}
+
 void LauncherIPC::PublishItemSyncTraffic() {
     item_sync::PickupEvent pickup{};
     for (std::size_t i = 0U; i < 16U && item_sync::TryPeekObservedPickup(pickup); ++i) {
@@ -1217,6 +1234,7 @@ void LauncherIPC::Run() {
             PublishPlayerSyncTraffic();
             PublishPlayerLifecycleTraffic();
             PublishItemSyncTraffic();
+            PublishMissionSyncTraffic();
             PublishItemSyncSpawnTraffic();
             PublishAISyncTraffic();
 
@@ -2907,6 +2925,10 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
                 pending->request.command == "RETURN_TO_FRONTEND") {
                 result = gameCommands_->ExecuteReturnToFrontend();
             } else if (
+                pending->request.command == "MISSION_SYNC_CONFIG" || pending->request.command == "MISSION_SYNC_APPLY") {
+                result = gameCommands_->ExecuteMissionSync(pending->request.missionSync,
+                    pending->request.command == "MISSION_SYNC_CONFIG");
+            } else if (
                 pending->request.command == "ITEM_SYNC_APPLY") {
                 result = gameCommands_->ExecuteItemSyncApply(
                     pending->request.itemSyncApply);
@@ -3068,6 +3090,7 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
         ai_sync::LogDiagnostics(*diagnostics_);
         voice_sync::LogDiagnostics(*diagnostics_);
         item_sync::LogDiagnostics(*diagnostics_);
+        mission_sync::LogDiagnostics(*diagnostics_);
         loading_context_guard::LogDiagnostics(*diagnostics_);
         experimental::DiagnosticSnapshotRequest request;
         if (!sessionConfigured_.load(std::memory_order_acquire) ||
@@ -3252,7 +3275,17 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
               true},
              {"remoteLocomotionProtectedFailures",
               Diagnostics::Unsigned(locomotion.protectedFailures),
-              true}});
+              true},
+             {"remotePostureApplications", Diagnostics::Unsigned(locomotion.posture.postureApplications), true},
+             {"remoteTraversalApplications", Diagnostics::Unsigned(locomotion.posture.traversalApplications), true},
+             {"remoteTraversalRejections", Diagnostics::Unsigned(locomotion.posture.traversalRejections), true},
+             {"remoteTraversalActiveRevision", Diagnostics::Unsigned(locomotion.posture.activeRevision), true},
+             {"remoteTraversalPending", Diagnostics::Unsigned(locomotion.posture.pendingTraversals), true},
+             {"remoteTorchApplications", Diagnostics::Unsigned(locomotion.torch.applications), true},
+             {"remoteTorchFailures", Diagnostics::Unsigned(locomotion.torch.failures), true},
+             {"remoteTorchCreations", Diagnostics::Unsigned(locomotion.torch.creations), true},
+             {"remoteTorchDesired", locomotion.torch.desired ? "true" : "false", true},
+             {"remoteTorchEmitted", locomotion.torch.emitted ? "true" : "false", true}});
         const auto ws3 = world_actions::Snapshot();
         const auto replication = replication_core::DiagnosticsSnapshot();
         const auto interactions = world_interactions::DiagnosticsSnapshot();

@@ -67,6 +67,7 @@ struct GameCommandRequest : RequestEnvelope {
     WorldManifestLoadCommand worldManifestLoad;
     WorldNetProbeCommand worldNetProbe;
     ItemSyncApplyCommand itemSyncApply;
+    MissionSyncCommand missionSync;
     ItemSyncSpawnCommand itemSyncSpawn;
 };
 

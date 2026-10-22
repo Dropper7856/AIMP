@@ -54,6 +54,8 @@ internal sealed class NativeRuntimeController : IDisposable
 
     internal event EventHandler<NativePlayerLifecycleStatePayload>? PlayerLifecycleStateChanged;
 
+    internal event EventHandler<NativeMissionSignalPayload>? MissionSignalProduced;
+
     internal event EventHandler<NativeItemSyncPickupPayload>? ItemSyncPickupProduced;
 
     internal event EventHandler<NativeItemSyncSpawnPayload>? ItemSyncSpawnProduced;
@@ -321,10 +323,13 @@ internal sealed class NativeRuntimeController : IDisposable
         string command,
         IReadOnlyDictionary<string, string> arguments,
         CancellationToken cancellationToken = default,
-        bool waitForExecution = false)
+        bool waitForExecution = false,
+        int? expectedLevelGeneration = null)
     {
         var session = GetCommandSession();
         var request = CreateCommandRequest(command, arguments);
+        if (expectedLevelGeneration is { } generation)
+            request = request with { LevelGeneration = generation };
         TaskCompletionSource<GameCommandResultPayload>? execution = null;
         var manifestLoad = command == GameCommandNames.WorldManifestLoad;
         if (waitForExecution || manifestLoad)
@@ -624,6 +629,7 @@ internal sealed class NativeRuntimeController : IDisposable
         session.PlayerSyncStateChanged += OnPlayerSyncStateChanged;
         session.PlayerSyncActionProduced += OnPlayerSyncActionProduced;
         session.PlayerLifecycleStateChanged += OnPlayerLifecycleStateChanged;
+        session.MissionSignalProduced += OnMissionSignalProduced;
         session.ItemSyncPickupProduced += OnItemSyncPickupProduced;
         session.ItemSyncSpawnProduced += OnItemSyncSpawnProduced;
         session.AISyncStateProduced += OnAISyncStateProduced;
@@ -644,6 +650,7 @@ internal sealed class NativeRuntimeController : IDisposable
         session.PlayerSyncStateChanged -= OnPlayerSyncStateChanged;
         session.PlayerSyncActionProduced -= OnPlayerSyncActionProduced;
         session.PlayerLifecycleStateChanged -= OnPlayerLifecycleStateChanged;
+        session.MissionSignalProduced -= OnMissionSignalProduced;
         session.ItemSyncPickupProduced -= OnItemSyncPickupProduced;
         session.ItemSyncSpawnProduced -= OnItemSyncSpawnProduced;
         session.AISyncStateProduced -= OnAISyncStateProduced;
@@ -674,6 +681,9 @@ internal sealed class NativeRuntimeController : IDisposable
         object? sender,
         NativePlayerLifecycleStatePayload value) =>
         PlayerLifecycleStateChanged?.Invoke(this, value);
+
+    private void OnMissionSignalProduced(object? sender, NativeMissionSignalPayload value) =>
+        MissionSignalProduced?.Invoke(this, value);
 
     private void OnItemSyncPickupProduced(
         object? sender,

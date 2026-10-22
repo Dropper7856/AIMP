@@ -447,6 +447,11 @@ enum class LocalCompositeInputInvokeStatus : std::uint8_t {
     InvalidBoundary = 7U,
     NativeFault = 8U,
 };
+[[nodiscard]] bool MissionOutputReady() noexcept;
+// MissionSync validates its own compiled frontier. This invokes only the native
+// emitted-port propagator with an empty context, never a source decision/AI.
+[[nodiscard]] LocalCompositeInputInvokeStatus InvokeMissionOutputNoCapture(
+    const WorldEntityLease& lease, std::uint32_t port, std::uint8_t selector) noexcept;
 [[nodiscard]] LocalCompositeInputInvokeStatus InvokeLocalCompositeInputNoCapture(
     void* executionObject, void* sharedRef, std::uint32_t publicInputShortGuid,
     std::uintptr_t* resolvedDispatchOut = nullptr) noexcept;

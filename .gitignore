@@ -42,3 +42,6 @@ tools/
 analysis/
 AIMP.Native/build_profiles
 docs/
+# Markdown stays local except the project README
+*.md
+!/README.md

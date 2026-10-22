@@ -28,7 +28,11 @@ internal sealed record RemotePositionTrackSnapshot(
     float LastCommandYaw,
     PlayerMoveType LastCommandMoveType,
     float LastCommandMoveSpeed,
-    DateTimeOffset LastCommandAtUtc);
+    DateTimeOffset LastCommandAtUtc,
+    PlayerPostureSnapshot? Posture = null,
+    bool PosturePending = false,
+    PlayerTorchSnapshot? Torch = null,
+    bool TorchPending = false);
 
 internal sealed class RemotePositionTrack
 {
@@ -44,6 +48,11 @@ internal sealed class RemotePositionTrack
 
     private PlayerPositionSnapshotPayload? _previous;
     private PlayerPositionSnapshotPayload? _latest;
+    private readonly PlayerPositionReceiveWindow _receiveWindow = new();
+    private readonly PlayerPostureDispatchQueue _postures = new();
+    private PlayerPostureSnapshot? _lastReceivedPosture;
+    private PlayerTorchSnapshot? _lastReceivedTorch;
+    private uint _boundCharacter;
     private DateTimeOffset _receivedAtUtc;
     private float _estimatedVelocityX;
     private float _estimatedVelocityZ;
@@ -65,7 +74,12 @@ internal sealed class RemotePositionTrack
 
     internal bool TryAccept(PlayerPositionSnapshotPayload value, DateTimeOffset receivedAtUtc)
     {
-        if (_latest is not null && value.Sequence <= _latest.Sequence) return false;
+        if (_latest is not null && (value.SessionId != _latest.SessionId || value.PeerId != _latest.PeerId
+            || value.LevelGeneration != _latest.LevelGeneration)) return false;
+        if (!_receiveWindow.TryAccept(value)) return false;
+        if (value.Posture is not null) _lastReceivedPosture = value.Posture;
+        if (value.Torch is not null) _lastReceivedTorch = value.Torch;
+        if (_boundCharacter != 0) _postures.Observe(value.Posture, value.Torch);
         var previous = _latest;
         var previousReceivedAtUtc = _receivedAtUtc;
         _previous = previous;
@@ -82,16 +96,28 @@ internal sealed class RemotePositionTrack
         return latest is null ? null : CreateSnapshot(latest);
     }
 
+    internal void BindCharacter(uint character)
+    {
+        if (_boundCharacter == character) return;
+        _boundCharacter = character;
+        _postures.Bind(_lastReceivedPosture, _lastReceivedTorch);
+        CommandMoving = false;
+        _lastCommandAtUtc = default;
+        _lastCommandYaw = float.NaN;
+    }
+
     private RemotePositionTrackSnapshot CreateSnapshot(PlayerPositionSnapshotPayload latest) =>
         new(_previous, latest, _receivedAtUtc, _observedMoving,
             _estimatedVelocityX, _estimatedVelocityZ, _remoteStepDistance, CommandMoving,
             _lastCommandDirectionX, _lastCommandDirectionZ, _lastCommandIntensity,
             _lastCommandPositionX, _lastCommandPositionY, _lastCommandPositionZ,
             _lastCommandYaw, _lastCommandMoveType, _lastCommandMoveSpeed,
-            _lastCommandAtUtc);
+            _lastCommandAtUtc, _postures.Next, _postures.HasPending && _postures.Next is not null,
+            _postures.NextTorch, _postures.HasPending && _postures.NextTorch is not null);
 
     internal void MarkCommand(RemoteMovementPlan plan, DateTimeOffset appliedAtUtc)
     {
+        if (plan.Action != RemoteMovementAction.None) _postures.Complete(plan.Posture, plan.Torch);
         if (plan.Action == RemoteMovementAction.Move)
         {
             MarkMoveCommand(plan, appliedAtUtc);
@@ -257,7 +283,9 @@ internal sealed record RemoteMovementPlan(
     float Yaw,
     float RemoteStepDistance,
     PlayerMoveType MoveType,
-    float NativeMoveSpeed);
+    float NativeMoveSpeed,
+    PlayerPostureSnapshot? Posture = null,
+    PlayerTorchSnapshot? Torch = null);
 
 internal static class RemoteMovementPlanner
 {
@@ -306,7 +334,7 @@ internal static class RemoteMovementPlanner
         return new(action, directionX, directionZ, BaseWalkIntensity,
             track.Latest.X, track.Latest.Y, track.Latest.Z,
             track.Latest.Yaw, track.RemoteStepDistance,
-            track.Latest.MoveType, nativeMoveSpeed);
+            track.Latest.MoveType, nativeMoveSpeed, track.Posture, track.Torch);
     }
 
     private static bool ShouldDispatchMove(
@@ -315,7 +343,7 @@ internal static class RemoteMovementPlanner
         float directionZ,
         DateTimeOffset now)
     {
-        if (!track.CommandMoving || track.LastCommandAtUtc == default) return true;
+        if (track.PosturePending || track.TorchPending || !track.CommandMoving || track.LastCommandAtUtc == default) return true;
         if (track.Latest.MoveType != track.LastCommandMoveType ||
             MathF.Abs(track.Latest.NativeMoveSpeed - track.LastCommandMoveSpeed) >= 0.005F)
             return true;
@@ -332,21 +360,21 @@ internal static class RemoteMovementPlanner
         RemotePositionTrackSnapshot track,
         DateTimeOffset now)
     {
-        var shouldSend = track.CommandMoving || PositionMoved(track)
+        var shouldSend = track.PosturePending || track.TorchPending || track.CommandMoving || PositionMoved(track)
             || ShouldDispatchOrientation(track, now);
         return new(shouldSend ? RemoteMovementAction.Stop : RemoteMovementAction.None,
             0F, 0F, BaseWalkIntensity,
             track.Latest.X, track.Latest.Y, track.Latest.Z,
             track.Latest.Yaw, track.RemoteStepDistance,
-            track.Latest.MoveType, track.Latest.NativeMoveSpeed);
+            track.Latest.MoveType, track.Latest.NativeMoveSpeed, track.Posture, track.Torch);
     }
 
     private static RemoteMovementPlan StalePlan(RemotePositionTrackSnapshot track) =>
-        new(track.CommandMoving ? RemoteMovementAction.Stop : RemoteMovementAction.None,
+        new(track.PosturePending || track.TorchPending || track.CommandMoving ? RemoteMovementAction.Stop : RemoteMovementAction.None,
             0F, 0F, BaseWalkIntensity,
             track.Latest.X, track.Latest.Y, track.Latest.Z,
             track.Latest.Yaw, track.RemoteStepDistance,
-            track.Latest.MoveType, track.Latest.NativeMoveSpeed);
+            track.Latest.MoveType, track.Latest.NativeMoveSpeed, track.Posture, track.Torch);
 
     private static bool ShouldDispatchOrientation(
         RemotePositionTrackSnapshot track,
@@ -398,9 +426,20 @@ internal static class RemoteMovementCommandFactory
     internal static IReadOnlyDictionary<string, string> Create(
         uint characterBase,
         RemoteMovementPlan plan) =>
-        plan.Action == RemoteMovementAction.Stop
+        AddPlayerState(plan.Action == RemoteMovementAction.Stop
             ? CreateStop(characterBase, plan)
-            : CreateMove(characterBase, plan);
+            : CreateMove(characterBase, plan), plan.Posture, plan.Torch);
+
+    private static IReadOnlyDictionary<string, string> AddPlayerState(
+        IReadOnlyDictionary<string, string> arguments, PlayerPostureSnapshot? posture,
+        PlayerTorchSnapshot? torch)
+    {
+        if (posture is null && torch is null) return arguments;
+        var result = new Dictionary<string, string>(arguments, StringComparer.Ordinal);
+        if (posture is not null) result["playerPosture"] = PlayerPostureCodec.Encode(posture);
+        if (torch is not null) result["playerTorch"] = torch.Enabled ? "1" : "0";
+        return result;
+    }
 
     internal static IReadOnlyDictionary<string, string> CreateStop(uint characterBase) =>
         CreateBaseArguments(characterBase, 0F, 0F,

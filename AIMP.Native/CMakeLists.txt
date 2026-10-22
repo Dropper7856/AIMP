@@ -52,6 +52,9 @@ set(AIMP_CORE_SOURCES
     src/NetZDiscovery.cpp
     src/ParticipantRegistry.cpp
     src/PlayerSyncObserver.cpp
+    src/PlayerPostureRuntime.cpp
+    src/PlayerTorchRuntime.cpp
+    src/MissionSync.cpp
     src/PlayerLifecycle.cpp
     src/LoadingContextGuard.cpp
     src/UIHeapGuard.cpp
@@ -123,6 +126,13 @@ set_target_properties(AIMP.NetZ PROPERTIES
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(AIMP.PlayerPostureTests tests/PlayerPostureTests.cpp)
+    target_link_libraries(AIMP.PlayerPostureTests PRIVATE AIMP.Core)
+    target_compile_definitions(AIMP.PlayerPostureTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(AIMP.PlayerPostureTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.PlayerPostureTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME PlayerPostureAndTraversal COMMAND AIMP.PlayerPostureTests)
     add_executable(AIMP.VoiceNativeAudioTests tests/VoiceNativeAudioTests.cpp)
     target_include_directories(AIMP.VoiceNativeAudioTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     target_compile_options(AIMP.VoiceNativeAudioTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)

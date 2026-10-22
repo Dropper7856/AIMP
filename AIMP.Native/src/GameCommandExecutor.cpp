@@ -1,5 +1,7 @@
 #include "aimp/GameCommandExecutor.h"
 #include "aimp/ReplicationCore.h"
+#include "aimp/PlayerTorchRuntime.h"
+#include "aimp/MissionSync.h"
 
 #include "aimp/BuildProfile.h"
 #include "aimp/CaptureCatalog.h"
@@ -1538,6 +1540,7 @@ bool GameCommandExecutor::CanExecute(const std::string_view command) const noexc
     if (command == "ITEM_SYNC_APPLY" || command == "ITEM_SYNC_SPAWN") {
         return item_sync::Installed();
     }
+    if (command == "MISSION_SYNC_CONFIG" || command == "MISSION_SYNC_APPLY") return worldRegistry_ != nullptr;
     if (command == "WORLD_REGISTRY_PROBE" ||
         command == "WORLD_MANIFEST_LOAD" ||
         command == "WORLD_NET_PROBE") {
@@ -3665,6 +3668,11 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteCharacterDirectMove(
         command.intensity > kMaximumCharacterDirectMoveIntensity ||
         command.frameCount > kMaximumCharacterDirectMoveFrames ||
         (command.hasMoveType && command.moveType > 3U) ||
+        (command.hasPlayerTorch && (!command.hasReplicationPosition ||
+         !command.hasReplicationYaw || !command.hasMoveType || !command.worldSpace)) ||
+        (command.hasPlayerPosture && (!command.hasReplicationPosition ||
+         !command.hasReplicationYaw || !command.hasMoveType ||
+         !player_posture::Valid(command.playerPosture))) ||
         (command.hasReplicationPosition &&
          (!command.hasReplicationYaw || !command.hasMoveType || !command.worldSpace ||
           !IsValidCoordinate(command.replicationPositionX) ||
@@ -3690,6 +3698,25 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteCharacterDirectMove(
             "L'adresse ne correspond pas à un objet Character valide de cette session.";
         return result;
     }
+
+    // Admit movement first so rejected/stale Characters cannot allocate a
+    // player-state mailbox. A full posture queue may retry without starving motion.
+    const auto publishPlayerState = [&]() {
+        if (command.hasPlayerTorch) {
+            std::string torchError;
+            if (!player_torch::Publish(command.characterAddress, command.playerTorchEnabled, torchError)) {
+                result.statusCode = "PLAYER_TORCH_PUBLICATION_FAILED";
+                result.message = torchError;
+                return false;
+            }
+        }
+        if (!command.hasPlayerPosture) return true;
+        std::string error;
+        if (player_posture::Publish(command.characterAddress, command.playerPosture, error)) return true;
+        result.statusCode = "PLAYER_POSTURE_PUBLICATION_FAILED";
+        result.message = error;
+        return false;
+    };
 
     if (command.frameCount == 0U) {
         const auto holdNetworkIdle =
@@ -3723,6 +3750,7 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteCharacterDirectMove(
                 return result;
             }
         }
+        if (!publishPlayerState()) return result;
         result.executed = true;
         result.statusCode = holdNetworkIdle
             ? "CHARACTER_DIRECT_MOVE_IDLE_HELD"
@@ -3783,6 +3811,7 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteCharacterDirectMove(
         return result;
     }
 
+    if (!publishPlayerState()) return result;
     result.executed = true;
     result.statusCode = "CHARACTER_DIRECT_MOVE_ARMED";
     result.message = command.hasReplicationPosition
@@ -4068,6 +4097,22 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteItemSyncSpawn(
                 : outcome == item_sync::ApplyStatus::AlreadyApplied
                     ? "decision already applied."
                     : item_sync::ApplyStatusMessage(outcome));
+    return result;
+}
+
+GameCommandExecutionResult GameCommandExecutor::ExecuteMissionSync(
+    const MissionSyncCommand& command, const bool configure) const {
+    GameCommandExecutionResult result{};
+    if (worldRegistry_ == nullptr) { result.statusCode = "MISSION_SYNC_NOT_READY"; return result; }
+    if (configure) {
+        result.executed = mission_sync::Configure(*worldRegistry_,
+            std::filesystem::path(std::u8string(command.path.begin(), command.path.end())), command.role, result.message);
+        result.statusCode = result.executed ? "MISSION_SYNC_CONFIGURED" : "MISSION_SYNC_NOT_READY";
+    } else {
+        const mission_sync::Signal signal{worldRegistry_->ReplicationContext().levelGeneration, command.sequence,
+            WorldEntityId{command.entityHigh, command.entityLow}, command.signal, command.selector};
+        result.executed = mission_sync::Apply(signal, result.statusCode, result.message);
+    }
     return result;
 }
 
