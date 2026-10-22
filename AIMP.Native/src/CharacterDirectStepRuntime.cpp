@@ -134,6 +134,10 @@ struct MovementSlot final {
     std::atomic<bool> stopPending{false};
     std::atomic<bool> initialPlacementPending{false};
     std::atomic<bool> idleConverged{false};
+    // A paired attack that aborted before retail's 4E destructor could clear
+    // the victim's grapple bytes leaves the representation frozen.
+    std::atomic<std::uint64_t> staleGrappleSinceMs{0U};
+    std::atomic<bool> pairedHoldReleaseRequested{false};
     std::atomic<std::uint64_t> nextIdleValidationTickMs{0U};
     std::atomic<std::uintptr_t> certifiedCycleAddress{0U};
     std::atomic<std::uint64_t> lastHookTickMs{0U};
@@ -175,6 +179,9 @@ std::atomic<NativeAIIntentObserver> gNativeAIIntentObserver{nullptr};
 std::atomic<NativeAITransitionGuard> gNativeAITransitionGuard{nullptr};
 std::array<MovementSlot, MaximumConcurrentTargets()> gSlots{};
 std::atomic<std::uintptr_t> gLastArmedCharacter{0U};
+std::atomic<std::uint64_t> gStaleGrappleReleases{0U};
+std::atomic<PairedVictimHeldQuery> gPairedVictimHeldQuery{nullptr};
+constexpr std::uint64_t kStaleGrappleReleaseMs = 1500U;
 std::uintptr_t gModuleBase{};
 std::uintptr_t gGlobalStateRootAddress{};
 ActivateLocomotionCycleFn gActivateLocomotionCycle{};
@@ -684,6 +691,52 @@ bool RetailOwnsPhysicalCycle(const std::uintptr_t characterAddress) noexcept {
     if (ReadNativeCycle(characterAddress, cycle, state) &&
         (state == 0x16U || state == 0x42U || state == 0x4EU || state == 0x4FU || state == 0x47U)) return true;
     return GuardedReadValue(characterAddress + 0x32CU, health) && health >= 3U;
+}
+
+bool PairedCycleState(const std::uint8_t state) noexcept {
+    return state == 0x16U || state == 0x42U || state == 0x4EU || state == 0x4FU || state == 0x47U;
+}
+
+// Engine thread. Retail clears victim +297/+298/+299 in the 4E destructor
+// (0065B190) through the source cycle's +44 victim pointer. An aborted Client
+// replay zeroes +44 first, so the bytes leak and RetailOwnsPhysicalCycle keeps
+// the representation frozen. Clear them only when no paired cycle owns the
+// Character and it is not dying: on AISync request, or after a bounded delay.
+bool ReleaseStalePairedHold(MovementSlot& slot, const std::uintptr_t characterAddress) noexcept {
+    std::uint8_t grappled{};
+    if (!GuardedReadValue(characterAddress + 0x297U, grappled) || grappled == 0U) {
+        slot.staleGrappleSinceMs.store(0U, std::memory_order_relaxed);
+        slot.pairedHoldReleaseRequested.store(false, std::memory_order_relaxed);
+        return false;
+    }
+    std::uintptr_t cycle{};
+    std::uint8_t state{};
+    std::uint32_t health{};
+    const auto held = gPairedVictimHeldQuery.load(std::memory_order_acquire);
+    if ((ReadNativeCycle(characterAddress, cycle, state) && PairedCycleState(state)) ||
+        !GuardedReadValue(characterAddress + 0x32CU, health) || health >= 3U ||
+        (held != nullptr && held(characterAddress))) {
+        slot.staleGrappleSinceMs.store(0U, std::memory_order_relaxed);
+        return false;
+    }
+    const auto now = GetTickCount64();
+    auto since = slot.staleGrappleSinceMs.load(std::memory_order_relaxed);
+    if (since == 0U) slot.staleGrappleSinceMs.store(since = now, std::memory_order_relaxed);
+    if (!slot.pairedHoldReleaseRequested.load(std::memory_order_acquire) && now - since < kStaleGrappleReleaseMs)
+        return false;
+    constexpr std::uint8_t kClear = 0U;
+    if (!GuardedWriteValue(characterAddress + 0x297U, kClear) ||
+        !GuardedWriteValue(characterAddress + 0x298U, kClear) ||
+        !GuardedWriteValue(characterAddress + 0x299U, kClear)) return false;
+    slot.staleGrappleSinceMs.store(0U, std::memory_order_relaxed);
+    slot.pairedHoldReleaseRequested.store(false, std::memory_order_release);
+    // Converge on the latest network transform instead of resuming in place.
+    slot.idleConverged.store(false, std::memory_order_release);
+    slot.initialPlacementPending.store(true, std::memory_order_release);
+    slot.targetRevision.fetch_add(1U, std::memory_order_release);
+    gStaleGrappleReleases.fetch_add(1U, std::memory_order_relaxed);
+    AppendLocomotionFlight("paired_hold_released", slot, characterAddress, cycle, state, grappled);
+    return true;
 }
 
 bool EnsureCertifiedCycle(
@@ -2110,6 +2163,8 @@ void PumpSlotOnEngineThread(
     // Network locomotion must not reacquire Move/Idle, teleport or rewrite yaw
     // over an admitted paired attack or a real death. Incoming commands may
     // update their mailbox, but the retail cycle keeps physical ownership.
+    if (phase == EnginePumpPhase::PreCharacterManager)
+        static_cast<void>(ReleaseStalePairedHold(slot, characterAddress));
     if (RetailOwnsPhysicalCycle(characterAddress)) {
         if (slot.stopPending.load(std::memory_order_acquire)) ReleaseSlot(slot);
         return;
@@ -2669,6 +2724,10 @@ void SetNativeAITransitionGuard(const NativeAITransitionGuard guard) noexcept {
     gNativeAITransitionGuard.store(guard, std::memory_order_release);
 }
 
+void SetPairedVictimHeldQuery(const PairedVictimHeldQuery query) noexcept {
+    gPairedVictimHeldQuery.store(query, std::memory_order_release);
+}
+
 void PumpOnEngineThread(const EnginePumpPhase phase) noexcept {
     if (!Installed() || !runtime_features::Enabled(
             runtime_features::Feature::RemoteMovementRuntime)) {
@@ -2964,6 +3023,15 @@ bool ApplyReplicatedYaw(
     if (WriteReplicatedYaw(characterAddress, yaw)) return true;
     error = "The replicated Character yaw field could not be written safely";
     return false;
+}
+
+void RequestPairedVictimRelease(const std::uintptr_t characterAddress) noexcept {
+    if (auto* slot = FindSlot(characterAddress))
+        slot->pairedHoldReleaseRequested.store(true, std::memory_order_release);
+}
+
+std::uint64_t StalePairedHoldReleases() noexcept {
+    return gStaleGrappleReleases.load(std::memory_order_relaxed);
 }
 
 bool FinishReplicatedInteraction(const std::uintptr_t characterAddress) noexcept {

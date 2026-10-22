@@ -88,6 +88,10 @@ void SetNativeAIIntentObserver(NativeAIIntentObserver observer) noexcept;
 // AISync can retain an acquired paired source independently of locomotion slots.
 // The callback must use published lifetime identities, never engine-owned Actor data.
 void SetNativeAITransitionGuard(NativeAITransitionGuard guard) noexcept;
+// Engine thread: true while some attacker's 42/4E source cycle still holds this
+// Character as its victim (cycle+44). The stale-grapple release never fires then.
+using PairedVictimHeldQuery = bool(*)(std::uintptr_t characterAddress);
+void SetPairedVictimHeldQuery(PairedVictimHeldQuery query) noexcept;
 
 // Authoritative NPC intent replay. Unlike ArmWorldReplication these functions
 // carry no network transform and therefore never chase/snap toward a position.
@@ -196,6 +200,12 @@ bool ApplyReplicatedYaw(
 // Engine thread only: leave a completed authoritative attack via the retail
 // Idle transition/destructor. Never touches a victim's death cycle or health.
 bool FinishReplicatedInteraction(std::uintptr_t characterAddress) noexcept;
+
+// Any thread: an aborted or abandoned paired attack no longer owns this remote
+// player representation. The next engine pump clears the leaked retail grapple
+// bytes (+297..+299) unless a paired cycle or death owns the Character.
+void RequestPairedVictimRelease(std::uintptr_t characterAddress) noexcept;
+[[nodiscard]] std::uint64_t StalePairedHoldReleases() noexcept;
 
 bool Arm(
     std::uintptr_t characterAddress,

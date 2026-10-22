@@ -242,6 +242,13 @@ struct Actor {
     NavigationGoalState convergenceGoal{};
     ULONGLONG convergenceDivergenceSince{};
     bool convergenceActive{};
+    // Pursuit: the Host Alien can travel fast in cycles other than the 0x38
+    // Move cycle (charge/run-at-target), publishing zero steering intensity.
+    // Its measured speed drives a bounded local path toward the Host pose.
+    NavigationGoalState pursuitGoal{};
+    float pursuitSampleX{}, pursuitSampleZ{}, hostSpeed{};
+    ULONGLONG pursuitSampleTick{}, pursuitDivergenceSince{};
+    bool pursuitSampleValid{}, pursuitActive{};
     std::uint32_t convergenceAuthorityRequest{};
     std::uint32_t remoteBirth{}, remoteRevision{};
     std::uint32_t healthRevision{}, damageRevision{};
@@ -337,6 +344,10 @@ struct OutcomeBinding final {
 std::array<OutcomeBinding, kActors> gOutcomes{};
 std::mutex gOutcomeMutex;
 std::atomic<std::uint64_t> gOutcomeCaptured{}, gOutcomeApplied{}, gOutcomeRejected{}, gOutcomeDuplicates{};
+// Client preparation replay rejection reasons (ResolvedClientPreparation).
+std::atomic<std::uint64_t> gPrepRejectSubmission{}, gPrepRejectSource{}, gPrepRejectTerminal{},
+    gPrepRejectDefinition{}, gPrepRejectGeometry{}, gPrepRejectFault{}, gPrepHealthOnlyApplied{},
+    gPairedVictimReleaseRequests{};
 std::array<PairBinding, kActors> gPairSources{};
 std::array<PairBinding, kParticipants + 1U> gPairParticipants{};
 std::array<std::atomic<bool>, kActors> gPairSourceBusy{};
@@ -436,6 +447,7 @@ thread_local std::uintptr_t gSchedulerTransitionOwner{};
 thread_local std::uint32_t gSchedulerTransitionRva{};
 std::atomic<std::uint32_t> gLastPairedBlockedSchedulerRva{};
 std::atomic<std::uint64_t> gNavigationConvergenceApplied{}, gNavigationConvergenceFailed{};
+std::atomic<std::uint64_t> gPursuitApplied{}, gPursuitFailed{}, gPursuitEnded{};
 std::atomic<std::uint64_t> gNavigationPaused{};
 std::atomic<std::uint64_t> gPairedRuntimePlayerRemaps{};
 std::atomic<void*> gPlayerPreparationPublished{}, gPlayerCategoryPublished{};
@@ -2205,6 +2217,7 @@ bool QuiesceProxyExecution(Actor& actor) noexcept {
     combat::Cancel(actor.character);
     navigation::Cancel(actor.character);
     actor.convergenceActive = false; actor.convergenceDivergenceSince = 0U;
+    actor.pursuitActive = false; actor.pursuitDivergenceSince = 0U;
     actor.replayedExecutionRevision = 0U;
     actor.completedExecutionRevision = 0U;
     actor.lastExecutionAttempt = 0U;
@@ -3082,13 +3095,54 @@ void __fastcall OutcomeHealthCommitDetour(void* context, void*, const std::uint3
     if (readable) RecordHostHealthOrigin(address - 0x320U, source, before);
     if (observeCommit) health::ObserveCommit(victim, victimIdentity.runtimeId, observedSource, beforeState);
 }
+// A pair that no longer owns a remote player representation must hand it back
+// to PlayerSync. Retail clears the victim's grapple bytes only in a completed
+// 4E destructor; an aborted or abandoned replay would otherwise freeze it.
+// Engine thread: an attacker's live 42/4E source cycle still names this victim.
+bool PairedVictimHeld(const std::uintptr_t victim) noexcept {
+    for (const auto& actor : gActors) {
+        std::uintptr_t cycle{}, held{};
+        std::uint8_t state{}, flags{};
+        if (actor.character == 0U || !Read(actor.character + 0x36CU, cycle) || cycle == 0U ||
+            !Read(cycle + 0x1AU, state) || (state != 0x4EU && state != 0x42U) ||
+            !Read(cycle + 8U, flags) || (flags & 6U) != 0U || !Read(cycle + 0x44U, held)) continue;
+        if (held == victim) return true;
+    }
+    return false;
+}
+void ReleasePairedVictim(const std::uintptr_t victim) noexcept {
+    if (victim == 0U || !RegisteredPlayerRepresentation(victim)) return;
+    character_direct_step_runtime::RequestPairedVictimRelease(victim);
+    gPairedVictimReleaseRequests.fetch_add(1U, std::memory_order_relaxed);
+}
+std::uintptr_t RejectClientPreparation(const std::uintptr_t victim,
+    std::atomic<std::uint64_t>& reason) noexcept {
+    reason.fetch_add(1U, std::memory_order_relaxed);
+    gOutcomeRejected.fetch_add(1U, std::memory_order_relaxed);
+    ReleasePairedVictim(victim);
+    return 2U;
+}
+// The Host's prepared result is authoritative even when this Client cannot
+// replay its animation (e.g. a non-lethal grab definition this table does not
+// resolve). Keep the witnessed health; the source then takes the failed-source
+// epilogue and the victim representation is released.
+void ApplyPreparationHealthOnly(const std::uintptr_t victim, const NativeVictimSubmission& submission) noexcept {
+    const auto& result = submission.outcome;
+    const auto damage = result.hpBefore - result.hpPrepared;
+    if (damage != 0U)
+        reinterpret_cast<NativeDamage>(gBase + 0x003CC900U)(reinterpret_cast<void*>(victim),
+            damage, submission.source, 0U, 0U, 1U, 0U, 0x16U, 0U, 0U);
+    CommitOutcomeHealth(victim, submission.source, result.hpReaction);
+    gPrepHealthOnlyApplied.fetch_add(1U, std::memory_order_relaxed);
+}
 std::uintptr_t ResolvedClientPreparation(const std::uintptr_t victim,
     const std::uintptr_t sourceCycle) noexcept {
     auto* submission = gNativeVictimSubmission;
     constexpr std::uintptr_t rejected = 2U;
     if (submission == nullptr || !submission->authoritativeClient ||
         submission->sourceCycle != sourceCycle || submission->victimBefore.character != victim ||
-        !VictimAdmissionMatches(victim, submission->source, sourceCycle)) return rejected;
+        !VictimAdmissionMatches(victim, submission->source, sourceCycle))
+        return RejectClientPreparation(victim, gPrepRejectSubmission);
     // A rejected result aborts this producer at its existing retail epilogue;
     // it must never fall back to an independent local difficulty/geometry roll.
     PairIdentity source{};
@@ -3100,16 +3154,15 @@ std::uintptr_t ResolvedClientPreparation(const std::uintptr_t victim,
         !Read(source.animated + 0x34B4U, manager) || manager == 0U ||
         !Read(manager, table) || !Read(table + 0x34U, getter) ||
         getter != gBase + 0x002D60F0U) {
-        gOutcomeRejected.fetch_add(1U, std::memory_order_relaxed); return rejected;
+        return RejectClientPreparation(victim, gPrepRejectSource);
     }
     __try {
         if ((result.flags & OutcomeVictimAdmitted) == 0U) {
             // A native interruption may keep preparation damage without ever
             // acquiring 4F. Replay that nonterminal result, then use the retail
             // failed-source epilogue; do not invent an acquired victim graph.
-            if ((result.flags & OutcomeTerminal) != 0U) {
-                gOutcomeRejected.fetch_add(1U, std::memory_order_relaxed); return rejected;
-            }
+            if ((result.flags & OutcomeTerminal) != 0U)
+                return RejectClientPreparation(victim, gPrepRejectTerminal);
             const auto damage = result.hpBefore - result.hpPrepared;
             if (damage != 0U)
                 reinterpret_cast<NativeDamage>(gBase + 0x003CC900U)(reinterpret_cast<void*>(victim),
@@ -3121,15 +3174,18 @@ std::uintptr_t ResolvedClientPreparation(const std::uintptr_t victim,
         definition = reinterpret_cast<std::uintptr_t(__thiscall*)(void*, std::uint32_t)>(getter)(
             reinterpret_cast<void*>(manager), result.definition);
         if (definition == 0U || !Read(definition + 8U, kind) || kind != result.kind) {
-            gOutcomeRejected.fetch_add(1U, std::memory_order_relaxed); return rejected;
+            if ((result.flags & OutcomeTerminal) == 0U) ApplyPreparationHealthOnly(victim, *submission);
+            return RejectClientPreparation(victim, gPrepRejectDefinition);
         }
         float position[3]{};
         for (std::size_t i = 0U; i < 3U; ++i)
             if (!Read(victim + kPositionOffset + i * 4U, position[i]) ||
-                !FiniteCoordinate(position[i] + result.targetOffset[i])) return rejected;
-        if (!Write(sourceCycle + 0xB8U, result.sourceYaw)) return rejected;
+                !FiniteCoordinate(position[i] + result.targetOffset[i]))
+                return RejectClientPreparation(victim, gPrepRejectGeometry);
+        if (!Write(sourceCycle + 0xB8U, result.sourceYaw)) return RejectClientPreparation(victim, gPrepRejectGeometry);
         for (std::size_t i = 0U; i < 3U; ++i)
-            if (!Write(sourceCycle + 0xD0U + i * 4U, position[i] + result.targetOffset[i])) return rejected;
+            if (!Write(sourceCycle + 0xD0U + i * 4U, position[i] + result.targetOffset[i]))
+                return RejectClientPreparation(victim, gPrepRejectGeometry);
         const auto damage = result.hpBefore - result.hpPrepared;
         if (damage != 0U)
             reinterpret_cast<NativeDamage>(gBase + 0x003CC900U)(reinterpret_cast<void*>(victim),
@@ -3140,7 +3196,8 @@ std::uintptr_t ResolvedClientPreparation(const std::uintptr_t victim,
         gOutcomeApplied.fetch_add(1U, std::memory_order_relaxed);
         return definition;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        gOutcomeRejected.fetch_add(1U, std::memory_order_relaxed); return rejected;
+        static_cast<void>(rejected);
+        return RejectClientPreparation(victim, gPrepRejectFault);
     }
 }
 std::uintptr_t __cdecl PlayerPreparationBoundary(const std::uintptr_t victim,
@@ -4268,6 +4325,7 @@ bool Release(Actor& actor) noexcept {
     combat::Cancel(actor.character);
     navigation::Cancel(actor.character);
     actor.convergenceActive = false; actor.convergenceDivergenceSince = 0U;
+    actor.pursuitActive = false; actor.pursuitDivergenceSince = 0U;
     actor.movementOwner = MovementOwner::None;
     actor.replayedExecutionRevision = 0U;
     actor.completedExecutionRevision = 0U;
@@ -4493,6 +4551,7 @@ bool RecoverLostPairAdmission(Actor& actor, const ULONGLONG now) noexcept {
     actor.interactionOwnsCycle = false;
     actor.lastProxyRefresh = 0U;
     ClearPairPlacement(actor);
+    ReleasePairedVictim(target);
     if (actor.admissionRetryBirth != actor.desired.birth || actor.admissionRetryPair != actor.desired.interactionPairRevision) {
         actor.admissionRetryBirth = actor.desired.birth;
         actor.admissionRetryPair = actor.desired.interactionPairRevision;
@@ -4790,6 +4849,11 @@ bool PairedTransitionOwnsCycle(Actor& actor, const ULONGLONG now) noexcept {
     }
     actor.interactionOwnsCycle = false;
     gPairedCycleReleased.fetch_add(1U, std::memory_order_relaxed);
+    // A survived (non-lethal) attack ends without Terminal/NativeDeath. The
+    // victim keeps its own 4F until retail ends it; the request is honoured by
+    // the movement pump only once no paired cycle owns the representation.
+    if ((actor.desired.outcome.flags & (OutcomeTerminal | OutcomeNativeDeath)) == 0U)
+        ReleasePairedVictim(target);
     if (observerRelease) {
         // Remember the exact released pair so repeated Host outro snapshots can
         // update metadata without reacquiring the old local 4E. Until a newer
@@ -5461,9 +5525,88 @@ bool ApplyNativeNavigationConvergence(Actor& actor, const ULONGLONG now) noexcep
     return false;
 }
 
+// Measured Host speed from successive authoritative poses (>=200ms apart).
+void SampleHostSpeed(Actor& actor, const ULONGLONG now) noexcept {
+    const auto& state = actor.desired;
+    if ((state.stateFlags & PoseValid) == 0U) { actor.pursuitSampleValid = false; actor.hostSpeed = 0.0F; return; }
+    if (!actor.pursuitSampleValid) {
+        actor.pursuitSampleX = state.position[0]; actor.pursuitSampleZ = state.position[2];
+        actor.pursuitSampleTick = now; actor.pursuitSampleValid = true;
+        return;
+    }
+    const auto elapsed = now - actor.pursuitSampleTick;
+    if (elapsed < 200U) return;
+    const auto travelled = std::hypot(state.position[0] - actor.pursuitSampleX, state.position[2] - actor.pursuitSampleZ);
+    actor.hostSpeed = std::isfinite(travelled) ? travelled * 1000.0F / static_cast<float>(elapsed) : 0.0F;
+    actor.pursuitSampleX = state.position[0]; actor.pursuitSampleZ = state.position[2];
+    actor.pursuitSampleTick = now;
+}
+
+void EndPursuit(Actor& actor) noexcept {
+    if (actor.pursuitActive) {
+        navigation::Cancel(actor.character);
+        gPursuitEnded.fetch_add(1U, std::memory_order_relaxed);
+    }
+    actor.pursuitActive = false;
+    actor.pursuitDivergenceSince = 0U;
+}
+
+// Engine thread, Intent owner only. Never during pairs, scripted/Host-replayed
+// execution, death or backstage; the catastrophic relocation stays the last resort.
+bool ApplyPursuitConvergence(Actor& actor, const ULONGLONG now) noexcept {
+    constexpr float kPursuitSpeed = 2.0F, kPursuitStart = 2.5F, kPursuitStop = 1.0F;
+    const auto& state = actor.desired;
+    float x{}, z{};
+    const bool eligible = (state.stateFlags & PoseValid) != 0U && !ProxyWithdrawn(state) &&
+        !LifecycleBlocksMovementRecovery(state, actor.completedLifecycleRevision) &&
+        !actor.interactionOwnsCycle && !PairSourceBusy(actor.character) &&
+        actor.hostSpeed >= kPursuitSpeed && now - actor.lastReceive < kMotionLease &&
+        Read(actor.character + kPositionOffset, x) && Read(actor.character + kPositionOffset + 8U, z) &&
+        FiniteCoordinate(x) && FiniteCoordinate(z);
+    const auto distance = eligible ? std::hypot(state.position[0] - x, state.position[2] - z) : 0.0F;
+    if (!eligible || distance < (actor.pursuitActive ? kPursuitStop : kPursuitStart)) {
+        EndPursuit(actor);
+        return false;
+    }
+    if (!actor.pursuitActive) {
+        if (actor.pursuitDivergenceSince == 0U) actor.pursuitDivergenceSince = now;
+        if (now - actor.pursuitDivergenceSince < 300U) return false;
+    }
+    auto& goal = actor.pursuitGoal;
+    float moved{};
+    for (std::size_t i = 0U; i < 3U; ++i) {
+        const auto delta = goal.position[i] - state.position[i];
+        moved += delta * delta;
+    }
+    if (!actor.pursuitActive || moved >= 0.0625F) {
+        for (std::size_t i = 0U; i < 3U; ++i) goal.position[i] = state.position[i];
+        ++goal.revision; if (goal.revision == 0U) goal.revision = 1U;
+    }
+    // requestRevision 2 keeps this lease distinct from the 0x38 convergence (1).
+    goal.flags = 1U; goal.kind = 1U; goal.requestRevision = 2U; goal.stoppingDistance = 0.5F;
+    goal.moveType = (std::max)(state.moveType, 2U);
+    std::string error;
+    if (navigation::Apply(actor.character, goal, actor.lastReceive + kMotionLease, error, true) &&
+        navigation::ApplyGait(actor.character, goal.moveType)) {
+        actor.pursuitActive = true;
+        actor.movementOwner = MovementOwner::Navigation;
+        actor.completedRevision = state.revision; actor.lastProxyRefresh = now;
+        gPursuitApplied.fetch_add(1U, std::memory_order_relaxed);
+        return true;
+    }
+    EndPursuit(actor);
+    actor.pursuitDivergenceSince = now;
+    gPursuitFailed.fetch_add(1U, std::memory_order_relaxed);
+    return false;
+}
+
 bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
     const auto& state = actor.desired;
+    SampleHostSpeed(actor, now);
     if (PairSourceBusy(actor.character)) { actor.movementOwner = MovementOwner::Paired; return true; }
+    if (actor.pursuitActive && (health::Terminal(state.health) || actor.reactionCycle != 0U ||
+            actor.observerHandoffNeutral || actor.pairPlacementPending || actor.interactionOwnsCycle))
+        EndPursuit(actor);
     if (health::Terminal(state.health)) {
         // Health is never a paired-graph completion signal. Once the native
         // death path owns this NPC, motion/idle replication cannot replace it.
@@ -5542,11 +5685,13 @@ bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
     }
     actor.movementOwner = ChooseMovementOwner(false, false, executionApplied, (state.navigation.flags & 1U) != 0U);
     if (actor.movementOwner == MovementOwner::Execution) {
+        EndPursuit(actor);
         actor.completedRevision = state.revision;
         actor.lastProxyRefresh = now;
         return true;
     }
     if (actor.movementOwner == MovementOwner::Navigation) {
+        EndPursuit(actor); // the Host's own path goal owns this Character
         if (ApplyNativeNavigationConvergence(actor, now)) return true;
         const bool rejected = actor.rejectedNavigationRevision == state.navigation.revision &&
             actor.rejectedNavigationRequestRevision == state.navigation.requestRevision;
@@ -5573,7 +5718,10 @@ bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
         // actor or its paired authority. Restore the existing steering path.
         actor.movementOwner = MovementOwner::Intent;
     }
-    if (ApplyNativeNavigationConvergence(actor, now)) return true;
+    if (ApplyNativeNavigationConvergence(actor, now)) { EndPursuit(actor); return true; }
+    // A Host Alien travelling fast outside the 0x38 Move cycle publishes no
+    // usable steering; follow its pose with a local path instead of idling.
+    if (ApplyPursuitConvergence(actor, now)) return true;
     navigation::Cancel(actor.character);
     // Unrecognized move requests retain the bounded steering carrier. Unknown
     // execution metadata does not suppress it and never runs a local brain.
@@ -7789,6 +7937,7 @@ bool Install(const std::uintptr_t base, HookManager& hooks, LevelGenerationTrack
     }
     character_direct_step_runtime::SetNativeAIIntentObserver(&ObserveNativeAIIntent);
     character_direct_step_runtime::SetNativeAITransitionGuard(&RetainAuthoritativeSourceGraph);
+    character_direct_step_runtime::SetPairedVictimHeldQuery(&PairedVictimHeld);
     gInstalled.store(true, std::memory_order_release);
     return true;
 }
@@ -8852,6 +9001,9 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"lastPairedBlockedSchedulerRva", Diagnostics::Unsigned(gLastPairedBlockedSchedulerRva.load()), true},
          {"navigationConvergenceApplied", Diagnostics::Unsigned(gNavigationConvergenceApplied.load()), true},
          {"navigationConvergenceFailed", Diagnostics::Unsigned(gNavigationConvergenceFailed.load()), true},
+         {"pursuitApplied", Diagnostics::Unsigned(gPursuitApplied.load()), true},
+         {"pursuitFailed", Diagnostics::Unsigned(gPursuitFailed.load()), true},
+         {"pursuitEnded", Diagnostics::Unsigned(gPursuitEnded.load()), true},
          {"navigationHostPauses", Diagnostics::Unsigned(gNavigationPaused.load()), true},
          {"pairedAdmissionRetries", Diagnostics::Unsigned(gPairedAdmissionRetries.load()), true},
          {"pairedAdmissionAbandoned", Diagnostics::Unsigned(gPairedAdmissionAbandoned.load()), true},
@@ -8873,6 +9025,15 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"nativeOutcomeCaptured", Diagnostics::Unsigned(gOutcomeCaptured.load()), true},
          {"nativeOutcomeApplied", Diagnostics::Unsigned(gOutcomeApplied.load()), true},
          {"nativeOutcomeRejected", Diagnostics::Unsigned(gOutcomeRejected.load()), true},
+         {"prepRejectSubmission", Diagnostics::Unsigned(gPrepRejectSubmission.load()), true},
+         {"prepRejectSource", Diagnostics::Unsigned(gPrepRejectSource.load()), true},
+         {"prepRejectTerminal", Diagnostics::Unsigned(gPrepRejectTerminal.load()), true},
+         {"prepRejectDefinition", Diagnostics::Unsigned(gPrepRejectDefinition.load()), true},
+         {"prepRejectGeometry", Diagnostics::Unsigned(gPrepRejectGeometry.load()), true},
+         {"prepRejectFault", Diagnostics::Unsigned(gPrepRejectFault.load()), true},
+         {"prepHealthOnlyApplied", Diagnostics::Unsigned(gPrepHealthOnlyApplied.load()), true},
+         {"pairedVictimReleaseRequests", Diagnostics::Unsigned(gPairedVictimReleaseRequests.load()), true},
+         {"stalePairedHoldReleases", Diagnostics::Unsigned(character_direct_step_runtime::StalePairedHoldReleases()), true},
          {"invalidOutgoing", Diagnostics::Unsigned(gInvalidOutgoing.load()), true},
          {"lastInvalidOutgoingFlags", Diagnostics::Unsigned(gLastInvalidOutgoingFlags.load()), true},
          {"lastInvalidOutgoingEntityA", Diagnostics::Unsigned(gLastInvalidOutgoingEntityA.load()), true},
