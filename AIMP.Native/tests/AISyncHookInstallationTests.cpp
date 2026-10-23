@@ -109,9 +109,9 @@ void TestInstallation(DataImage& image) {
         Require(success, std::string(stage) + ": " + error);
     };
     const auto base = image.Base();
-    constexpr std::array<std::uintptr_t, 8U> sites{
+    constexpr std::array<std::uintptr_t, 9U> sites{
         0x003CAAC0U, 0x003C3B10U, 0x00286570U, 0x00286860U,
-        0x002556F0U, 0x00263E00U, 0x00291220U, 0x00291000U};
+        0x002556F0U, 0x0024E70FU, 0x00263E00U, 0x00291220U, 0x00291000U};
     std::array<std::array<std::byte, 32U>, sites.size()> original{};
     for (std::size_t i = 0U; i < sites.size(); ++i)
         std::memcpy(original[i].data(), reinterpret_cast<const void*>(base + sites[i]), original[i].size());
@@ -129,12 +129,14 @@ void TestInstallation(DataImage& image) {
     CheckCall(health::InstallDamageObserver(hooks, error), "Health installation");
     Require(hooks.InstalledCount() == 1U, "Missing health hook");
     CheckCall(combat::Install(hooks, error), "Combat installation");
-    Require(hooks.InstalledCount() == 2U, "Missing shot hook");
+    // Combat owns a call redirect (0054A3AB) plus the shot detour; only the
+    // detour site is a JMP-patched prefix listed in `sites`.
+    Require(hooks.InstalledCount() == 3U, "Missing shot hook");
     CheckCall(navigation::InstallGoalObservers(hooks, error), "Navigation installation");
-    Require(hooks.InstalledCount() == 4U, "Missing directed goal hooks");
+    Require(hooks.InstalledCount() == 5U, "Missing directed goal hooks");
     CheckCall(animation::Install(base, hooks,
         {&NoHumanPair, &NoManagedCharacter, nullptr, &NoManagedCharacter}, error), "Animation installation");
-    Require(hooks.InstalledCount() == sites.size(), "Missing animation hooks");
+    Require(hooks.InstalledCount() == sites.size() + 1U, "Missing animation hooks");
     for (const auto site : sites)
         Require(*reinterpret_cast<const std::uint8_t*>(base + site) == 0xE9U, "Hook did not patch the private image");
 
@@ -142,7 +144,7 @@ void TestInstallation(DataImage& image) {
     for (std::size_t i = 0U; i < sites.size(); ++i)
         Require(std::memcmp(original[i].data(), reinterpret_cast<const void*>(base + sites[i]), original[i].size()) == 0,
             "Rollback did not restore the original prefix");
-    Require(hooks.InstalledCount() == 0U && hooks.RetiredCount() == sites.size(), "Unexpected rollback state");
+    Require(hooks.InstalledCount() == 0U && hooks.RetiredCount() == sites.size() + 1U, "Unexpected rollback state");
     // No detour/trampoline has been invoked; this test owns their quiescence.
     CheckCall(hooks.ReleaseRetiredTrampolines(true, error), "Trampoline release");
     Require(hooks.RetiredCount() == 0U, "Trampolines were not released");
@@ -157,7 +159,7 @@ int main(int argc, char** argv) {
     try {
         DataImage image(argv[1]);
         TestInstallation(image);
-        std::cout << "PASS: eight AISync hooks installed and rolled back on rebased PE data; no game code executed.\n";
+        std::cout << "PASS: nine AISync hooks installed and rolled back on rebased PE data; no game code executed.\n";
         return 0;
     } catch (const std::exception& exception) {
         std::cerr << "FAIL: " << exception.what() << '\n';

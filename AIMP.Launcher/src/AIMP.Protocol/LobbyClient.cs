@@ -545,6 +545,10 @@ public sealed partial class LobbyClient : IAsyncDisposable
                         ItemSpawnDecided?.Invoke(this, itemSpawn);
                         break;
 
+                    case MessageType.ThrowableCommit:
+                        HandleThrowableCommit(frame.Payload);
+                        break;
+
                     case MessageType.InboundNetZFrame:
                         OpaqueFrameReceived?.Invoke(this, frame.Payload);
                         break;

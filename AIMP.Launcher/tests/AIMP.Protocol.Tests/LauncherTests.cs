@@ -538,8 +538,15 @@ internal static class LauncherTests
         {
             voice with { Mode = "unknown" }, voice with { MicrophoneId = "" },
             voice with { PushToTalkKey = 256 }, voice with { ActivationThreshold = float.NaN },
-            voice with { InputGain = 4.1f }, voice with { PlaybackVolume = -1 }
+            voice with { InputGain = 4.1f }, voice with { PlaybackVolume = -1 },
+            voice with { PlaybackVolume = 3.01f }, voice with { PlaybackVolume = float.NaN }
         }) AssertEx.False(invalid.TryValidate(out _));
+        var amplifiedVoice = voice with { PlaybackVolume = 3f };
+        AssertEx.True(amplifiedVoice.TryValidate(out _));
+        AssertEx.Equal(3f, amplifiedVoice.Normalize().PlaybackVolume);
+        store.Save(loaded with { Voice = amplifiedVoice });
+        AssertEx.Equal(3f, store.Load().Voice!.PlaybackVolume);
+        AssertEx.Equal(3f, (voice with { PlaybackVolume = 4f }).Normalize().PlaybackVolume);
         AssertEx.Equal(0.02f, (voice with { ActivationThreshold = float.NaN }).Normalize().ActivationThreshold);
 
         File.WriteAllText(temporary.Combine("legacy-settings.json"),

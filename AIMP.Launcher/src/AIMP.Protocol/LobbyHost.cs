@@ -1259,6 +1259,10 @@ public sealed partial class LobbyHost : IAsyncDisposable
                         .ConfigureAwait(false);
                     break;
 
+                case MessageType.ThrowableProposal:
+                    HandleThrowableProposal(state, frame.Payload);
+                    break;
+
                 case MessageType.PlayerPositionSnapshot:
                     await HandlePlayerPositionAsync(state, frame.Payload, cancellationToken)
                         .ConfigureAwait(false);

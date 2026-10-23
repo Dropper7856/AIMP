@@ -35,6 +35,8 @@ public enum MessageType : ushort
     ItemSyncSpawn = 29, // DLL -> launcher only: GCIP spawn proposal or local player drop.
     VoiceConfigure = 30, // Launcher -> DLL voice session, local IPC only.
     VoicePcmFrame = 31, // Launcher -> DLL decoded audio, local IPC only.
+    ThrowableConfigure = 32, // Launcher -> DLL Survival session fence.
+    ThrowableEvent = 33, // DLL <-> Launcher released native item/lifetime.
 
     LobbyJoin = 100,
     LobbyJoinAccepted = 101,
@@ -72,6 +74,8 @@ public enum MessageType : ushort
     MissionSignalProposal = 132, // Client -> Host; authored mission-graph ingress.
     MissionSignalCommitted = 133, // Host -> everyone; ordered mission progression.
     MissionSignalProduced = 134, // Native -> Launcher, local authored mission ingress.
+    ThrowableProposal = 135, // Client -> Host native release, authenticated owner.
+    ThrowableCommit = 136, // Host -> Clients admitted release or native removal.
 
     TestModeConfigure = 200,
     CapabilityQuery = 201,

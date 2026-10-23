@@ -60,6 +60,7 @@ set(AIMP_CORE_SOURCES
     src/UIHeapGuard.cpp
     src/MultiplayerPause.cpp
     src/ItemSync.cpp
+    src/ThrowableSync.cpp
     src/RuntimeFeatureFlags.cpp
     src/Protocol.cpp
     src/ReadyReplayGate.cpp

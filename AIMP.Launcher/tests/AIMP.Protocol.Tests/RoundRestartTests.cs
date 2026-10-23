@@ -4,7 +4,7 @@ namespace AIMP.Protocol.Tests;
 
 internal static class RoundRestartTests
 {
-    internal static Task AuthorityGenerationsAsync()
+    internal static async Task AuthorityGenerationsAsync()
     {
         var counter = new SessionWorldGenerationCounter();
         var session = Guid.NewGuid();
@@ -12,7 +12,65 @@ internal static class RoundRestartTests
         AssertEx.Equal(2, counter.Next(session), "A new round must not reuse the previous world's journal identity.");
         AssertEx.Equal(3, counter.Next(session), "An additional world activation must also have a unique generation.");
         AssertEx.Equal(1, counter.Next(Guid.NewGuid()), "A different lobby owns a separate generation space.");
-        return Task.CompletedTask;
+        await ReturnFenceRecoveryAsync().ConfigureAwait(false);
+    }
+
+    private static async Task ReturnFenceRecoveryAsync()
+    {
+        var round = new RoundEndedPayload(Guid.NewGuid(), 1, "all_dead", 5_000);
+        var socket = Guid.NewGuid();
+        var ready = new ScaleformBridgeEvent("command", "", new ScaleformBridgeMessage(
+            "ROUND_RETURN_READY", new Dictionary<string, string>()), (_, _) => Task.FromResult(true), socket);
+        var fence = new MultiplayerSessionCoordinator.RoundReturnFence(round, recoverable: true);
+
+        // A timed-out waiter must leave the underlying fence available for a
+        // delayed HUD notification. No wall-clock delay is needed by this test.
+        try
+        {
+            await fence.Closed.Task.WaitAsync(TimeSpan.Zero).ConfigureAwait(false);
+            throw new InvalidOperationException("An unacknowledged HUD fence unexpectedly completed.");
+        }
+        catch (TimeoutException) { }
+        AssertEx.False(fence.Closed.Task.IsCompleted);
+        AssertEx.True(fence.TryBind(ready), "Late HUD readiness must remain admissible after timeout.");
+        AssertEx.False(fence.TryBind(ready), "Only one acknowledgement may be in flight per socket.");
+        AssertEx.False(fence.TryBind(ready with { ConnectionId = Guid.NewGuid() }));
+        AssertEx.False(fence.AcceptPeerClosure(new("event", socket, true)));
+        AssertEx.False(fence.AcceptPeerClosure(new("command", socket, false)),
+            "Local socket replacement is not evidence that the movie stopped its callbacks.");
+        AssertEx.False(fence.AcceptPeerClosure(new("command", Guid.NewGuid(), true)));
+        AssertEx.False(fence.CompleteIfReady());
+        AssertEx.True(fence.AcceptPeerClosure(new("command", socket, true)));
+        AssertEx.False(fence.CanRenew, "A pending ACK continuation must settle before token renewal.");
+        AssertEx.False(fence.CompleteIfReady(), "Peer closure alone cannot authorize native teardown.");
+        fence.Acknowledged = true;
+        fence.AcknowledgementPending = false;
+        AssertEx.True(fence.CompleteIfReady(), "ACK continuation may arrive after peer closure.");
+        AssertEx.True(await fence.Closed.Task.ConfigureAwait(false));
+        AssertEx.False(fence.CanRenew);
+
+        var ackFirst = new MultiplayerSessionCoordinator.RoundReturnFence(round, recoverable: true);
+        AssertEx.True(ackFirst.TryBind(ready));
+        ackFirst.Acknowledged = true;
+        ackFirst.AcknowledgementPending = false;
+        AssertEx.False(ackFirst.CompleteIfReady(), "ACK alone cannot authorize native teardown.");
+        AssertEx.True(ackFirst.AcceptPeerClosure(new("command", socket, true)));
+        AssertEx.True(ackFirst.CompleteIfReady());
+
+        var failedAck = new MultiplayerSessionCoordinator.RoundReturnFence(round, recoverable: true);
+        AssertEx.True(failedAck.TryBind(ready));
+        failedAck.AcknowledgementPending = false;
+        AssertEx.False(failedAck.CanRenew, "A live socket must remain pinned after an ACK failure.");
+        AssertEx.True(failedAck.TryBind(ready), "Failed ACK can be retried on the same socket.");
+        failedAck.AcknowledgementPending = false;
+        AssertEx.True(failedAck.AcceptPeerClosure(new("command", socket, true)));
+        AssertEx.True(failedAck.CanRenew);
+        var replacement = new MultiplayerSessionCoordinator.RoundReturnFence(round, recoverable: true);
+        AssertEx.True(failedAck.Token != replacement.Token, "A renewed attempt needs a fresh token.");
+        AssertEx.False(replacement.CompleteIfReady(), "A replacement cannot inherit the old socket's closure.");
+        replacement.Closed.TrySetResult(false); // Disconnect/new generation cancels pending recovery.
+        AssertEx.False(replacement.TryBind(ready));
+        AssertEx.False(await replacement.Closed.Task.ConfigureAwait(false));
     }
 
     internal static async Task GameplaySequencesAsync()

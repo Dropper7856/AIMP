@@ -2,9 +2,18 @@
 
 #include <Windows.h>
 #include <array>
+#include <cmath>
 #include <mutex>
 
 namespace aimp::player_torch {
+bool BuildYawTransform(const float yaw, const std::array<float, 3>& origin,
+    std::array<float, 12>& output) noexcept {
+    if (!std::isfinite(yaw)) return false;
+    for (const auto value : origin) if (!std::isfinite(value)) return false;
+    const auto s = std::sin(yaw), c = std::cos(yaw);
+    output = {c, 0, s, origin[0], 0, 1, 0, origin[1], -s, 0, c, origin[2]};
+    return true;
+}
 namespace {
 struct Slot final {
     std::uintptr_t character{};
@@ -22,11 +31,62 @@ Slot* Find(const std::uintptr_t character) noexcept {
     return nullptr;
 }
 
+#if defined(_MSC_VER) && defined(_M_IX86)
+// Certified AI.exe SHA256 00d6bb846ac5a78916baf363eb148aa255a23bf216a271cfd23a0ece3c368364.
+// 7AC0BA..107: lookup returns a counted bone (+6C), accessor uses ECX=bone,
+// one output argument / RET4. Release the bone even if its transform faults.
+bool ReadSocketOrigin(const std::uintptr_t character, std::array<float, 3>& origin) {
+    using FindBone = std::uintptr_t*(__thiscall*)(void*, std::uintptr_t*, const char*);
+    using BoneTransform = float*(__thiscall*)(void*, float*);
+    std::uintptr_t bone{};
+    bool found{};
+    __try {
+        reinterpret_cast<FindBone>(gModuleBase + 0x2B4E70U)(
+            reinterpret_cast<void*>(character + 0x3F0U), &bone, "FLASHLIGHT");
+        if (bone >= 0x10000U) {
+            alignas(16) float matrix[16]{};
+            reinterpret_cast<BoneTransform>(gModuleBase + 0xBE1F0U)(
+                reinterpret_cast<void*>(bone), matrix);
+            // Accessor expands compact rows to a column-major 4x4.
+            origin = {matrix[12], matrix[13], matrix[14]};
+            found = true;
+        }
+    } __finally {
+        if (bone >= 0x10000U) --*reinterpret_cast<std::int32_t*>(bone + 0x6CU);
+    }
+    return found;
+}
+
+bool UpdateRemoteLight(const std::uintptr_t character, std::uint32_t* const light,
+    bool& socketOrigin) {
+    // Actor +174 is the replicated yaw used by CharacterDirectStepRuntime.
+    const auto yaw = *reinterpret_cast<const float*>(character + 0x174U);
+    std::array<float, 3> origin{};
+    socketOrigin = ReadSocketOrigin(character, origin);
+    if (!socketOrigin) {
+        // Skeletons without FLASHLIGHT still get an actor-bound origin. This
+        // shoulder-height approximation is deliberately independent of camera.
+        const auto* position = reinterpret_cast<const float*>(character + 0x70U);
+        origin = {position[0], position[1] + 1.5F, position[2]};
+    }
+    alignas(16) std::array<float, 12> transform{};
+    if (!BuildYawTransform(yaw, origin, transform)) return false;
+    // 7AC502..531 transposes 4x4 to these compact rows then calls 8BC500;
+    // 8BC524/558 read TWO stack args and 8BC584 RET (caller cleanup).
+    // The setter borrows the controller's ref, guards it with 932CC0, and
+    // dispatches the native transform service (+70 -> +60). No ref transfer.
+    using SetTransform = void(__cdecl*)(const std::uint32_t*, const float*);
+    reinterpret_cast<SetTransform>(gModuleBase + 0x4BC500U)(light, transform.data());
+    return true;
+}
+#endif
+
 // Reproduce only the Player_Torch_Light portion of EquipmentController's
 // constructor. The existing controller owns the returned strong reference and
 // destroys it through its normal reset/destructor; inventory is left intact.
 bool Apply(const std::uintptr_t character, const bool enabled,
-    std::uint32_t& activationHandle, bool& emitted, bool& created) noexcept {
+    std::uint32_t& activationHandle, bool& emitted, bool& created,
+    bool& transformSubmitted, bool& socketOrigin) noexcept {
 #if defined(_MSC_VER) && defined(_M_IX86)
     __try {
         auto* actor = reinterpret_cast<std::uint8_t*>(character);
@@ -69,28 +129,33 @@ bool Apply(const std::uintptr_t character, const bool enabled,
                     *reinterpret_cast<void**>(gModuleBase + 0x134EF40U), copy)) return false;
             activationHandle = 0U;
         }
+        // Never call 7ABFB0 here: 7AC055 onward resolves the process-global
+        // camera even for an NPC light. Place the remote light before showing.
+        transformSubmitted = enabled && *light != 0U &&
+            UpdateRemoteLight(character, light, socketOrigin);
+        const auto effectiveEnabled = enabled && transformSubmitted;
         using Update = void(__thiscall*)(void*);
         // Both retail perception and equipment presentation observe this flag.
-        actor[0x2BAU] = static_cast<std::uint8_t>(enabled);
+        actor[0x2BAU] = static_cast<std::uint8_t>(effectiveEnabled);
         // Publish the NPC-visible state before show/hide emits its native
         // notification, so observers querying CHR_GetTorch see the new state.
         const auto torchManager = *reinterpret_cast<std::uintptr_t*>(actor + 0x34C8U);
         if (torchManager >= 0x10000U)
-            *reinterpret_cast<std::uint8_t*>(torchManager + 8U) = static_cast<std::uint8_t>(enabled);
+            *reinterpret_cast<std::uint8_t*>(torchManager + 8U) = static_cast<std::uint8_t>(effectiveEnabled);
         if (*light != 0U) {
-            reinterpret_cast<Update>(gModuleBase + (enabled ? 0x3C3700U : 0x3C3840U))(
+            reinterpret_cast<Update>(gModuleBase + (effectiveEnabled ? 0x3C3700U : 0x3C3840U))(
                 reinterpret_cast<void*>(equipment));
-            if (enabled) reinterpret_cast<Update>(gModuleBase + 0x3ABFB0U)(reinterpret_cast<void*>(equipment));
         }
         emitted = *light != 0U && *reinterpret_cast<std::uint8_t*>(equipment + 0x1574U) != 0U;
         // CHR_GetTorch uses the NPC manager's effective flag for representations.
         if (torchManager >= 0x10000U)
             *reinterpret_cast<std::uint8_t*>(torchManager + 8U) = static_cast<std::uint8_t>(emitted);
-        return emitted == enabled;
+        return emitted == enabled && (!enabled || transformSubmitted);
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 #else
     static_cast<void>(character); static_cast<void>(enabled);
     static_cast<void>(activationHandle); static_cast<void>(emitted); static_cast<void>(created);
+    static_cast<void>(transformSubmitted); static_cast<void>(socketOrigin);
     return false;
 #endif
 }
@@ -126,13 +191,16 @@ void PumpOnEngineThread(const std::uintptr_t character) noexcept {
         if (slot == nullptr || gModuleBase == 0U || GetTickCount64() < slot->retryAt) return;
         state = *slot;
     }
-    bool emitted{}, created{};
-    const auto success = Apply(character, state.diagnostics.desired, state.activationHandle, emitted, created);
+    bool emitted{}, created{}, transformSubmitted{}, socketOrigin{};
+    const auto success = Apply(character, state.diagnostics.desired, state.activationHandle,
+        emitted, created, transformSubmitted, socketOrigin);
     std::scoped_lock lock(gMutex);
     auto* slot = Find(character);
     if (slot == nullptr || slot->epoch != state.epoch) return;
     slot->activationHandle = state.activationHandle;
     slot->diagnostics.emitted = emitted;
+    slot->diagnostics.transformSubmitted = transformSubmitted;
+    slot->diagnostics.socketOrigin = socketOrigin;
     slot->retryAt = success || slot->diagnostics.desired != state.diagnostics.desired
         ? 0U : GetTickCount64() + 500U;
     if (success) ++slot->diagnostics.applications;

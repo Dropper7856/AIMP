@@ -238,6 +238,9 @@ struct Actor {
     std::uint64_t observerReleasedTargetPeer{};
     bool observerHandoffNeutral{};
     ULONGLONG lastObserverFinishAttempt{};
+    // First tick at which this observer kept its local 4E through the Host's
+    // stage-6 outro; 0 while no outro is retained.
+    ULONGLONG observerOutroSince{};
     std::uint32_t admissionRetryBirth{}, admissionRetryPair{}, admissionRetries{};
     NavigationGoalState convergenceGoal{};
     ULONGLONG convergenceDivergenceSince{};
@@ -580,6 +583,13 @@ std::atomic<std::uint64_t> gPairedObserverCompletions{}, gPairedObserverReleaseA
 std::atomic<std::uint64_t> gPairedObserverReleases{}, gPairedObserverReleaseRejected{};
 std::atomic<std::uint64_t> gPairedObserverPairReopenSuppressed{}, gPairedObserverNeutralHolds{};
 std::atomic<std::uint64_t> gPairedObserverFinishRetries{}, gPairedObserverFinishCompleted{};
+// Engine-thread published per source slot: until when the Host still retains
+// its own 4E for the pair this observer owns, and the outro time bound.
+std::array<std::atomic<ULONGLONG>, kActors> gHostSourceRetainedUntil{};
+std::array<std::atomic<ULONGLONG>, kActors> gObserverOutroDeadline{};
+std::atomic<std::uint64_t> gPairedObserverOutroRetained{}, gPairedObserverOutroExpired{};
+std::atomic<std::uint64_t> gPairedOutroSchedulerBlocked{};
+constexpr ULONGLONG kObserverOutroLimit = 10000ULL;
 std::atomic<std::uint64_t> gNavigationFallbacks{};
 std::atomic<std::uint64_t> gPairedObserverHandoffResumed{};
 std::atomic<std::uint64_t> gPairedVictimTransitions{}, gPairedVictimTransitionRejected{};
@@ -613,6 +623,10 @@ struct PairedGraphProbe final {
     std::uint32_t role{}, generation{}, event{}, side{}, phase{}, pairRevision{}, birth{};
     std::uint32_t sourceA{}, sourceB{}, victimA{}, victimB{}, sourceStage{0xFFFFFFFFU};
     std::uint8_t sourceState{}, victimState{}, sourceFinished{}, victimEnded{}, victimAcquired{};
+    std::uintptr_t cycle{}, graph{};
+    std::uint32_t callerRva{}, markerIndex{}, thread{};
+    std::uint8_t serial{};
+    float sourceAlignment{}, victimAlignment{};
     bool readable{};
 };
 std::array<PairedGraphProbe, kParticipantProbeRing> gPairedGraphProbes{};
@@ -2750,10 +2764,37 @@ bool ClientNativeVictimOwnsPair(const std::uintptr_t source) noexcept {
         (interactive == 0U || TerminalDeadCharacter(target));
 }
 
+// Host stage 6 is the source's native kill outro: after the victim 4F ends
+// (E6/D8), the same 4E graph keeps emitting markers on the Host (an End_Action
+// 30-80 ms later) while the Alien finishes the kill. A brainless Client
+// observer must not let its idle/stop scheduler replace that live 4E.
+bool LocalSourceOutroAlive(const std::uintptr_t source, std::uintptr_t& cycle) noexcept {
+    std::uintptr_t owner{}, table{}, graph{};
+    std::uint8_t state{}, flags{}, finished{};
+    std::uint32_t stage{};
+    return Read(source + 0x36CU, cycle) && cycle != 0U && Read(cycle + 4U, owner) && owner == source &&
+        Read(cycle, table) && table == gBase + 0x00EAE5D0U &&
+        Read(cycle + 0x1AU, state) && state == 0x4EU &&
+        Read(cycle + 8U, flags) && (flags & 6U) == 0U &&
+        Read(cycle + 0x14U, graph) && graph != 0U &&
+        Read(cycle + 0xE0U, stage) && Read(cycle + 0xE6U, finished) && (stage >= 6U || finished != 0U);
+}
+bool RetainObserverOutroCycle(const std::uintptr_t source, const std::uintptr_t cycle) noexcept {
+    PairIdentity identity{};
+    const auto slot = PublishedPairSource(source, identity);
+    std::uintptr_t current{};
+    const auto now = GetTickCount64();
+    if (slot == kActors || now >= gHostSourceRetainedUntil[slot].load(std::memory_order_acquire) ||
+        now >= gObserverOutroDeadline[slot].load(std::memory_order_acquire) ||
+        !LocalSourceOutroAlive(source, current) || current != cycle) return false;
+    gPairedOutroSchedulerBlocked.fetch_add(1U, std::memory_order_relaxed);
+    return true;
+}
 bool RetainAuthoritativeSourceGraph(const std::uintptr_t source,
     const std::uintptr_t cycle, const std::uint32_t requestedState) noexcept {
     if (source != gSchedulerTransitionOwner || gRole.load(std::memory_order_acquire) != Role::Client ||
         !PairGenerationStable()) return false;
+    if (RetainObserverOutroCycle(source, cycle)) return true;
     PairIdentity sourceIdentity{}, victimIdentity{};
     std::uintptr_t current{}, owner{}, table{}, victim{}, victimCycle{}, linked{}, linkedSource{}, graph{};
     std::uint32_t victimBirth{}, sourceBirth{}, stage{};
@@ -3863,7 +3904,8 @@ __declspec(naked) void PairedVictimAvailabilityShim() {
     }
 }
 void TracePairedGraph(const std::uintptr_t source, const std::uintptr_t victim,
-    const std::uint32_t event, const std::uint32_t side, const std::uint32_t phase) noexcept {
+    const std::uint32_t event, const std::uint32_t side, const std::uint32_t phase,
+    const animation::Observation* observation = nullptr) noexcept {
     PairIdentity identity{};
     if (PublishedPairSource(source, identity) == kActors || !PairIdentityLive(identity)) return;
     PairedGraphProbe sample{};
@@ -3871,6 +3913,14 @@ void TracePairedGraph(const std::uintptr_t source, const std::uintptr_t victim,
     sample.role = static_cast<std::uint32_t>(gRole.load(std::memory_order_acquire));
     sample.generation = gActiveWorldGeneration.load(std::memory_order_acquire);
     sample.sourceA = identity.entityA; sample.sourceB = identity.entityB;
+    sample.thread = GetCurrentThreadId();
+    static_cast<void>(Read(source + 0x1004U, sample.sourceAlignment));
+    if (victim != 0U) static_cast<void>(Read(victim + 0x1004U, sample.victimAlignment));
+    if (observation != nullptr) {
+        sample.cycle = observation->cycle; sample.graph = observation->graph;
+        sample.callerRva = observation->callerRva; sample.markerIndex = observation->markerIndex;
+        static_cast<void>(Read(observation->cycle + 0x19U, sample.serial));
+    }
     std::uint32_t victimType{};
     static_cast<void>(CharacterIdentity(victim, sample.victimA, sample.victimB, victimType));
     OutcomeBinding binding{};
@@ -3897,6 +3947,24 @@ void TracePairedGraph(const std::uintptr_t source, const std::uintptr_t victim,
         gPairedGraphDropped.fetch_add(1U, std::memory_order_relaxed); return;
     }
     gPairedGraphProbes[gPairedGraphWrite++ % kParticipantProbeRing] = sample;
+}
+
+void ObservePairedAnimation(const animation::Observation& observation) noexcept {
+    // Animation workers read published lifetimes only. Periodic source updates
+    // are sampled; every marker boundary is kept in the existing bounded ring.
+    if (observation.boundary == animation::Boundary::SourceUpdateEnter) return;
+    if (observation.boundary == animation::Boundary::SourceUpdateLeave) {
+        static std::array<std::atomic<ULONGLONG>, kActors> last{};
+        PairIdentity identity{};
+        const auto slot = PublishedPairSource(observation.source, identity);
+        if (slot == kActors) return;
+        const auto now = GetTickCount64();
+        auto before = last[slot].load(std::memory_order_relaxed);
+        if (now - before < 250U || !last[slot].compare_exchange_strong(before, now,
+            std::memory_order_relaxed)) return;
+    }
+    TracePairedGraph(observation.source, observation.victim, observation.marker, 4U,
+        static_cast<std::uint32_t>(observation.boundary), &observation);
 }
 void __fastcall SourceGraphEventDetour(void* context, void*, const std::uint32_t event) noexcept {
     using Event = void(__thiscall*)(void*, std::uint32_t);
@@ -4772,10 +4840,37 @@ void RetryObserverSourceFinish(Actor& actor, const ULONGLONG now) noexcept {
         gFaults.fetch_add(1U, std::memory_order_relaxed);
     }
 }
+// Engine thread, every pump of an owned pair. The scheduler can run before
+// the next pump, so publish the Host retention lease ahead of the outro.
+void PublishObserverOutroLease(Actor& actor, const ULONGLONG now) noexcept {
+    const auto index = static_cast<std::size_t>(&actor - gActors.data());
+    const bool hostRetains = Client() && actor.interactionOwnsCycle && !ProxyWithdrawn(actor.desired) &&
+        actor.completedPairRevision == actor.desired.interactionPairRevision &&
+        (actor.desired.interactionFlags & InteractionSourceCycleRetained) != 0U;
+    std::uintptr_t cycle{};
+    const bool outro = hostRetains && LocalSourceOutroAlive(actor.character, cycle);
+    if (!outro) actor.observerOutroSince = 0U;
+    else if (actor.observerOutroSince == 0U) {
+        actor.observerOutroSince = now;
+        gPairedObserverOutroRetained.fetch_add(1U, std::memory_order_relaxed);
+    }
+    gHostSourceRetainedUntil[index].store(hostRetains ? now + 500U : 0U, std::memory_order_release);
+    gObserverOutroDeadline[index].store((outro ? actor.observerOutroSince : now) + kObserverOutroLimit,
+        std::memory_order_release);
+}
+// Keep the observer's local 4E through the outro only while the Host still
+// retains its own source cycle for this pair, bounded in time.
+bool RetainObserverOutro(Actor& actor, const ULONGLONG now) noexcept {
+    if (actor.observerOutroSince == 0U) return false;
+    if (now - actor.observerOutroSince < kObserverOutroLimit) return true;
+    gPairedObserverOutroExpired.fetch_add(1U, std::memory_order_relaxed);
+    return false;
+}
 bool PairedTransitionOwnsCycle(Actor& actor, const ULONGLONG now) noexcept {
     // Do not reuse the source layout while a retail worker admits its victim.
     if (PairSourceBusy(actor.character)) return true;
     if (RecoverLostPairAdmission(actor, now)) return false;
+    PublishObserverOutroLease(actor, now);
     if (!actor.interactionOwnsCycle) return false;
     // A replacement event is admitted below after the old local victim lease
     // has ended. Its new Host cycle cannot extend ownership of our old pair.
@@ -4810,7 +4905,7 @@ bool PairedTransitionOwnsCycle(Actor& actor, const ULONGLONG now) noexcept {
                 std::uint8_t nativeState{};
                 bool localActive{};
                 if (ReadPairedCycleActivity(actor.character, cycle, nativeState, localActive) &&
-                    nativeState == 0x4EU && !localActive) {
+                    nativeState == 0x4EU && !localActive && !RetainObserverOutro(actor, now)) {
                     remoteObserverFatalComplete = true;
                     gPairedObserverCompletions.fetch_add(1U, std::memory_order_relaxed);
                     SamplePresentation(actor, now, 4U);
@@ -5476,7 +5571,7 @@ bool ApplyNativeNavigationConvergence(Actor& actor, const ULONGLONG now) noexcep
     const bool hasGoal = (state.navigation.flags & navigation::kLiveGoal) != 0U;
     const auto authorityRequest = hasGoal ? state.navigation.requestRevision : 0U;
     if (actor.convergenceAuthorityRequest != authorityRequest) {
-        if (actor.convergenceActive) navigation::Cancel(actor.character);
+        if (actor.convergenceActive) static_cast<void>(navigation::CancelOwned(actor.character, true, 1U));
         actor.convergenceActive = false; actor.convergenceDivergenceSince = 0U;
         actor.convergenceAuthorityRequest = authorityRequest;
     }
@@ -5487,7 +5582,7 @@ bool ApplyNativeNavigationConvergence(Actor& actor, const ULONGLONG now) noexcep
         (state.position[2] - z) * state.velocityZ : 0.0F;
     if (!eligible || !readable || (hasGoal && along <= 0.0F) ||
         distance < (actor.convergenceActive ? 0.65F : hasGoal ? 2.5F : 1.5F)) {
-        if (actor.convergenceActive) navigation::Cancel(actor.character);
+        if (actor.convergenceActive) static_cast<void>(navigation::CancelOwned(actor.character, true, 1U));
         actor.convergenceActive = false; actor.convergenceDivergenceSince = 0U;
         return false;
     }
@@ -5519,7 +5614,7 @@ bool ApplyNativeNavigationConvergence(Actor& actor, const ULONGLONG now) noexcep
         gNavigationConvergenceApplied.fetch_add(1U, std::memory_order_relaxed);
         return true;
     }
-    navigation::Cancel(actor.character);
+    static_cast<void>(navigation::CancelOwned(actor.character, true, 1U));
     actor.convergenceActive = false; actor.convergenceDivergenceSince = now;
     gNavigationConvergenceFailed.fetch_add(1U, std::memory_order_relaxed);
     return false;
@@ -5544,7 +5639,9 @@ void SampleHostSpeed(Actor& actor, const ULONGLONG now) noexcept {
 
 void EndPursuit(Actor& actor) noexcept {
     if (actor.pursuitActive) {
-        navigation::Cancel(actor.character);
+        // A convergence/Host route may already have replaced this request.
+        // Retire only the pursuit admission, never its new movement owner.
+        static_cast<void>(navigation::CancelOwned(actor.character, true, 2U));
         gPursuitEnded.fetch_add(1U, std::memory_order_relaxed);
     }
     actor.pursuitActive = false;
@@ -5662,7 +5759,7 @@ bool ApplyAuthoritativeIntent(Actor& actor, const ULONGLONG now) noexcept {
         return character_direct_step_runtime::HoldAIIntentIdle(actor.character, state.moveType, idleError);
     }
     if (actor.convergenceActive && !NativeMoveConvergenceEligible(actor, state)) {
-        navigation::Cancel(actor.character);
+        static_cast<void>(navigation::CancelOwned(actor.character, true, 1U));
         actor.convergenceActive = false; actor.convergenceDivergenceSince = 0U;
     }
     if (!RecoverCatastrophicIntentDivergence(actor, state, now)) return false;
@@ -7927,7 +8024,7 @@ bool Install(const std::uintptr_t base, HookManager& hooks, LevelGenerationTrack
             {0x8B,0x54,0x24,0x04,0x85,0xD2},
             &gHostilityTrampoline, &gHostilityOriginal, error) &&
         HookThePlayerResolver(hooks, error) &&
-        animation::Install(base, hooks, {&AnimationHumanPair, &AnimationManagedSource, nullptr,
+        animation::Install(base, hooks, {&AnimationHumanPair, &AnimationManagedSource, &ObservePairedAnimation,
             &AnimationCanReplayScripted}, error);
     if (!installed) {
         std::string rollback;
@@ -8842,6 +8939,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
     diagnostics.Log("info", "aisync_native_animation", "Native paired updates and markers are observed, never ticked twice.",
         {{"sourceUpdates", Diagnostics::Unsigned(graph.sourceUpdates), true},
          {"coupledPlayerUpdates", Diagnostics::Unsigned(graph.coupledPlayerUpdates), true},
+         {"humanAlignmentUpdates", Diagnostics::Unsigned(graph.humanAlignmentUpdates), true},
          {"markerCallbacks", Diagnostics::Unsigned(graph.markerCallbacks), true},
          {"markerDispatches", Diagnostics::Unsigned(graph.markerDispatches), true},
          {"markerCallbacksSkipped", Diagnostics::Unsigned(graph.markerCallbacksSkipped), true},
@@ -8874,13 +8972,21 @@ void LogDiagnostics(Diagnostics& diagnostics) {
             if (!lock.owns_lock() || gPairedGraphRead == gPairedGraphWrite) break;
             sample = gPairedGraphProbes[gPairedGraphRead++ % kParticipantProbeRing];
         }
-        diagnostics.Log("info", "aisync_paired_graph", "Retail callback trace: side 1=source event, 2=victim event, 3=source finish; phase 0=entry, 1=return. Observation only.",
+        diagnostics.Log("info", "aisync_paired_graph", "Retail callback trace: side 1=source event, 2=victim event, 3=source finish, 4=shared animation boundary. Side 4 phase follows animation::Boundary; other phases 0=entry, 1=return. Observation only.",
             {{"sampleTick", Diagnostics::Unsigned(sample.tick), true},
              {"role", Diagnostics::Unsigned(sample.role), true},
              {"worldGeneration", Diagnostics::Unsigned(sample.generation), true},
              {"nativeEventId", Diagnostics::Unsigned(sample.event), true},
              {"side", Diagnostics::Unsigned(sample.side), true},
              {"phase", Diagnostics::Unsigned(sample.phase), true},
+             {"callbackThread", Diagnostics::Unsigned(sample.thread), true},
+             {"cycle", Diagnostics::Pointer(reinterpret_cast<const void*>(sample.cycle))},
+             {"graph", Diagnostics::Pointer(reinterpret_cast<const void*>(sample.graph))},
+             {"cycleSerial", Diagnostics::Unsigned(sample.serial), true},
+             {"callerRva", Diagnostics::Unsigned(sample.callerRva), true},
+             {"markerIndex", Diagnostics::Unsigned(sample.markerIndex), true},
+             {"sourceAlignment", std::isfinite(sample.sourceAlignment) ? std::to_string(sample.sourceAlignment) : "null", true},
+             {"victimAlignment", std::isfinite(sample.victimAlignment) ? std::to_string(sample.victimAlignment) : "null", true},
              {"sourceA", Diagnostics::Unsigned(sample.sourceA), true},
              {"sourceB", Diagnostics::Unsigned(sample.sourceB), true},
              {"victimA", Diagnostics::Unsigned(sample.victimA), true},
@@ -8992,6 +9098,9 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"pairedInitializeFailed", Diagnostics::Unsigned(ai.pairedInitializeFailed), true},
          {"pairedCycleReleased", Diagnostics::Unsigned(ai.pairedCycleReleased), true},
          {"pairedObserverCompletions", Diagnostics::Unsigned(ai.pairedObserverCompletions), true},
+         {"pairedObserverOutroRetained", Diagnostics::Unsigned(gPairedObserverOutroRetained.load()), true},
+         {"pairedObserverOutroExpired", Diagnostics::Unsigned(gPairedObserverOutroExpired.load()), true},
+         {"pairedOutroSchedulerBlocked", Diagnostics::Unsigned(gPairedOutroSchedulerBlocked.load()), true},
          {"pairedObserverFinishRetries", Diagnostics::Unsigned(gPairedObserverFinishRetries.load()), true},
          {"pairedObserverFinishCompleted", Diagnostics::Unsigned(gPairedObserverFinishCompleted.load()), true},
          {"pairedLocalVictimFinishes", Diagnostics::Unsigned(gPairedLocalVictimFinishes.load()), true},

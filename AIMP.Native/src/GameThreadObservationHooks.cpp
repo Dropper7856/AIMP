@@ -8,6 +8,7 @@
 #include "aimp/GameThreadDispatcher.h"
 #include "aimp/HookManager.h"
 #include "aimp/ItemSync.h"
+#include "aimp/ThrowableSync.h"
 #include "aimp/LevelGenerationTracker.h"
 #include "aimp/NativeLimits.h"
 #include "aimp/PlayerSyncObserver.h"
@@ -279,6 +280,7 @@ void __fastcall CharacterManagerUpdateDetour(
     ai_sync::PumpOnEngineThread();
     voice_sync::PumpOnEngineThread();
     item_sync::PumpOnEngineThread();
+    throwable_sync::PumpOnEngineThread();
     const auto original = reinterpret_cast<ManagerUpdate>(
         gManagerUpdateTrampoline.load(std::memory_order_acquire));
     if (original != nullptr) {

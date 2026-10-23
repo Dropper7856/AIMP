@@ -10,6 +10,12 @@
 
 int main() {
     using namespace aimp::ai_sync;
+    // Pursuit (2), local rejoin (1), and Host route (non-convergence) can
+    // replace each other in one tick. Old cleanup must leave the successor alive.
+    static_assert(navigation::SameLeaseOwner(true, 2U, true, 2U));
+    static_assert(!navigation::SameLeaseOwner(true, 1U, true, 2U));
+    static_assert(!navigation::SameLeaseOwner(false, 2U, true, 2U));
+    static_assert(!navigation::SameLeaseOwner(true, 2U, true, 1U));
     static_assert(!AlienSuppressionRequested(Role::Host, 0U));
     static_assert(AlienSuppressionRequested(Role::Host, kDisableAlien));
     static_assert(!AlienSuppressionRequested(Role::Retail, kDisableAlien));

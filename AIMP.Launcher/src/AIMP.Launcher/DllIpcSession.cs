@@ -69,6 +69,7 @@ internal sealed class DllIpcSession : IAsyncDisposable
     internal event EventHandler<NativeItemSyncPickupPayload>? ItemSyncPickupProduced;
 
     internal event EventHandler<NativeItemSyncSpawnPayload>? ItemSyncSpawnProduced;
+    internal event EventHandler<ReadOnlyMemory<byte>>? ThrowableProduced;
 
     internal event EventHandler<ReadOnlyMemory<byte>>? AISyncStateProduced;
 
@@ -458,6 +459,10 @@ internal sealed class DllIpcSession : IAsyncDisposable
             case MessageType.MissionSignalProduced: HandleMissionSignal(frame); return true;
             case MessageType.ItemSyncPickup: HandleItemSyncPickup(frame); return true;
             case MessageType.ItemSyncSpawn: HandleItemSyncSpawn(frame); return true;
+            case MessageType.ThrowableEvent:
+                ThrowableSyncCodec.Validate(frame.Payload.Span);
+                ThrowableProduced?.Invoke(this, frame.Payload);
+                return true;
             case MessageType.AISyncState:
                 HandleAISyncState(frame);
                 return true;
@@ -687,6 +692,14 @@ internal sealed class DllIpcSession : IAsyncDisposable
     {
         EnsureReady();
         if (type is not (MessageType.AISyncConfigure or MessageType.AISyncState or MessageType.AISyncImpact))
+            throw new ArgumentOutOfRangeException(nameof(type));
+        return SendAsync(type, payload, token);
+    }
+
+    internal Task SendThrowableAsync(MessageType type, ReadOnlyMemory<byte> payload, CancellationToken token)
+    {
+        EnsureReady();
+        if (type is not (MessageType.ThrowableConfigure or MessageType.ThrowableEvent))
             throw new ArgumentOutOfRangeException(nameof(type));
         return SendAsync(type, payload, token);
     }

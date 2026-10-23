@@ -55,6 +55,10 @@ bool Apply(std::uintptr_t character, const NavigationGoalState& goal,
 // Keep local pathfinding/steering; replicate only the Host-selected gait.
 bool ApplyGait(std::uintptr_t character, std::uint32_t moveType) noexcept;
 void Cancel(std::uintptr_t character) noexcept;
+// Retiring a movement owner must not cancel a replacement installed by a
+// different owner during the same engine tick.
+bool CancelOwned(std::uintptr_t character, bool convergence,
+    std::uint32_t requestRevision) noexcept;
 void Reset(bool cancelNative) noexcept;
 void Pump(std::uint64_t now) noexcept;
 Counters Snapshot() noexcept;
@@ -62,6 +66,10 @@ inline constexpr std::uint32_t kLiveGoal = 1U, kWorldEndpoint = 2U;
 inline constexpr std::uint32_t kPointRequest = 1U, kTurnRequest = 4U, kStanceRequest = 7U,
     kDirectedRequest = 9U;
 inline constexpr std::size_t kNavigationCapacity = 256U;
+inline constexpr bool SameLeaseOwner(const bool actualConvergence, const std::uint32_t actualRevision,
+    const bool expectedConvergence, const std::uint32_t expectedRevision) noexcept {
+    return actualConvergence == expectedConvergence && actualRevision == expectedRevision;
+}
 inline bool HasWorldEndpoint(const NavigationGoalState& goal) noexcept {
     return (goal.flags == kLiveGoal && goal.kind == kPointRequest) ||
         (goal.flags == (kLiveGoal | kWorldEndpoint) &&

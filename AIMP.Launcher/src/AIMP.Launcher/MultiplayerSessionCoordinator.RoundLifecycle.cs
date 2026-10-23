@@ -17,15 +17,47 @@ internal sealed partial class MultiplayerSessionCoordinator
     private string? _frontendLobbyReturnRole;
     private RoundReturnFence? _roundReturnFence;
 
-    private sealed class RoundReturnFence(RoundEndedPayload round)
+    internal sealed class RoundReturnFence(RoundEndedPayload round, bool recoverable = false)
     {
         internal RoundEndedPayload Round { get; } = round;
+        internal bool Recoverable { get; } = recoverable;
         internal Guid Token { get; } = Guid.NewGuid();
         internal Guid ConnectionId { get; set; }
         internal bool Acknowledged { get; set; }
         internal bool ConnectionClosed { get; set; }
+        internal bool AcknowledgementPending { get; set; }
+        internal ScaleformBridgeEvent? Ready { get; set; }
         internal TaskCompletionSource<bool> Closed { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource<bool> Retry { get; set; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // Caller holds _stateGate. A live/locally replaced socket cannot be
+        // abandoned: its movie may still be dispatching native callbacks.
+        internal bool CanRenew => Recoverable && ConnectionClosed && !Acknowledged
+            && !AcknowledgementPending && !Closed.Task.IsCompleted;
+
+        internal bool TryBind(ScaleformBridgeEvent ready)
+        {
+            if (ready.ConnectionId == Guid.Empty || Closed.Task.IsCompleted || Acknowledged
+                || AcknowledgementPending || ConnectionClosed
+                || (ConnectionId != Guid.Empty && ConnectionId != ready.ConnectionId)) return false;
+            ConnectionId = ready.ConnectionId;
+            Ready = ready;
+            AcknowledgementPending = true;
+            return true;
+        }
+
+        internal bool CompleteIfReady() =>
+            Acknowledged && ConnectionClosed && Closed.TrySetResult(true);
+
+        internal bool AcceptPeerClosure(ScaleformBridgeConnectionClosed value)
+        {
+            if (value.Channel != "command" || !value.PeerClosed || ConnectionId == Guid.Empty
+                || ConnectionId != value.ConnectionId) return false;
+            ConnectionClosed = true;
+            return true;
+        }
     }
 
     private void OnNativePlayerLifecycleStateChanged(
@@ -84,6 +116,11 @@ internal sealed partial class MultiplayerSessionCoordinator
         _diagnostics.Log("PlayerLifecycle",
             $"Round {value.LevelGeneration} ended ({value.Reason}); minimum lobby return delay " +
             $"{value.ReturnDelayMilliseconds} ms, followed by HUD readiness/closure.");
+        if (fence.Recoverable)
+        {
+            await RecoverSurvivalRoundReturnAsync(fence).ConfigureAwait(false);
+            return;
+        }
         try
         {
             if (!await ShowRoundEndAsync(fence).ConfigureAwait(false))
@@ -113,6 +150,83 @@ internal sealed partial class MultiplayerSessionCoordinator
         }
     }
 
+    private async Task RecoverSurvivalRoundReturnAsync(RoundReturnFence fence)
+    {
+        try
+        {
+            await NotifySurvivalReturnAsync(fence).ConfigureAwait(false);
+            await Task.Delay(fence.Round.ReturnDelayMilliseconds, _lifetime.Token).ConfigureAwait(false);
+            while (CurrentSurvivalReturnFence(fence) is { } current)
+            {
+                await NotifySurvivalReturnAsync(fence = current).ConfigureAwait(false);
+                if (!await WaitForSurvivalReturnAsync(fence).ConfigureAwait(false)) continue;
+                await ReturnToLobbyAsync(fence).ConfigureAwait(false);
+                return;
+            }
+        }
+        catch (Exception exception) when (exception is IOException or ObjectDisposedException
+            || (exception is OperationCanceledException && _lifetime.IsCancellationRequested))
+        { _diagnostics.Log("PlayerLifecycle", $"Round return stopped: {exception.Message}"); }
+    }
+
+    private RoundReturnFence? CurrentSurvivalReturnFence(RoundReturnFence fence)
+    {
+        lock (_stateGate)
+        {
+            if (!ReferenceEquals(_roundReturnFence, fence) || _start is null
+                || _start.SessionId != fence.Round.SessionId
+                || _start.LevelGeneration != fence.Round.LevelGeneration) return null;
+            if (!fence.CanRenew) return fence.Closed.Task.IsCompletedSuccessfully
+                && !fence.Closed.Task.Result ? null : fence;
+            // Renewal is allowed only after the old peer actually closed and
+            // its ACK continuation settled. The new movie must prove readiness.
+            _roundReturnFence = new RoundReturnFence(fence.Round, recoverable: true);
+            fence.Closed.TrySetResult(false);
+            return _roundReturnFence;
+        }
+    }
+
+    private (bool Show, ScaleformBridgeEvent? Ready) ReserveSurvivalReturnNotification(RoundReturnFence fence)
+    {
+        lock (_stateGate)
+        {
+            if (!ReferenceEquals(_roundReturnFence, fence)) return (false, null);
+            if (fence.ConnectionId == Guid.Empty) return (true, null);
+            if (fence.Acknowledged || fence.ConnectionClosed || fence.AcknowledgementPending
+                || fence.Ready is not { } ready) return (false, null);
+            fence.AcknowledgementPending = true;
+            return (false, ready);
+        }
+    }
+
+    private async Task NotifySurvivalReturnAsync(RoundReturnFence fence)
+    {
+        var notification = ReserveSurvivalReturnNotification(fence);
+        if (notification.Ready is { } ready) _ = AcknowledgeRoundReturnAsync(ready, fence);
+        if (!notification.Show) return;
+        try { await ShowRoundEndAsync(fence).ConfigureAwait(false); }
+        catch (Exception exception) when (exception is IOException or ObjectDisposedException)
+        { _diagnostics.Log("PlayerLifecycle", $"Round HUD notification deferred: {exception.Message}"); }
+    }
+
+    private async Task<bool> WaitForSurvivalReturnAsync(RoundReturnFence fence)
+    {
+        try
+        {
+            var completed = await Task.WhenAny(fence.Closed.Task, fence.Retry.Task)
+                .WaitAsync(TimeSpan.FromSeconds(10), _lifetime.Token).ConfigureAwait(false);
+            if (completed == fence.Closed.Task) return await fence.Closed.Task.ConfigureAwait(false);
+            lock (_stateGate) fence.Retry = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            await Task.Delay(250, _lifetime.Token).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            _diagnostics.Log("PlayerLifecycle",
+                $"Round {fence.Round.LevelGeneration} return deferred: awaiting HUD readiness/peer closure; retry remains active.");
+        }
+        return false;
+    }
+
     private RoundReturnFence? BeginRoundEnd(RoundEndedPayload value)
     {
         lock (_stateGate)
@@ -120,7 +234,7 @@ internal sealed partial class MultiplayerSessionCoordinator
             if (_start is null || _start.SessionId != value.SessionId || _start.LevelGeneration != value.LevelGeneration
                 || _roundEndingGeneration == value.LevelGeneration) return null;
             _roundEndingGeneration = value.LevelGeneration;
-            _roundReturnFence = new RoundReturnFence(value);
+            _roundReturnFence = new RoundReturnFence(value, LevelGameMode(_start.Level) == "Survival");
             return _roundReturnFence;
         }
     }
@@ -136,7 +250,8 @@ internal sealed partial class MultiplayerSessionCoordinator
             ["seconds"] = seconds.ToString(CultureInfo.InvariantCulture),
             ["generation"] = value.LevelGeneration.ToString(CultureInfo.InvariantCulture),
             ["sessionId"] = value.SessionId.ToString("D"),
-            ["returnToken"] = fence.Token.ToString("D")
+            ["returnToken"] = fence.Token.ToString("D"),
+            ["retryReturn"] = fence.Recoverable ? "1" : "0"
         }, _lifetime.Token);
     }
 
@@ -155,8 +270,7 @@ internal sealed partial class MultiplayerSessionCoordinator
                 || current.Round.LevelGeneration != generation || _start is null || _start.SessionId != sessionId
                 || _start.LevelGeneration != generation || current.Closed.Task.IsCompleted) return;
             fence = current;
-            if (fence.ConnectionId != Guid.Empty && fence.ConnectionId != value.ConnectionId) return;
-            fence.ConnectionId = value.ConnectionId;
+            if (!fence.TryBind(value)) return;
         }
         _diagnostics.Log("PlayerLifecycle", $"Round {generation}: HUD ready; acknowledging before its connection closes.");
         _ = AcknowledgeRoundReturnAsync(value, fence);
@@ -181,13 +295,21 @@ internal sealed partial class MultiplayerSessionCoordinator
         }
         catch (Exception exception) when (exception is IOException or ObjectDisposedException)
         { _diagnostics.Log("PlayerLifecycle", $"Round return acknowledgement failed: {exception.Message}"); }
+        finally
+        {
+            lock (_stateGate)
+            {
+                fence.AcknowledgementPending = false;
+                if (fence.Recoverable && !fence.Acknowledged) fence.Retry.TrySetResult(true);
+            }
+        }
     }
 
     // The ACK write continuation and reader termination can run in either order.
     // Both must complete for this authorized connection before native teardown.
     private void CompleteRoundReturnFence(RoundReturnFence fence)
     {
-        if (fence.Acknowledged && fence.ConnectionClosed && fence.Closed.TrySetResult(true))
+        if (fence.CompleteIfReady())
             _diagnostics.Log("PlayerLifecycle", $"Round {fence.Round.LevelGeneration}: acknowledged HUD connection closed.");
     }
 
@@ -197,8 +319,7 @@ internal sealed partial class MultiplayerSessionCoordinator
         lock (_stateGate)
         {
             var fence = _roundReturnFence;
-            if (fence is null || fence.ConnectionId == Guid.Empty || fence.ConnectionId != value.ConnectionId) return;
-            fence.ConnectionClosed = true;
+            if (fence is null || !fence.AcceptPeerClosure(value)) return;
             CompleteRoundReturnFence(fence);
         }
     }
