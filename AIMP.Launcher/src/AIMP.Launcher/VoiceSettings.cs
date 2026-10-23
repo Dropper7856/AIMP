@@ -12,7 +12,7 @@ internal sealed record VoiceSettings(bool Enabled = true, string Mode = "pushToT
         PushToTalkKey = PushToTalkKey is >= 1 and <= 254 ? PushToTalkKey : 0x56,
         ActivationThreshold = Clamp(ActivationThreshold, 0, 1, 0.02f),
         InputGain = Clamp(InputGain, 0, 4, 1),
-        PlaybackVolume = Clamp(PlaybackVolume, 0, 1, 1)
+        PlaybackVolume = Clamp(PlaybackVolume, 0, 3, 1)
     };
 
     internal bool TryValidate(out string error)
@@ -22,7 +22,7 @@ internal sealed record VoiceSettings(bool Enabled = true, string Mode = "pushToT
             : PushToTalkKey is < 1 or > 254 ? "Push-to-talk key must be a Windows virtual key between 1 and 254."
             : !InRange(ActivationThreshold, 0, 1) ? "Voice activation threshold must be between 0 and 1."
             : !InRange(InputGain, 0, 4) ? "Voice input gain must be between 0 and 4."
-            : !InRange(PlaybackVolume, 0, 1) ? "Voice playback volume must be between 0 and 1."
+            : !InRange(PlaybackVolume, 0, 3) ? "Voice playback volume must be between 0 and 3 (300%)."
             : string.Empty;
         return error.Length == 0;
     }

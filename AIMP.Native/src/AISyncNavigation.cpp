@@ -1,6 +1,7 @@
 #include "aimp/AISyncNavigation.h"
 #include "aimp/CrashGuard.h"
 #include "aimp/CharacterDirectStepRuntime.h"
+#include "aimp/CharacterResourceAdmission.h"
 #include "aimp/HookManager.h"
 
 #include <Windows.h>
@@ -415,7 +416,7 @@ HeadObservation InspectHead(const std::uintptr_t character) noexcept {
     result.readable = true;
     return result;
 }
-bool Apply(const std::uintptr_t character, const NavigationGoalState& goal,
+static bool ApplyPinned(const std::uintptr_t character, const NavigationGoalState& goal,
     const std::uint64_t expiresAt, std::string& error, const bool convergence) noexcept {
     if (gBase == 0U || (goal.flags & kLiveGoal) == 0U || !ValidGoal(goal)) return false;
     // A captured world endpoint is a decision above steering, even when the
@@ -571,6 +572,17 @@ bool Apply(const std::uintptr_t character, const NavigationGoalState& goal,
         return false;
     }
 }
+bool Apply(const std::uintptr_t character, const NavigationGoalState& goal,
+    const std::uint64_t expiresAt, std::string& error, const bool convergence) noexcept {
+    if (gBase == 0U || character < 0x10000U) return false;
+    const character_direct_step_runtime::MovementResourceLease resources(character);
+    if (!resources) {
+        error = "AISync movement resources are not ready";
+        return false;
+    }
+    // Pin outside the SEH leaf: a stop/goal setter can call into native graphs.
+    return ApplyPinned(character, goal, expiresAt, error, convergence);
+}
 bool ApplyGait(const std::uintptr_t character, const std::uint32_t moveType) noexcept {
     std::uintptr_t movement{};
     std::uint32_t requested{};
@@ -589,6 +601,14 @@ bool ApplyGait(const std::uintptr_t character, const std::uint32_t moveType) noe
 }
 void Cancel(const std::uintptr_t character) noexcept {
     if (auto* lease = Find(character)) Release(*lease, true);
+}
+bool CancelOwned(const std::uintptr_t character, const bool convergence,
+    const std::uint32_t requestRevision) noexcept {
+    auto* lease = Find(character);
+    if (lease == nullptr || !SameLeaseOwner(lease->convergence, lease->requestRevision,
+        convergence, requestRevision)) return false;
+    Release(*lease, true);
+    return true;
 }
 void Reset(const bool cancelNative) noexcept {
     ResetSubmissionObservations();

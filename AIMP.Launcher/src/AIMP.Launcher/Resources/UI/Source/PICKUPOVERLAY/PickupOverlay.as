@@ -152,6 +152,7 @@ package
       private var aimp_round_return_pending:Boolean = false;
 
       private var aimp_round_return_ack_deadline:int = 0;
+      private var aimp_round_return_retry:Boolean = false;
 
       private var aimp_bridge_close_pending:Boolean = false;
 
@@ -733,6 +734,22 @@ package
          }
          if(this.aimp_round_return_pending && !this.aimp_bridge_close_pending && getTimer() >= this.aimp_round_return_ack_deadline)
          {
+            if(this.aimp_round_return_retry)
+            {
+               // A timeout does not end the readiness handshake. Keep this
+               // movie alive until its matching ACK is consumed on a frame.
+               this.aimp_round_end_count_text.text = "Returning to lobby...";
+               this.aimp_round_return_ack_deadline = getTimer() + 2000;
+               if(this.aimp_bridge_socket == null)
+               {
+                  this.aimp_bridge_init_pending = true;
+               }
+               else
+               {
+                  this.aimp_send_bridge_message("ROUND_RETURN_READY|source=pickup_overlay|phase=gameplay" + this.aimp_round_return_fields);
+               }
+               return;
+            }
             this.aimp_round_end_count_text.text = "Unable to return to lobby. Use Disconnect in Pause.";
             this.aimp_returning = true;
             removeEventListener(Event.ENTER_FRAME,this.aimp_on_bridge_frame);
@@ -759,6 +776,19 @@ package
          }
          if(this.aimp_round_return_pending)
          {
+            if(this.aimp_round_return_retry && param1.indexOf("ROUND_END|") == 0 &&
+               this.aimp_get_bridge_value(param1,"retryReturn") == "1" &&
+               this.aimp_get_bridge_value(param1,"sessionId") == this.aimp_get_bridge_value(this.aimp_round_return_fields,"sessionId") &&
+               this.aimp_get_bridge_value(param1,"generation") == this.aimp_get_bridge_value(this.aimp_round_return_fields,"generation"))
+            {
+               // Only a renewed token for the same ended round is admissible.
+               this.aimp_round_return_fields = "|sessionId=" + this.aimp_encode_bridge_value(this.aimp_get_bridge_value(param1,"sessionId"));
+               this.aimp_round_return_fields += "|generation=" + this.aimp_encode_bridge_value(this.aimp_get_bridge_value(param1,"generation"));
+               this.aimp_round_return_fields += "|returnToken=" + this.aimp_encode_bridge_value(this.aimp_get_bridge_value(param1,"returnToken"));
+               this.aimp_round_return_ack_deadline = getTimer() + 10000;
+               this.aimp_send_bridge_message("ROUND_RETURN_READY|source=pickup_overlay|phase=gameplay" + this.aimp_round_return_fields);
+               return;
+            }
             if(param1.indexOf("ROUND_RETURN_CLOSE|") == 0 &&
                this.aimp_get_bridge_value(param1,"returnToken") == this.aimp_get_bridge_value(this.aimp_round_return_fields,"returnToken") &&
                this.aimp_get_bridge_value(param1,"sessionId") == this.aimp_get_bridge_value(this.aimp_round_return_fields,"sessionId") &&
@@ -915,6 +945,7 @@ package
             this.aimp_round_end_remaining = _loc4_;
             this.aimp_update_round_end_count();
             this.aimp_round_end_deadline = getTimer() + _loc4_ * 1000;
+            this.aimp_round_return_retry = this.aimp_get_bridge_value(param1,"retryReturn") == "1";
             this.aimp_round_end_active = true;
             this.aimp_round_return_fields = "|sessionId=" + this.aimp_encode_bridge_value(this.aimp_get_bridge_value(param1,"sessionId"));
             this.aimp_round_return_fields += "|generation=" + this.aimp_encode_bridge_value(this.aimp_get_bridge_value(param1,"generation"));
@@ -980,6 +1011,7 @@ package
       {
          this.aimp_round_end_active = false;
          this.aimp_round_return_fields = "";
+         this.aimp_round_return_retry = false;
          if(this.aimp_round_end_layer != null && this.aimp_round_end_layer.parent != null)
          {
             this.aimp_round_end_layer.parent.removeChild(this.aimp_round_end_layer);

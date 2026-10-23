@@ -59,6 +59,7 @@ internal sealed class NativeRuntimeController : IDisposable
     internal event EventHandler<NativeItemSyncPickupPayload>? ItemSyncPickupProduced;
 
     internal event EventHandler<NativeItemSyncSpawnPayload>? ItemSyncSpawnProduced;
+    internal event EventHandler<ReadOnlyMemory<byte>>? ThrowableProduced;
 
     internal event EventHandler<ReadOnlyMemory<byte>>? AISyncStateProduced;
 
@@ -391,6 +392,9 @@ internal sealed class NativeRuntimeController : IDisposable
     internal Task SendAISyncConfigurationAsync(ReadOnlyMemory<byte> payload, CancellationToken token) =>
         GetCommandSession().SendAISyncAsync(MessageType.AISyncConfigure, payload, token);
 
+    internal Task SendThrowableAsync(MessageType type, ReadOnlyMemory<byte> payload, CancellationToken token) =>
+        GetCommandSession().SendThrowableAsync(type, payload, token);
+
     internal Task SendAISyncStateAsync(ReadOnlyMemory<byte> payload, CancellationToken token) =>
         GetCommandSession().SendAISyncAsync(MessageType.AISyncState, payload, token);
 
@@ -632,6 +636,7 @@ internal sealed class NativeRuntimeController : IDisposable
         session.MissionSignalProduced += OnMissionSignalProduced;
         session.ItemSyncPickupProduced += OnItemSyncPickupProduced;
         session.ItemSyncSpawnProduced += OnItemSyncSpawnProduced;
+        session.ThrowableProduced += OnThrowableProduced;
         session.AISyncStateProduced += OnAISyncStateProduced;
         session.AISyncImpactProduced += OnAISyncImpactProduced;
         session.ConnectionClosed += OnConnectionClosed;
@@ -653,12 +658,16 @@ internal sealed class NativeRuntimeController : IDisposable
         session.MissionSignalProduced -= OnMissionSignalProduced;
         session.ItemSyncPickupProduced -= OnItemSyncPickupProduced;
         session.ItemSyncSpawnProduced -= OnItemSyncSpawnProduced;
+        session.ThrowableProduced -= OnThrowableProduced;
         session.AISyncStateProduced -= OnAISyncStateProduced;
         session.AISyncImpactProduced -= OnAISyncImpactProduced;
         session.ConnectionClosed -= OnConnectionClosed;
     }
 
     private void OnSessionLog(object? sender, string message) => Log(message, "DLL");
+
+    private void OnThrowableProduced(object? sender, ReadOnlyMemory<byte> value) =>
+        ThrowableProduced?.Invoke(this, value);
 
     private void OnWorldIntentReceived(object? sender, WorldIntent value) =>
         WorldIntentProduced?.Invoke(this, value);

@@ -1,4 +1,5 @@
 #include "aimp/CharacterDirectStepRuntime.h"
+#include "aimp/CharacterResourceAdmission.h"
 #include "aimp/AISyncExecutionPolicy.h"
 #include "aimp/PlayerPostureRuntime.h"
 #include "aimp/PlayerTorchRuntime.h"
@@ -136,7 +137,6 @@ struct MovementSlot final {
     std::atomic<bool> idleConverged{false};
     // A paired attack that aborted before retail's 4E destructor could clear
     // the victim's grapple bytes leaves the representation frozen.
-    std::atomic<std::uint64_t> staleGrappleSinceMs{0U};
     std::atomic<bool> pairedHoldReleaseRequested{false};
     std::atomic<std::uint64_t> nextIdleValidationTickMs{0U};
     std::atomic<std::uintptr_t> certifiedCycleAddress{0U};
@@ -181,7 +181,6 @@ std::array<MovementSlot, MaximumConcurrentTargets()> gSlots{};
 std::atomic<std::uintptr_t> gLastArmedCharacter{0U};
 std::atomic<std::uint64_t> gStaleGrappleReleases{0U};
 std::atomic<PairedVictimHeldQuery> gPairedVictimHeldQuery{nullptr};
-constexpr std::uint64_t kStaleGrappleReleaseMs = 1500U;
 std::uintptr_t gModuleBase{};
 std::uintptr_t gGlobalStateRootAddress{};
 ActivateLocomotionCycleFn gActivateLocomotionCycle{};
@@ -697,15 +696,15 @@ bool PairedCycleState(const std::uint8_t state) noexcept {
     return state == 0x16U || state == 0x42U || state == 0x4EU || state == 0x4FU || state == 0x47U;
 }
 
-// Engine thread. Retail clears victim +297/+298/+299 in the 4E destructor
+// Engine thread. Retail clears victim +297/+29A in the 4E destructor
 // (0065B190) through the source cycle's +44 victim pointer. An aborted Client
 // replay zeroes +44 first, so the bytes leak and RetailOwnsPhysicalCycle keeps
 // the representation frozen. Clear them only when no paired cycle owns the
-// Character and it is not dying: on AISync request, or after a bounded delay.
+// Character and it is not dying, after AISync explicitly retires this pair.
+// Elapsed time is not proof that a native interaction has ended.
 bool ReleaseStalePairedHold(MovementSlot& slot, const std::uintptr_t characterAddress) noexcept {
     std::uint8_t grappled{};
     if (!GuardedReadValue(characterAddress + 0x297U, grappled) || grappled == 0U) {
-        slot.staleGrappleSinceMs.store(0U, std::memory_order_relaxed);
         slot.pairedHoldReleaseRequested.store(false, std::memory_order_relaxed);
         return false;
     }
@@ -713,22 +712,15 @@ bool ReleaseStalePairedHold(MovementSlot& slot, const std::uintptr_t characterAd
     std::uint8_t state{};
     std::uint32_t health{};
     const auto held = gPairedVictimHeldQuery.load(std::memory_order_acquire);
-    if ((ReadNativeCycle(characterAddress, cycle, state) && PairedCycleState(state)) ||
+    if (!ReadNativeCycle(characterAddress, cycle, state) || PairedCycleState(state) ||
         !GuardedReadValue(characterAddress + 0x32CU, health) || health >= 3U ||
         (held != nullptr && held(characterAddress))) {
-        slot.staleGrappleSinceMs.store(0U, std::memory_order_relaxed);
         return false;
     }
-    const auto now = GetTickCount64();
-    auto since = slot.staleGrappleSinceMs.load(std::memory_order_relaxed);
-    if (since == 0U) slot.staleGrappleSinceMs.store(since = now, std::memory_order_relaxed);
-    if (!slot.pairedHoldReleaseRequested.load(std::memory_order_acquire) && now - since < kStaleGrappleReleaseMs)
-        return false;
+    if (!slot.pairedHoldReleaseRequested.load(std::memory_order_acquire)) return false;
     constexpr std::uint8_t kClear = 0U;
     if (!GuardedWriteValue(characterAddress + 0x297U, kClear) ||
-        !GuardedWriteValue(characterAddress + 0x298U, kClear) ||
-        !GuardedWriteValue(characterAddress + 0x299U, kClear)) return false;
-    slot.staleGrappleSinceMs.store(0U, std::memory_order_relaxed);
+        !GuardedWriteValue(characterAddress + 0x29AU, kClear)) return false;
     slot.pairedHoldReleaseRequested.store(false, std::memory_order_release);
     // Converge on the latest network transform instead of resuming in place.
     slot.idleConverged.store(false, std::memory_order_release);
@@ -847,7 +839,7 @@ bool PrepareNativeMovementAction(
         movementAction + kMovementActionStateOffset, moveState);
 }
 
-bool CallNativeMoveTransition(
+bool CallNativeMoveTransitionWithResources(
     MovementSlot& slot,
     const std::uintptr_t characterAddress,
     const bool reacquisition) noexcept {
@@ -937,7 +929,23 @@ bool CallNativeMoveTransition(
     return true;
 }
 
-bool CallNativeIdleTransition(
+bool CallNativeMoveTransition(
+    MovementSlot& slot,
+    const std::uintptr_t characterAddress,
+    const bool reacquisition) noexcept {
+    const MovementResourceLease resources(characterAddress);
+    if (!resources) {
+        slot.nativeStateActive.store(false, std::memory_order_release);
+        slot.activationFailures.fetch_add(1U, std::memory_order_relaxed);
+        AppendLocomotionFlight("move_resources_unavailable", slot, characterAddress,
+            slot.stateAddress.load(std::memory_order_relaxed),
+            slot.lastObservedNativeState.load(std::memory_order_relaxed));
+        return false;
+    }
+    return CallNativeMoveTransitionWithResources(slot, characterAddress, reacquisition);
+}
+
+bool CallNativeIdleTransitionWithResources(
     MovementSlot& slot,
     const std::uintptr_t characterAddress) noexcept {
     std::uintptr_t cycleAddress = 0U;
@@ -982,6 +990,17 @@ bool CallNativeIdleTransition(
     slot.nativeIdleApplications.fetch_add(1U, std::memory_order_relaxed);
     AppendLocomotionFlight("idle_transition_applied", slot, characterAddress, nextCycle, nextState);
     return true;
+}
+
+bool CallNativeIdleTransition(
+    MovementSlot& slot,
+    const std::uintptr_t characterAddress) noexcept {
+    const MovementResourceLease resources(characterAddress);
+    if (!resources) {
+        slot.protectedFailures.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+    return CallNativeIdleTransitionWithResources(slot, characterAddress);
 }
 
 bool WriteReplicatedYaw(
@@ -2844,7 +2863,7 @@ bool HoldAIIntentIdle(
     return true;
 }
 
-AIExecutionReplayResult ReplayAIExecutionTransition(
+static AIExecutionReplayResult ReplayAIExecutionTransitionWithResources(
     const std::uintptr_t characterAddress,
     const std::uint32_t cycleTypeRva,
     const std::uint32_t cycleState,
@@ -2909,6 +2928,31 @@ AIExecutionReplayResult ReplayAIExecutionTransition(
         return AIExecutionReplayResult::Failed;
     }
 #endif
+}
+
+AIExecutionReplayResult ReplayAIExecutionTransition(
+    const std::uintptr_t characterAddress,
+    const std::uint32_t cycleTypeRva,
+    const std::uint32_t cycleState,
+    std::string& error) noexcept {
+    // Preserve the existing no-op/unsupported and unload handling. Those
+    // branches never invoke a native transition and need no resource lease.
+    if (!GameplayLoaded() || !Installed() || gModuleBase == 0U || characterAddress == 0U ||
+        cycleTypeRva == 0U || cycleState > 0xFFU ||
+        cycleState == kNpcLocomotionIdleState || cycleState == kNpcLocomotionMoveState ||
+        cycleState == 0x42U || cycleState == 0x47U || cycleState == 0x4EU || cycleState == 0x4FU ||
+        ai_sync::FindExecutionTransition(cycleTypeRva, cycleState) == nullptr ||
+        RetailOwnsPhysicalCycle(characterAddress))
+        return ReplayAIExecutionTransitionWithResources(characterAddress, cycleTypeRva, cycleState, error);
+    // In particular 3B/006625E0 destroys the previous cycle before 00661270
+    // reads the movement reference. Check and pin BEFORE either side effect.
+    // Keep the native RET4 wrapper and its ignored argument in the inner call.
+    const MovementResourceLease resources(characterAddress);
+    if (!resources) {
+        error = "AI execution replay deferred: native movement resources are unavailable";
+        return AIExecutionReplayResult::Failed;
+    }
+    return ReplayAIExecutionTransitionWithResources(characterAddress, cycleTypeRva, cycleState, error);
 }
 
 bool ReleaseAIIntentOwnership(const std::uintptr_t characterAddress) noexcept {

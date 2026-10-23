@@ -203,7 +203,8 @@ bool FinishReplicatedInteraction(std::uintptr_t characterAddress) noexcept;
 
 // Any thread: an aborted or abandoned paired attack no longer owns this remote
 // player representation. The next engine pump clears the leaked retail grapple
-// bytes (+297..+299) unless a paired cycle or death owns the Character.
+// bytes (+297/+29A) only with a readable, non-paired current cycle and no death
+// or source ownership. Time alone never releases a victim.
 void RequestPairedVictimRelease(std::uintptr_t characterAddress) noexcept;
 [[nodiscard]] std::uint64_t StalePairedHoldReleases() noexcept;
 

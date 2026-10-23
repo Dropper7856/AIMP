@@ -70,7 +70,7 @@ struct Callbacks final {
 };
 
 struct Counters final {
-    std::uint64_t sourceUpdates{}, coupledPlayerUpdates{};
+    std::uint64_t sourceUpdates{}, coupledPlayerUpdates{}, humanAlignmentUpdates{};
     std::uint64_t markerCallbacks{}, markerCallbacksSkipped{}, markerDispatches{};
     std::uint64_t boundedListenerScans{};
     std::uint64_t scriptedCaptured{}, scriptedUnsupported{}, scriptedApplied{}, scriptedFailed{};

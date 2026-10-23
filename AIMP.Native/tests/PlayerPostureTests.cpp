@@ -4,6 +4,8 @@
 #include "aimp/Common.h"
 
 #include <cstddef>
+#include <cmath>
+#include <limits>
 #include <iostream>
 #include <span>
 #include <string>
@@ -16,7 +18,22 @@ void Check(const bool result, const char* name) {
 }
 
 int main() {
-    static_assert(aimp::kProtocolVersion == 10U);
+    std::array<float, 12> light{};
+    Check(aimp::player_torch::BuildYawTransform(0.0F, {2.0F, 3.0F, 4.0F}, light),
+        "Remote torch transform");
+    Check(light[0] == 1.0F && light[5] == 1.0F && light[10] == 1.0F
+        && light[3] == 2.0F && light[7] == 3.0F && light[11] == 4.0F,
+        "Torch uses native compact transform translation");
+    Check(aimp::player_torch::BuildYawTransform(1.570796327F, {2.0F, 3.0F, 4.0F}, light)
+        && std::abs(light[2] - 1.0F) < 0.00001F && std::abs(light[8] + 1.0F) < 0.00001F,
+        "Torch follows remote yaw");
+    const auto previousLight = light;
+    Check(!aimp::player_torch::BuildYawTransform(std::numeric_limits<float>::quiet_NaN(),
+        {2.0F, 3.0F, 4.0F}, light) && light == previousLight, "Reject invalid torch direction");
+    Check(!aimp::player_torch::BuildYawTransform(0.0F,
+        {std::numeric_limits<float>::infinity(), 3.0F, 4.0F}, light) && light == previousLight,
+        "Reject invalid torch position");
+    static_assert(aimp::kProtocolVersion == 11U);
     using namespace aimp::player_posture;
     State value{};
     Check(Decode("0,0,0,0,0,0,0", value), "Standing state");

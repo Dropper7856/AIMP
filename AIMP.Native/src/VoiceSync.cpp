@@ -112,6 +112,17 @@ Speaker* ForPlaying(const std::uint32_t id) noexcept {
     return nullptr;
 }
 
+// Gain above unity is applied here, not through Wwise's input gain, so a boost
+// up to 300% is honoured even if the engine clamps that callback. A soft knee
+// keeps loud speech from hard-clipping; spatial mix stays with Wwise.
+float BoostSample(const float sample, const float boost) noexcept {
+    constexpr float kKnee = 0.8F;
+    const auto value = sample * boost;
+    const auto magnitude = std::fabs(value);
+    if (magnitude <= kKnee) return value;
+    const auto limited = kKnee + (1.0F - kKnee) * std::tanh((magnitude - kKnee) / (1.0F - kKnee));
+    return value < 0.0F ? -limited : limited;
+}
 void __cdecl Render(const std::uint32_t id, AudioBuffer* buffer) noexcept {
     auto* speaker = ForPlaying(id);
     if (speaker == nullptr) {
@@ -139,8 +150,11 @@ void __cdecl Render(const std::uint32_t id, AudioBuffer* buffer) noexcept {
     const auto count = active && !speaker->buffering
         ? (std::min)(static_cast<std::uint32_t>(buffer->maximum), write - read) : 0U;
     // Mono PCM only. Wwise owns panning, attenuation, filtering and aux/reverb.
-    for (std::uint32_t i = 0U; i < count; ++i)
-        buffer->data[i] = speaker->samples[(read + i) % kRingSize];
+    const auto boost = (std::max)(gVolume.load(std::memory_order_relaxed), 1.0F);
+    for (std::uint32_t i = 0U; i < count; ++i) {
+        const auto sample = speaker->samples[(read + i) % kRingSize];
+        buffer->data[i] = boost > 1.0F ? BoostSample(sample, boost) : sample;
+    }
     std::fill(buffer->data + count, buffer->data + buffer->maximum, 0.0F);
     read += count;
     speaker->read.store(read, std::memory_order_release);
@@ -156,7 +170,7 @@ void __cdecl SetFormat(const std::uint32_t id, AudioFormat* format) noexcept {
 }
 float __cdecl GetGain(const std::uint32_t id) noexcept {
     // User playback volume only; engine/Wwise own the spatial acoustic mix.
-    if (ForPlaying(id) != nullptr) return gVolume.load(std::memory_order_relaxed);
+    if (ForPlaying(id) != nullptr) return (std::min)(gVolume.load(std::memory_order_relaxed), 1.0F);
     const auto original = gOriginalGain.load(std::memory_order_acquire);
     return original != nullptr ? original(id) : 1.0F;
 }
@@ -381,7 +395,7 @@ bool Configure(const std::span<const std::byte> bytes, const bool authorityHost)
     Configuration configuration{};
     std::memcpy(&configuration, bytes.data(), sizeof(configuration));
     if (configuration.magic != 0x31435641U || configuration.flags > 3U || configuration.reserved != 0U ||
-        !std::isfinite(configuration.volume) || configuration.volume < 0.0F || configuration.volume > 1.0F ||
+        !std::isfinite(configuration.volume) || configuration.volume < 0.0F || configuration.volume > 3.0F ||
         ((configuration.flags & 1U) != 0U && (configuration.native == 0U || configuration.round == 0U ||
             configuration.localPeer == 0U || ((configuration.flags & 2U) != 0U) != authorityHost))) return false;
     std::lock_guard lock(gQueueLock);

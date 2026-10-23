@@ -41,6 +41,7 @@
 #include "aimp/LoadingContextGuard.h"
 #include "aimp/MultiplayerPause.h"
 #include "aimp/ItemSync.h"
+#include "aimp/ThrowableSync.h"
 #include "aimp/PeerManager.h"
 #include "aimp/RangeProvider.h"
 #include "aimp/SignatureResolver.h"
@@ -674,6 +675,15 @@ DWORD Bootstrap::RunImpl() {
         diagnostics.Log(installed ? "info" : "error", "itemsync_initialized",
             installed ? "[ItemSync] initialized: InventoryItem collections are observed; spawned pickups use the pickup manager, placed pickups replay native completion without an inventory grant."
                 : (itemSyncError.empty() ? "[ItemSync] unavailable: exact executable hash required." : itemSyncError));
+    }
+
+    {
+        std::string throwableError;
+        const bool installed = validation.hashMatch && levelGenerations != nullptr &&
+            throwable_sync::Install(moduleBase, *hooks, *levelGenerations, *gameThreadDispatcher, throwableError);
+        diagnostics.Log(installed ? "info" : "error", "throwables_initialized",
+            installed ? "Native released item factories and Host lifetime replication installed."
+                : (throwableError.empty() ? "Throwables require the exact executable hash." : throwableError));
     }
 
     if (signaturesValid && resolver != nullptr) {
@@ -1562,6 +1572,7 @@ DWORD Bootstrap::RunImpl() {
     player_lifecycle::Shutdown();
     multiplayer_pause::Shutdown();
     item_sync::Shutdown();
+    throwable_sync::Shutdown();
     player_lifecycle::DrainDiagnostics(diagnostics);
     character_action_runtime::RequestStopAll();
     const auto actionReleaseDeadline = GetTickCount64() + 5500U;
@@ -1572,7 +1583,7 @@ DWORD Bootstrap::RunImpl() {
     const bool retainAISyncHooks = ai_sync::Installed();
     // The ItemSync detour runs on the engine thread like the pause shims: keep it for the process lifetime.
     const bool retainUiRuntime = ui_heap_guard::Installed() || multiplayer_pause::Installed() ||
-        item_sync::Installed() || voice_sync::Installed() || loading_context_guard::Installed();
+        item_sync::Installed() || throwable_sync::Installed() || voice_sync::Installed() || loading_context_guard::Installed();
     ai_sync::BeginLogicalShutdown();
     const bool retainActionReleaseHook = character_action_runtime::BeginLogicalShutdown();
     character_action_probe::BeginLogicalShutdown();

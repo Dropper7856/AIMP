@@ -7,6 +7,7 @@
 #include "aimp/GameThreadDispatcher.h"
 #include "aimp/HookManager.h"
 #include "aimp/LevelGenerationTracker.h"
+#include "aimp/NativeResourceLease.h"
 #include "aimp/SignatureResolver.h"
 
 #include <Windows.h>
@@ -148,6 +149,31 @@ std::atomic<void*> gOriginal{nullptr};
 std::atomic<bool> gInstalled{false};
 void* gTrampoline{};
 thread_local unsigned int gUpdateDepth{};
+
+using GraphCreateFn = void*(__thiscall*)(void*, std::uint32_t, std::uint32_t,
+    std::uint32_t, std::uint32_t, std::uint32_t);
+using GraphLookupFn = std::uintptr_t(__thiscall*)(void*, const void*);
+using BlendLookupFn = std::uintptr_t(__thiscall*)(void*, const void*, void*);
+std::atomic<void*> gGraphCreateOriginal{};
+void* gGraphCreateTrampoline{};
+std::uintptr_t gGraphBase{};
+
+struct GraphAdmission {
+    Birth birth{};
+    std::uintptr_t owner{}, asset{}, graphLibrary{}, blendLibrary{}, variants{};
+};
+thread_local const GraphAdmission* gGraphAdmission{};
+
+class GraphAdmissionScope final {
+public:
+    explicit GraphAdmissionScope(const GraphAdmission& value) noexcept
+        : previous_(gGraphAdmission) { gGraphAdmission = &value; }
+    explicit GraphAdmissionScope(std::nullptr_t) noexcept
+        : previous_(gGraphAdmission) { gGraphAdmission = nullptr; }
+    ~GraphAdmissionScope() { gGraphAdmission = previous_; }
+private:
+    const GraphAdmission* previous_;
+};
 
 // This is an admission hint, not an object-lifetime cache. Only AIMP-owned
 // controller addresses are published. Every hit is rechecked under mutex and
@@ -485,6 +511,134 @@ bool CharacterIdentity(const Birth& birth, std::uintptr_t& controller,
         Read(birth.character, 0x1100U, controller) && controller >= 0x10000U;
     if (valid && validatedDescriptor != nullptr) *validatedDescriptor = descriptor;
     return valid;
+}
+
+bool GraphOwnerIdentity(const GraphAdmission& admission) noexcept {
+    std::lock_guard lock(gRuntime.mutex);
+    std::uintptr_t controller{}, owner{}, variants{}, asset{}, graphs{}, blends{};
+    return EngineThread() && CharacterIdentity(admission.birth, controller) &&
+        admission.owner == admission.birth.character + 0x3F0U &&
+        Read(admission.owner, 0x730U, owner) && owner == admission.birth.character &&
+        Read(admission.owner, 0x338U, variants) && variants == admission.variants &&
+        (admission.asset == 0U ||
+            (Read(admission.owner, 0x330U, asset) && asset == admission.asset &&
+             Read(asset, 8U, graphs) && graphs == admission.graphLibrary &&
+             Read(asset, 0x10U, blends) && blends == admission.blendLibrary));
+}
+
+// Only the added preflight lookup is guarded. Its pinned libraries can still
+// contain an incomplete table while assets are loading. Refuse that admission;
+// never resume a faulted constructor or catch the original graph operation.
+std::uintptr_t LookupBlendForAdmission(const std::uintptr_t library,
+    const void* request, const std::uintptr_t variants) noexcept {
+    __try {
+        return reinterpret_cast<BlendLookupFn>(gGraphBase + 0x00636760U)(
+            reinterpret_cast<void*>(library), request, reinterpret_cast<void*>(variants));
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+        ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return 0U;
+    }
+}
+
+struct GraphWalk {
+    const GraphAdmission& admission;
+    std::array<std::uintptr_t, 64U> ancestors{};
+    std::uint32_t remaining{4096U};
+
+    bool Blend(const std::uintptr_t payload, const std::uintptr_t keyOffset) const noexcept {
+        std::array<std::uint32_t, 3U> request{};
+        if (admission.blendLibrary == 0U || !Read(payload, keyOffset, request[2]) ||
+            !GraphOwnerIdentity(admission)) return false;
+        // Exact key/variant resolver used by 006A1B90 -> 00A36760. No
+        // replacement key, fallback asset, or cached result is manufactured.
+        const auto resource = LookupBlendForAdmission(
+            admission.blendLibrary, request.data(), admission.variants);
+        return resource != 0U && Readable(reinterpret_cast<const void*>(resource), 0x3AU) &&
+            GraphOwnerIdentity(admission);
+    }
+
+    bool Node(const std::uintptr_t node, const std::size_t depth) noexcept {
+        if (depth >= ancestors.size() || remaining == 0U ||
+            !Readable(reinterpret_cast<const void*>(node), 0x28U)) return false;
+        --remaining;
+        for (std::size_t i = 0U; i < depth; ++i)
+            if (ancestors[i] == node) return false;
+        ancestors[depth] = node;
+        std::uintptr_t payload{}, table{}, factory{}, children{};
+        std::uint32_t count{};
+        if (!Read(node, 0x14U, payload) || payload == 0U || !Read(payload, 0U, table) ||
+            !Read(table, 4U, factory) || !Read(node, 0x1CU, count) ||
+            !Read(node, 0x20U, children)) return false;
+        // Native serialized node type 4 (A504E0/6A7530) and its two-resource
+        // sibling type 5 (A50770/6A7650) both require non-null blend definitions.
+        if (factory == gGraphBase + 0x006504E0U && !Blend(payload, 0x10U)) return false;
+        if (factory == gGraphBase + 0x00650770U &&
+            (!Blend(payload, 0x10U) || !Blend(payload, 0x14U))) return false;
+        return Children(children, count, depth + 1U);
+    }
+
+    bool Children(const std::uintptr_t children, const std::uint32_t count,
+        const std::size_t depth) noexcept {
+        if (count > remaining || (count != 0U && (children < 0x10000U ||
+            children > kMaximumAddress || count > (kMaximumAddress - children) / 0x28U))) return false;
+        for (std::uint32_t i = 0U; i < count; ++i)
+            if (!Node(children + i * 0x28U, depth)) return false;
+        return true;
+    }
+};
+
+std::uintptr_t __fastcall GraphLookupDetour(void* library, void*, const void* request) {
+    const auto graph = reinterpret_cast<GraphLookupFn>(gGraphBase + 0x00631400U)(library, request);
+    const auto* admission = gGraphAdmission;
+    if (admission == nullptr || graph == 0U) return graph;
+    std::uintptr_t children{};
+    std::uint32_t count{};
+    if (reinterpret_cast<std::uintptr_t>(library) != admission->graphLibrary ||
+        !GraphOwnerIdentity(*admission) ||
+        !Read(graph, 0x1CU, count) || !Read(graph, 0x24U, children)) return 0U;
+    GraphWalk walk{*admission};
+    // Returning zero feeds 6A97A2 -> 6A97DE, the native missing-resource path,
+    // before 6A9360 allocates or partially constructs any graph node.
+    return walk.Children(children, count, 0U) ? graph : 0U;
+}
+
+void* __fastcall GraphCreateDetour(void* owner, void*, const std::uint32_t a,
+    const std::uint32_t b, const std::uint32_t key, const std::uint32_t flags,
+    const std::uint32_t layer) {
+    const auto original = reinterpret_cast<GraphCreateFn>(gGraphCreateOriginal.load(std::memory_order_acquire));
+    if (original == nullptr) return nullptr;
+    const auto address = reinterpret_cast<std::uintptr_t>(owner);
+    GraphAdmission admission{};
+    {
+        std::lock_guard lock(gRuntime.mutex);
+        // The worker/render graph path remains retail-owned. Only a certified
+        // engine-thread operation may borrow a Character's live resource refs.
+        // Resident hooks become transparent once resource tracking is disabled.
+        const auto* birth = gRuntime.enabled && gRuntime.generations != nullptr &&
+            EngineThread() && address >= 0x3F0U
+            ? FindBirth(address - 0x3F0U) : nullptr;
+        if (birth != nullptr) admission.birth = *birth;
+    }
+    if (admission.birth.character == 0U) {
+        const GraphAdmissionScope scope(nullptr);
+        return original(owner, a, b, key, flags, layer);
+    }
+    admission.owner = address;
+    if (!Read(address, 0x338U, admission.variants) || admission.variants == 0U ||
+        !Readable(reinterpret_cast<const void*>(admission.variants), 0x44U) ||
+        !GraphOwnerIdentity(admission)) return nullptr;
+    // Pin the same owner asset and both nested native libraries throughout
+    // preflight AND native graph construction, including synchronous callbacks.
+    const native_resource::StrongLease asset(address + 0x330U, 0x18U);
+    if (!asset) return nullptr;
+    const native_resource::StrongLease graphs(asset.Object() + 8U, 0x20U);
+    if (!graphs) return nullptr;
+    const native_resource::StrongLease blends(asset.Object() + 0x10U, 0x38U);
+    admission.asset = asset.Object();
+    admission.graphLibrary = graphs.Object();
+    admission.blendLibrary = blends.Object();
+    const GraphAdmissionScope scope(admission);
+    return original(owner, a, b, key, flags, layer);
 }
 
 bool ControllerIdentity(const Session& session) noexcept {
@@ -1284,6 +1438,26 @@ bool Install(const SignatureResolver& resolver, HookManager& hooks,
     if (!ExpectedBytes(resolver, SymbolId::CharacterEquipmentControllerUpdate, reference, 32U, updateSignature)) {
         error = "Equipment update bytes differ from the certified image"; return false;
     }
+    // Validate the COMPLETE graph admission function, including CALL 6A9754,
+    // TEST/JZ 6A97A2 and the native null-return branch 6A97DE/RET14. Also
+    // validate both lookup ABIs against the independently mapped retail image.
+    const auto graphBytesMatch = [&](const std::size_t rva, const std::size_t count) {
+        if (rva > reference.size() || count > reference.size() - rva) return false;
+        std::vector<std::byte> actual(count);
+        return crash_guard::TryCopy(actual.data(), reinterpret_cast<const void*>(moduleBase + rva), count) &&
+            std::memcmp(actual.data(), reference.data() + rva, count) == 0;
+    };
+    if (!graphBytesMatch(0x002A9700U, 0xF4U) ||
+        !graphBytesMatch(0x00631400U, 16U) || !graphBytesMatch(0x00636760U, 16U)) {
+        error = "Native graph admission, failure branch or resource lookup ABI differs from the certified image";
+        return false;
+    }
+    // The single six-byte FS:[0] load has no relative operand and is already
+    // supported by the same prefix decoder used for the equipment update.
+    if (SafeInstructionLength(std::span<const std::byte>(reference).subspan(0x002A9700U, 6U)) != 6U) {
+        error = "Native graph admission prefix is not safely relocatable";
+        return false;
+    }
     constexpr SymbolId callees[]{SymbolId::CharacterAimStart, SymbolId::CharacterAimStop,
         SymbolId::CharacterPrimaryActionStart, SymbolId::CharacterPrimaryActionStop,
         SymbolId::CharacterCurrentEquipmentItem,
@@ -1334,7 +1508,28 @@ bool Install(const SignatureResolver& resolver, HookManager& hooks,
     request.relocationSafePrefix = true; // independently decoded from the certified file
     request.trampolineOut = &gTrampoline;
     request.publishedTrampolineOut = &gOriginal;
-    if (!hooks.Install(request, error)) {
+    const auto installStart = hooks.InstalledCount();
+    gGraphBase = moduleBase;
+    HookRequest graphRequest{};
+    graphRequest.name = "character_graph_resource_lifetime";
+    graphRequest.target = reinterpret_cast<void*>(moduleBase + 0x002A9700U);
+    graphRequest.detour = reinterpret_cast<void*>(&GraphCreateDetour);
+    graphRequest.patchLength = 6U;
+    graphRequest.expected.bytes.resize(6U);
+    graphRequest.expected.mask.assign(6U, 'x');
+    std::memcpy(graphRequest.expected.bytes.data(), reference.data() + 0x002A9700U, 6U);
+    graphRequest.relocationSafePrefix = true;
+    graphRequest.trampolineOut = &gGraphCreateTrampoline;
+    graphRequest.publishedTrampolineOut = &gGraphCreateOriginal;
+    CallRedirectRequest graphLookup{};
+    graphLookup.name = "character_graph_resource_admission";
+    graphLookup.callSite = reinterpret_cast<void*>(moduleBase + 0x002A9754U);
+    graphLookup.expectedTarget = reinterpret_cast<void*>(moduleBase + 0x00631400U);
+    graphLookup.detour = reinterpret_cast<void*>(&GraphLookupDetour);
+    if (!hooks.Install(graphRequest, error) || !hooks.InstallCallRedirect(graphLookup, error) ||
+        !hooks.Install(request, error)) {
+        std::string rollbackError;
+        if (!hooks.UninstallFrom(installStart, rollbackError)) error += "; graph admission rollback: " + rollbackError;
         std::lock_guard lock(gRuntime.mutex);
         gRuntime.enabled = false;
         gRuntime.generations = nullptr;

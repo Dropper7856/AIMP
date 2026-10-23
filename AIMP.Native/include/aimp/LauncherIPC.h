@@ -133,6 +133,7 @@ private:
     void PublishItemSyncTraffic();
     void PublishMissionSyncTraffic();
     void PublishItemSyncSpawnTraffic();
+    void PublishThrowableTraffic();
     void PublishAISyncTraffic();
     bool HandleAISyncFrame(const protocol::Frame& frame);
     bool TryConnect();

@@ -232,6 +232,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             await _aiSync.ConfigureAsync(sessionId, isHost, _controller.Snapshot.LevelGeneration,
                 aiWorldGeneration, authorityBound, payload.WorldBusActive, peerId, _lifetime.Token, alienEnabled)
                 .ConfigureAwait(false);
+            await ConfigureThrowableSyncAsync(sessionId, peerId, authorityBound && payload.WorldBusActive)
+                .ConfigureAwait(false);
             lock (_stateGate)
             {
                 if (authorityBound)
@@ -438,6 +440,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _controller.MissionSignalProduced += OnNativeMissionSignalProduced;
         _controller.ItemSyncPickupProduced += OnNativeItemSyncPickupProduced;
         _controller.ItemSyncSpawnProduced += OnNativeItemSyncSpawnProduced;
+        _controller.ThrowableProduced += OnNativeThrowableProduced;
     }
 
     internal async Task ApplyPerformanceIsolationModuleAsync(
@@ -719,6 +722,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _controller.MissionSignalProduced -= OnNativeMissionSignalProduced;
         _controller.ItemSyncPickupProduced -= OnNativeItemSyncPickupProduced;
         _controller.ItemSyncSpawnProduced -= OnNativeItemSyncSpawnProduced;
+        _controller.ThrowableProduced -= OnNativeThrowableProduced;
         StopNetworkAsync("Launcher closed").GetAwaiter().GetResult();
         Task.WhenAll(_missionReportTask, _missionApplyTask).GetAwaiter().GetResult();
         _commandGate.Dispose();
@@ -2426,6 +2430,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         host.MissionPreparationFailed += OnNetworkError;
         host.ItemCollected += OnItemCollected;
         host.ItemSpawnDecided += OnItemSpawnDecided;
+        host.ThrowableProposed += OnRemoteThrowableProposed;
         host.SpawnRemotePlayersRequested += OnSpawnRemotePlayersRequested;
         host.PlayerPositionReceived += OnPlayerPositionReceived;
         host.PlayerEquipmentReceived += OnPlayerEquipmentReceived;
@@ -2451,6 +2456,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         host.MissionPreparationFailed -= OnNetworkError;
         host.ItemCollected -= OnItemCollected;
         host.ItemSpawnDecided -= OnItemSpawnDecided;
+        host.ThrowableProposed -= OnRemoteThrowableProposed;
         host.SpawnRemotePlayersRequested -= OnSpawnRemotePlayersRequested;
         host.PlayerPositionReceived -= OnPlayerPositionReceived;
         host.PlayerEquipmentReceived -= OnPlayerEquipmentReceived;
@@ -2474,6 +2480,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         client.MissionSignalCommitted += OnMissionSignalCommitted;
         client.ItemCollected += OnItemCollected;
         client.ItemSpawnDecided += OnItemSpawnDecided;
+        client.ThrowableCommitted += OnRemoteThrowableCommitted;
         client.SpawnPositionRequested += OnSpawnPositionRequested;
         client.SpawnRemotePlayersRequested += OnSpawnRemotePlayersRequested;
         client.PlayerPositionReceived += OnPlayerPositionReceived;
@@ -2501,6 +2508,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         client.MissionSignalCommitted -= OnMissionSignalCommitted;
         client.ItemCollected -= OnItemCollected;
         client.ItemSpawnDecided -= OnItemSpawnDecided;
+        client.ThrowableCommitted -= OnRemoteThrowableCommitted;
         client.SpawnPositionRequested -= OnSpawnPositionRequested;
         client.SpawnRemotePlayersRequested -= OnSpawnRemotePlayersRequested;
         client.PlayerPositionReceived -= OnPlayerPositionReceived;
@@ -2884,7 +2892,10 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 != ResolveVisibleRemoteEquipmentIndex(value);
         var actionStateChanged = previous is null
             || previous.AimHeld != value.AimHeld
-            || previous.PrimaryHeld != value.PrimaryHeld;
+            || previous.PrimaryHeld != value.PrimaryHeld
+            || (IsSurvivalEquipmentSession() && RemoteEquipmentSelection.ActionEligibilityChanged(
+                previous.CurrentEquipmentIndex, previous.EquipmentActive,
+                value.CurrentEquipmentIndex, value.EquipmentActive));
         if (!equipmentChanged && !actionStateChanged) return;
 
         if (equipmentChanged)
@@ -3078,7 +3089,10 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 || ResolveVisibleLocalEquipmentIndex(_lastQueuedEquipmentState)
                     != ResolveVisibleLocalEquipmentIndex(state)
                 || (includeActions && (_lastQueuedEquipmentState.AimHeld != state.AimHeld
-                    || _lastQueuedEquipmentState.PrimaryHeld != state.PrimaryHeld));
+                    || _lastQueuedEquipmentState.PrimaryHeld != state.PrimaryHeld
+                    || (IsSurvivalEquipmentSession() && RemoteEquipmentSelection.ActionEligibilityChanged(
+                        _lastQueuedEquipmentState.CurrentEquipmentIndex, _lastQueuedEquipmentState.EquipmentActive,
+                        state.CurrentEquipmentIndex, state.EquipmentActive))));
             if (!changed && now < _nextEquipmentRefreshAtUtc) return false;
 
             _lastQueuedEquipmentState = state;
@@ -3251,7 +3265,11 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             if (value.Active && !await EnsureRemotePlayerEquipmentAsync(
                     value.PeerId, characterBase, value.CurrentEquipmentIndex)
                     .ConfigureAwait(false))
+            {
+                if (IsSurvivalEquipmentSession())
+                    await StopRemotePlayerActionsAsync(value.PeerId, characterBase).ConfigureAwait(false);
                 return;
+            }
 
             // Provisioning can await the catalog/Give path. A newer durable
             // snapshot supersedes this edge; a newer action edge does not, because
@@ -3290,7 +3308,10 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 {
                     var aimApplied = false;
                     lock (_stateGate) _remoteAppliedAim.TryGetValue(value.PeerId, out aimApplied);
-                    if (!aimApplied && equipment?.AimHeld == true)
+                    if (!aimApplied && equipment?.AimHeld == true
+                        && (!IsSurvivalEquipmentSession()
+                            || (equipment.CurrentEquipmentIndex == value.CurrentEquipmentIndex
+                                && equipment.EquipmentActive)))
                     {
                         if (await ExecuteRemoteCharacterActionAsync(characterBase, "aim-start")
                                 .ConfigureAwait(false))
@@ -3362,6 +3383,14 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                     return;
             }
 
+            var canApplyInputs = !IsSurvivalEquipmentSession()
+                || RemoteEquipmentSelection.SupportsActions(
+                    equipment.CurrentEquipmentIndex, equipment.EquipmentActive);
+            if (!canApplyInputs)
+            {
+                await StopRemotePlayerActionsAsync(peerId, characterBase).ConfigureAwait(false);
+                return;
+            }
             var desiredAim = equipment.AimHeld;
             var desiredPrimary = equipment.PrimaryHeld && desiredAim;
             bool appliedAim;
@@ -3404,9 +3433,17 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         }
     }
 
-    private static int ResolveVisibleLocalEquipmentIndex(
+    private bool IsSurvivalEquipmentSession()
+    {
+        lock (_stateGate) return _start is not null && LevelGameMode(_start.Level) == "Survival";
+    }
+
+    private int ResolveVisibleLocalEquipmentIndex(
         NativePlayerEquipmentStatePayload equipment)
     {
+        if (IsSurvivalEquipmentSession())
+            return RemoteEquipmentSelection.VisibleIndex(equipment.CurrentEquipmentIndex,
+                equipment.PreviousEquipmentIndex, equipment.EquipmentActive);
         if (RemoteEquipmentDefinitions.TryGetPlayerSyncEquipmentId(
                 equipment.CurrentEquipmentIndex, out _))
             return equipment.CurrentEquipmentIndex;
@@ -3416,9 +3453,12 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         return equipment.CurrentEquipmentIndex;
     }
 
-    private static int ResolveVisibleRemoteEquipmentIndex(
+    private int ResolveVisibleRemoteEquipmentIndex(
         PlayerEquipmentSnapshotPayload equipment)
     {
+        if (IsSurvivalEquipmentSession())
+            return RemoteEquipmentSelection.VisibleIndex(equipment.CurrentEquipmentIndex,
+                equipment.PreviousEquipmentIndex, equipment.EquipmentActive);
         if (RemoteEquipmentDefinitions.TryGetPlayerSyncEquipmentId(
                 equipment.CurrentEquipmentIndex, out _))
             return equipment.CurrentEquipmentIndex;

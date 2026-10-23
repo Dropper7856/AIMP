@@ -34,6 +34,9 @@ std::atomic<ManagedSourcePredicate> gCanReplayScripted{};
 
 void* gCoupledClassificationTrampoline{};
 void* gCoupledPlayerContinue{};
+void* gAlignmentClassificationTrampoline{};
+void* gAlignmentPlayerContinue{};
+std::uintptr_t gUnitFloatAddress{};
 void* gSourceUpdateTrampoline{};
 void* gMarkerCallbackTrampoline{};
 void* gMarkerDispatchTrampoline{};
@@ -42,6 +45,7 @@ std::atomic<void*> gMarkerCallbackOriginal{};
 std::atomic<void*> gMarkerDispatchOriginal{};
 
 std::atomic<std::uint64_t> gSourceUpdates{}, gCoupledPlayerUpdates{};
+std::atomic<std::uint64_t> gHumanAlignmentUpdates{};
 std::atomic<std::uint64_t> gMarkerCallbacks{}, gMarkerCallbacksSkipped{}, gMarkerDispatches{};
 std::atomic<std::uint64_t> gBoundedListenerScans{};
 std::atomic<std::uint64_t> gScriptedCaptured{}, gScriptedUnsupported{}, gScriptedApplied{}, gScriptedFailed{};
@@ -198,6 +202,59 @@ __declspec(naked) void HumanCoupledShim() {
     }
 }
 
+int __cdecl HumanAlignmentBoundary(const std::uintptr_t cycle,
+    const std::uintptr_t character) noexcept {
+    const auto classify = gHumanPair.load(std::memory_order_acquire);
+    std::uintptr_t source{}, victim{};
+    if (classify == nullptr || !CurrentCycle(cycle, kSourceTypeRva, 0x4EU, source) ||
+        !Read(cycle + 0x44U, victim) || (character != source && character != victim)) return 0;
+    // Preparation calls this before E7/the 4F handshake exists. Classification
+    // still requires the published, exact human pair, just as the retail player
+    // branch does; never fabricate an acquired victim or an animation event.
+    if (!classify(cycle, victim)) return 0;
+    gHumanAlignmentUpdates.fetch_add(1U, std::memory_order_relaxed);
+    return 1;
+}
+
+// 0064E70F, EBX=source 4E, ESI=the Character being aligned. Retail uses
+// victim+31C/+48 again here, independently of 006556D0's coupling branch.
+// Human representations must keep the player branch's XMM0=XMM1=1, rather
+// than applying the NPC time ramp to Character+1004. Native pose integration,
+// collision and graph progression after 0064E771 remain untouched.
+__declspec(naked) void HumanAlignmentShim() {
+    __asm {
+        pushfd
+        pushad
+        mov edi, esp
+        sub esp, 210h
+        and esp, 0FFFFFFF0h
+        fxsave [esp]
+        cld
+        push esi
+        push ebx
+        call HumanAlignmentBoundary
+        add esp, 8
+        test eax, eax
+        jnz participant
+        fxrstor [esp]
+        mov esp, edi
+        popad
+        popfd
+        jmp dword ptr [gAlignmentClassificationTrampoline]
+    participant:
+        fxrstor [esp]
+        mov esp, edi
+        popad
+        popfd
+        push eax
+        mov eax, dword ptr [gUnitFloatAddress]
+        movss xmm1, dword ptr [eax]
+        movaps xmm0, xmm1
+        pop eax
+        jmp dword ptr [gAlignmentPlayerContinue]
+    }
+}
+
 void __fastcall SourceUpdateDetour(void* context, void*) noexcept {
     const auto original = reinterpret_cast<void(__thiscall*)(void*)>(
         gSourceUpdateOriginal.load(std::memory_order_acquire));
@@ -328,6 +385,10 @@ bool Install(const std::uintptr_t base, HookManager& hooks,
         !Match(0x002556F9U, {0x85,0xC0,0x74,0x06,0x80,0x78,0x48,0x00,0x75,0x78}) ||
         !Match(0x0025577BU, {0x8B,0x4E,0x4C,0x8B,0x11,0x8B,0x42,0x04,0xFF,0xD0}) ||
         !Match(0x00255999U, {0xC3}) ||
+        !Match(0x0024E70FU, {0x8B,0x43,0x44,0x8B,0x80,0x1C,0x03,0x00,0x00}) ||
+        !Match(0x0024E723U, {0x85,0xC0,0x74,0x06,0x80,0x78,0x48,0x00,0x75,0x44}) ||
+        !Match(0x0024E771U, {0x80,0x7D,0x0C,0x00,0xF3,0x0F,0x11,0x86,0x04,0x10,0x00,0x00}) ||
+        !Match(0x00DBED34U, {0x00,0x00,0x80,0x3F}) ||
         !Match(0x00263E00U, {0x56,0x8B,0xF1,0x8B,0x46,0x44}) ||
         !Match(0x00291220U, {0x8B,0x44,0x24,0x04,0xF6,0x80,0x18,0x01,0x00,0x00,0x04}) ||
         !Match(0x0029122DU, {0x8B,0x51,0x10,0x8B,0x49,0x14,0x52,0xE8,0xC7,0xFD,0xFF,0xFF}) ||
@@ -342,6 +403,8 @@ bool Install(const std::uintptr_t base, HookManager& hooks,
         return false;
     }
     gCoupledPlayerContinue = reinterpret_cast<void*>(base + 0x0025577BU);
+    gAlignmentPlayerContinue = reinterpret_cast<void*>(base + 0x0024E771U);
+    gUnitFloatAddress = base + 0x00DBED34U;
     gHumanPair.store(callbacks.humanPair, std::memory_order_release);
     gManagedSource.store(callbacks.managedSource, std::memory_order_release);
     gObserver.store(callbacks.observer, std::memory_order_release);
@@ -351,6 +414,9 @@ bool Install(const std::uintptr_t base, HookManager& hooks,
         Hook(hooks, "aisync_paired_coupled_human_execution", 0x002556F0U,
             reinterpret_cast<void*>(&HumanCoupledShim), {0x8B,0x46,0x44,0x8B,0x80,0x1C,0x03,0x00,0x00},
             &gCoupledClassificationTrampoline, nullptr, error) &&
+        Hook(hooks, "aisync_paired_human_alignment", 0x0024E70FU,
+            reinterpret_cast<void*>(&HumanAlignmentShim), {0x8B,0x43,0x44,0x8B,0x80,0x1C,0x03,0x00,0x00},
+            &gAlignmentClassificationTrampoline, nullptr, error) &&
         Hook(hooks, "aisync_paired_native_source_update", 0x00263E00U,
             reinterpret_cast<void*>(&SourceUpdateDetour), {0x56,0x8B,0xF1,0x8B,0x46,0x44},
             &gSourceUpdateTrampoline, &gSourceUpdateOriginal, error) &&
@@ -490,6 +556,7 @@ Counters Snapshot() noexcept {
     Counters counters{};
     counters.sourceUpdates = gSourceUpdates.load(std::memory_order_relaxed);
     counters.coupledPlayerUpdates = gCoupledPlayerUpdates.load(std::memory_order_relaxed);
+    counters.humanAlignmentUpdates = gHumanAlignmentUpdates.load(std::memory_order_relaxed);
     counters.markerCallbacks = gMarkerCallbacks.load(std::memory_order_relaxed);
     counters.markerCallbacksSkipped = gMarkerCallbacksSkipped.load(std::memory_order_relaxed);
     counters.markerDispatches = gMarkerDispatches.load(std::memory_order_relaxed);

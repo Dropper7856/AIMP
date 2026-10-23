@@ -15,6 +15,7 @@
 #include "aimp/GameCommandExecutor.h"
 #include "aimp/InboundQueue.h"
 #include "aimp/ItemSync.h"
+#include "aimp/ThrowableSync.h"
 #include "aimp/MissionSync.h"
 #include "aimp/LevelGenerationTracker.h"
 #include "aimp/MultiplayerPause.h"
@@ -790,6 +791,19 @@ void LauncherIPC::PublishItemSyncSpawnTraffic() {
     }
 }
 
+void LauncherIPC::PublishThrowableTraffic() {
+    throwable_sync::Event event{};
+    std::uint64_t ticket{};
+    for (std::size_t count = 0U; count < 32U && throwable_sync::TryPeekObserved(event, ticket); ++count) {
+        if (!worldSyncAuthorityBound_ || !worldSyncWorldBusActive_) break;
+        const auto bytes = std::as_bytes(std::span{&event, 1U});
+        if (!Queue(protocol::MessageType::ThrowableEvent, 0,
+            localSequence_.fetch_add(1U, std::memory_order_relaxed),
+            std::vector<std::byte>(bytes.begin(), bytes.end()))) break;
+        throwable_sync::PopObserved(ticket);
+    }
+}
+
 void LauncherIPC::PublishPlayerSyncTraffic() {
     if (playerSyncObserver_ == nullptr) {
         return;
@@ -1236,6 +1250,7 @@ void LauncherIPC::Run() {
             PublishItemSyncTraffic();
             PublishMissionSyncTraffic();
             PublishItemSyncSpawnTraffic();
+            PublishThrowableTraffic();
             PublishAISyncTraffic();
 
             if (!FlushOutgoing(96U)) continue;
@@ -1333,6 +1348,7 @@ bool LauncherIPC::TryConnect() {
 }
 
 void LauncherIPC::Disconnect(const std::string_view reason) noexcept {
+    throwable_sync::TransportLost();
     voice_sync::TransportLost();
     multiplayer_pause::ClearLoadingHold();
     ai_sync::TransportLost();
@@ -1676,6 +1692,14 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
     case protocol::MessageType::AISyncState:
     case protocol::MessageType::AISyncImpact:
         return HandleAISyncFrame(frame);
+    case protocol::MessageType::ThrowableConfigure:
+        if (sessionConfigured_.load(std::memory_order_acquire))
+            static_cast<void>(throwable_sync::Configure(frame.payload));
+        return true;
+    case protocol::MessageType::ThrowableEvent:
+        if (sessionConfigured_.load(std::memory_order_acquire) && worldSyncAuthorityBound_ && worldSyncWorldBusActive_)
+            static_cast<void>(throwable_sync::QueueRemote(frame.payload));
+        return true;
     case protocol::MessageType::VoiceConfigure:
         if (!sessionConfigured_.load(std::memory_order_acquire)) return true;
         if (frame.payload.size() == 48U) {
@@ -3090,6 +3114,7 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
         ai_sync::LogDiagnostics(*diagnostics_);
         voice_sync::LogDiagnostics(*diagnostics_);
         item_sync::LogDiagnostics(*diagnostics_);
+        throwable_sync::LogDiagnostics(*diagnostics_);
         mission_sync::LogDiagnostics(*diagnostics_);
         loading_context_guard::LogDiagnostics(*diagnostics_);
         experimental::DiagnosticSnapshotRequest request;
