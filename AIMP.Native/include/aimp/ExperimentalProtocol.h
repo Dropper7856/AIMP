@@ -127,7 +127,9 @@ std::vector<std::byte> EncodeCaptureState(
     std::uint32_t remoteCharacterSpawnKey = 0,
     std::uintptr_t remoteCharacterAddress = 0,
     std::uintptr_t remoteCharacterRecordAddress = 0,
-    bool characterCreateHookInstalled = false);
+    bool characterCreateHookInstalled = false,
+    std::uint64_t remoteCharacterCreationSerial = 0,
+    std::uint32_t remoteCharacterRuntimeId = 0);
 
 std::vector<std::byte> EncodeDummyOperationResult(
     const RequestEnvelope& request,

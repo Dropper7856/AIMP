@@ -6,6 +6,7 @@
 #include "aimp/RuntimeFeatureFlags.h"
 
 #include <Windows.h>
+#include <cstring>
 
 namespace aimp {
 namespace {
@@ -27,6 +28,29 @@ bool ValidEquipmentIndex(const std::int32_t value) noexcept {
 
 bool ValidPresentationState(const std::int32_t value) noexcept {
     return value >= 0 && value <= 64;
+}
+
+// Wire-only identities, never written into the retail slot table. Slot 9 is
+// shared by all inventory items; +3BC8 selects the actual definition and +6C
+// is IS_ACTIVATED (FUN_0079CC60 and inventory restoration FUN_007CC960).
+std::int32_t FlareIdentity(std::uintptr_t player, std::int32_t slot) noexcept {
+    if (slot != 9) return slot;
+#if defined(_MSC_VER)
+    __try {
+        const auto component = *reinterpret_cast<const std::uintptr_t*>(player + 0x31CU);
+        if (component == 0U) return slot;
+        const auto inventory = *reinterpret_cast<const std::uintptr_t*>(component + 0x3CU);
+        if (inventory == 0U) return slot;
+        const auto definition = *reinterpret_cast<const std::uintptr_t*>(inventory + 0x3BC8U);
+        if (definition == 0U) return slot;
+        const auto name = *reinterpret_cast<const char* const*>(definition + 8U);
+        if (name == nullptr || std::strcmp(name, "flare") != 0) return slot;
+        return *reinterpret_cast<const std::uint8_t*>(definition + 0x6CU) != 0U ? 33 : 32;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return slot; }
+#else
+    (void)player;
+    return slot;
+#endif
 }
 
 struct RawEquipmentState {
@@ -166,7 +190,7 @@ void PlayerSyncObserver::ObserveOnGameThread() noexcept {
     PlayerEquipmentSnapshot observed{};
     observed.localPlayer = localPlayer;
     observed.equipmentManager = equipmentManager;
-    observed.currentEquipmentIndex = raw.currentEquipmentIndex;
+    observed.currentEquipmentIndex = FlareIdentity(localPlayer, raw.currentEquipmentIndex);
     observed.previousEquipmentIndex = raw.previousEquipmentIndex;
     observed.presentationState = raw.presentationState;
     observed.equipmentActive = raw.equipmentActive != 0U;

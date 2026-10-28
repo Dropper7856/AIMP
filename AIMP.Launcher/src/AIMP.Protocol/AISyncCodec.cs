@@ -8,11 +8,11 @@ namespace AIMP.Protocol;
 // regenerate presentation locally; resolved paired health/outcomes come from Host.
 public static class AISyncCodec
 {
-    public const uint StateVersion = 12;
+    public const uint StateVersion = 15;
     public const uint ImpactVersion = 2;
-    public const int NativeStateBytes = 640;
+    public const int NativeStateBytes = 816;
     public const int NativeImpactBytes = 64;
-    public const int ConfigurationBytes = 552;
+    public const int ConfigurationBytes = 1096;
     public const int NetworkStateBytes = 16 + NativeStateBytes;
     public const int NetworkImpactBytes = 16 + NativeImpactBytes;
     public const int MaximumActors = 256;
@@ -52,13 +52,46 @@ public static class AISyncCodec
             || (U32(bytes, 20) == 0 && U32(bytes, 24) == 0) || U32(bytes, 32) == 0
             || U32(bytes, 36) == 0
             || !AllowedCharacterClass(U32(bytes, 28)))
-            throw new ProtocolException("Invalid AISync authority snapshot v12.");
+            throw new ProtocolException("Invalid AISync authority snapshot v14.");
         ValidateAuthorityState(bytes);
+    }
+
+    // v15 block at 764: the Host's native cycle constructor call. The native
+    // side owns the contract table; here the carrier must be canonical.
+    private static void ValidateCycleCall(ReadOnlySpan<byte> bytes)
+    {
+        var rva = U32(bytes, 764);
+        if (rva == 0)
+        {
+            foreach (var value in bytes.Slice(764, 52))
+                if (value != 0) throw new ProtocolException("Invalid AISync cycle call padding.");
+            return;
+        }
+        var kinds = U32(bytes, 768);
+        if ((kinds >> 8) != 0) throw new ProtocolException("Invalid AISync cycle call arity.");
+        for (var i = 0; i < 2; ++i)
+        {
+            var kind = (kinds >> (i * 4)) & 0xF;
+            if (kind > 5 && kind != 15) throw new ProtocolException("Invalid AISync cycle call argument.");
+        }
+        for (var i = 0; i < 4; ++i)
+            if (!float.IsFinite(BinaryPrimitives.ReadSingleLittleEndian(bytes[(796 + i * 4)..])))
+                throw new ProtocolException("Invalid AISync cycle call vector.");
+        if (U32(bytes, 812) > 0xFF) throw new ProtocolException("Invalid AISync cycle call serial.");
     }
 
     private static void ValidateAuthorityState(ReadOnlySpan<byte> bytes)
     {
+        AISyncActionCorrelation.ValidateState(bytes);
+        var causeSession=new Guid(bytes.Slice(644,16));
+        var authority=BinaryPrimitives.ReadUInt64LittleEndian(bytes[660..]);
+        var command=BinaryPrimitives.ReadUInt64LittleEndian(bytes[668..]);
+        if(causeSession!=Guid.Empty||authority!=0||command!=0)
+            if(causeSession==Guid.Empty||authority==0||command==0||(U32(bytes,40)&InteractionValid)==0||
+                SessionCookie(causeSession)!=BinaryPrimitives.ReadUInt64LittleEndian(bytes[8..]))
+                throw new ProtocolException("Invalid registration-time interaction authority seal.");
         ValidateNavigation(bytes);
+        ValidateCycleCall(bytes);
         ValidateConsequences(bytes);
         ValidateScripted(bytes);
         ValidateCombat(bytes);
@@ -87,6 +120,8 @@ public static class AISyncCodec
         var interactionVariant = I32(bytes, 132);
         var interactionFlags = U32(bytes, 112);
         var targetPeer = BinaryPrimitives.ReadUInt64LittleEndian(bytes[172..]);
+        if(U32(bytes,640)!=0&&((flags&InteractionValid)==0||(interactionFlags&2U)==0||targetPeer==0))
+            throw new ProtocolException("Participant incarnation requires an identified player interaction.");
         var transitionVariant = I32(bytes, 180);
         if ((interactionFlags & ~KnownInteractionFlags) != 0
             || U32(bytes, 116) > 2 || (U32(bytes, 120) & ~0xFFFFU) != 0
@@ -321,6 +356,7 @@ public static class AISyncCodec
     public static bool BelongsTo(ReadOnlySpan<byte> bytes, Guid session, int worldGeneration) =>
         bytes.Length == NativeStateBytes && session != Guid.Empty && worldGeneration > 0
         && BinaryPrimitives.ReadUInt64LittleEndian(bytes[8..]) == SessionCookie(session)
+        && MatchesSnapshotSessions(bytes,session)
         && U32(bytes, 16) == (uint)worldGeneration;
 
     public static ulong ActorKey(ReadOnlySpan<byte> bytes) =>
@@ -348,7 +384,7 @@ public static class AISyncCodec
     public static byte[] EncodeNetwork(Guid session, ReadOnlySpan<byte> native)
     {
         ValidateNative(native);
-        if (session == Guid.Empty || BinaryPrimitives.ReadUInt64LittleEndian(native[8..]) != SessionCookie(session))
+        if (session == Guid.Empty || BinaryPrimitives.ReadUInt64LittleEndian(native[8..]) != SessionCookie(session)||!MatchesSnapshotSessions(native,session))
             throw new ProtocolException("AISync session identity mismatch.");
         var bytes = new byte[NetworkStateBytes];
         session.TryWriteBytes(bytes.AsSpan(0, 16));
@@ -362,9 +398,14 @@ public static class AISyncCodec
             throw new ProtocolException("AISync network session mismatch.");
         var native = bytes[16..];
         ValidateNative(native.Span);
-        if (BinaryPrimitives.ReadUInt64LittleEndian(native.Span[8..]) != SessionCookie(session))
+        if (BinaryPrimitives.ReadUInt64LittleEndian(native.Span[8..]) != SessionCookie(session)||!MatchesSnapshotSessions(native.Span,session))
             throw new ProtocolException("AISync cookie mismatch.");
         return native;
+    }
+    internal static bool MatchesSnapshotSessions(ReadOnlySpan<byte> bytes,Guid session)
+    {
+        var cause=new Guid(bytes.Slice(644,16));var action=new Guid(bytes.Slice(676,16));
+        return (cause==Guid.Empty||cause==session)&&(action==Guid.Empty||action==session);
     }
 
     public static void ValidateNativeImpact(ReadOnlySpan<byte> bytes)
@@ -411,7 +452,8 @@ public static class AISyncCodec
     }
 
     public static byte[] Configuration(uint role, int nativeGeneration, int worldGeneration, Guid session,
-        ulong localPeer, IReadOnlyDictionary<ulong, uint> participants, bool alienEnabled = true)
+        ulong localPeer, IReadOnlyDictionary<ulong, uint> participants, bool alienEnabled = true,
+        AISyncParticipantBinding? localBinding = null,IReadOnlyDictionary<ulong,AISyncParticipantBinding>? certifiedBindings = null)
     {
         if (role > 3 || nativeGeneration < 0 || worldGeneration < 0)
             throw new ArgumentOutOfRangeException(nameof(role));
@@ -421,7 +463,7 @@ public static class AISyncCodec
         if (participants.Count > MaximumParticipants)
             throw new ProtocolException("Too many AISync participant bindings.");
         var bytes = new byte[ConfigurationBytes];
-        BinaryPrimitives.WriteUInt32LittleEndian(bytes, 2);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes, 3);
         BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(4), role);
         BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(8), (uint)nativeGeneration);
         BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(12), (uint)worldGeneration);
@@ -429,16 +471,26 @@ public static class AISyncCodec
         BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(24), localPeer);
         BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(32), (uint)participants.Count);
         BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(36), role != 0 && !alienEnabled ? 1U : 0U);
-        var offset = 40;
+        var offset = 72;
         var characters = new HashSet<uint>();
+        if(localBinding is not null)
+        {
+            if(localBinding.Incarnation==0)throw new ProtocolException("Local binding needs its portable incarnation.");
+            AISyncParticipantBindingCodec.Write(bytes.AsSpan(40,32),localPeer,localBinding);
+            characters.Add(localBinding.Character);
+        }
+        if(certifiedBindings is not null && certifiedBindings.Keys.Any(peer=>!participants.ContainsKey(peer)))
+            throw new ProtocolException("Construction binding has no participant mapping.");
         foreach (var binding in participants.OrderBy(value => value.Key))
         {
             if (binding.Key == 0 || binding.Key == localPeer || binding.Value < 0x10000
                 || !characters.Add(binding.Value))
                 throw new ProtocolException("Invalid local AISync participant binding.");
-            BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(offset), binding.Key);
-            BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(offset + 8), binding.Value);
-            offset += 16;
+            var proof=certifiedBindings is not null&&certifiedBindings.TryGetValue(binding.Key,out var stored)
+                ? stored : new AISyncParticipantBinding(binding.Value,0,0,0);
+            if(proof.Character!=binding.Value)throw new ProtocolException("Participant address differs from its captured construction.");
+            AISyncParticipantBindingCodec.Write(bytes.AsSpan(offset,32),binding.Key,proof);
+            offset += 32;
         }
         return bytes;
     }

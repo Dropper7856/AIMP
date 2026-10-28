@@ -546,18 +546,28 @@ ApplyResult ApplyState(const std::uintptr_t character, const std::uint32_t runti
 }
 ApplyResult ApplyShot(const std::uintptr_t character, const std::uint32_t runtimeId,
     const ShotEvent& event, ReplayCursor& cursor, const std::uint64_t expiresAt) noexcept {
-    if (!Valid(event) || event.flags == 0U) return Failed();
+    if (gBase == 0U || !Valid(event) || event.flags == 0U) return Failed();
+    if (gMode.load(std::memory_order_acquire) != Mode::Client || cursor.busy) return Deferred();
+    if (cursor.character != 0U && (cursor.character != character || cursor.runtimeId != runtimeId)) return Failed();
+    struct Guard final { bool& busy; explicit Guard(bool& value) noexcept : busy(value) { busy = true; } ~Guard() { busy = false; } } guard(cursor.busy);
     std::uintptr_t controller{}, item{};
     if (!Controller(character, runtimeId, controller)) return Failed();
     if (event.revision < cursor.revision) return ApplyResult::AlreadyMatched;
-    if (event.revision == cursor.revision && cursor.invoked)
+    if (event.revision == cursor.revision && cursor.invoked) {
+        if (std::memcmp(&cursor.admitted, &event, sizeof(event)) != 0) return Failed();
         return cursor.failed ? ApplyResult::Failed : ApplyResult::AlreadyMatched;
+    }
     if (!WeaponMatches(controller, event.state, item)) {
         static_cast<void>(RequestEquipment(character, controller, event.state)); return Deferred();
     }
     if (Busy(controller)) return Deferred();
     const auto prepared = ApplyState(character, runtimeId, event.state, expiresAt);
     if (prepared != ApplyResult::Applied && prepared != ApplyResult::AlreadyMatched) return prepared;
+    std::uintptr_t currentController{}, currentItem{};
+    if (gMode.load(std::memory_order_acquire) != Mode::Client ||
+        !Controller(character, runtimeId, currentController) || currentController != controller ||
+        !WeaponMatches(controller, event.state, currentItem) || currentItem != item) return Deferred();
+    cursor.character = character; cursor.runtimeId = runtimeId; cursor.admitted = event;
     cursor.revision = event.revision;
     cursor.invoked = true; // Includes partial native failures: never submit a shot twice.
     cursor.failed = !AdmitShot(character, controller, item, event);

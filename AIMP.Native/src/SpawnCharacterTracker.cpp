@@ -1,6 +1,7 @@
 #include "aimp/AISync.h"
 #include "aimp/CharacterActionRuntime.h"
 #include "aimp/SpawnCharacterTracker.h"
+#include "aimp/CharacterIncarnation.h"
 #include "aimp/BuildProfile.h"
 #include "aimp/CrashGuard.h"
 #include "aimp/Diagnostics.h"
@@ -414,6 +415,11 @@ void SpawnCharacterTracker::ObserveCreated(
     const auto levelGeneration = generations_ == nullptr
         ? 0U
         : generations_->CurrentGeneration();
+    character_incarnations::Ticket creation{};
+    if(characterAddress) {
+        const auto runtime=crash_guard::SafeRead<std::uint32_t>(reinterpret_cast<const void*>(characterAddress+0x50U));
+        if(runtime)static_cast<void>(character_incarnations::NativeRegistry().Created(levelGeneration,characterAddress,*runtime,creation));
+    }
     auto* lifecycle = lifecycle_.load(std::memory_order_acquire);
     if (lifecycle != nullptr) {
         lifecycle->CaptureFromHook(
@@ -447,7 +453,7 @@ void SpawnCharacterTracker::ObserveCreated(
         spawnKey,
         characterAddress,
         recordAddress,
-        SpawnCharacterTrackingState::Ready);
+        SpawnCharacterTrackingState::Ready, creation);
 }
 
 
@@ -460,7 +466,7 @@ SpawnCharacterTracker::ProvisionRemoteEquipmentOnGameThread(
     const std::uint32_t equipmentOutputShortGuid,
     const std::uint32_t spawnSchedulerParameterShortGuid,
     const std::uint32_t spawnTargetInputShortGuid,
-    const std::uint32_t equipmentSlot) {
+    const std::uint32_t equipmentSlot, const bool activateHeld, const bool releaseHeld) {
     using cathode_equipment::Result;
     using cathode_equipment::Stage;
 
@@ -508,11 +514,16 @@ SpawnCharacterTracker::ProvisionRemoteEquipmentOnGameThread(
         records.begin(), records.end(),
         [&](const cathode_equipment::Record& candidate) {
             if (!sameCatalog(candidate)) return false;
+            // A newly selected unlit flare cannot reuse the consumed/lit
+            // composite retained in the equipment slot from an earlier flare.
+            if (!releaseHeld && !activateHeld && candidate.activateHeldDispatched) return false;
             return candidate.stage != Stage::Equipped ||
                 cathode_equipment::IsAttached(characterAddress, candidate);
         });
     bool inserted = false;
     if (found == records.end()) {
+        if (releaseHeld)
+            return {true, false, "REMOTE_EQUIPMENT_ALREADY_RELEASED", "No matching attached held flare remains."};
         const auto operationActive = std::any_of(
             records.begin(), records.end(),
             [&](const cathode_equipment::Record& candidate) {
@@ -542,6 +553,8 @@ SpawnCharacterTracker::ProvisionRemoteEquipmentOnGameThread(
     }
 
     auto& record = *found;
+    record.activateHeldRequested = record.activateHeldRequested || activateHeld;
+    record.releaseHeldRequested = record.releaseHeldRequested || releaseHeld;
     const auto previous = record.stage;
     const auto* previousOperation = record.operation;
     const auto result = cathode_equipment::Step(
@@ -653,9 +666,14 @@ SpawnCharacterTrackingSnapshot SpawnCharacterTracker::Snapshot() const noexcept 
         snapshot.recordAddress = recordAddress_.load(std::memory_order_acquire);
         snapshot.state = state_.load(std::memory_order_acquire);
         snapshot.hookInstalled = HookInstalled();
+        snapshot.creation = {snapshot.levelGeneration,creationSerial_.load(std::memory_order_acquire),
+            snapshot.characterAddress,creationRuntime_.load(std::memory_order_acquire),character_incarnations::Origin::Created};
         const auto after = version_.load(std::memory_order_acquire);
         if (before == after) {
             snapshot.version = after;
+            // Value-only revalidation. Never find the replacement at this
+            // address and silently attribute it to the old spawn request.
+            if (!character_incarnations::NativeRegistry().Current(snapshot.creation)) snapshot.creation = {};
             return snapshot;
         }
     }
@@ -679,7 +697,8 @@ void SpawnCharacterTracker::Publish(
     const std::uint32_t spawnKey,
     const std::uintptr_t characterAddress,
     const std::uintptr_t recordAddress,
-    const SpawnCharacterTrackingState state) noexcept {
+    const SpawnCharacterTrackingState state,
+    const character_incarnations::Ticket& creation) noexcept {
     while (publishLock_.test_and_set(std::memory_order_acquire)) {
     }
     version_.fetch_add(1, std::memory_order_acq_rel);
@@ -687,6 +706,8 @@ void SpawnCharacterTracker::Publish(
     spawnKey_.store(spawnKey, std::memory_order_release);
     characterAddress_.store(characterAddress, std::memory_order_release);
     recordAddress_.store(recordAddress, std::memory_order_release);
+    creationSerial_.store(creation.serial, std::memory_order_release);
+    creationRuntime_.store(creation.runtimeId, std::memory_order_release);
     state_.store(state, std::memory_order_release);
     version_.fetch_add(1, std::memory_order_release);
     publishLock_.clear(std::memory_order_release);

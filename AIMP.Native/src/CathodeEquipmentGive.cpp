@@ -54,6 +54,7 @@ using ReleaseWork = void(__fastcall*)(void*);
 using Execute = std::uint8_t(__thiscall*)(void*, void**, void**);
 using EquipmentItem = void*(__thiscall*)(void*);
 using InitializeNpcResources = std::uint32_t(__thiscall*)(void*, std::int32_t);
+using RemoveSlot = void(__thiscall*)(void*, std::int32_t, std::uint8_t);
 
 void Release(std::uintptr_t base, void*& ref) {
     if (ref == nullptr) return;
@@ -217,8 +218,38 @@ Result StepNative(std::uintptr_t base, std::uintptr_t character, Record& r) {
             return Result::Pending;
         if (*attached == reinterpret_cast<std::uintptr_t>(r.resolvedEquipment)) {
             r.equipmentSlot = r.expectedSlot;
+            if (r.releaseHeldRequested) {
+                if (r.compositeName != "Required_Assets\\Archetypes\\Equipment\\Flare_Held" ||
+                    r.expectedSlot != 9U) return Fail(r, Result::InvalidCatalog);
+                if (!r.releaseHeldDispatched) {
+                    r.releaseHeldDispatched = true;
+                    // Retail inventory throw/place/discard uses this exact
+                    // slot removal to detach the hand model and its VFX.
+                    Fn<RemoveSlot>(base, 0x007D26D0U)(reinterpret_cast<void*>(equipmentManager), 9, 1U);
+                }
+                if (Read<std::uintptr_t>(equipmentManager + 9U * 4U) != 0U)
+                    return Fail(r, Result::OutputMismatch);
+                r.stage = Stage::Equipped;
+                r.operation = "held_flare_released";
+                return Result::Equipped;
+            }
             const auto resources = InitializeGivenResources(base, character, equipmentManager, r);
             if (resources != Result::Equipped) return resources;
+            if (r.activateHeldRequested && !r.activateHeldDispatched) {
+                // Same public input dispatched by retail inventory activation.
+                // Use the retained root of this exact attached Flare_Held, so
+                // fire/light/audio are created by the game's CATHODE graph.
+                if (r.compositeName != "Required_Assets\\Archetypes\\Equipment\\Flare_Held")
+                    return Fail(r, Result::InvalidCatalog);
+                const auto root = Payload(r.root);
+                const auto dispatch = Virtual(root, 0x10CU);
+                if (root == 0U || dispatch != base + 0x005425A0U)
+                    return Fail(r, Result::OutputMismatch);
+                const auto activate = Guid(base, "ACTIVATE_HELD");
+                r.activateHeldDispatched = true; // no duplicate after callbacks/fault
+                reinterpret_cast<PublicInput>(dispatch)(
+                    reinterpret_cast<void*>(root), &r.root, &activate, 0U);
+            }
             r.stage = Stage::Equipped;
             r.result = Result::Equipped;
             r.operation = "equipment_attached";
@@ -434,6 +465,7 @@ std::uintptr_t Validate(const SignatureResolver& resolver) noexcept {
     struct Entry { std::uintptr_t va; std::uint16_t prefix; };
     constexpr Entry entries[]{
         {0x0093F820U, 0x418DU},
+          {0x007D26D0U, 0xA164U},
         {0x0040A1D0U, 0x448BU},
         {0x004673C0U, 0x8B55U},
         {0x004C2A00U, 0xFF6AU},

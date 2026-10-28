@@ -20,8 +20,10 @@ namespace {
 // factories, including the inventory discard/flare path, not equip slot 9.
 constexpr std::uintptr_t kManager = 0x012F0DE4U;
 constexpr std::uintptr_t kThrow = 0x003B5050U, kPlace = 0x003B5190U;
-using ThrowFn = void(__thiscall*)(void*, const float*, const float*, float, const char*, float);
-using PlaceFn = void(__thiscall*)(void*, const float*, const char*, float);
+// The final stack argument is overwritten with a temporary shared reference by
+// FUN_005079C0. It is NOT a remaining lifetime float (FUN_007B5050/007B5190).
+using ThrowFn = void(__thiscall*)(void*, const float*, const float*, float, const char*, std::uintptr_t);
+using PlaceFn = void(__thiscall*)(void*, const float*, const char*, std::uintptr_t);
 using KeyFn = void(__thiscall*)(void*, std::uint32_t*);
 using RemoveFn = void(__thiscall*)(void*, std::uint32_t, std::uint32_t);
 using InventoryActionFn = void(__thiscall*)(void*);
@@ -34,7 +36,11 @@ void* gThrowTrampoline{}, *gPlaceTrampoline{};
 std::atomic<void*> gThrowOriginal{}, gPlaceOriginal{};
 void* gInventoryThrowTrampoline{}, *gInventoryPlaceTrampoline{}, *gInventoryDiscardTrampoline{};
 std::atomic<void*> gInventoryThrowOriginal{}, gInventoryPlaceOriginal{}, gInventoryDiscardOriginal{};
-struct ReleaseContext final { std::uintptr_t inventory{}, definition{}; std::uint32_t kind{}; };
+struct ReleaseContext final {
+    std::uintptr_t inventory{}, definition{};
+    std::uint32_t kind{};
+    std::uint64_t epoch{};
+};
 thread_local ReleaseContext gReleaseContext{};
 std::mutex gMailbox;
 Configuration gDesired{}, gCurrent{};
@@ -47,7 +53,7 @@ std::size_t gInRead{}, gInCount{}, gOutRead{}, gOutCount{};
 std::uint64_t gNextSequence{};
 std::uint64_t gDesiredEpoch{}, gCurrentEpoch{};
 std::atomic<std::uint64_t> gExpired{}, gNativeFaults{}, gUnknownPath{}, gTracked{}, gRetried{};
-bool gReplaying{}; // engine thread only
+thread_local bool gReplaying{};
 bool gPumping{};
 struct Live final {
     Event event{};
@@ -56,6 +62,15 @@ struct Live final {
     bool retiring{}, publishPending{};
 };
 std::array<Live, 128U> gLive{};
+struct Observation final {
+    Event event{};
+    std::uintptr_t manager{}, slot{}, ref{};
+    std::uint32_t key[2]{};
+    std::uint64_t epoch{};
+};
+std::array<Observation, 128U> gObservations{};
+std::size_t gObservationRead{}, gObservationCount{};
+std::atomic<std::uint64_t> gLocalReleases{}, gCaptureRejected{}, gObservationOverflow{};
 struct Watermark final { std::uint64_t peer{}, sequence{}; };
 std::array<Watermark, 32U> gWatermarks{};
 
@@ -69,6 +84,14 @@ bool Stable() noexcept {
         gGenerations != nullptr && gGenerations->IsStableGeneration(gCurrent.nativeGeneration) &&
         world_actions::SessionAuthorityBound() && world_actions::WorldBusActive() &&
         world_actions::SessionAuthorityPeer() == gCurrent.localPeer;
+}
+bool CaptureReady() noexcept {
+    if (gReplaying || !gEnabled.load(std::memory_order_acquire) ||
+        !world_actions::SessionAuthorityBound() || !world_actions::WorldBusActive()) return false;
+    std::lock_guard lock(gMailbox);
+    return gDesired.enabled != 0U && gGenerations != nullptr &&
+        gGenerations->IsStableGeneration(gDesired.nativeGeneration) &&
+        world_actions::SessionAuthorityPeer() == gDesired.localPeer;
 }
 bool SameContext(const Event& event) noexcept {
     return event.sessionCookie == gCurrent.sessionCookie && event.worldGeneration == gCurrent.worldGeneration;
@@ -90,10 +113,12 @@ bool LocalInventory(std::uintptr_t inventory) noexcept {
 }
 ReleaseContext InventoryContext(void* inventory, void* definition, std::uint32_t kind) noexcept {
     const auto address = reinterpret_cast<std::uintptr_t>(inventory);
-    if (!Stable() || gReplaying || !LocalInventory(address)) return {};
+    if (!CaptureReady() || !LocalInventory(address)) return {};
+    gLocalReleases.fetch_add(1U, std::memory_order_relaxed);
     std::uintptr_t selected = reinterpret_cast<std::uintptr_t>(definition);
     if (kind != 3U && !Read(address + 0x3BC8U, selected)) return {};
-    return selected == 0U ? ReleaseContext{} : ReleaseContext{address, selected, kind};
+    std::lock_guard lock(gMailbox);
+    return selected == 0U ? ReleaseContext{} : ReleaseContext{address, selected, kind, gDesiredEpoch};
 }
 struct ReleaseScope final {
     ReleaseContext previous{gReleaseContext};
@@ -126,10 +151,10 @@ bool LocalReleasePath(const char* path, std::uintptr_t caller, bool placement) n
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 bool CopyRelease(Event& event, const float* transform, const float* velocity,
-    const char* path, float timeLeft, bool placement) noexcept {
+    const char* path, bool placement) noexcept {
     __try {
         event.placement = placement ? 1U : 0U;
-        event.timeLeft = timeLeft;
+        event.timeLeft = 0.0F; // reserved legacy carrier field; retail owns lifetime
         std::memcpy(event.transform, transform, sizeof(event.transform));
         if (!placement) std::memcpy(event.velocity, velocity, sizeof(event.velocity));
         for (std::size_t i = 0U; i < sizeof(event.path); ++i) {
@@ -273,45 +298,60 @@ bool Track(Event event, std::uintptr_t manager, std::uintptr_t slot, bool publis
     return false;
 }
 void Observe(std::uintptr_t manager, std::uintptr_t slot, Event& event) noexcept {
-    if (slot == 0U) return;
-    event.nativeGeneration = gCurrent.nativeGeneration;
-    event.worldGeneration = gCurrent.worldGeneration;
-    event.sessionCookie = gCurrent.sessionCookie;
-    event.peer = gCurrent.localPeer;
-    event.sequence = ++gNextSequence;
-    if (Valid(event) && Fresh(event)) static_cast<void>(Track(event, manager, slot, true));
+    // Character behaviours can release inventory on a worker. Never mutate
+    // engine-owned tracking/sequence state there; retain the exact slot identity
+    // and consume it on the certified engine callback.
+    Observation observation{};
+    std::uint8_t active{};
+    if (slot == 0U || !Read(slot, active) || active == 0U ||
+        !Read(slot + 4U, observation.ref) || observation.ref == 0U ||
+        !NativeKey(observation.ref, observation.key)) {
+        gCaptureRejected.fetch_add(1U, std::memory_order_relaxed); return;
+    }
+    std::lock_guard lock(gMailbox);
+    if (gDesired.enabled == 0U || gReleaseContext.epoch != gDesiredEpoch) return;
+    event.nativeGeneration = gDesired.nativeGeneration;
+    event.worldGeneration = gDesired.worldGeneration;
+    event.sessionCookie = gDesired.sessionCookie;
+    event.peer = gDesired.localPeer;
+    observation.event = event; observation.manager = manager; observation.slot = slot;
+    observation.epoch = gDesiredEpoch;
+    if (gObservationCount == gObservations.size()) {
+        gObservationOverflow.fetch_add(1U, std::memory_order_relaxed); return;
+    }
+    gObservations[(gObservationRead + gObservationCount++) % gObservations.size()] = observation;
 }
 void __fastcall ThrowDetour(void* manager, void*, const float* transform, const float* velocity,
-    float unused, const char* path, float timeLeft) {
+    float unused, const char* path, std::uintptr_t unusedReference) {
     const auto original = reinterpret_cast<ThrowFn>(gThrowOriginal.load(std::memory_order_acquire));
     if (original == nullptr) return;
     Event event{};
-    const bool capture = Stable() && !gReplaying &&
-        CopyRelease(event, transform, velocity, path, timeLeft, false) &&
+    const bool capture = CaptureReady() &&
+        CopyRelease(event, transform, velocity, path, false) &&
         LocalReleasePath(event.path, reinterpret_cast<std::uintptr_t>(_ReturnAddress()), false) && AdmittedPath(event.path);
     const auto slot = capture ? FirstFree(reinterpret_cast<std::uintptr_t>(manager)) : 0U;
-    original(manager, transform, velocity, unused, path, timeLeft);
+    original(manager, transform, velocity, unused, path, unusedReference);
     if (capture) Observe(reinterpret_cast<std::uintptr_t>(manager), slot, event);
 }
-void __fastcall PlaceDetour(void* manager, void*, const float* transform, const char* path, float timeLeft) {
+void __fastcall PlaceDetour(void* manager, void*, const float* transform, const char* path, std::uintptr_t unusedReference) {
     const auto original = reinterpret_cast<PlaceFn>(gPlaceOriginal.load(std::memory_order_acquire));
     if (original == nullptr) return;
     Event event{};
-    const bool capture = Stable() && !gReplaying &&
-        CopyRelease(event, transform, nullptr, path, timeLeft, true) &&
+    const bool capture = CaptureReady() &&
+        CopyRelease(event, transform, nullptr, path, true) &&
         LocalReleasePath(event.path, reinterpret_cast<std::uintptr_t>(_ReturnAddress()), true) && AdmittedPath(event.path);
     const auto slot = capture ? FirstFree(reinterpret_cast<std::uintptr_t>(manager)) : 0U;
-    original(manager, transform, path, timeLeft);
+    original(manager, transform, path, unusedReference);
     if (capture) Observe(reinterpret_cast<std::uintptr_t>(manager), slot, event);
 }
 bool Spawn(const Event& event, std::uintptr_t manager) noexcept {
     __try {
         if (event.placement != 0U)
             reinterpret_cast<PlaceFn>(gPlaceOriginal.load(std::memory_order_acquire))(
-                reinterpret_cast<void*>(manager), event.transform, event.path, event.timeLeft);
+                reinterpret_cast<void*>(manager), event.transform, event.path, 0U);
         else
             reinterpret_cast<ThrowFn>(gThrowOriginal.load(std::memory_order_acquire))(
-                reinterpret_cast<void*>(manager), event.transform, event.velocity, 0.0F, event.path, event.timeLeft);
+                reinterpret_cast<void*>(manager), event.transform, event.velocity, 0.0F, event.path, 0U);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
@@ -384,6 +424,7 @@ bool Configure(std::span<const std::byte> bytes) noexcept {
     std::lock_guard lock(gMailbox);
     if (std::memcmp(&gDesired, &config, sizeof(config)) != 0) {
         ++gDesiredEpoch; gInRead = gInCount = gOutRead = gOutCount = 0U;
+        gObservationRead = gObservationCount = 0U;
     }
     gDesired = config; gEnabled.store(config.enabled != 0U, std::memory_order_release); return true;
 }
@@ -437,6 +478,21 @@ void PumpOnEngineThread() noexcept {
     }
     if (!Stable()) return;
     const bool host = world_actions::SessionAuthorityHost();
+    for (std::size_t n = 0U; n < gObservations.size(); ++n) {
+        Observation observation{};
+        { std::lock_guard lock(gMailbox);
+          if (gObservationCount == 0U) break;
+          observation = gObservations[gObservationRead];
+          gObservationRead = (gObservationRead + 1U) % gObservations.size(); --gObservationCount; }
+        if (observation.epoch != gCurrentEpoch || !SameContext(observation.event)) continue;
+        auto event = observation.event;
+        event.sequence = ++gNextSequence;
+        const Live identity{event, observation.manager, observation.slot, observation.ref,
+            {observation.key[0], observation.key[1]}, false, false};
+        if (!Valid(event) || !Alive(identity) || !Fresh(event) ||
+            !Track(event, observation.manager, observation.slot, true))
+            gCaptureRejected.fetch_add(1U, std::memory_order_relaxed);
+    }
     for (auto& live : gLive) {
         if (live.ref == 0U || live.retiring) continue;
         if (live.publishPending) { if (!Publish(live.event)) continue; live.publishPending = false; }
@@ -490,12 +546,16 @@ void TransportLost() noexcept {
     gEnabled.store(false, std::memory_order_release);
     std::lock_guard lock(gMailbox); gDesired.enabled = 0U; ++gDesiredEpoch;
     gInRead = gInCount = gOutRead = gOutCount = 0U;
+    gObservationRead = gObservationCount = 0U;
 }
 void Shutdown() noexcept { TransportLost(); }
 void LogDiagnostics(Diagnostics& diagnostics) {
     diagnostics.Log("info", "throwables", "Native stimulus releases and Host lifetime; damaging archetypes are excluded pending exact impact provenance.",
         {{"installed", Diagnostics::Boolean(Installed()), true},
          {"tracked", Diagnostics::Unsigned(gTracked.load()), true},
+         {"localReleases", Diagnostics::Unsigned(gLocalReleases.load()), true},
+         {"captureRejected", Diagnostics::Unsigned(gCaptureRejected.load()), true},
+         {"observationOverflow", Diagnostics::Unsigned(gObservationOverflow.load()), true},
          {"retried", Diagnostics::Unsigned(gRetried.load()), true},
          {"expired", Diagnostics::Unsigned(gExpired.load()), true},
          {"nativeFaults", Diagnostics::Unsigned(gNativeFaults.load()), true},

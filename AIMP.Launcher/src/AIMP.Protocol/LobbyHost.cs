@@ -373,6 +373,8 @@ public sealed partial class LobbyHost : IAsyncDisposable
         RoundEndedPayload payload,
         CancellationToken cancellationToken)
     {
+        await StopAISyncShadowAsync().ConfigureAwait(false);
+        await StopAISyncExecutionAsync().ConfigureAwait(false);
         Log?.Invoke(this, $"Round {payload.LevelGeneration} ended: {payload.Reason}.");
         await BroadcastAsync(MessageType.RoundEnded, JsonPayload.Serialize(payload),
             cancellationToken).ConfigureAwait(false);
@@ -518,13 +520,6 @@ public sealed partial class LobbyHost : IAsyncDisposable
         await BroadcastAsync(MessageType.PlayerPositionSnapshot, JsonPayload.Serialize(payload),
             cancellationToken).ConfigureAwait(false);
         PlayerPositionReceived?.Invoke(this, payload);
-    }
-
-    public Task PublishHostAISyncAsync(ReadOnlyMemory<byte> bytes, CancellationToken token = default)
-    {
-        _ = AISyncCodec.DecodeNetwork(bytes, SessionId);
-        if (!AreWorldPeersCompatible()) return Task.CompletedTask;
-        return BroadcastAsync(MessageType.AISyncNetworkState, bytes, token);
     }
 
     public async Task PublishHostPlayerEquipmentAsync(
@@ -1152,6 +1147,8 @@ public sealed partial class LobbyHost : IAsyncDisposable
 
             if (state is not null && removed)
             {
+                await RemoveShadowPeerAsync(state.PeerId).ConfigureAwait(false);
+                await RemoveExecutionPeerAsync(state.PeerId).ConfigureAwait(false);
                 lock (_stateLock) {
                     _lobbyPreparations.Remove(state.PeerId);
                     _sessionPreparedPeers.Remove(state.PeerId);
@@ -1174,6 +1171,26 @@ public sealed partial class LobbyHost : IAsyncDisposable
             state.Touch();
             switch (frame.Type)
             {
+                case MessageType.AISyncExecutionControl:
+                    HandleAISyncExecutionControl(state, frame.Payload);
+                    break;
+                case MessageType.AISyncExecutionNetworkReceipt:
+                    HandleAISyncExecutionReceipt(state, frame.Payload);
+                    break;
+                case MessageType.AISyncExecutionNetworkBatch:
+                case MessageType.AISyncCausalStateNetwork:
+                case MessageType.AISyncRouteNetwork:
+                case MessageType.AISyncExecutionNetworkRetry:
+                    throw new ProtocolException("Only the Host may publish executable AISync commands.");
+                case MessageType.AISyncShadowReceipt:
+                    await HandleAISyncShadowReceiptAsync(state, frame.Payload, cancellationToken).ConfigureAwait(false);
+                    break;
+                case MessageType.AISyncShadowRecovery:
+                    HandleAISyncShadowRecovery(state, frame.Payload);
+                    break;
+                case MessageType.AISyncShadowOpen:
+                case MessageType.AISyncShadowData:
+                    throw new ProtocolException("Only the host may publish AISync shadow observations.");
                 case MessageType.Heartbeat:
                     break;
 
@@ -2059,6 +2076,8 @@ public sealed partial class LobbyHost : IAsyncDisposable
             _worldAuthorityBroadcastCancellation.Dispose();
         }
         _shutdown.Cancel();
+        await StopAISyncShadowAsync().ConfigureAwait(false);
+        await StopAISyncExecutionAsync().ConfigureAwait(false);
         _listener.Stop();
         foreach (var client in _clients.Values)
         {

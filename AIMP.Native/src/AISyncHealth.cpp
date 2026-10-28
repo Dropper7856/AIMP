@@ -335,11 +335,25 @@ ApplyResult ApplyDamageEvent(const std::uintptr_t character, const std::uint32_t
         gDamageRejected.fetch_add(1U, std::memory_order_relaxed);
         return Fail();
     }
+    if (cursor.busy) return Defer();
+    if (cursor.character != 0U && (cursor.character != character || cursor.runtimeId != expectedRuntimeId)) {
+        gLifetimeRejected.fetch_add(1U, std::memory_order_relaxed);
+        return Fail();
+    }
+    struct Guard final { bool& busy; explicit Guard(bool& value) noexcept : busy(value) { busy = true; } ~Guard() { busy = false; } } guard(cursor.busy);
     if (event.revision < cursor.revision) return ApplyResult::AlreadyMatched;
-    if (event.revision == cursor.revision && cursor.invoked)
+    if (event.revision == cursor.revision && cursor.invoked) {
+        if (std::memcmp(&cursor.admitted, &event, sizeof(event)) != 0 ||
+            cursor.source.character != source.character || cursor.source.runtimeId != source.runtimeId) return Fail();
         return Apply(character, expectedRuntimeId, event.result, source);
-    if ((event.flags & CommitOnly) != 0U) {
+    }
+    const auto entered = [&]() noexcept {
+        cursor.character = character; cursor.runtimeId = expectedRuntimeId;
+        cursor.source = source; cursor.admitted = event;
         cursor.revision = event.revision; cursor.invoked = true;
+    };
+    if ((event.flags & CommitOnly) != 0U) {
+        entered();
         return Apply(character, expectedRuntimeId, event.result, source);
     }
     State before{};
@@ -351,15 +365,15 @@ ApplyResult ApplyDamageEvent(const std::uintptr_t character, const std::uint32_t
             gRevivalRefused.fetch_add(1U, std::memory_order_relaxed);
             return Fail();
         }
-        cursor.revision = event.revision; cursor.invoked = true;
+        entered();
         return Apply(character, expectedRuntimeId, event.result, source);
     }
     // The caller can converge this observed precondition with ApplySnapshot.
     // Do not infer a native pre-hit phase from HP alone.
     if (before.hp != event.hpBefore || before.healthState != event.healthStateBefore) return Defer();
-    cursor.revision = event.revision; cursor.invoked = true;
-    bool entered{};
-    if (!ReplayDamage(character, expectedRuntimeId, event, source, entered) || !entered) {
+    entered();
+    bool nativeEntered{};
+    if (!ReplayDamage(character, expectedRuntimeId, event, source, nativeEntered) || !nativeEntered) {
         gDamageRejected.fetch_add(1U, std::memory_order_relaxed);
         return Fail();
     }

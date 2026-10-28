@@ -503,6 +503,26 @@ void TestSpawnCharacterTracker() {
     state = tracker.Snapshot();
     CHECK(state.state == aimp::SpawnCharacterTrackingState::None);
     CHECK(state.characterAddress == 0U);
+
+    // An owned creation ticket is captured at construction, not looked up
+    // later by pointer. A replacement with identical native values revokes it.
+    alignas(16) std::array<std::byte,0x100> character{};
+    const std::uint32_t runtime=77;
+    std::memcpy(character.data()+0x50U,&runtime,sizeof(runtime));
+    const auto address=reinterpret_cast<std::uintptr_t>(character.data());
+    tracker.Begin(generations.CurrentGeneration(),74);
+    tracker.ObserveCreated(74,0x10000,address,0x20000,0x30000);
+    state=tracker.Snapshot();
+    CHECK(state.creation.serial!=0U);
+    CHECK(state.creation.runtimeId==runtime);
+    CHECK(state.creation.character==address);
+    CHECK(state.creation.origin==aimp::character_incarnations::Origin::Created);
+    auto& registry=aimp::character_incarnations::NativeRegistry();
+    aimp::character_incarnations::Ticket replacement{};
+    CHECK(registry.Created(generations.CurrentGeneration(),address,runtime,replacement)==aimp::character_incarnations::Result::Ok);
+    CHECK(replacement.serial!=state.creation.serial);
+    CHECK(tracker.Snapshot().creation.serial==0U);
+    CHECK(registry.Retire(replacement)==aimp::character_incarnations::Result::Ok);
 }
 
 void TestLifecycleCatalog() {
@@ -2364,10 +2384,12 @@ void TestExperimentalProtocol() {
             73,
             0x2C37BBB0,
             0x1C374418,
-            true);
+            true, 1234567890123ULL, 73);
     const std::string captureJson(
         reinterpret_cast<const char*>(captureBytes.data()),
         captureBytes.size());
+    CHECK(captureJson.find("\"remoteCharacterCreationSerial\":1234567890123") != std::string::npos);
+    CHECK(captureJson.find("\"remoteCharacterRuntimeId\":73") != std::string::npos);
     CHECK(captureJson.find(
               R"("gameThreadCandidateId":27844)") !=
           std::string::npos);

@@ -1,7 +1,12 @@
 #include "aimp/LoadingContextGuard.h"
 #include "aimp/AISync.h"
+#include "aimp/AISyncTransactionCapture.h"
+#include "aimp/AISyncExecutionRuntime.h"
+#include "aimp/AISyncRouteRuntime.h"
+#include "aimp/AISyncHostProducer.h"
 #include "aimp/VoiceSync.h"
 #include "aimp/LauncherIPC.h"
+#include "aimp/CharacterIncarnation.h"
 
 #include "aimp/BuildProfile.h"
 #include "aimp/CapabilityMatrix.h"
@@ -656,15 +661,69 @@ void LauncherIPC::AttachPlayerSyncObserver(
     playerSyncObserver_ = &observer;
 }
 
-void LauncherIPC::PublishAISyncTraffic() {
-    ai_sync::State state{};
-    for (std::size_t i = 0U; i < 16U && ai_sync::TryPopObserved(state); ++i) {
-        if (!sessionConfigured_.load(std::memory_order_acquire) ||
-            !worldSyncAuthorityBound_ || !worldSyncAuthorityHost_ || !worldSyncWorldBusActive_) continue;
-        if (!Queue(protocol::MessageType::AISyncState, 0U,
-                localSequence_.fetch_add(1U, std::memory_order_relaxed),
-                std::as_bytes(std::span(&state, 1U)))) break;
+void LauncherIPC::PublishAISyncTransactionTraffic() {
+    if (!sessionConfigured_.load(std::memory_order_acquire) ||
+        !worldSyncAuthorityBound_ || !worldSyncAuthorityHost_ || !worldSyncWorldBusActive_) return;
+    ai_sync::transaction_capture::TransportEnvelope bytes{};
+    for (std::size_t i = 0; i < 32U && ai_sync::transaction_capture::PeekTransport(bytes); ++i) {
+        // Queue keeps all bytes and the original local cookie/epochs. Launcher
+        // binds the outer full session identity and rejects stale cookie/world
+        // values. No native object is read or executed on this worker.
+        if (!Queue(protocol::MessageType::AISyncTransactionObservation, 0U,
+                localSequence_.fetch_add(1U, std::memory_order_relaxed), std::as_bytes(std::span(bytes)))) break;
+        ai_sync::transaction_capture::CommitTransport();
     }
+}
+void LauncherIPC::PublishAISyncExecutionTraffic() {
+    if (!sessionConfigured_.load(std::memory_order_acquire) || !worldSyncAuthorityBound_ ||
+        worldSyncAuthorityHost_ || !worldSyncWorldBusActive_) return;
+    ai_sync::execution::MailboxPacket packet{};
+    for (std::size_t i = 0; i < 32 && ai_sync::execution_runtime::Peek(packet); ++i) {
+        ai_sync::transactions::SessionId session{};
+        std::copy_n(packet.bytes.begin() + 16, session.size(), session.begin());
+        std::uint64_t world{};
+        for (std::size_t n = 0; n < 8; ++n) world |= static_cast<std::uint64_t>(packet.bytes[40 + n]) << (8U * n);
+        if (!ai_sync::execution::SessionTextMatches(session, worldSyncAuthoritySessionId_) || world != worldSyncAuthorityGeneration_) {
+            // WorldSyncLifecycle already requested local retirement. Drop
+            // only this copied old-scope disposition so it cannot obstruct
+            // the new binding's Ready response.
+            if (!ai_sync::execution_runtime::Commit(packet.token)) break;
+            continue;
+        }
+        if (!Queue(packet.receipt ? protocol::MessageType::AISyncExecutionReceipt : protocol::MessageType::AISyncExecutionBinding,
+            0, localSequence_.fetch_add(1, std::memory_order_relaxed), std::as_bytes(std::span(packet.bytes).first(packet.size)))) break;
+        static_cast<void>(ai_sync::execution_runtime::Commit(packet.token));
+    }
+}
+
+void LauncherIPC::PublishAISyncHostTraffic() {
+    if (!sessionConfigured_.load(std::memory_order_acquire) || !worldSyncAuthorityBound_ ||
+        !worldSyncAuthorityHost_ || !worldSyncWorldBusActive_) return;
+    ai_sync::host_producer::HostPacket packet{};
+    for (std::size_t i = 0; i < 32 && ai_sync::host_producer::PeekHost(packet); ++i) {
+        // A packet carries its original full binding. The IPC thread never
+        // reads Characters or relabels output from a retired Host incarnation.
+        if (packet.size < (packet.route ? ai_sync::route::kHeaderBytes : ai_sync::execution::kHeaderSize) || packet.size > packet.bytes.size()) {
+            ai_sync::host_producer::RetireHost(); break;
+        }
+        ai_sync::transactions::SessionId session{};
+        std::copy_n(packet.bytes.begin() + (packet.route ? 32 : 16), session.size(), session.begin());
+        std::uint64_t world{};
+        for (std::size_t n = 0; n < 8; ++n) world |= static_cast<std::uint64_t>(packet.bytes[(packet.route ? 56 : 40) + n]) << (8U * n);
+        if (!ai_sync::execution::SessionTextMatches(session, worldSyncAuthoritySessionId_) || world != worldSyncAuthorityGeneration_) {
+            // The lifecycle boundary already retired the old source. Its
+            // retained bytes cannot be rebound and must not block a new Offer.
+            if (!ai_sync::host_producer::CommitHost(packet.token)) break;
+            continue;
+        }
+        if (!Queue(packet.state ? protocol::MessageType::AISyncHostState : packet.route ? protocol::MessageType::AISyncHostRoute :
+            (packet.control ? protocol::MessageType::AISyncHostControl : protocol::MessageType::AISyncHostBatch),
+            0, localSequence_.fetch_add(1, std::memory_order_relaxed), std::as_bytes(std::span(packet.bytes).first(packet.size)))) break;
+        if (!ai_sync::host_producer::CommitHost(packet.token)) break;
+    }
+}
+
+void LauncherIPC::PublishAISyncTraffic() {
     ai_sync::ImpactEvent impact{};
     for (std::size_t i = 0U; i < 16U && ai_sync::TryPopObservedImpact(impact); ++i) {
         if (!sessionConfigured_.load(std::memory_order_acquire) ||
@@ -699,6 +758,19 @@ void LauncherIPC::PublishPlayerLifecycleTraffic() {
             localSequence_.fetch_add(1U, std::memory_order_relaxed),
             JsonBytes(json.str()))) {
         publishedDeathSequence_ = sequence;
+    }
+}
+
+void LauncherIPC::PublishCharacterIncarnationTraffic() {
+    if(!sessionConfigured_.load(std::memory_order_acquire)||!netzReadySent_.load(std::memory_order_acquire)) {
+        characterIncarnationPublished_=false;return;
+    }
+    const auto ticket=character_incarnations::NativeRegistry().Local();
+    std::array<std::uint8_t,character_incarnations::kLocalStateBytes> bytes{};
+    if(!character_incarnations::EncodeLocalState(ticket,bytes)||
+        (characterIncarnationPublished_&&bytes==publishedCharacterIncarnation_))return;
+    if(Queue(protocol::MessageType::CharacterIncarnationState,0,localSequence_.fetch_add(1U,std::memory_order_relaxed),std::as_bytes(std::span(bytes)))) {
+        publishedCharacterIncarnation_=bytes;characterIncarnationPublished_=true;
     }
 }
 
@@ -1049,7 +1121,8 @@ void LauncherIPC::PublishRuntimeState() {
     const auto previousSpawnTrackerVersion =
         lastPublishedSpawnTrackerVersion_.load(std::memory_order_acquire);
     const bool spawnTrackerChanged =
-        previousSpawnTrackerVersion != spawnTracking.version;
+        previousSpawnTrackerVersion != spawnTracking.version ||
+        lastPublishedSpawnCreationSerial_.load(std::memory_order_acquire) != spawnTracking.creation.serial;
     const bool gameThreadStateChanged =
         previousGameThreadValidated !=
             static_cast<std::uint8_t>(gameThreadValidated ? 1U : 0U) ||
@@ -1102,7 +1175,7 @@ void LauncherIPC::PublishRuntimeState() {
         spawnTracking.spawnKey,
         spawnTracking.characterAddress,
         spawnTracking.recordAddress,
-        spawnTracking.hookInstalled);
+        spawnTracking.hookInstalled, spawnTracking.creation.serial, spawnTracking.creation.runtimeId);
     if (QueueExperimental(protocol::MessageType::CaptureState, payload)) {
         lastPublishedCaptureCount_.store(
             summary.accepted,
@@ -1126,6 +1199,7 @@ void LauncherIPC::PublishRuntimeState() {
         lastPublishedSpawnTrackerVersion_.store(
             spawnTracking.version,
             std::memory_order_release);
+        lastPublishedSpawnCreationSerial_.store(spawnTracking.creation.serial, std::memory_order_release);
     }
 }
 
@@ -1247,11 +1321,15 @@ void LauncherIPC::Run() {
             PublishWorldReplicationTraffic();
             PublishPlayerSyncTraffic();
             PublishPlayerLifecycleTraffic();
+            PublishCharacterIncarnationTraffic();
             PublishItemSyncTraffic();
             PublishMissionSyncTraffic();
             PublishItemSyncSpawnTraffic();
             PublishThrowableTraffic();
             PublishAISyncTraffic();
+            PublishAISyncTransactionTraffic();
+            PublishAISyncExecutionTraffic();
+            PublishAISyncHostTraffic();
 
             if (!FlushOutgoing(96U)) continue;
 
@@ -1320,6 +1398,7 @@ bool LauncherIPC::TryConnect() {
 
     pipe_.store(pipe, std::memory_order_release);
     connected_.store(true, std::memory_order_release);
+    characterIncarnationPublished_=false;
     helloAcknowledged_.store(false, std::memory_order_release);
     sessionConfigured_.store(false, std::memory_order_release);
     netzReadySent_.store(false, std::memory_order_release);
@@ -1348,6 +1427,9 @@ bool LauncherIPC::TryConnect() {
 }
 
 void LauncherIPC::Disconnect(const std::string_view reason) noexcept {
+    // Worker owns the consumer; Stop also calls this after joining the worker.
+    ai_sync::host_producer::RetireHost();
+    ai_sync::transaction_capture::DiscardTransport();
     throwable_sync::TransportLost();
     voice_sync::TransportLost();
     multiplayer_pause::ClearLoadingHold();
@@ -1427,6 +1509,63 @@ void LauncherIPC::Disconnect(const std::string_view reason) noexcept {
     }
 }
 
+bool LauncherIPC::HandleAISyncExecutionFrame(const protocol::Frame& frame) {
+    if (!sessionConfigured_.load(std::memory_order_acquire)) return false;
+    if (!worldSyncAuthorityBound_ || worldSyncAuthorityHost_ || !worldSyncWorldBusActive_ || generations_ == nullptr) return true;
+    const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(frame.payload.data()), frame.payload.size());
+    if(frame.type==protocol::MessageType::AISyncClientState) {
+        static_cast<void>(ai_sync::execution_runtime::QueueCarrier(bytes));return true;
+    }
+    if(frame.type==protocol::MessageType::AISyncClientRoute) {
+        ai_sync::route::Key key{};
+        if(ai_sync::route::DecodeKey(bytes,key)!=ai_sync::route::Result::Ok||
+            !ai_sync::execution::SessionTextMatches(key.scope.session,worldSyncAuthoritySessionId_)||
+            key.scope.worldEpoch!=worldSyncAuthorityGeneration_)return true;
+        static_cast<void>(ai_sync::execution_runtime::QueueRoute(bytes));return true;
+    }
+    if (frame.type == protocol::MessageType::AISyncExecutionBinding) {
+        ai_sync::execution::Control control{};
+        if (!ai_sync::execution::DecodeControl(bytes, control) ||
+            !ai_sync::execution::SessionTextMatches(control.scope.session, worldSyncAuthoritySessionId_) ||
+            control.scope.worldEpoch != worldSyncAuthorityGeneration_ || control.kind == ai_sync::execution::ControlKind::Ready) return true;
+        const auto nativeGeneration = generations_->CurrentGeneration();
+        const auto generation32 = nativeGeneration <= UINT32_MAX ? static_cast<std::uint32_t>(nativeGeneration) : 0U;
+        if (!ai_sync::execution_runtime::QueueBinding(bytes, generation32) &&
+            control.kind == ai_sync::execution::ControlKind::Offer) {
+            std::array<std::uint8_t, ai_sync::execution::kHeaderSize> refusal{};
+            control.kind = ai_sync::execution::ControlKind::Recovery;
+            control.value = static_cast<std::uint32_t>(ai_sync::execution::Recovery::NativeUnavailable);
+            if (ai_sync::execution::EncodeControl(control, refusal))
+                static_cast<void>(Queue(protocol::MessageType::AISyncExecutionBinding, 0,
+                    localSequence_.fetch_add(1, std::memory_order_relaxed), std::as_bytes(std::span(refusal))));
+        }
+    } else static_cast<void>(ai_sync::execution_runtime::QueueBatch(bytes, frame.type == protocol::MessageType::AISyncExecutionRetry));
+    return true;
+}
+
+bool LauncherIPC::HandleAISyncHostFrame(const protocol::Frame& frame) {
+    if (!sessionConfigured_.load(std::memory_order_acquire)) return false;
+    if (!worldSyncAuthorityBound_ || !worldSyncAuthorityHost_ || !worldSyncWorldBusActive_ || generations_ == nullptr) return true;
+    const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(frame.payload.data()), frame.payload.size());
+    ai_sync::execution::Control control{};
+    if (!ai_sync::execution::DecodeControl(bytes, control) ||
+        !ai_sync::execution::SessionTextMatches(control.scope.session, worldSyncAuthoritySessionId_) ||
+        control.scope.worldEpoch != worldSyncAuthorityGeneration_ || control.scope.consumerEpoch != 1 ||
+        control.kind == ai_sync::execution::ControlKind::Ready) return true;
+    const auto generation = generations_->CurrentGeneration();
+    const auto generation32 = generation <= UINT32_MAX ? static_cast<std::uint32_t>(generation) : 0U;
+    const bool routeProvider = (control.value & 8U) == 0U || ai_sync::route_runtime::Available();
+    if ((!routeProvider || !ai_sync::host_producer::QueueBindingHost(bytes, generation32)) &&
+        control.kind == ai_sync::execution::ControlKind::Offer) {
+        std::array<std::uint8_t, ai_sync::execution::kHeaderSize> refusal{};
+        control.kind = ai_sync::execution::ControlKind::Recovery;
+        control.value = static_cast<std::uint32_t>(ai_sync::execution::Recovery::NativeUnavailable);
+        if (ai_sync::execution::EncodeControl(control, refusal))
+            static_cast<void>(Queue(protocol::MessageType::AISyncHostControl, 0,
+                localSequence_.fetch_add(1, std::memory_order_relaxed), std::as_bytes(std::span(refusal))));
+    }
+    return true;
+}
 bool LauncherIPC::HandleAISyncFrame(const protocol::Frame& frame) {
     if (!sessionConfigured_.load(std::memory_order_acquire)) return false;
     bool accepted{};
@@ -1438,7 +1577,7 @@ bool LauncherIPC::HandleAISyncFrame(const protocol::Frame& frame) {
         return true; // A stale application packet cannot bind gameplay authority.
     } else if (frame.type == protocol::MessageType::AISyncState) {
         if (worldSyncAuthorityHost_) return true;
-        accepted = ai_sync::QueueRemote(frame.payload);
+        return true; // Retired independent state lane; AISE uses the execution mailbox.
     } else {
         if (!worldSyncAuthorityHost_) return true;
         accepted = ai_sync::QueueRemoteImpact(frame.payload);
@@ -1535,6 +1674,9 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
         return false;
     }
     switch (frame.type) {
+    case protocol::MessageType::AISyncTransactionObservation:
+        // Outbound-only observation export has no native input/replay path.
+        return false;
     case protocol::MessageType::HelloAck: {
         if (helloAcknowledged_.load(std::memory_order_acquire) ||
             frame.payload.size() > 4096) {
@@ -1648,6 +1790,8 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
         // SessionConfig is IPC bootstrap only. It must never freeze gameplay
         // authority before a real LobbyHost/LobbyClient exists. The dedicated
         // WorldSyncLifecycle message binds the actual multiplayer PeerId/role.
+        ai_sync::host_producer::RetireHost();
+        ai_sync::transaction_capture::DiscardTransport();
         localPeerId_ = 0U;
         world_actions::ClearSessionAuthority();
         localLauncherPlayerId_ =
@@ -1688,6 +1832,14 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
         netzReadySent_.store(queued, std::memory_order_release);
         return queued;
     }
+    case protocol::MessageType::AISyncExecutionBinding:
+    case protocol::MessageType::AISyncExecutionBatch:
+    case protocol::MessageType::AISyncClientState:
+    case protocol::MessageType::AISyncClientRoute:
+    case protocol::MessageType::AISyncExecutionRetry:
+        return HandleAISyncExecutionFrame(frame);
+    case protocol::MessageType::AISyncHostBinding:
+        return HandleAISyncHostFrame(frame);
     case protocol::MessageType::AISyncConfigure:
     case protocol::MessageType::AISyncState:
     case protocol::MessageType::AISyncImpact:
@@ -1766,6 +1918,12 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
             if (!sameIdentity) return false;
         }
 
+        if (!bound || !worldSyncAuthorityBound_ || worldSyncAuthorityGeneration_ != generation ||
+            worldSyncWorldBusActive_ != busActive) {
+            ai_sync::execution_runtime::Retire();
+            ai_sync::host_producer::RetireHost();
+            ai_sync::transaction_capture::DiscardTransport();
+        }
         if (!bound) {
             world_actions::ClearSessionAuthority();
             localPeerId_ = 0U;

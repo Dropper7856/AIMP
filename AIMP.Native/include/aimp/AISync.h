@@ -7,12 +7,15 @@
 #include "aimp/AISyncHealth.h"
 #include "aimp/AISyncAnimation.h"
 #include "aimp/AISyncCombat.h"
+#include "aimp/AISyncParticipantIdentity.h"
+#include "aimp/AISyncActionCorrelation.h"
 
 namespace aimp {
 class HookManager;
 class LevelGenerationTracker;
 class GameThreadDispatcher;
 class Diagnostics;
+class WorldEntityRegistry;
 
 namespace ai_sync {
 // Host decisions are NOT WorldMutation/PlayerSync messages. AISync owns every
@@ -111,8 +114,19 @@ struct ParticipantConsequence final {
     std::uint64_t targetPeer{};
     health::DamageEvent damage{};
 };
+// v15: the native execution-cycle constructor CATHODE called on the Host to
+// enter the current cycle, with portable arguments. rva==0: none captured.
+// kinds: 4 bits per argument (ExecutionArgKind). Entity identities are the
+// Character/entity handle at object+54/+58, never a process pointer.
+struct ExecutionCycleCall final {
+    std::uint32_t rva{}, kinds{};
+    std::uint32_t value[2]{};
+    std::uint32_t entityA[2]{}, entityB[2]{};
+    float vector[4]{};
+    std::uint32_t cycleSerial{};
+};
 struct State final {
-    std::uint32_t version{12U};
+    std::uint32_t version{15U};
     std::uint32_t nativeGeneration{}; // informational: generations differ per process
     std::uint64_t sessionCookie{};
     std::uint32_t worldGeneration{};
@@ -185,6 +199,18 @@ struct State final {
     // Exact native HP-write provenance. A victim snapshot waits for this pair's
     // consumed outcome; it cannot kill the victim before native admission.
     std::uint32_t healthPairRevision{};
+    // v13: exact portable player life selected at Host registration. Zero
+    // preserves the uncertified legacy carrier and grants no strict admission.
+    std::uint32_t interactionParticipantIncarnation{};
+    // Causal seal captured at registration while the Host command source is
+    // actually bound. All zero means legacy; never stamp an old pair later.
+    std::uint8_t interactionSession[16]{};
+    std::uint64_t interactionAuthority{},interactionCommand{};
+    // v14: frozen reference to a proven observed kind5 reservation. Source
+    // scope consumer=1; the snapshot actor supplies the rest of OwnerKey.
+    // All zero is explicitly uncorrelated, never a replay permission.
+    action_correlation::Reference executionAction{};
+    ExecutionCycleCall transition{};
 };
 struct ImpactEvent final {
     // v2 targetBirth is the Host's portable AISync incarnation, never +50.
@@ -197,18 +223,15 @@ struct ImpactEvent final {
     std::uint32_t targetA{}, targetB{}, targetClass{}, targetBirth{};
     std::uint32_t damage{}, descriptor{}, channel{}, reserved{};
 };
-struct ParticipantBinding final {
-    std::uint64_t peer{};
-    std::uint32_t character{}, reserved{};
-};
 struct Configuration final {
-    std::uint32_t version{2U};
+    std::uint32_t version{3U};
     Role role{Role::Retail};
     std::uint32_t nativeGeneration{}, worldGeneration{};
     std::uint64_t sessionCookie{};
     // Launcher -> local DLL only. Never passed to the lobby transport.
     std::uint64_t localPeer{};
     std::uint32_t participantCount{}, flags{}; // bit 0: suppress Alien (Host only)
+    ParticipantBinding localBinding{}; // all zero if not certified yet
     ParticipantBinding participants[32]{};
 };
 #pragma pack(pop)
@@ -228,18 +251,20 @@ static_assert(offsetof(State, participantConsequence) == 472U);
 static_assert(offsetof(State, interactionTargetBirth) == 544U);
 static_assert(offsetof(State, combat) == 552U && offsetof(State, shot) == 588U);
 static_assert(offsetof(State, healthPairRevision) == 636U);
-static_assert(sizeof(State) == 640U);
+static_assert(offsetof(State,interactionParticipantIncarnation)==640U&&offsetof(State,interactionSession)==644U&&
+    offsetof(State,interactionAuthority)==660U&&offsetof(State,interactionCommand)==668U&&offsetof(State,executionAction)==676U&&offsetof(State,transition)==764U&&sizeof(State) == 816U);
 static_assert(sizeof(ImpactEvent) == 64U);
-static_assert(sizeof(ParticipantBinding) == 16U);
-static_assert(sizeof(Configuration) == 552U);
+static_assert(offsetof(Configuration,localBinding)==40U && offsetof(Configuration,participants)==72U);
+static_assert(sizeof(Configuration) == 1096U);
 
 bool Install(std::uintptr_t moduleBase, HookManager& hooks,
     LevelGenerationTracker& generations, GameThreadDispatcher& dispatcher,
-    std::string& error);
+    std::string& error, WorldEntityRegistry* scriptReferences = nullptr);
 bool Configure(std::span<const std::byte> payload) noexcept;
-bool QueueRemote(std::span<const std::byte> payload) noexcept;
+bool QueueRemote(std::span<const std::byte> payload, std::uint64_t through = 0) noexcept;
+void BeginExecutionCarrierScope(const transactions::Scope&) noexcept;
+bool ApplyExecutionCarrier(const State&,std::uint64_t through) noexcept;
 bool QueueRemoteImpact(std::span<const std::byte> payload) noexcept;
-bool TryPopObserved(State& state) noexcept;
 bool TryPopObservedImpact(ImpactEvent& impact) noexcept;
 void PumpOnEngineThread() noexcept;
 // SpawnCharacter creates the NPC-backed visual representation of a remote
@@ -247,6 +272,7 @@ void PumpOnEngineThread() noexcept;
 // Character manager can update it re-entrantly before CharacterCreate returns.
 void ObservePlayerRepresentationSpawn(std::uint32_t spawnKey) noexcept;
 void ObservePlayerRepresentation(std::uintptr_t character) noexcept;
+void BeforeCharacterDestruction(std::uintptr_t character) noexcept;
 void ForgetCharacter(std::uintptr_t character) noexcept;
 void ForgetSpawnKey(std::uint32_t spawnKey) noexcept;
 void TransportLost() noexcept;

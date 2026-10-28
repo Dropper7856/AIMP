@@ -31,6 +31,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private readonly CancellationTokenSource _lifetime = new();
     private readonly object _stateGate = new();
     private readonly GameplaySpawnReadinessGate _gameplayReadiness = new();
+    private readonly PlayerIncarnationAllocator _playerIncarnations = new();
     private LobbyHost? _host;
     private LobbyClient? _client;
     private LobbySnapshotPayload? _lobby;
@@ -60,7 +61,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private bool _remoteSpawnConvergenceRunning;
     private long _remoteSpawnEpoch;
     private readonly record struct RemoteSpawnContext(
-        Guid SessionId, int WorldGeneration, int NativeGeneration, int ProcessId, long Epoch);
+        Guid SessionId, int WorldGeneration, int NativeGeneration, int ProcessId, long Epoch,
+        ulong Peer,uint Incarnation,Guid ConnectionIdentity);
     private sealed class RemoteSpawnContextChangedException : OperationCanceledException
     {
         internal RemoteSpawnContextChangedException()
@@ -72,7 +74,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     // spawn (each extra submission became an orphan Character in the world).
     private readonly record struct InFlightRemoteSpawn(
         uint PreviousKey, uint? SpawnKey, Guid SessionId, int StartGeneration, int ProcessId,
-        DateTimeOffset SubmittedUtc);
+        DateTimeOffset SubmittedUtc,int NativeGeneration,uint Incarnation,Guid ConnectionIdentity);
     private static readonly TimeSpan InFlightRemoteSpawnLifetime = TimeSpan.FromSeconds(90);
     private readonly Dictionary<ulong, InFlightRemoteSpawn> _inFlightRemoteSpawns = new();
     private readonly Dictionary<ulong, int> _remoteSpawnRetryAttempts = new();
@@ -863,7 +865,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         settings.PlayerName,
         settings.PlayerId,
         settings.Port,
-        ProtocolConstants.DefaultLobbyCapacity,
+        ResolveCapacity(message),
         ResolveLevel(message),
         LobbyCompatibility.Create(settings),
         RequireWorldPreparation: true,
@@ -878,6 +880,20 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         return requested.Length is >= 1 and <= ProtocolConstants.MaximumServerNameLength
             ? requested : fallback;
     }
+
+    private static int ResolveCapacity(ScaleformBridgeMessage message) =>
+        // The menu stepper defaults to "2 Players", which capped lobbies at two ("Lobby is full").
+        // The menu selection is ignored for now: every lobby uses the default capacity (4).
+        // Remove this line to honor the menu selection again.
+        ProtocolConstants.DefaultLobbyCapacity;
+
+    // Original menu-driven capacity resolution (currently unused, see ResolveCapacity).
+    private static int ResolveRequestedCapacity(ScaleformBridgeMessage message) =>
+        int.TryParse(message.Get("maxPlayers"), NumberStyles.Integer,
+            CultureInfo.InvariantCulture, out var requested)
+            ? Math.Clamp(requested, ProtocolConstants.MinimumLobbyCapacity,
+                ProtocolConstants.MaximumLobbyCapacity)
+            : ProtocolConstants.DefaultLobbyCapacity;
 
     private static string ResolveLevel(ScaleformBridgeMessage message)
     {
@@ -2221,9 +2237,10 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                     $"localPakSha256={automaticPrepared.Manifest.Source.CommandsPakSha256} " +
                     $"localBinSha256={automaticPrepared.Manifest.Source.CommandsBinSha256}.");
             }
-            var prepared = automaticMatchesHost
-                ? automaticPrepared!
-                : WorldManifestSessionLoader.LoadFromCache(hostContext);
+            // Manifest hash match with the host is no longer required: use the locally prepared
+            // manifest when available, and only fall back to the host-identified cache entry.
+            var prepared = automaticPrepared
+                ?? WorldManifestSessionLoader.LoadFromCache(hostContext);
             var nativeGeneration = _controller.Snapshot.LevelGeneration;
             await EnsureNativeManifestLoadedAsync(prepared, loadingStart, nativeGeneration).ConfigureAwait(false);
             EnsureManifestLoadContext(loadingStart, nativeGeneration);
@@ -2644,6 +2661,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             if (_start?.SessionId != value.SessionId || _start.LevelGeneration != value.LevelGeneration)
                 throw new OperationCanceledException("Lobby changed while arming preparation hold.");
             _loadingHoldStart = value;
+            _worldQuiescenceWaitSinceUtc = null;
+            _loadingHoldStartedUtc = DateTimeOffset.UtcNow;
             _nextPreparationProgressUtc = DateTimeOffset.MinValue;
             _loadingOverlayAcknowledged = false;
             _loadingOverlayConnection = Guid.Empty;
@@ -2787,6 +2806,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             if (!_remotePositions.TryGetValue(value.PeerId, out var track))
                 _remotePositions[value.PeerId] = track = new RemotePositionTrack();
             if (!track.TryAccept(value, receivedAtUtc)) return false;
+            _aiSync.ObserveParticipantIncarnation(value.PeerId,value.CharacterIncarnation);
 
             // A current-generation position can only be published after the
             // sender completed its local gameplay-ready transition. Treat it
@@ -3001,9 +3021,13 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 return false;
             var peerId = LocalPeerId();
             if (peerId == 0 || (_host is null && _client is null)) return false;
+            var runtime=_controller.Snapshot;var connection=_controller.AISyncConnectionIdentity;
+            var incarnation=_playerIncarnations.Observe(_start.SessionId,peerId,_start.LevelGeneration,runtime,connection);
+            _aiSync.SetLocalIncarnation(_start.SessionId,peerId,incarnation,runtime,connection);
             _pendingLocalPosition = new PlayerPositionSnapshotPayload(_start.SessionId, peerId,
                 _start.LevelGeneration, ++_localPositionSequence, now.ToUnixTimeMilliseconds(),
-                _position.X, _position.Y, _position.Z, _yaw, _moveType, _nativeMoveSpeed, _posture, _torch);
+                _position.X, _position.Y, _position.Z, _yaw, _moveType, _nativeMoveSpeed, _posture, _torch,
+                incarnation);
             QueueLocalPostureEdge(_pendingLocalPosition);
             if (_positionSendRunning) return false;
             _positionSendRunning = true;
@@ -3363,10 +3387,11 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                     peerId, characterBase, visibleEquipmentIndex)
                     .ConfigureAwait(false))
             {
-                // No supported carried equipment: keep any already-provisioned
-                // weapon visible, but never leave remote input held.
+                // Stop inputs for an unsupported selection. A released held
+                // flare also needs retail slot cleanup to detach its model/VFX.
                 await StopRemotePlayerActionsAsync(peerId, characterBase)
                     .ConfigureAwait(false);
+                await ReleaseRemoteHeldFlareAsync(peerId, characterBase).ConfigureAwait(false);
                 return;
             }
 
@@ -3436,6 +3461,34 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private bool IsSurvivalEquipmentSession()
     {
         lock (_stateGate) return _start is not null && LevelGameMode(_start.Level) == "Survival";
+    }
+
+    private async Task ReleaseRemoteHeldFlareAsync(ulong peerId, uint characterBase)
+    {
+        if (!TryGetRemoteHeldFlareContext(peerId, out var player, out var preparation)
+            || player is null || preparation is null) return;
+        var catalogs = await preparation.ConfigureAwait(false);
+        if (catalogs is null || !catalogs.TryGet("flare-held", out var catalog)) return;
+        await _remoteEquipmentProvisionGate.WaitAsync(_lifetime.Token).ConfigureAwait(false);
+        try
+        {
+            if (await ProvisionRemoteEquipmentAsync(player, characterBase, catalog, releaseHeld: true).ConfigureAwait(false))
+                lock (_stateGate) _remoteProvisionedEquipment.Remove(peerId);
+        }
+        finally { _remoteEquipmentProvisionGate.Release(); }
+    }
+
+    private bool TryGetRemoteHeldFlareContext(ulong peerId, out LobbyPlayer? player,
+        out Task<RemoteEquipmentCatalogSet?>? preparation)
+    {
+        lock (_stateGate)
+        {
+            player = null; preparation = null;
+            if (!_remoteProvisionedEquipment.TryGetValue(peerId, out var index) || index is not (32 or 33)) return false;
+            player = _lobby?.Players.FirstOrDefault(value => value.PeerId == peerId);
+            preparation = _remoteEquipmentCatalogPreparation;
+            return player is not null && preparation is not null;
+        }
     }
 
     private int ResolveVisibleLocalEquipmentIndex(
@@ -3514,7 +3567,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         try
         {
             provisioned = await ProvisionRemoteEquipmentAsync(
-                player, characterBase, catalog).ConfigureAwait(false);
+                player, characterBase, catalog, equipmentIndex == 33).ConfigureAwait(false);
         }
         finally
         {
@@ -4268,14 +4321,16 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             _lobby, _pendingSpawnRequest?.Players, LocalPeerId(), _remoteCharacters);
     }
 
-    private RemoteSpawnContext CaptureRemoteSpawnContext(NativeRuntimeSnapshot runtime)
+    private RemoteSpawnContext CaptureRemoteSpawnContext(NativeRuntimeSnapshot runtime,ulong peer)
     {
         lock (_stateGate)
         {
             if (_start is null || !runtime.AiRunning || runtime.ProcessId == 0)
                 throw new RemoteSpawnContextChangedException();
             return new(_start.SessionId, _start.LevelGeneration,
-                runtime.LevelGeneration, runtime.ProcessId, _remoteSpawnEpoch);
+                runtime.LevelGeneration, runtime.ProcessId, _remoteSpawnEpoch,peer,
+                _remotePositions.TryGetValue(peer,out var track)?track.Snapshot()?.Latest.CharacterIncarnation??0:0,
+                _controller.AISyncConnectionIdentity);
         }
     }
 
@@ -4286,6 +4341,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             if (_start is null || _start.SessionId != context.SessionId
                 || _start.LevelGeneration != context.WorldGeneration
                 || _remoteSpawnEpoch != context.Epoch
+                || _controller.AISyncConnectionIdentity!=context.ConnectionIdentity
+                || (_remotePositions.TryGetValue(context.Peer,out var track)?track.Snapshot()?.Latest.CharacterIncarnation??0:0)!=context.Incarnation
                 || !runtime.AiRunning || runtime.ProcessId != context.ProcessId
                 || runtime.LevelGeneration != context.NativeGeneration)
                 throw new RemoteSpawnContextChangedException();
@@ -4295,7 +4352,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private async Task SpawnRemotePlayerAsync(RemotePlayerSpawnTarget target)
     {
         var initialRuntime = _controller.Snapshot;
-        var context = CaptureRemoteSpawnContext(initialRuntime);
+        var context = CaptureRemoteSpawnContext(initialRuntime,target.Player.PeerId);
         if (TryResumeInFlightSpawn(target.Player.PeerId, context, out var inFlight))
         {
             _diagnostics.Log("Multiplayer",
@@ -4337,7 +4394,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         lock (_stateGate)
             _inFlightRemoteSpawns[target.Player.PeerId] = new InFlightRemoteSpawn(
                 previousKey, expectedSpawnKey, context.SessionId, context.WorldGeneration,
-                context.ProcessId, DateTimeOffset.UtcNow);
+                context.ProcessId, DateTimeOffset.UtcNow,context.NativeGeneration,context.Incarnation,context.ConnectionIdentity);
         EnsureRemoteSpawnContext(context, _controller.Snapshot);
         await CompleteRemoteSpawnAsync(target.Player, previousKey, expectedSpawnKey, context)
             .ConfigureAwait(false);
@@ -4346,10 +4403,10 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private async Task CompleteRemoteSpawnAsync(
         LobbyPlayer player, uint previousKey, uint? expectedSpawnKey, RemoteSpawnContext context)
     {
-        uint characterBase;
+        NativeRuntimeSnapshot tracked;
         try
         {
-            characterBase = await WaitForTrackedSpawnAsync(previousKey, expectedSpawnKey, context)
+            tracked = await WaitForTrackedSpawnAsync(previousKey, expectedSpawnKey, context)
                 .ConfigureAwait(false);
         }
         catch (InvalidOperationException)
@@ -4358,7 +4415,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             lock (_stateGate) _inFlightRemoteSpawns.Remove(player.PeerId);
             throw;
         }
-        StoreRemoteCharacter(player, characterBase, context);
+        StoreRemoteCharacter(player, tracked, context);
         lock (_stateGate) _inFlightRemoteSpawns.Remove(player.PeerId);
         await ShowPlayerJoinedMessageAsync(player.DisplayName).ConfigureAwait(false);
     }
@@ -4370,8 +4427,14 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         lock (_stateGate)
         {
             if (!_inFlightRemoteSpawns.TryGetValue(peerId, out inFlight)) return false;
+            if(inFlight.SessionId==context.SessionId&&inFlight.StartGeneration==context.WorldGeneration
+                &&inFlight.ProcessId==context.ProcessId&&inFlight.NativeGeneration==context.NativeGeneration
+                &&inFlight.ConnectionIdentity==context.ConnectionIdentity&&inFlight.Incarnation!=context.Incarnation)
+                throw new RemoteSpawnContextChangedException(); // Retain accepted old spawn; never relabel or duplicate it.
             if (inFlight.SessionId == context.SessionId && inFlight.StartGeneration == context.WorldGeneration
                 && inFlight.ProcessId == context.ProcessId
+                && inFlight.NativeGeneration==context.NativeGeneration&&inFlight.Incarnation==context.Incarnation
+                && inFlight.ConnectionIdentity==context.ConnectionIdentity
                 && DateTimeOffset.UtcNow - inFlight.SubmittedUtc < InFlightRemoteSpawnLifetime)
                 return true;
             _inFlightRemoteSpawns.Remove(peerId);
@@ -4489,7 +4552,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private async Task<bool> ProvisionRemoteEquipmentAsync(
         LobbyPlayer player,
         uint characterBase,
-        RemoteEquipmentCatalog catalog)
+        RemoteEquipmentCatalog catalog,
+        bool activateHeld = false, bool releaseHeld = false)
     {
         var arguments = new Dictionary<string, string>(StringComparer.Ordinal)
         {
@@ -4507,6 +4571,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 catalog.EquipmentSlot.ToString(CultureInfo.InvariantCulture)
         };
         var deadline = DateTimeOffset.UtcNow.AddSeconds(8);
+        if (activateHeld) arguments["activateHeld"] = "true";
+        if (releaseHeld) arguments["releaseHeld"] = "true";
         string lastStatus = string.Empty;
         string lastMessage = string.Empty;
         while (DateTimeOffset.UtcNow < deadline)
@@ -4588,7 +4654,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             $"SpawnCharacter was rejected: {result.StatusCode} - {result.Message}");
     }
 
-    private async Task<uint> WaitForTrackedSpawnAsync(
+    private async Task<NativeRuntimeSnapshot> WaitForTrackedSpawnAsync(
         uint previousKey,
         uint? expectedSpawnKey,
         RemoteSpawnContext context)
@@ -4604,7 +4670,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             if (!expectedSpawnKey.HasValue && runtime.RemoteCharacterSpawnKey != previousKey)
                 expectedSpawnKey = runtime.RemoteCharacterSpawnKey;
             var resolved = ResolveTrackedSpawn(previousKey, expectedSpawnKey, runtime);
-            if (resolved.HasValue) return resolved.Value;
+            if (resolved.HasValue) return runtime;
             if (DateTimeOffset.UtcNow >= nextNotice)
             {
                 _diagnostics.Log("Multiplayer",
@@ -4655,11 +4721,16 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     }
 
     private void StoreRemoteCharacter(
-        LobbyPlayer player, uint characterBase, RemoteSpawnContext context)
+        LobbyPlayer player, NativeRuntimeSnapshot tracked, RemoteSpawnContext context)
     {
+        var characterBase=tracked.RemoteCharacterBase;
         lock (_stateGate)
         {
-            EnsureRemoteSpawnContext(context, _controller.Snapshot);
+            var current=_controller.Snapshot;
+            EnsureRemoteSpawnContext(context, current);
+            if(tracked.RemoteCharacterCreationSerial!=0&&(current.RemoteCharacterCreationSerial!=tracked.RemoteCharacterCreationSerial
+                ||current.RemoteCharacterBase!=characterBase||current.RemoteCharacterRuntimeId!=tracked.RemoteCharacterRuntimeId
+                ||current.RemoteCharacterSpawnKey!=tracked.RemoteCharacterSpawnKey))throw new RemoteSpawnContextChangedException();
             if (_lobby?.Players.Any(value => value.PeerId == player.PeerId) != true)
                 throw new RemoteSpawnContextChangedException();
             if (!_remoteCharacters.TryGetValue(player.PeerId, out var previousCharacter)
@@ -4672,7 +4743,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             _remoteCharacters[player.PeerId] = characterBase;
             _remoteSpawnRetryAttempts.Remove(player.PeerId);
             _remoteSpawnRetryNotBeforeUtc.Remove(player.PeerId);
-            _aiSync.SetParticipant(player.PeerId, characterBase);
+            _aiSync.SetParticipant(player.PeerId, characterBase,AISyncParticipantEvidence.FromSpawn(context.Incarnation,
+                characterBase,tracked.RemoteCharacterSpawnKey,tracked,context.ConnectionIdentity));
         }
         _diagnostics.Log("Multiplayer",
             $"Remote player {player.DisplayName} mapped to CharacterBase=0x{characterBase:X8}.");
@@ -4867,8 +4939,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             ["mapName"] = snapshot.Level,
             ["p1"] = FormatPlayer(players, 0, 1),
             ["p2"] = FormatPlayer(players, 1, 2),
-            ["p3"] = "3  Empty",
-            ["p4"] = "4  Empty"
+            ["p3"] = FormatPlayer(players, 2, 3),
+            ["p4"] = FormatPlayer(players, 3, 4)
         });
     }
 

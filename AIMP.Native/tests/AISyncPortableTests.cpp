@@ -1,5 +1,6 @@
 #include "aimp/AISyncExecutionPolicy.h"
 #include "aimp/AISyncNavigation.h"
+#include "aimp/AISyncCausalState.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -7,15 +8,71 @@
 #include <cassert>
 #include <limits>
 #include <iostream>
+#include <fstream>
+#include <iterator>
+#include <string>
+#include <algorithm>
+#include <cctype>
+#include <cstring>
+#include <array>
 
-int main() {
+int main(int argc,char** argv) {
     using namespace aimp::ai_sync;
-    // Pursuit (2), local rejoin (1), and Host route (non-convergence) can
-    // replace each other in one tick. Old cleanup must leave the successor alive.
-    static_assert(navigation::SameLeaseOwner(true, 2U, true, 2U));
-    static_assert(!navigation::SameLeaseOwner(true, 1U, true, 2U));
-    static_assert(!navigation::SameLeaseOwner(false, 2U, true, 2U));
-    static_assert(!navigation::SameLeaseOwner(true, 2U, true, 1U));
+    // Deferred End_Action cannot finish early, from stale evidence, or via a
+    // lethal native branch. All five independent obligations are mandatory.
+    for(unsigned mask=0;mask<32U;++mask)
+        assert(DeferredSourceEndReady((mask&1U)!=0U,(mask&2U)!=0U,(mask&4U)!=0U,
+            (mask&8U)!=0U,(mask&16U)!=0U)==(mask==31U));
+    // Cycle 57 takes float bits, including values whose bit pattern can name
+    // readable memory. Their portability must never depend on VirtualQuery.
+    const auto* scalarCycle=FindExecutionTransitionContract(0xEAD918U,0x57U);
+    assert(scalarCycle&&scalarCycle->rva==0x257DA0U&&scalarCycle->arity==1U&&scalarCycle->args[0]==TransitionArg::FloatBits);
+    for(const auto bits:{0U,0x80000000U,0x3F800000U,0xBF800000U,0x7F7FFFFFU,0xFF7FFFFFU})
+        assert(FiniteExecutionFloatBits(bits));
+    for(const auto bits:{0x7F800000U,0xFF800000U,0x7FC00000U,0xFFC00000U})
+        assert(!FiniteExecutionFloatBits(bits));
+    assert(argc==2);
+    std::ifstream input(argv[1]);std::string hex{std::istreambuf_iterator<char>{input},{}};
+    hex.erase(std::remove_if(hex.begin(),hex.end(),[](unsigned char c){return std::isspace(c)!=0;}),hex.end());
+    assert(hex.size()==sizeof(Configuration)*2U);
+    std::array<std::uint8_t,sizeof(Configuration)> fixture{};
+    for(std::size_t i=0;i<fixture.size();++i)fixture[i]=static_cast<std::uint8_t>(std::stoul(hex.substr(i*2,2),nullptr,16));
+    Configuration configuration{};configuration.role=Role::Client;configuration.nativeGeneration=7U;configuration.worldGeneration=5U;
+    configuration.sessionCookie=0x6677445500112233ULL;configuration.localPeer=7U;configuration.participantCount=1U;
+    configuration.localBinding={7U,0x100000U,3U,15U,0U,9U};configuration.participants[0]={9U,0x200000U,4U,77U,0U,10U};
+    assert(std::memcmp(&configuration,fixture.data(),fixture.size())==0);
+    assert(ValidParticipantBinding(configuration.localBinding)&&ValidParticipantBinding(configuration.participants[0]));
+    assert(ValidParticipantBinding({})&&ValidParticipantBinding({9U,0x200000U}));
+    auto bad=configuration.participants[0];bad.creationSerial=0U;assert(!ValidParticipantBinding(bad));
+    bad=configuration.participants[0];bad.runtimeId=0U;assert(!ValidParticipantBinding(bad));
+    bad=configuration.participants[0];bad.incarnation=0U;assert(!ValidParticipantBinding(bad));
+    bad=configuration.participants[0];bad.reserved=1U;assert(!ValidParticipantBinding(bad));
+    bad=configuration.participants[0];bad.character+=1U;assert(!ValidParticipantBinding(bad));
+    bad=configuration.participants[0];bad.peer=0U;assert(!ValidParticipantBinding(bad));
+    aimp::character_incarnations::Ticket ticket{7U,10U,0x200000U,77U,aimp::character_incarnations::Origin::Created};
+    assert(MatchesParticipantTicket(configuration.participants[0],ticket,7U,false));
+    assert(!MatchesParticipantTicket(configuration.participants[0],ticket,8U,false));
+    ++ticket.serial;assert(!MatchesParticipantTicket(configuration.participants[0],ticket,7U,false));--ticket.serial;
+    ++ticket.runtimeId;assert(!MatchesParticipantTicket(configuration.participants[0],ticket,7U,false));--ticket.runtimeId;
+    ticket.origin=aimp::character_incarnations::Origin::ExistingAtBinding;
+    assert(!MatchesParticipantTicket(configuration.participants[0],ticket,7U,false));
+    assert(MatchesParticipantTicket(configuration.participants[0],ticket,7U,true));
+    assert(MatchesParticipantTarget(9U,4U,9U,4U));
+    assert(!MatchesParticipantTarget(9U,4U,9U,5U));
+    assert(!MatchesParticipantTarget(9U,4U,9U,0U));
+    assert(!MatchesParticipantTarget(9U,4U,10U,4U));
+    assert(!MatchesParticipantTarget(0U,0U,0U,0U));
+    assert(MatchesParticipantTarget(9U,0U,9U,5U)); // Explicit legacy, not strict authority.
+    assert(NativeOwnerEpoch(0U,1U)==0U && NativeOwnerEpoch(1U,0U)==0U);
+    assert(NativeOwnerEpoch(7U,2U)>NativeOwnerEpoch(7U,1U));
+    assert(NativeOwnerEpoch(8U,1U)>NativeOwnerEpoch(7U,UINT32_MAX));
+    assert(NativeOwnerEpoch(UINT32_MAX,UINT32_MAX)==UINT64_MAX);
+    for (unsigned state=0;state<256U;++state) {
+        assert(MovementDrainCycleAllowed(0xEABF80U,static_cast<std::uint8_t>(state)) == (state==1U || state==0x38U));
+        assert(MovementDrainCycleAllowed(0xEABEC0U,static_cast<std::uint8_t>(state)) == (state==0x3BU));
+        assert(MovementDrainCycleAllowed(0xEAD858U,static_cast<std::uint8_t>(state)) == (state==1U));
+        assert(!MovementDrainCycleAllowed(0xEAE5D0U,static_cast<std::uint8_t>(state)));
+    }
     static_assert(!AlienSuppressionRequested(Role::Host, 0U));
     static_assert(AlienSuppressionRequested(Role::Host, kDisableAlien));
     static_assert(!AlienSuppressionRequested(Role::Retail, kDisableAlien));
@@ -286,9 +343,21 @@ int main() {
     aim.flags = combat::Present | combat::Aiming; assert(!combat::Valid(aim));
     static_assert(navigation::kNavigationCapacity >= 256U);
     static_assert(sizeof(NavigationGoalState) == 60U && offsetof(State, navigation) == 256U);
-    static_assert(sizeof(State) == 640U && State{}.version == 12U);
+    static_assert(sizeof(State) == 816U && State{}.version == 15U);
     static_assert(offsetof(State, outcome) == 192U && offsetof(State, executionRevision) == 240U);
     static_assert(sizeof(ImpactEvent) == 64U && ImpactEvent{}.version == 2U);
     static_assert(offsetof(State, health) == 316U && offsetof(State, damage) == 356U);
-    std::cout << "AISync ownership, typed navigation, health/combat and v12 wire layout passed\n";
+    {
+        // Every published State crosses the ordered causal stream: the
+        // current State version must round-trip through its codec.
+        transactions::Scope scope{};scope.session.fill(7U);scope.authorityEpoch=3U;scope.worldEpoch=2U;scope.consumerEpoch=1U;
+        State value{};value.sessionCookie=0x0707070707070707ULL;value.worldGeneration=2U;
+        value.transition.rva=0x2584A0U;value.transition.kinds=2U;value.transition.entityA[0]=11U;value.transition.entityB[0]=12U;
+        std::array<std::uint8_t,causal_state::kBytes> bytes{};
+        assert(causal_state::Encode(bytes,scope,5U,4U,value));
+        transactions::Scope decodedScope{};std::uint64_t serial{},through{};State decoded{};
+        assert(causal_state::Decode(bytes,decodedScope,serial,through,decoded)&&serial==5U&&through==4U&&
+            decoded.transition.rva==0x2584A0U&&decoded.transition.entityB[0]==12U);
+    }
+    std::cout << "AISync ownership, typed navigation, health/combat and v15 wire layout passed\n";
 }

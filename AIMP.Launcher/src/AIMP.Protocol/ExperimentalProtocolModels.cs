@@ -305,7 +305,9 @@ public sealed record CaptureStatePayload(
     uint RemoteCharacterSpawnKey = 0,
     ulong RemoteCharacterAddress = 0,
     ulong RemoteCharacterRecordAddress = 0,
-    bool CharacterCreateHookInstalled = false);
+    bool CharacterCreateHookInstalled = false,
+    ulong RemoteCharacterCreationSerial = 0,
+    uint RemoteCharacterRuntimeId = 0);
 
 public static class RemoteCharacterStateNames
 {

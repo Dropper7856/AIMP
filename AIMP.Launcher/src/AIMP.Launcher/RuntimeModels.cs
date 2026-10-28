@@ -39,7 +39,17 @@ internal sealed record NativeRuntimeSnapshot(
     uint RemoteCharacterSpawnKey = 0,
     uint RemoteCharacterBase = 0,
     uint RemoteCharacterRecord = 0,
-    bool CharacterCreateHookInstalled = false)
+    bool CharacterCreateHookInstalled = false,
+    ulong LocalCharacterGeneration = 0,
+    ulong LocalCharacterSerial = 0,
+    uint LocalCharacterBase = 0,
+    uint LocalCharacterRuntimeId = 0,
+    uint LocalCharacterOrigin = 0,
+    Guid LocalCharacterConnectionIdentity = default,
+    int RemoteCharacterGeneration = 0,
+    ulong RemoteCharacterCreationSerial = 0,
+    uint RemoteCharacterRuntimeId = 0,
+    Guid RemoteCharacterConnectionIdentity = default)
 {
     internal static NativeRuntimeSnapshot Empty { get; } = new(
         false, 0, string.Empty, 0, string.Empty, false, false, string.Empty,

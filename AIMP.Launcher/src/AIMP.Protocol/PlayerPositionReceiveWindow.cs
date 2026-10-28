@@ -6,6 +6,8 @@ public sealed class PlayerPositionReceiveWindow
 {
     private PlayerPositionSnapshotPayload? _latest;
     private PlayerPostureSnapshot? _traversal;
+    private uint _incarnationFloor;
+    private bool _incarnationActive;
 
     public bool TryAccept(PlayerPositionSnapshotPayload value)
     {
@@ -14,8 +16,15 @@ public sealed class PlayerPositionReceiveWindow
         if (previous is not null && (value.SessionId != previous.SessionId || value.PeerId != previous.PeerId
             || value.LevelGeneration < previous.LevelGeneration)) return false;
         var sameGeneration = previous?.LevelGeneration == value.LevelGeneration;
-        if (sameGeneration && (value.Sequence <= previous!.Sequence || !ValidTraversal(value.Posture))) return false;
-        if (!sameGeneration) _traversal = null;
+        var incarnation = value.CharacterIncarnation;
+        if (incarnation != 0 && (incarnation < _incarnationFloor
+            || incarnation == _incarnationFloor && (!_incarnationActive || !sameGeneration))) return false;
+        var sameLife = sameGeneration && previous!.CharacterIncarnation == incarnation;
+        if (sameGeneration && value.Sequence <= previous!.Sequence) return false;
+        if (sameLife && !ValidTraversal(value.Posture)) return false;
+        if (!sameLife) _traversal = null;
+        if (incarnation != 0) _incarnationFloor = incarnation;
+        _incarnationActive = incarnation != 0;
         if (value.Posture is { TraversalRevision: > 0 } posture) _traversal = posture;
         else if (value.Posture is not null && _traversal is not null)
             _traversal = _traversal with { TraversalActive = false };

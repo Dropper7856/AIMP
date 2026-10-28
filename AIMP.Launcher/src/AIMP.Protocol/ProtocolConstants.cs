@@ -2,7 +2,7 @@ namespace AIMP.Protocol;
 
 public static class ProtocolConstants
 {
-    public const ushort Version = 11;
+    public const ushort Version = 24;
     public const int HeaderSize = 22;
     public const int MaximumPayloadSize = 1024 * 1024;
     public const int MaximumDiscoveryPayloadSize = 4096;
@@ -10,7 +10,9 @@ public static class ProtocolConstants
     public const int MaximumServerNameLength = 48;
     public const int DefaultGamePort = 28015;
     public const int DefaultDiscoveryPort = 28016;
-    public const int DefaultLobbyCapacity = 2;
+    public const int DefaultLobbyCapacity = 4;
+    public const int MinimumLobbyCapacity = 2;
+    public const int MaximumLobbyCapacity = 4;
     public const int ExperimentalSchemaVersion = 1;
     public const int MaximumExperimentalListItems = 64;
     public const int MaximumExperimentalTextLength = 1024;

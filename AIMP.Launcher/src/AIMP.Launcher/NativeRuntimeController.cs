@@ -41,6 +41,8 @@ internal sealed class NativeRuntimeController : IDisposable
     internal LauncherDiagnostics Diagnostics => _diagnostics;
 
     internal bool AISyncAvailable => _ipc is { IsReady: true, AISyncAvailable: true };
+    internal Guid AISyncConnectionIdentity => _ipc is { IsReady: true } session
+        ? session.ConnectionIdentity : Guid.Empty;
 
     internal event EventHandler<NativeRuntimeSnapshot>? StateChanged;
 
@@ -61,9 +63,10 @@ internal sealed class NativeRuntimeController : IDisposable
     internal event EventHandler<NativeItemSyncSpawnPayload>? ItemSyncSpawnProduced;
     internal event EventHandler<ReadOnlyMemory<byte>>? ThrowableProduced;
 
-    internal event EventHandler<ReadOnlyMemory<byte>>? AISyncStateProduced;
 
     internal event EventHandler<ReadOnlyMemory<byte>>? AISyncImpactProduced;
+    internal event EventHandler<NativeAISyncObservation>? AISyncTransactionObservationProduced;
+    internal event EventHandler<NativeAISyncExecution>? AISyncExecutionProduced;
 
     internal void RefreshProcessStatus()
     {
@@ -389,14 +392,25 @@ internal sealed class NativeRuntimeController : IDisposable
         return session.ReserveWorldMutationDispatchId();
     }
 
-    internal Task SendAISyncConfigurationAsync(ReadOnlyMemory<byte> payload, CancellationToken token) =>
-        GetCommandSession().SendAISyncAsync(MessageType.AISyncConfigure, payload, token);
+    internal Task SendAISyncConfigurationAsync(Guid connection, int processId,
+        ReadOnlyMemory<byte> payload, CancellationToken token)
+    {
+        var session = GetCommandSession();
+        if (session.ConnectionIdentity != connection || session.TargetProcessId != processId)
+            throw new InvalidOperationException("AISync configuration belongs to a retired native IPC instance.");
+        return session.SendAISyncAsync(MessageType.AISyncConfigure, payload, token);
+    }
+    internal Task SendAISyncExecutionAsync(MessageType type, Guid connection, int processId,
+        ReadOnlyMemory<byte> payload, CancellationToken token)
+    {
+        var session = GetCommandSession();
+        if (session.ConnectionIdentity != connection || session.TargetProcessId != processId)
+            throw new InvalidOperationException("AISync execution belongs to a retired native IPC instance.");
+        return session.SendAISyncExecutionAsync(type, payload, token);
+    }
 
     internal Task SendThrowableAsync(MessageType type, ReadOnlyMemory<byte> payload, CancellationToken token) =>
         GetCommandSession().SendThrowableAsync(type, payload, token);
-
-    internal Task SendAISyncStateAsync(ReadOnlyMemory<byte> payload, CancellationToken token) =>
-        GetCommandSession().SendAISyncAsync(MessageType.AISyncState, payload, token);
 
     internal Task SendAISyncImpactAsync(ReadOnlyMemory<byte> payload, CancellationToken token) =>
         GetCommandSession().SendAISyncAsync(MessageType.AISyncImpact, payload, token);
@@ -633,12 +647,14 @@ internal sealed class NativeRuntimeController : IDisposable
         session.PlayerSyncStateChanged += OnPlayerSyncStateChanged;
         session.PlayerSyncActionProduced += OnPlayerSyncActionProduced;
         session.PlayerLifecycleStateChanged += OnPlayerLifecycleStateChanged;
+        session.CharacterIncarnationChanged += OnCharacterIncarnationChanged;
         session.MissionSignalProduced += OnMissionSignalProduced;
         session.ItemSyncPickupProduced += OnItemSyncPickupProduced;
         session.ItemSyncSpawnProduced += OnItemSyncSpawnProduced;
         session.ThrowableProduced += OnThrowableProduced;
-        session.AISyncStateProduced += OnAISyncStateProduced;
         session.AISyncImpactProduced += OnAISyncImpactProduced;
+        session.AISyncTransactionObservationProduced += OnAISyncTransactionObservationProduced;
+        session.AISyncExecutionProduced += OnAISyncExecutionProduced;
         session.ConnectionClosed += OnConnectionClosed;
     }
 
@@ -655,12 +671,14 @@ internal sealed class NativeRuntimeController : IDisposable
         session.PlayerSyncStateChanged -= OnPlayerSyncStateChanged;
         session.PlayerSyncActionProduced -= OnPlayerSyncActionProduced;
         session.PlayerLifecycleStateChanged -= OnPlayerLifecycleStateChanged;
+        session.CharacterIncarnationChanged -= OnCharacterIncarnationChanged;
         session.MissionSignalProduced -= OnMissionSignalProduced;
         session.ItemSyncPickupProduced -= OnItemSyncPickupProduced;
         session.ItemSyncSpawnProduced -= OnItemSyncSpawnProduced;
         session.ThrowableProduced -= OnThrowableProduced;
-        session.AISyncStateProduced -= OnAISyncStateProduced;
         session.AISyncImpactProduced -= OnAISyncImpactProduced;
+        session.AISyncTransactionObservationProduced -= OnAISyncTransactionObservationProduced;
+        session.AISyncExecutionProduced -= OnAISyncExecutionProduced;
         session.ConnectionClosed -= OnConnectionClosed;
     }
 
@@ -675,17 +693,32 @@ internal sealed class NativeRuntimeController : IDisposable
     private void OnWorldMutationResultReceived(object? sender, WorldMutationResult value) =>
         WorldMutationCompleted?.Invoke(this, value);
 
-    private void OnAISyncStateProduced(object? sender, ReadOnlyMemory<byte> value) =>
-        AISyncStateProduced?.Invoke(this, value);
 
     private void OnAISyncImpactProduced(object? sender, ReadOnlyMemory<byte> value) =>
         AISyncImpactProduced?.Invoke(this, value);
+
+    private void OnAISyncTransactionObservationProduced(object? sender, ReadOnlyMemory<byte> bytes)
+    {
+        if (sender is DllIpcSession session && ReferenceEquals(session, _ipc))
+            AISyncTransactionObservationProduced?.Invoke(this,
+                new NativeAISyncObservation(session.ConnectionIdentity, session.TargetProcessId, bytes));
+    }
+    private void OnAISyncExecutionProduced(object? sender, (MessageType Type, ReadOnlyMemory<byte> Bytes) packet)
+    {
+        if (sender is DllIpcSession session && ReferenceEquals(session, _ipc))
+            AISyncExecutionProduced?.Invoke(this, new(session.ConnectionIdentity, session.TargetProcessId, packet.Type, packet.Bytes));
+    }
 
     private void OnPlayerSyncStateChanged(
         object? sender,
         NativePlayerEquipmentStatePayload value) =>
         PlayerSyncStateProduced?.Invoke(this, value);
 
+    private void OnCharacterIncarnationChanged(object? sender, NativeCharacterIncarnationState value)
+    {
+        if (sender is not DllIpcSession session || !ReferenceEquals(session, _ipc) || !session.IsReady) return;
+        Update(state => NativeCharacterIncarnationBinding.Apply(state,value,session.ConnectionIdentity));
+    }
     private void OnPlayerLifecycleStateChanged(
         object? sender,
         NativePlayerLifecycleStatePayload value) =>
@@ -755,7 +788,7 @@ internal sealed class NativeRuntimeController : IDisposable
 
     private void OnCaptureChanged(object? sender, CaptureStatePayload value)
     {
-        ApplyRemoteCharacterState(value);
+        if (sender is not DllIpcSession session || !ReferenceEquals(session,_ipc) || !session.IsReady) return;
         var threadId = value.EngineThreadId > 0
             ? value.EngineThreadId : value.GameThreadCandidateId;
         var source = NormalizeCaptureSource(value.EngineThreadSource);
@@ -767,9 +800,10 @@ internal sealed class NativeRuntimeController : IDisposable
             value.LastEngineCallbackPerformanceCounter, value.PendingCommandCount,
             value.LevelGeneration);
         ApplyEngineState(update);
+        ApplyRemoteCharacterState(value,session.ConnectionIdentity);
     }
 
-    private void ApplyRemoteCharacterState(CaptureStatePayload value)
+    private void ApplyRemoteCharacterState(CaptureStatePayload value,Guid connection)
     {
         var before = Snapshot;
         Update(state => state with
@@ -778,6 +812,10 @@ internal sealed class NativeRuntimeController : IDisposable
             RemoteCharacterSpawnKey = value.RemoteCharacterSpawnKey,
             RemoteCharacterBase = (uint)value.RemoteCharacterAddress,
             RemoteCharacterRecord = (uint)value.RemoteCharacterRecordAddress,
+            RemoteCharacterGeneration = value.RemoteCharacterCreationSerial == 0 ? 0 : value.LevelGeneration,
+            RemoteCharacterCreationSerial = value.RemoteCharacterCreationSerial,
+            RemoteCharacterRuntimeId = value.RemoteCharacterRuntimeId,
+            RemoteCharacterConnectionIdentity = value.RemoteCharacterCreationSerial == 0 ? Guid.Empty : connection,
             CharacterCreateHookInstalled = value.CharacterCreateHookInstalled
         });
         if (RemoteCharacterChanged(before, Snapshot)) Log(RemoteCharacterText(Snapshot), "DLL");
@@ -825,13 +863,15 @@ internal sealed class NativeRuntimeController : IDisposable
 
     private static NativeRuntimeSnapshot ResetRemoteCharacterForGeneration(
         NativeRuntimeSnapshot value,
-        int generation) => generation == value.LevelGeneration ? value : value with
+        int generation) => generation == value.LevelGeneration ? value : NativeCharacterIncarnationBinding.RetainForGeneration(value with
     {
         RemoteCharacterState = RemoteCharacterStateNames.None,
         RemoteCharacterSpawnKey = 0,
         RemoteCharacterBase = 0,
-        RemoteCharacterRecord = 0
-    };
+        RemoteCharacterRecord = 0,
+        RemoteCharacterGeneration = 0,RemoteCharacterCreationSerial = 0,
+        RemoteCharacterRuntimeId = 0,RemoteCharacterConnectionIdentity = Guid.Empty
+    },generation);
 
     private static NativeRuntimeSnapshot MergeEngineState(
         NativeRuntimeSnapshot value,
@@ -890,15 +930,18 @@ internal sealed class NativeRuntimeController : IDisposable
 
     private void OnConnectionClosed(object? sender, EventArgs value)
     {
-        Update(state => state with
+        if (sender is not DllIpcSession session || !ReferenceEquals(session,_ipc)) return;
+        Update(state => NativeCharacterIncarnationBinding.Clear(state with
         {
             IpcConnected = false,
             EngineThreadReady = false,
             RemoteCharacterState = RemoteCharacterStateNames.None,
             RemoteCharacterSpawnKey = 0,
             RemoteCharacterBase = 0,
-            RemoteCharacterRecord = 0
-        });
+            RemoteCharacterRecord = 0,
+            RemoteCharacterGeneration = 0,RemoteCharacterCreationSerial = 0,
+            RemoteCharacterRuntimeId = 0,RemoteCharacterConnectionIdentity = Guid.Empty
+        }));
         Log("IPC disconnected");
     }
 

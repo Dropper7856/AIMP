@@ -216,7 +216,10 @@ public sealed record PlayerPositionSnapshotPayload(
     PlayerMoveType MoveType,
     float NativeMoveSpeed,
     PlayerPostureSnapshot? Posture = null,
-    PlayerTorchSnapshot? Torch = null);
+    PlayerTorchSnapshot? Torch = null,
+    // Source-owner allocated, monotone within this session/peer. Zero means
+    // unavailable. Never a runtime ID or permission to enter a native pair.
+    uint CharacterIncarnation = 0);
 
 public enum PlayerActionKind
 {

@@ -37,6 +37,19 @@ public enum MessageType : ushort
     VoicePcmFrame = 31, // Launcher -> DLL decoded audio, local IPC only.
     ThrowableConfigure = 32, // Launcher -> DLL Survival session fence.
     ThrowableEvent = 33, // DLL <-> Launcher released native item/lifetime.
+    AISyncTransactionObservation = 34, // DLL -> Launcher only; P2 copied shadow observation.
+    AISyncExecutionBinding = 35, // Local IPC scope binding/retirement; no actor ownership.
+    AISyncExecutionBatch = 36, // Local IPC typed executable batch.
+    AISyncExecutionReceipt = 37, // Local IPC exact operation disposition.
+    AISyncExecutionRetry = 38, // Local IPC explicit retry of one exact Waiting operation.
+    AISyncHostBinding = 39, // Launcher -> Host DLL full producer scope.
+    AISyncHostBatch = 40, // Host DLL -> Launcher typed executable operations.
+    AISyncHostControl = 41, // Host DLL -> Launcher readiness/recovery, never an observation.
+    AISyncHostRoute = 42, // Host DLL -> Launcher solved native route.
+    AISyncClientRoute = 43, // Launcher -> Client DLL authenticated native route.
+    CharacterIncarnationState = 44, // DLL -> Launcher local lifetime, never a peer authority grant.
+    AISyncHostState = 45,
+    AISyncClientState = 46,
 
     LobbyJoin = 100,
     LobbyJoinAccepted = 101,
@@ -76,6 +89,16 @@ public enum MessageType : ushort
     MissionSignalProduced = 134, // Native -> Launcher, local authored mission ingress.
     ThrowableProposal = 135, // Client -> Host native release, authenticated owner.
     ThrowableCommit = 136, // Host -> Clients admitted release or native removal.
+    AISyncShadowOpen = 137, // Host opens an observation stream; no execution authority.
+    AISyncShadowData = 138, // Host -> Client ordered observation batches.
+    AISyncShadowReceipt = 139, // Client -> Host received/verified only; Applied always zero.
+    AISyncShadowRecovery = 140, // Shadow scope invalidation; gameplay remains on v12.
+    AISyncExecutionControl = 141, // Host Offer/Close; Client Ready; either side Recovery.
+    AISyncExecutionNetworkBatch = 142, // Host -> Client only; distinct from observation.
+    AISyncExecutionNetworkReceipt = 143, // Client -> Host only; exact operation echo.
+    AISyncExecutionNetworkRetry = 144, // Host -> Client only; exact Waiting token, not a new command.
+    AISyncRouteNetwork = 145, // Host -> Client solved route tied to a native command part.
+    AISyncCausalStateNetwork = 146, // Host -> Client events in the execution sender.
 
     TestModeConfigure = 200,
     CapabilityQuery = 201,

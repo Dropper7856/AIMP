@@ -82,7 +82,12 @@ internal sealed class WorldManifestCompiler
         ReportProgress(progress, 10, "Hashing COMMANDS sources...");
         var pakHash = pakPresent ? HashFile(pakPath) : string.Empty;
         var binHash = binPresent ? HashFile(binPath) : string.Empty;
-        _mapContentId = ComputeMapContentId(pakHash, binHash, pakPresent, binPresent);
+        // Entity identity no longer depends on the COMMANDS file hashes: the preparation step rewrites
+        // those files per installation, so two untouched copies of a level ended up with different
+        // entity ids and every replicated world mutation was rejected (ManifestRejected).
+        // Original (hash-based) identity, kept for reference:
+        // _mapContentId = ComputeMapContentId(pakHash, binHash, pakPresent, binPresent);
+        _mapContentId = ComputeStableMapContentId(worldDirectory, pakPresent, binPresent);
 
         var cachePath = GetDefaultCachePath(_mapContentId);
         outputPath ??= useCache
@@ -1883,6 +1888,23 @@ internal sealed class WorldManifestCompiler
 
     private static uint[] GetPathSteps(EntityPath path) =>
         (path.path ?? Array.Empty<ShortGuid>()).Select(static value => value.AsUInt32).ToArray();
+
+    internal static WorldEntityId ComputeStableMapContentId(string worldDirectory, bool pakPresent, bool binPresent)
+    {
+        var trimmed = worldDirectory.TrimEnd('\\', '/');
+        var name = Path.GetFileName(trimmed);
+        if (name.Equals("WORLD", StringComparison.OrdinalIgnoreCase))
+            name = Path.GetFileName(Path.GetDirectoryName(trimmed) ?? string.Empty);
+        using var stream = new MemoryStream();
+        using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
+        writer.Write("AIMP-WORLDMANIFEST-MAP-V3-LEVEL");
+        writer.Write(WorldManifestConstants.FormatVersion);
+        writer.Write(pakPresent);
+        writer.Write(binPresent);
+        writer.Write(name.ToUpperInvariant());
+        writer.Flush();
+        return Hash128(stream.ToArray());
+    }
 
     internal static WorldEntityId ComputeMapContentId(string pakHash, string binHash, bool pakPresent, bool binPresent)
     {

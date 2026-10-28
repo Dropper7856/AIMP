@@ -1401,7 +1401,12 @@ bool DecodeGameCommand(
         }
 
         if (command->stringValue == "REMOTE_EQUIPMENT_PROVISION") {
-            if (arguments->objectValue.size() != 7U) {
+            const auto* activateHeld = Field(*arguments, "activateHeld", JsonType::String);
+            const auto* releaseHeld = Field(*arguments, "releaseHeld", JsonType::String);
+            if (arguments->objectValue.size() != ((activateHeld != nullptr || releaseHeld != nullptr) ? 8U : 7U) ||
+                (activateHeld != nullptr && activateHeld->stringValue != "true") ||
+                (releaseHeld != nullptr && releaseHeld->stringValue != "true") ||
+                (activateHeld != nullptr && releaseHeld != nullptr)) {
                 return false;
             }
             const auto* characterAddress =
@@ -1483,6 +1488,10 @@ bool DecodeGameCommand(
                 parsedSpawnTargetInput;
             output.remoteEquipmentProvision.equipmentSlot =
                 parsedEquipmentSlot;
+            output.remoteEquipmentProvision.activateHeld = activateHeld != nullptr;
+            output.remoteEquipmentProvision.releaseHeld = releaseHeld != nullptr;
+            if ((activateHeld != nullptr || releaseHeld != nullptr) && (parsedEquipmentSlot != 9U || compositeName->stringValue !=
+                "Required_Assets\\Archetypes\\Equipment\\Flare_Held")) return false;
             output.command = command->stringValue;
             return true;
         }
@@ -1699,7 +1708,9 @@ std::vector<std::byte> EncodeCaptureState(
     const std::uint32_t remoteCharacterSpawnKey,
     const std::uintptr_t remoteCharacterAddress,
     const std::uintptr_t remoteCharacterRecordAddress,
-    const bool characterCreateHookInstalled) {
+    const bool characterCreateHookInstalled,
+    const std::uint64_t remoteCharacterCreationSerial,
+    const std::uint32_t remoteCharacterRuntimeId) {
     std::ostringstream json;
     Prefix(json, request);
     json << ",\"spawnRequestF0Captured\":"
@@ -1749,6 +1760,8 @@ std::vector<std::byte> EncodeCaptureState(
          << static_cast<std::uint64_t>(remoteCharacterRecordAddress)
          << ",\"characterCreateHookInstalled\":"
          << (characterCreateHookInstalled ? "true" : "false")
+         << ",\"remoteCharacterCreationSerial\":" << remoteCharacterCreationSerial
+         << ",\"remoteCharacterRuntimeId\":" << remoteCharacterRuntimeId
          << ",\"lastOperation\":" << Escape(lastOperation) << '}';
     return Bytes(json.str());
 }

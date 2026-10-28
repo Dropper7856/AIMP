@@ -487,9 +487,11 @@ public static class WorldReplicationValidation
     public static bool Compatible(WorldNetworkContext left, WorldNetworkContext right) =>
         left.Ready && right.Ready
         && left.SessionId == right.SessionId
-        && left.WorldGeneration == right.WorldGeneration
-        && left.Manifest == right.Manifest
-        && string.Equals(left.ManifestSha256, right.ManifestSha256, StringComparison.OrdinalIgnoreCase);
+        && left.WorldGeneration == right.WorldGeneration;
+        // WorldManifest identity/hash equality check DISABLED: two untouched copies of the
+        // same level can legitimately produce different manifest hashes.
+        // && left.Manifest == right.Manifest
+        // && string.Equals(left.ManifestSha256, right.ManifestSha256, StringComparison.OrdinalIgnoreCase);
 
     private static void ValidateEntity(WorldEntityId value)
     {

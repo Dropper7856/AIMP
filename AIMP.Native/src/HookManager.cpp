@@ -171,10 +171,17 @@ bool MakeRelativeJump(
     const auto source = reinterpret_cast<std::uintptr_t>(instruction);
     const auto target = reinterpret_cast<std::uintptr_t>(destination);
     const auto after = static_cast<std::int64_t>(source) + 5;
-    const auto displacement = static_cast<std::int64_t>(target) - after;
+    auto displacement = static_cast<std::int64_t>(target) - after;
     if (displacement < std::numeric_limits<std::int32_t>::min() ||
         displacement > std::numeric_limits<std::int32_t>::max()) {
-        return false;
+        // In a 32-bit process rel32 displacements wrap modulo 2^32, so any destination is
+        // reachable (the trampoline can land above 2 GB on large-address-aware systems).
+        if constexpr (sizeof(void*) == 4) {
+            displacement = static_cast<std::int32_t>(
+                static_cast<std::uint32_t>(target) - static_cast<std::uint32_t>(after));
+        } else {
+            return false;
+        }
     }
 
     output[0] = std::byte{0xE9};
@@ -190,10 +197,17 @@ bool MakeRelativeCall(
     const auto source = reinterpret_cast<std::uintptr_t>(instruction);
     const auto target = reinterpret_cast<std::uintptr_t>(destination);
     const auto after = static_cast<std::int64_t>(source) + 5;
-    const auto displacement = static_cast<std::int64_t>(target) - after;
+    auto displacement = static_cast<std::int64_t>(target) - after;
     if (displacement < std::numeric_limits<std::int32_t>::min() ||
         displacement > std::numeric_limits<std::int32_t>::max()) {
-        return false;
+        // In a 32-bit process rel32 displacements wrap modulo 2^32, so any destination is
+        // reachable (the trampoline can land above 2 GB on large-address-aware systems).
+        if constexpr (sizeof(void*) == 4) {
+            displacement = static_cast<std::int32_t>(
+                static_cast<std::uint32_t>(target) - static_cast<std::uint32_t>(after));
+        } else {
+            return false;
+        }
     }
 
     output[0] = std::byte{0xE8};

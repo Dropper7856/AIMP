@@ -1,7 +1,10 @@
 #include "aimp/AISync.h"
+#include "aimp/AISyncExecutionRuntime.h"
 #include "aimp/CharacterActionRuntime.h"
 #include "aimp/CharacterDirectStepRuntime.h"
 #include "aimp/CharacterObservationHooks.h"
+#include "aimp/CharacterIncarnation.h"
+#include "aimp/CrashGuard.h"
 
 #include "aimp/BuildProfile.h"
 #include "aimp/CaptureCatalog.h"
@@ -141,6 +144,12 @@ void* __fastcall CharacterCreateDetour(
             gCharacterCreateTrampoline.load(std::memory_order_acquire));
     void* result =
         original == nullptr ? nullptr : original(manager, record, request);
+    if(result) {
+        const auto runtime=crash_guard::SafeRead<std::uint32_t>(static_cast<const std::byte*>(result)+0x50U);
+        character_incarnations::Ticket ticket{};
+        if(runtime)static_cast<void>(character_incarnations::NativeRegistry().Created(
+            Generation(),reinterpret_cast<std::uintptr_t>(result),*runtime,ticket));
+    }
     Lifecycle(
         LifecycleEventKind::CharacterCreateEnd,
         reinterpret_cast<std::uintptr_t>(manager),
@@ -178,6 +187,14 @@ void __fastcall CharacterFullDestroyDetour(
     void*,
     void* character) noexcept {
     ActiveDetour active;
+    character_incarnations::Ticket ticket{};
+    static_cast<void>(character_incarnations::NativeRegistry().Find(Generation(),reinterpret_cast<std::uintptr_t>(character),ticket));
+    ai_sync::BeforeCharacterDestruction(reinterpret_cast<std::uintptr_t>(character));
+    // Pre-destruction callbacks can reenter destruction or replace this address.
+    // Only the exact lifetime retired by this invocation may produce its proof.
+    const bool retired = ticket.serial != 0U &&
+        character_incarnations::NativeRegistry().Retire(ticket) ==
+            character_incarnations::Result::Ok;
     ai_sync::ForgetCharacter(reinterpret_cast<std::uintptr_t>(character));
     character_action_runtime::ForgetCharacter(reinterpret_cast<std::uintptr_t>(character));
     // The network movement pump caches raw Character addresses and writes yaw
@@ -193,6 +210,9 @@ void __fastcall CharacterFullDestroyDetour(
                 std::memory_order_acquire));
     if (original != nullptr) {
         original(manager, character);
+        if(retired&&ticket.generation<=UINT32_MAX)
+            ai_sync::execution_runtime::AfterActorDestruction({ticket.character,ticket.runtimeId,
+                static_cast<std::uint32_t>(ticket.generation),ticket.serial});
     }
     Lifecycle(
         LifecycleEventKind::CharacterFullDestroyEnd,
@@ -503,6 +523,10 @@ bool CharacterObservationHooks::InstallActionLifetimeHooks(
         return false;
     }
     const auto baseline = hooks.InstalledCount();
+    // These shared detours need the world identity even without RE capture.
+    // Publish it before HookManager makes either detour reachable.
+    auto* previousGeneration = gGeneration.exchange(
+        generation_, std::memory_order_acq_rel);
     const auto install = [&](SymbolId id, const char* name, void* detour,
         void** trampoline, std::atomic<void*>& published) {
         const auto* spec = Retail2015Profile().Find(id);
@@ -531,7 +555,11 @@ bool CharacterObservationHooks::InstallActionLifetimeHooks(
             reinterpret_cast<void*>(&CharacterFullDestroyDetour),
             &characterFullDestroyTrampoline_, gCharacterFullDestroyTrampoline)) {
         std::string rollback;
-        hooks.UninstallFrom(baseline, rollback);
+        if (hooks.UninstallFrom(baseline, rollback)) {
+            gGeneration.store(previousGeneration, std::memory_order_release);
+        }
+        // Failed rollback leaves callable detours; keep their generation service
+        // and the existing process-lifetime retention flag and trampolines.
         if (!rollback.empty()) error += "; rollback: " + rollback;
         return false;
     }

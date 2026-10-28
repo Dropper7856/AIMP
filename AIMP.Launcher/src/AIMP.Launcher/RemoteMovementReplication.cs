@@ -77,10 +77,17 @@ internal sealed class RemotePositionTrack
         if (_latest is not null && (value.SessionId != _latest.SessionId || value.PeerId != _latest.PeerId
             || value.LevelGeneration != _latest.LevelGeneration)) return false;
         if (!_receiveWindow.TryAccept(value)) return false;
+        var changedLife = _latest is not null && _latest.CharacterIncarnation != value.CharacterIncarnation;
+        if (changedLife)
+        {
+            _lastReceivedPosture = null; _lastReceivedTorch = null;
+            _postures.Bind(value.Posture,value.Torch);
+            CommandMoving = false; _lastCommandAtUtc = default; _lastCommandYaw = float.NaN;
+        }
         if (value.Posture is not null) _lastReceivedPosture = value.Posture;
         if (value.Torch is not null) _lastReceivedTorch = value.Torch;
         if (_boundCharacter != 0) _postures.Observe(value.Posture, value.Torch);
-        var previous = _latest;
+        var previous = changedLife ? null : _latest;
         var previousReceivedAtUtc = _receivedAtUtc;
         _previous = previous;
         _latest = value;

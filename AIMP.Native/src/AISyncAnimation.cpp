@@ -1,4 +1,5 @@
 #include "aimp/AISyncAnimation.h"
+#include "aimp/AISyncProfiling.h"
 
 #include "aimp/CrashGuard.h"
 #include "aimp/HookManager.h"
@@ -12,6 +13,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <initializer_list>
 
@@ -34,6 +36,10 @@ std::atomic<ManagedSourcePredicate> gCanReplayScripted{};
 
 void* gCoupledClassificationTrampoline{};
 void* gCoupledPlayerContinue{};
+void* gGraphClassificationTrampoline{};
+void* gGraphPlayerContinue{};
+void* gVictimGraphClassificationTrampoline{};
+void* gVictimGraphPlayerContinue{};
 void* gAlignmentClassificationTrampoline{};
 void* gAlignmentPlayerContinue{};
 std::uintptr_t gUnitFloatAddress{};
@@ -46,6 +52,8 @@ std::atomic<void*> gMarkerDispatchOriginal{};
 
 std::atomic<std::uint64_t> gSourceUpdates{}, gCoupledPlayerUpdates{};
 std::atomic<std::uint64_t> gHumanAlignmentUpdates{};
+std::atomic<std::uint64_t> gHumanGraphInitializations{};
+std::atomic<std::uint64_t> gHumanVictimGraphInitializations{};
 std::atomic<std::uint64_t> gMarkerCallbacks{}, gMarkerCallbacksSkipped{}, gMarkerDispatches{};
 std::atomic<std::uint64_t> gBoundedListenerScans{};
 std::atomic<std::uint64_t> gScriptedCaptured{}, gScriptedUnsupported{}, gScriptedApplied{}, gScriptedFailed{};
@@ -57,12 +65,24 @@ bool Read(const std::uintptr_t address, T& value) noexcept {
         crash_guard::TryCopy(&value, reinterpret_cast<const void*>(address), sizeof(value));
 }
 
+thread_local std::uint32_t gAbiMismatchRva{};
+thread_local std::uint8_t gAbiExpected{}, gAbiActual{};
+thread_local bool gAbiReadable{};
+
 bool Match(const std::uintptr_t rva,
     const std::initializer_list<std::uint8_t> expected) noexcept {
     std::array<std::uint8_t, 64U> bytes{};
-    return expected.size() <= bytes.size() &&
-        crash_guard::TryCopy(bytes.data(), reinterpret_cast<const void*>(gBase + rva), expected.size()) &&
-        std::memcmp(bytes.data(), expected.begin(), expected.size()) == 0;
+    const bool readable = expected.size() <= bytes.size() &&
+        crash_guard::TryCopy(bytes.data(), reinterpret_cast<const void*>(gBase + rva), expected.size());
+    if (readable && std::memcmp(bytes.data(), expected.begin(), expected.size()) == 0) return true;
+    std::size_t offset{};
+    if (readable)
+        while (offset < expected.size() && bytes[offset] == expected.begin()[offset]) ++offset;
+    gAbiMismatchRva = static_cast<std::uint32_t>(rva + offset);
+    gAbiReadable = readable;
+    gAbiExpected = expected.size() > offset ? expected.begin()[offset] : 0U;
+    gAbiActual = readable ? bytes[offset] : 0U;
+    return false;
 }
 
 std::uint32_t CallerRva(const void* caller) noexcept {
@@ -170,6 +190,96 @@ int __cdecl HumanCoupledBoundary(const std::uintptr_t cycle,
     return 1;
 }
 
+int __cdecl HumanGraphBoundary(const std::uintptr_t cycle,
+    const std::uintptr_t victim) noexcept {
+    const auto classify = gHumanPair.load(std::memory_order_acquire);
+    if (classify == nullptr || !classify(cycle, victim)) return 0;
+    gHumanGraphInitializations.fetch_add(1U, std::memory_order_relaxed);
+    return 1;
+}
+
+// 0066C06F initializes the source graph's "player_or_NPC" parameter (+B0).
+// A remote player's Character has no first-person controller at +31C. Retail
+// therefore selected the NPC grapple graph even though the later 4E update,
+// coupling and alignment hooks correctly classified this exact pair as human.
+// Select the existing player branch before the graph is created and bound.
+// The acquired 4F handshake does not exist at this initializer boundary yet.
+__declspec(naked) void HumanGraphShim() {
+    __asm {
+        pushfd
+        pushad
+        mov edi, esp
+        sub esp, 210h
+        and esp, 0FFFFFFF0h
+        fxsave [esp]
+        cld
+        push dword ptr [edi + 1Ch]
+        push esi
+        call HumanGraphBoundary
+        add esp, 8
+        test eax, eax
+        jnz participant
+        fxrstor [esp]
+        mov esp, edi
+        popad
+        popfd
+        jmp dword ptr [gGraphClassificationTrampoline]
+    participant:
+        fxrstor [esp]
+        mov esp, edi
+        popad
+        popfd
+        jmp dword ptr [gGraphPlayerContinue]
+    }
+}
+
+int __cdecl HumanVictimGraphBoundary(const std::uintptr_t cycle) noexcept {
+    std::uintptr_t victim{}, sourceCycle{}, source{}, linkedSource{}, linkedVictim{};
+    std::uint8_t acquired{};
+    const auto classify = gHumanPair.load(std::memory_order_acquire);
+    if (classify == nullptr || !CurrentCycle(cycle, kVictimTypeRva, 0x4FU, victim) ||
+        !Read(cycle + 0xD9U, acquired) || acquired == 0U ||
+        !Read(cycle + 0xB0U, sourceCycle) ||
+        !CurrentCycle(sourceCycle, kSourceTypeRva, 0x4EU, source) ||
+        !Read(cycle + 0x68U, linkedSource) || linkedSource != source ||
+        !Read(sourceCycle + 0x44U, linkedVictim) || linkedVictim != victim ||
+        !classify(sourceCycle, victim)) return 0;
+    gHumanVictimGraphInitializations.fetch_add(1U, std::memory_order_relaxed);
+    return 1;
+}
+
+// 00676080 follows the native in-vent branch. Select the matched player pair
+// graph for a proven human victim, instead of the shorter VS_NPC graph whose
+// Start_Death callback finishes the source early. This only changes graph
+// selection; subsequent first-person camera/controller checks remain retail.
+__declspec(naked) void HumanVictimGraphShim() {
+    __asm {
+        pushfd
+        pushad
+        mov edi, esp
+        sub esp, 210h
+        and esp, 0FFFFFFF0h
+        fxsave [esp]
+        cld
+        push esi
+        call HumanVictimGraphBoundary
+        add esp, 4
+        test eax, eax
+        jnz participant
+        fxrstor [esp]
+        mov esp, edi
+        popad
+        popfd
+        jmp dword ptr [gVictimGraphClassificationTrampoline]
+    participant:
+        fxrstor [esp]
+        mov esp, edi
+        popad
+        popfd
+        jmp dword ptr [gVictimGraphPlayerContinue]
+    }
+}
+
 // 006556F0: ESI=the source 4E. A human proxy takes the existing player
 // integration branch at 0065577B. The original function remains the sole writer
 // of source/victim displacement, physical state, collision and graph progress.
@@ -256,6 +366,7 @@ __declspec(naked) void HumanAlignmentShim() {
 }
 
 void __fastcall SourceUpdateDetour(void* context, void*) noexcept {
+    const profiling::Timer timing(profiling::Section::AnimationHook);
     const auto original = reinterpret_cast<void(__thiscall*)(void*)>(
         gSourceUpdateOriginal.load(std::memory_order_acquire));
     if (original == nullptr) return;
@@ -269,7 +380,10 @@ void __fastcall SourceUpdateDetour(void* context, void*) noexcept {
         gLastSourceUpdateCallerRva.store(observation.callerRva, std::memory_order_relaxed);
         Observe(observation);
     }
-    original(context); // Exactly the existing native update; no synthetic tick.
+    {
+        const profiling::Timer retailTiming(profiling::Section::AnimationOriginal);
+        original(context); // Exactly the existing native update; no synthetic tick.
+    }
     if (tracked) {
         observation.boundary = Boundary::SourceUpdateLeave;
         Observe(observation);
@@ -379,9 +493,18 @@ bool Install(const std::uintptr_t base, HookManager& hooks,
         return false;
     }
     gBase = base;
+    gAbiMismatchRva = 0U;
     // All displaced instructions and continuations are independently checked.
-    // None of the four prefixes carries a relative or ASLR-adjusted operand.
+    // None of the prefixes carries a relative or ASLR-adjusted operand.
     if (!Match(0x002556F0U, {0x8B,0x46,0x44,0x8B,0x80,0x1C,0x03,0x00,0x00}) ||
+        !Match(0x0026C062U, {0x8B,0x46,0x44,0xC7,0x86,0xAC,0x00,0x00,0x00,0x01,0x00,0x00,0x00}) ||
+        !Match(0x0026C06FU, {0x8B,0x80,0x1C,0x03,0x00,0x00,0x3B,0xC3,0x74,0x0F,0x38,0x58,0x48,0x74,0x0A}) ||
+        !Match(0x0026C07EU, {0x8D,0xBE,0xB0,0x00,0x00,0x00,0x89,0x1F,0xEB,0x0C}) ||
+        !Match(0x0026C088U, {0x8D,0xBE,0xB0,0x00,0x00,0x00,0xC7,0x07,0x01,0x00,0x00,0x00}) ||
+        !Match(0x00276075U, {0x8B,0x46,0x68,0x38,0x98,0xB4,0x02,0x00,0x00,0x75,0x3A}) ||
+        !Match(0x00276080U, {0x8B,0x46,0x04,0x8B,0x40,0x64,0x38,0x58,0x1C,0x74,0x1A,
+            0x38,0x58,0x1F,0x74,0x15}) ||
+        !Match(0x00276090U, {0x83,0xEC,0x10,0x89,0x64,0x24,0x20,0x8B,0xFC}) ||
         !Match(0x002556F9U, {0x85,0xC0,0x74,0x06,0x80,0x78,0x48,0x00,0x75,0x78}) ||
         !Match(0x0025577BU, {0x8B,0x4E,0x4C,0x8B,0x11,0x8B,0x42,0x04,0xFF,0xD0}) ||
         !Match(0x00255999U, {0xC3}) ||
@@ -400,9 +523,22 @@ bool Install(const std::uintptr_t base, HookManager& hooks,
             0x8B,0x04,0xA8,0x8B,0x52,0x04,0x50,0xFF,0xD2}) ||
         !Match(0x00291068U, {0xC2,0x04,0x00}) || !ScriptedContract()) {
         error = "AISync animation: paired coupling or native marker ABI mismatch";
+        if (gAbiMismatchRva != 0U) {
+            char detail[112]{};
+            if (gAbiReadable)
+                std::snprintf(detail, sizeof(detail), "; RVA 0x%08X expected 0x%02X, actual 0x%02X",
+                    static_cast<unsigned>(gAbiMismatchRva), static_cast<unsigned>(gAbiExpected),
+                    static_cast<unsigned>(gAbiActual));
+            else
+                std::snprintf(detail, sizeof(detail), "; unreadable RVA 0x%08X",
+                    static_cast<unsigned>(gAbiMismatchRva));
+            error += detail;
+        } else error += "; scripted vtable identity mismatch";
         return false;
     }
     gCoupledPlayerContinue = reinterpret_cast<void*>(base + 0x0025577BU);
+    gGraphPlayerContinue = reinterpret_cast<void*>(base + 0x0026C07EU);
+    gVictimGraphPlayerContinue = reinterpret_cast<void*>(base + 0x00276090U);
     gAlignmentPlayerContinue = reinterpret_cast<void*>(base + 0x0024E771U);
     gUnitFloatAddress = base + 0x00DBED34U;
     gHumanPair.store(callbacks.humanPair, std::memory_order_release);
@@ -411,6 +547,12 @@ bool Install(const std::uintptr_t base, HookManager& hooks,
     gCanReplayScripted.store(callbacks.canReplayScripted, std::memory_order_release);
     const auto checkpoint = hooks.InstalledCount();
     const bool installed =
+        Hook(hooks, "aisync_paired_human_graph_parameter", 0x0026C06FU,
+            reinterpret_cast<void*>(&HumanGraphShim), {0x8B,0x80,0x1C,0x03,0x00,0x00},
+            &gGraphClassificationTrampoline, nullptr, error) &&
+        Hook(hooks, "aisync_paired_human_victim_graph", 0x00276080U,
+            reinterpret_cast<void*>(&HumanVictimGraphShim), {0x8B,0x46,0x04,0x8B,0x40,0x64},
+            &gVictimGraphClassificationTrampoline, nullptr, error) &&
         Hook(hooks, "aisync_paired_coupled_human_execution", 0x002556F0U,
             reinterpret_cast<void*>(&HumanCoupledShim), {0x8B,0x46,0x44,0x8B,0x80,0x1C,0x03,0x00,0x00},
             &gCoupledClassificationTrampoline, nullptr, error) &&
@@ -557,6 +699,8 @@ Counters Snapshot() noexcept {
     counters.sourceUpdates = gSourceUpdates.load(std::memory_order_relaxed);
     counters.coupledPlayerUpdates = gCoupledPlayerUpdates.load(std::memory_order_relaxed);
     counters.humanAlignmentUpdates = gHumanAlignmentUpdates.load(std::memory_order_relaxed);
+    counters.humanGraphInitializations = gHumanGraphInitializations.load(std::memory_order_relaxed);
+    counters.humanVictimGraphInitializations = gHumanVictimGraphInitializations.load(std::memory_order_relaxed);
     counters.markerCallbacks = gMarkerCallbacks.load(std::memory_order_relaxed);
     counters.markerCallbacksSkipped = gMarkerCallbacksSkipped.load(std::memory_order_relaxed);
     counters.markerDispatches = gMarkerDispatches.load(std::memory_order_relaxed);
@@ -569,6 +713,79 @@ Counters Snapshot() noexcept {
     counters.lastMarker = gLastMarker.load(std::memory_order_relaxed);
     counters.lastMarkerCallerRva = gLastMarkerCallerRva.load(std::memory_order_relaxed);
     return counters;
+}
+
+bool ResolvePairDefinition(const std::uintptr_t source, const std::uint32_t sourceRuntimeId,
+    const std::uintptr_t victim, const std::uint32_t victimRuntimeId, const std::uint32_t selector,
+    interactions::Definition& output) noexcept {
+    output = {};
+    if (gBase == 0U || source == victim || selector > 0xFFFFU || sourceRuntimeId == 0U || victimRuntimeId == 0U)
+        return false;
+    std::uint32_t sourceId{}, victimId{};
+    std::uintptr_t type{}, animatedGetter{}, animated{}, manager{}, table{}, getter{};
+    if (!Read(source + 0x50U, sourceId) || sourceId != sourceRuntimeId ||
+        !Read(victim + 0x50U, victimId) || victimId != victimRuntimeId ||
+        !Read(source, type) || !Read(type + 0x1CU, animatedGetter) ||
+        animatedGetter < gBase + kCodeBegin || animatedGetter >= gBase + kCodeEnd) return false;
+    interactions::Definition result{};
+    result.selector = selector;
+    // 0066BDE0 obtains the source's animation manager through the actual
+    // AnimatedCharacter getter; a Character address need not alias that view.
+    __try {
+        animated = reinterpret_cast<std::uintptr_t(__thiscall*)(void*)>(animatedGetter)(reinterpret_cast<void*>(source));
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (animated == 0U || !Read(animated + 0x34B4U, manager) || manager == 0U ||
+        !Read(manager, table) || !Read(table + 0x34U, getter) ||
+        getter < gBase + kCodeBegin || getter >= gBase + kCodeEnd) return false;
+    __try {
+        result.object = reinterpret_cast<std::uintptr_t(__thiscall*)(void*, std::uint32_t)>(getter)(
+            reinterpret_cast<void*>(manager), selector);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    result.manager = manager;
+    if (result.object == 0U || !Read(result.object + 8U, result.kind)) return false;
+    std::array<char, 128U> boneName{};
+    bool terminated{};
+    for (std::size_t i = 0U; i < boneName.size(); ++i) {
+        if (!Read(result.object + 0x20U + i, boneName[i])) return false;
+        if (boneName[i] == '\0') { terminated = true; break; }
+    }
+    if (!terminated || !Read(source + 0x50U, sourceId) || sourceId != sourceRuntimeId ||
+        !Read(victim + 0x50U, victimId) || victimId != victimRuntimeId) return false;
+    // Native 0067DCD0/006DC310 use this same bone-name lookup on the victim,
+    // RET 8 includes the second zero word omitted by the old C decompilation.
+    __try {
+        using Bone = std::int32_t(__thiscall*)(void*, const char*, std::uint32_t);
+        result.victimAttachment = reinterpret_cast<Bone>(gBase + 0x002B4BA0U)(
+            reinterpret_cast<void*>(victim + 0x3F0U), boneName.data(), 0U);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (result.victimAttachment < -1 || result.victimAttachment > 0xFFFF ||
+        !Read(source + 0x50U, sourceId) || sourceId != sourceRuntimeId ||
+        !Read(victim + 0x50U, victimId) || victimId != victimRuntimeId) return false;
+    std::uintptr_t currentManager{}, currentTable{}, currentGetter{}, currentDefinition{};
+    if (!Read(animated + 0x34B4U, currentManager) || currentManager != manager ||
+        !Read(manager, currentTable) || currentTable != table || !Read(table + 0x34U, currentGetter) || currentGetter != getter) return false;
+    __try {
+        currentDefinition = reinterpret_cast<std::uintptr_t(__thiscall*)(void*, std::uint32_t)>(getter)(
+            reinterpret_cast<void*>(manager), selector);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (currentDefinition != result.object) return false;
+    output = result;
+    return true;
+}
+
+bool InspectPair(const std::uintptr_t source, const std::uint32_t sourceRuntimeId,
+    interactions::PairState& output) noexcept {
+    const auto read = [](void*, const std::uintptr_t address, void* destination, const std::size_t size) noexcept {
+        return crash_guard::TryCopy(destination, reinterpret_cast<const void*>(address), size);
+    };
+    return interactions::InspectNativePair({gBase, nullptr, read}, source, sourceRuntimeId, output);
+}
+
+bool OwnsPairSource(const std::uintptr_t source, const std::uint32_t sourceRuntimeId,
+    const std::uintptr_t expectedCycle) noexcept {
+    interactions::PairState state{};
+    return InspectPair(source, sourceRuntimeId, state) &&
+        (expectedCycle == 0U || expectedCycle == state.sourceCycle) && interactions::OwnsSource(state);
 }
 
 } // namespace aimp::ai_sync::animation

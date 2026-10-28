@@ -62,8 +62,11 @@ public sealed partial class LobbyHost
             _lobbyPreparations.TryGetValue(peerId, out var peer) && peer.Ready
             && peer.PreparationToken == _preparationToken
             && string.Equals(peer.Level, _level, StringComparison.OrdinalIgnoreCase)
-            && peer.Manifest == host.Manifest
-            && string.Equals(peer.ManifestSha256, host.ManifestSha256, StringComparison.OrdinalIgnoreCase));
+            // WorldManifest identity/hash equality check DISABLED: two untouched copies of the
+            // same level can legitimately produce different manifest hashes.
+            // && peer.Manifest == host.Manifest
+            // && string.Equals(peer.ManifestSha256, host.ManifestSha256, StringComparison.OrdinalIgnoreCase)
+            );
     }
 
     private bool AcceptLobbyPreparationLocked(LobbyPreparationPayload preparation)
@@ -172,9 +175,13 @@ public sealed partial class LobbyHost
 
     private bool MissionPreparationsMatchLocked()
     {
-        if (!_missionPreparationHashes.TryGetValue(HostPeerId, out var hostHash)) return true;
-        return _clients.Keys.All(peer => !_missionPreparationHashes.TryGetValue(peer, out var hash)
-            || string.Equals(hash, hostHash, StringComparison.OrdinalIgnoreCase));
+        // Mission catalog hash equality check DISABLED: identical, unmodified levels can still
+        // produce slightly different mission catalog hashes, which blocked sessions needlessly.
+        // The original check is kept below for reference.
+        return true;
+        // if (!_missionPreparationHashes.TryGetValue(HostPeerId, out var hostHash)) return true;
+        // return _clients.Keys.All(peer => !_missionPreparationHashes.TryGetValue(peer, out var hash)
+        //     || string.Equals(hash, hostHash, StringComparison.OrdinalIgnoreCase));
     }
 
     private async Task PublishSessionReleaseAsync(

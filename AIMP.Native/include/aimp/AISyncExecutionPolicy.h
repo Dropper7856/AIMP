@@ -2,7 +2,9 @@
 
 #include "aimp/AISync.h"
 #include <array>
+#include <algorithm>
 #include <cstdint>
+#include <cmath>
 
 namespace aimp::ai_sync {
 
@@ -29,6 +31,56 @@ inline constexpr std::array<ExecutionTransitionEntry, 7U> kExecutionTransitions{
     // its forwarded argument is unused by 00661270, so replay supplies zero.
     {0x3BU, 0x00EABEC0U, 0x002625E0U, true},
 }};
+
+// Native execution-cycle constructors (RVA, AI.exe 00d6bb84). Every one
+// starts by notifying 0078AAA0, destroys the current cycle in place and
+// constructs the new class with the arguments below. Argument kinds were read
+// from each constructor body: Value is stored raw; Identity is an object whose
+// +54/+58 handle is copied (pointer not retained); Entity is a retained
+// Character pointer; Vector is a pointer to four copied floats. Unresolved
+// payloads are refused; address readability never determines argument type.
+enum class ExecutionArgKind : std::uint32_t { None = 0, Value = 1, Identity = 2, Entity = 3, Vector = 4, Null = 5, Refused = 15 };
+enum class TransitionArg : std::uint8_t { None, Value, Identity, Entity, Vector, Ambiguous, FloatBits };
+constexpr bool FiniteExecutionFloatBits(const std::uint32_t bits) noexcept {
+    return (bits & 0x7F800000U) != 0x7F800000U;
+}
+enum class TransitionPrologue : std::uint8_t { Simple, Seh, Frame };
+struct ExecutionTransitionContract final {
+    std::uint32_t rva, state, typeRva, arity;
+    TransitionArg args[2];
+    TransitionPrologue prologue;
+    std::uint32_t sehHandlerRva;
+};
+inline constexpr std::array<ExecutionTransitionContract, 12U> kExecutionTransitionContracts{{
+    {0x258000U, 0x0EU, 0xEAC340U, 1U, {TransitionArg::Value, TransitionArg::None}, TransitionPrologue::Simple, 0U},
+    {0x2581D0U, 0x16U, 0xEAC100U, 2U, {TransitionArg::Value, TransitionArg::Value}, TransitionPrologue::Seh, 0xD26279U},
+    {0x257D10U, 0x53U, 0xEACE68U, 1U, {TransitionArg::Value, TransitionArg::None}, TransitionPrologue::Simple, 0U},
+    // 0065813B/00658180 copy float duration; +48 holds effect bits.
+    // Still refused by the intent codec: 00670570 also chooses local timing.
+    {0x258100U, 0x56U, 0xEAC908U, 2U, {TransitionArg::FloatBits, TransitionArg::Value}, TransitionPrologue::Simple, 0U},
+    // 0066F7F0 -> 00665A30/0066F700 compare both selectors with 1.
+    // Both words are values, despite the incomplete old decompiler signature.
+    {0x258610U, 0x5AU, 0xEAD558U, 2U, {TransitionArg::Value, TransitionArg::Value}, TransitionPrologue::Simple, 0U},
+    // 00657DD7 MOVSS xmm0,[esp+8]; 00657E16 MOVSS [esi+44],xmm0.
+    // A float's bits can coincide with mapped memory; never classify it as a pointer.
+    {0x257DA0U, 0x57U, 0xEAD918U, 1U, {TransitionArg::FloatBits, TransitionArg::None}, TransitionPrologue::Simple, 0U},
+    {0x257760U, 0x27U, 0xEABB00U, 2U, {TransitionArg::Ambiguous, TransitionArg::Value}, TransitionPrologue::Simple, 0U},
+    {0x257B40U, 0x40U, 0xEAC788U, 1U, {TransitionArg::Identity, TransitionArg::None}, TransitionPrologue::Seh, 0xD26279U},
+    {0x257C30U, 0x52U, 0xEAC6C8U, 1U, {TransitionArg::Identity, TransitionArg::None}, TransitionPrologue::Seh, 0xD26279U},
+    {0x2584A0U, 0x58U, 0xEAD3D8U, 1U, {TransitionArg::Identity, TransitionArg::None}, TransitionPrologue::Seh, 0xD262B4U},
+    {0x257A40U, 0x3FU, 0xEAC848U, 1U, {TransitionArg::Entity, TransitionArg::None}, TransitionPrologue::Seh, 0xD26279U},
+    {0x2586A0U, 0x5BU, 0xEACB08U, 1U, {TransitionArg::Vector, TransitionArg::None}, TransitionPrologue::Frame, 0U},
+}};
+constexpr const ExecutionTransitionContract* FindExecutionTransitionContract(const std::uint32_t rva) noexcept {
+    for (const auto& entry : kExecutionTransitionContracts) if (entry.rva == rva) return &entry;
+    return nullptr;
+}
+constexpr const ExecutionTransitionContract* FindExecutionTransitionContract(
+    const std::uint32_t typeRva, const std::uint32_t state) noexcept {
+    for (const auto& entry : kExecutionTransitionContracts)
+        if (entry.typeRva == typeRva && entry.state == state) return &entry;
+    return nullptr;
+}
 
 constexpr const ExecutionTransitionEntry* FindExecutionTransition(
     const std::uint32_t typeRva, const std::uint32_t state) noexcept {
@@ -73,6 +125,13 @@ constexpr bool ImpactTargetLifetimeMatches(const std::uint32_t receivedBirth,
     const std::uint32_t admittedRuntimeId) noexcept {
     return receivedBirth != 0U && receivedBirth == authoritativeBirth &&
         admittedRuntimeId != 0U && currentRuntimeId == admittedRuntimeId;
+}
+
+// Source-owned generation, not a Client runtime ID. Births increase within a
+// native world; including both prevents a replacement actor in the same world
+// from reusing its predecessor's owner epoch. No ownership is granted here.
+constexpr std::uint64_t NativeOwnerEpoch(const std::uint32_t generation, const std::uint32_t birth) noexcept {
+    return generation == 0U || birth == 0U ? 0U : (static_cast<std::uint64_t>(generation) << 32U) | birth;
 }
 
 constexpr bool ExecutionCycleOwnsMovement(const std::uint32_t expectedType,
@@ -133,6 +192,21 @@ constexpr bool PairAdmissionPending(const State& state,
             state.outcome.revision != 0U);
 }
 
+// Only known locomotion cycles can be handed off by the movement drain. A
+// pair, damage reaction, traversal or unknown cycle retains its own executor;
+// neither an end flag nor zero HP turns it into a movement-only operation.
+constexpr bool MovementDrainCycleAllowed(const std::uint32_t typeRva,const std::uint8_t state) noexcept {
+    // 00656430 installs the neutral base cycle (RVA EAD858), state 1.
+    // 0065BDD0 selects it for NPCs when no execution is active. It is distinct
+    // from locomotion Idle; requiring locomotion before admitting the first
+    // request deadlocks a Client which is correctly holding this neutral cycle.
+    // This only permits the drain. Scheduler, navigation, health, ownership
+    // and incarnation checks must still prove quiescence before execution.
+    return (typeRva == 0xEAD858U && state == 0x01U) ||
+        (typeRva == 0xEABF80U && (state == 0x01U || state == 0x38U)) ||
+        (typeRva == 0xEABEC0U && state == 0x3BU);
+}
+
 constexpr bool NavigationAuthorityAdvanced(const std::uint32_t flags,
     const std::uint32_t revision, const std::uint32_t requestRevision,
     const std::uint32_t releasedRevision, const std::uint32_t releasedRequestRevision) noexcept {
@@ -142,6 +216,13 @@ constexpr bool NavigationAuthorityAdvanced(const std::uint32_t flags,
 constexpr bool HostLeftPairedExecution(const bool executionValid, const bool executionPaired,
     const bool interactionActive, const bool sourceRetained) noexcept {
     return executionValid && !executionPaired && !interactionActive && !sourceRetained;
+}
+
+// The observer's local End_Action may be retained while the Host still plays
+// its outro. Both facts are required before forwarding that deferred marker.
+constexpr bool DeferredSourceEndReady(const bool currentLifetime, const bool hostLeft,
+    const bool localEndAction, const bool exactGraphRetained, const bool nonLethalBranch) noexcept {
+    return currentLifetime && hostLeft && localEndAction && exactGraphRetained && nonLethalBranch;
 }
 
 // Metadata gives no local ownership until replay succeeds for this revision.

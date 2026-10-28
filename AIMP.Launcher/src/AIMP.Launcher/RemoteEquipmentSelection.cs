@@ -5,7 +5,8 @@ namespace AIMP.Launcher;
 internal static class RemoteEquipmentSelection
 {
     internal static bool SupportsActions(int current, bool active) =>
-        active && RemoteEquipmentDefinitions.TryGetPlayerSyncEquipmentId(current, out _);
+        active && current is not (32 or 33)
+        && RemoteEquipmentDefinitions.TryGetPlayerSyncEquipmentId(current, out _);
 
     internal static bool ActionEligibilityChanged(int previousCurrent, bool previousActive, int current, bool active) =>
         SupportsActions(previousCurrent, previousActive) != SupportsActions(current, active);

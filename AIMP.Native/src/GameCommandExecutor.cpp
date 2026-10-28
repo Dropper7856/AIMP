@@ -3959,7 +3959,7 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteRemoteEquipmentProvision(
         command.equipmentOutputShortGuid,
         command.spawnSchedulerParameterShortGuid,
         command.spawnTargetInputShortGuid,
-        command.equipmentSlot);
+        command.equipmentSlot, command.activateHeld, command.releaseHeld);
     result.executed = provision.executed;
     if (!provision.executed && provision.retryable) {
         // LauncherIPC preserves REMOTE_EQUIPMENT_NOT_READY as a convergence result.
