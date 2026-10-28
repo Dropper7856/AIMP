@@ -67,6 +67,7 @@ public:
     [[nodiscard]] std::size_t InstalledCount() const noexcept;
     [[nodiscard]] std::size_t RetiredCount() const noexcept;
     [[nodiscard]] bool MutationAllowed() const noexcept;
+    [[nodiscard]] bool ExactBuildValidated() const noexcept { return exactBuildValidated_; }
 
 private:
     struct Hook;

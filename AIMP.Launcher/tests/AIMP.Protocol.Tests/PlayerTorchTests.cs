@@ -18,7 +18,7 @@ internal static class PlayerTorchTests
 
     internal static Task WireAsync()
     {
-        AssertEx.Equal((ushort)11, ProtocolConstants.Version);
+        AssertEx.Equal((ushort)14, ProtocolConstants.Version);
         foreach (var torch in new PlayerTorchSnapshot?[] { null, Off, On })
         {
             var position = Position(1, torch, Crouched);

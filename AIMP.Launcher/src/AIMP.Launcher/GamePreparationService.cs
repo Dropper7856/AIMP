@@ -15,7 +15,7 @@ internal static class GamePreparationSynchronization
 
 public sealed class GamePreparationService
 {
-    private const int RecipeVersion = 2; // Automatic preparation covers DLC levels only; Debug prepares other maps individually.
+    private const int RecipeVersion = 3; // Automatic preparation covers DLC levels only; Debug prepares other maps individually.
     private readonly object _sync = new();
     private readonly LauncherSettingsStore _settings;
     private readonly LauncherDiagnostics _diagnostics;
@@ -150,7 +150,7 @@ public sealed class GamePreparationService
         var bin = Path.Combine(world, "COMMANDS.BIN");
         var pakHash = HashIfPresent(pak);
         var binHash = HashIfPresent(bin);
-        var mapId = WorldManifestCompiler.ComputeMapContentId(pakHash, binHash, File.Exists(pak), File.Exists(bin));
+        var mapId = WorldManifestCompiler.ComputeStableMapContentId(world, File.Exists(pak), File.Exists(bin));
         var path = WorldManifestCompiler.GetDefaultCachePath(mapId);
         if (!File.Exists(path))
             throw new InvalidOperationException($"No current manifest exists for this map at '{path}' (level='{level}', map={mapId}). Prepare it in Debug > WorldManifest before creating the lobby.");

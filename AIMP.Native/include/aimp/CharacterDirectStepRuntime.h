@@ -110,24 +110,6 @@ bool HoldAIIntentIdle(
     std::uint32_t moveType,
     std::string& error) noexcept;
 
-enum class AIExecutionReplayResult : std::uint8_t {
-    NotRequired = 0U,
-    Applied = 1U,
-    Unsupported = 2U,
-    Failed = 3U,
-};
-
-// Replays a Host-selected Character execution transition through the same
-// retail transition entry point. Only transitions whose ABI and destination
-// cycle identity are certified are admitted (including the
-// ignored stack word of the native 3B stop transition); unknown states are
-// deliberately left untouched rather than fabricating a native C++ object.
-AIExecutionReplayResult ReplayAIExecutionTransition(
-    std::uintptr_t characterAddress,
-    std::uint32_t cycleTypeRva,
-    std::uint32_t cycleState,
-    std::string& error) noexcept;
-
 // Drops only AIMP's persistent intent slot. Unlike Stop(), this deliberately
 // does not force Idle or submit a zero movement request, so a just-replayed
 // retail transition remains fully owned by CATHODE.

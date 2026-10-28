@@ -70,7 +70,6 @@ public sealed partial class LobbyClient : IAsyncDisposable
 
     public event EventHandler<PlayerActionEventPayload>? PlayerActionReceived;
 
-    public event EventHandler<ReadOnlyMemory<byte>>? AISyncStateReceived;
 
     public event EventHandler<WorldNetworkContext>? WorldContextReceived;
 
@@ -379,6 +378,34 @@ public sealed partial class LobbyClient : IAsyncDisposable
                 Interlocked.Exchange(ref _lastHostSeenTicks, Environment.TickCount64);
                 switch (frame.Type)
                 {
+                    case MessageType.AISyncExecutionControl:
+                        await HandleAISyncExecutionControlAsync(frame.Payload).ConfigureAwait(false);
+                        break;
+                    case MessageType.AISyncExecutionNetworkBatch:
+                        HandleAISyncExecutionBatch(frame.Payload);
+                        break;
+                    case MessageType.AISyncCausalStateNetwork:
+                        HandleAISyncCausalState(frame.Payload);
+                        break;
+                    case MessageType.AISyncRouteNetwork:
+                        HandleAISyncRoute(frame.Payload);
+                        break;
+                    case MessageType.AISyncExecutionNetworkRetry:
+                        HandleAISyncExecutionBatch(frame.Payload, retry: true);
+                        break;
+                    case MessageType.AISyncExecutionNetworkReceipt:
+                        throw new ProtocolException("Only a Client may send executable AISync receipts.");
+                    case MessageType.AISyncShadowOpen:
+                        await HandleAISyncShadowOpenAsync(frame.Payload, cancellationToken).ConfigureAwait(false);
+                        break;
+                    case MessageType.AISyncShadowData:
+                        await HandleAISyncShadowDataAsync(frame.Payload, cancellationToken).ConfigureAwait(false);
+                        break;
+                    case MessageType.AISyncShadowRecovery:
+                        HandleAISyncShadowRecovery(frame.Payload);
+                        break;
+                    case MessageType.AISyncShadowReceipt:
+                        throw new ProtocolException("Only a shadow consumer may send receipts.");
                     case MessageType.VoiceFrame:
                         HandleVoiceFrame(frame.Payload);
                         break;
@@ -479,8 +506,7 @@ public sealed partial class LobbyClient : IAsyncDisposable
                         break;
 
                     case MessageType.AISyncNetworkState:
-                        AISyncStateReceived?.Invoke(this, AISyncCodec.DecodeNetwork(frame.Payload, SessionId));
-                        break;
+                        throw new ProtocolException("Independent AISync state traffic is retired.");
 
                     case MessageType.WorldContext:
                         var worldContext = WorldReplicationCodec.DecodeNetworkContext(frame.Payload.Span);
@@ -526,6 +552,9 @@ public sealed partial class LobbyClient : IAsyncDisposable
                         ModelValidation.Validate(roundEnded);
                         if (roundEnded.SessionId != SessionId)
                             throw new ProtocolException("The round-ended SessionId is invalid.");
+                        await StopShadowControlsAsync().ConfigureAwait(false);
+                        ClearAISyncShadow();
+                        await ClearAISyncExecutionAsync().ConfigureAwait(false);
                         RoundEnded?.Invoke(this, roundEnded);
                         break;
 
@@ -572,6 +601,11 @@ public sealed partial class LobbyClient : IAsyncDisposable
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
         }
+        catch (ObjectDisposedException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Dispose cancels then closes the socket to unblock its reader.
+            // The next ReadAsync can observe closure before cancellation.
+        }
         catch (Exception exception) when (
             exception is IOException or SocketException or EndOfStreamException
                 or ProtocolException)
@@ -580,6 +614,9 @@ public sealed partial class LobbyClient : IAsyncDisposable
         }
         finally
         {
+            await StopShadowControlsAsync().ConfigureAwait(false);
+            ClearAISyncShadow();
+            await ClearAISyncExecutionAsync().ConfigureAwait(false);
             if (Volatile.Read(ref _disposing) == 0)
             {
                 Disconnected?.Invoke(this, EventArgs.Empty);

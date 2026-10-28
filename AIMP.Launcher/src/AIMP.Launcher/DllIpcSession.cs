@@ -39,6 +39,8 @@ internal sealed class DllIpcSession : IAsyncDisposable
     }
 
     internal bool IsReady { get; private set; }
+    internal Guid ConnectionIdentity { get; } = Guid.NewGuid();
+    internal int TargetProcessId => _targetProcessId;
 
     internal bool AISyncAvailable { get; private set; }
 
@@ -63,6 +65,7 @@ internal sealed class DllIpcSession : IAsyncDisposable
     internal event EventHandler<NativePlayerActionEventPayload>? PlayerSyncActionProduced;
 
     internal event EventHandler<NativePlayerLifecycleStatePayload>? PlayerLifecycleStateChanged;
+    internal event EventHandler<NativeCharacterIncarnationState>? CharacterIncarnationChanged;
 
     internal event EventHandler<NativeMissionSignalPayload>? MissionSignalProduced;
 
@@ -71,9 +74,10 @@ internal sealed class DllIpcSession : IAsyncDisposable
     internal event EventHandler<NativeItemSyncSpawnPayload>? ItemSyncSpawnProduced;
     internal event EventHandler<ReadOnlyMemory<byte>>? ThrowableProduced;
 
-    internal event EventHandler<ReadOnlyMemory<byte>>? AISyncStateProduced;
 
     internal event EventHandler<ReadOnlyMemory<byte>>? AISyncImpactProduced;
+    internal event EventHandler<ReadOnlyMemory<byte>>? AISyncTransactionObservationProduced;
+    internal event EventHandler<(MessageType Type, ReadOnlyMemory<byte> Bytes)>? AISyncExecutionProduced;
 
     internal event EventHandler<string>? Log;
 
@@ -450,12 +454,23 @@ internal sealed class DllIpcSession : IAsyncDisposable
     {
         switch (frame.Type)
         {
+            case MessageType.AISyncExecutionBinding:
+            case MessageType.AISyncExecutionReceipt:
+            case MessageType.AISyncHostBatch:
+            case MessageType.AISyncHostState:
+            case MessageType.AISyncHostRoute:
+            case MessageType.AISyncHostControl:
+                HandleAISyncExecution(frame);
+                return true;
             case MessageType.CapabilityState: HandleCapability(frame); return true;
             case MessageType.CaptureState: HandleCapture(frame); return true;
             case MessageType.LevelState: HandleLevel(frame); return true;
             case MessageType.PlayerSyncState: HandlePlayerSyncState(frame); return true;
             case MessageType.PlayerSyncAction: HandlePlayerSyncAction(frame); return true;
             case MessageType.PlayerLifecycleState: HandlePlayerLifecycleState(frame); return true;
+            case MessageType.CharacterIncarnationState:
+                HandleCharacterIncarnation(frame);
+                return true;
             case MessageType.MissionSignalProduced: HandleMissionSignal(frame); return true;
             case MessageType.ItemSyncPickup: HandleItemSyncPickup(frame); return true;
             case MessageType.ItemSyncSpawn: HandleItemSyncSpawn(frame); return true;
@@ -464,24 +479,61 @@ internal sealed class DllIpcSession : IAsyncDisposable
                 ThrowableProduced?.Invoke(this, frame.Payload);
                 return true;
             case MessageType.AISyncState:
-                HandleAISyncState(frame);
+                Log?.Invoke(this, "Retired AISync state message ignored; execution stream required.");
                 return true;
             case MessageType.AISyncImpact:
                 HandleAISyncImpact(frame);
+                return true;
+            case MessageType.AISyncTransactionObservation:
+                HandleAISyncTransactionObservation(frame);
                 return true;
             default: return false;
         }
     }
 
-    private void HandleAISyncState(AimpFrame frame)
+    private void HandleCharacterIncarnation(AimpFrame frame)
     {
-        try { AISyncCodec.ValidateNative(frame.Payload.Span); }
+        if (!IsReady) throw new ProtocolException("Character lifetime arrived before the DLL handshake.");
+        NativeCharacterIncarnationState state;
+        try { state = NativeCharacterIncarnationCodec.Decode(frame.Payload.Span); }
         catch (ProtocolException exception)
         {
-            Log?.Invoke(this, $"Rejected AISYNC_STATE sequence={frame.Sequence} bytes={frame.Payload.Length} without closing IPC: {exception.Message}");
+            state = new(0,0,0,0);
+            Log?.Invoke(this, $"Character lifetime unavailable after malformed native observation: {exception.Message}");
+        }
+        CharacterIncarnationChanged?.Invoke(this, state);
+    }
+    private void HandleAISyncTransactionObservation(AimpFrame frame)
+    {
+        try { AISyncShadowCodec.ValidateNativeObservation(frame.Payload.Span); }
+        catch (ProtocolException exception)
+        {
+            Log?.Invoke(this, $"Rejected optional AISync shadow observation without closing IPC: {exception.Message}");
             return;
         }
-        AISyncStateProduced?.Invoke(this, frame.Payload);
+        AISyncTransactionObservationProduced?.Invoke(this, frame.Payload);
+    }
+    private void HandleAISyncExecution(AimpFrame frame)
+    {
+        try { ValidateAISyncExecution(frame); }
+        catch (ProtocolException exception) { Log?.Invoke(this, $"Rejected AISync execution disposition: {exception.Message}"); return; }
+        AISyncExecutionProduced?.Invoke(this, (frame.Type, frame.Payload));
+    }
+    private static void ValidateAISyncExecution(AimpFrame frame)
+    {
+        if (frame.Type is MessageType.AISyncExecutionBinding or MessageType.AISyncHostControl)
+        {
+            var control = AISyncExecutionControlCodec.Decode(frame.Payload.Span);
+            if (control.Kind is not (AISyncExecutionControlKind.Ready or AISyncExecutionControlKind.Recovery or AISyncExecutionControlKind.CheckpointAck))
+                throw new ProtocolException("Invalid native execution control direction.");
+        }
+        else if (frame.Type == MessageType.AISyncHostState)
+            _ = AISyncCausalStateCodec.Decode(frame.Payload.Span);
+        else if (frame.Type == MessageType.AISyncHostRoute)
+            _ = AISyncRouteCodec.Decode(frame.Payload.Span, AISyncRouteCodec.DecodeKey(frame.Payload.Span));
+        else if (frame.Type == MessageType.AISyncHostBatch)
+            _ = AISyncExecutionCodec.DecodeBatch(frame.Payload.Span);
+        else _ = AISyncExecutionCodec.DecodeReceipt(frame.Payload.Span);
     }
 
     private void HandleAISyncImpact(AimpFrame frame)
@@ -691,8 +743,23 @@ internal sealed class DllIpcSession : IAsyncDisposable
     internal Task SendAISyncAsync(MessageType type, ReadOnlyMemory<byte> payload, CancellationToken token)
     {
         EnsureReady();
-        if (type is not (MessageType.AISyncConfigure or MessageType.AISyncState or MessageType.AISyncImpact))
+        if (type is not (MessageType.AISyncConfigure or MessageType.AISyncImpact))
             throw new ArgumentOutOfRangeException(nameof(type));
+        return SendAsync(type, payload, token);
+    }
+    internal Task SendAISyncExecutionAsync(MessageType type, ReadOnlyMemory<byte> payload, CancellationToken token)
+    {
+        if (type is not (MessageType.AISyncExecutionBinding or MessageType.AISyncExecutionBatch or MessageType.AISyncExecutionRetry or MessageType.AISyncHostBinding or MessageType.AISyncClientRoute or MessageType.AISyncClientState))
+            throw new ArgumentOutOfRangeException(nameof(type));
+        if (type is MessageType.AISyncExecutionBinding or MessageType.AISyncHostBinding) {
+            if (AISyncExecutionControlCodec.Decode(payload.Span).Kind == AISyncExecutionControlKind.Ready)
+                throw new ProtocolException("Launcher cannot forge native execution readiness.");
+        }
+        else if (type == MessageType.AISyncClientState)
+            _ = AISyncCausalStateCodec.Decode(payload.Span);
+        else if (type == MessageType.AISyncClientRoute)
+            _ = AISyncRouteCodec.Decode(payload.Span, AISyncRouteCodec.DecodeKey(payload.Span));
+        else _ = AISyncExecutionCodec.DecodeBatch(payload.Span);
         return SendAsync(type, payload, token);
     }
 
@@ -809,6 +876,7 @@ internal sealed class DllIpcSession : IAsyncDisposable
             var frame = new AimpFrame(type, 0, sequence, payload);
             await FrameCodec.WriteAsync(_pipe, frame, token).ConfigureAwait(false);
         }
+        catch { _pipe.Dispose(); throw; } // A partial frame must never share the pipe with later traffic.
         finally
         {
             _writeLock.Release();

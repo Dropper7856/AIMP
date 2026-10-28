@@ -92,6 +92,8 @@ struct RemoteEquipmentProvisionCommand {
     std::uint32_t spawnSchedulerParameterShortGuid{};
     std::uint32_t spawnTargetInputShortGuid{};
     std::uint32_t equipmentSlot{};
+    bool activateHeld{};
+    bool releaseHeld{};
 };
 
 struct WorldRegistryProbeCommand {

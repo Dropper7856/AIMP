@@ -563,6 +563,9 @@ public static class ModelValidation
     private static bool ValidRemoteCharacterState(CaptureStatePayload value)
     {
         if (!RemoteCharacterStateNames.All.Contains(value.RemoteCharacterState)) return false;
+        if ((value.RemoteCharacterCreationSerial == 0) != (value.RemoteCharacterRuntimeId == 0)
+            || value.RemoteCharacterCreationSerial != 0 &&
+                (value.RemoteCharacterState != RemoteCharacterStateNames.Ready || value.LevelGeneration <= 0)) return false;
         var hasKey = value.RemoteCharacterSpawnKey != 0;
         var hasCharacter = ValidCharacterAddress(value.RemoteCharacterAddress);
         var hasRecord = ValidNativeAddress(value.RemoteCharacterRecordAddress);
@@ -1202,6 +1205,8 @@ public static class ModelValidation
                 GameCommandNames.RemoteEquipmentProvision,
                 StringComparison.Ordinal))
         {
+            var activateHeld = value.Arguments.TryGetValue("activateHeld", out var activation);
+            var releaseHeld = value.Arguments.TryGetValue("releaseHeld", out var release);
             var expected = new HashSet<string>(
                 new[]
                 {
@@ -1211,10 +1216,10 @@ public static class ModelValidation
                     "equipmentOutputShortGuid",
                     "spawnSchedulerParameterShortGuid",
                     "spawnTargetInputShortGuid",
-                    "equipmentSlot"
+                    "equipmentSlot", "activateHeld", "releaseHeld"
                 },
                 StringComparer.Ordinal);
-            if (value.Arguments.Count != expected.Count
+            if (value.Arguments.Count != (activateHeld || releaseHeld ? 8 : 7)
                 || value.Arguments.Keys.Any(key => !expected.Contains(key))
                 || !value.Arguments.TryGetValue("characterAddress", out var addressText)
                 || !value.Arguments.TryGetValue("compositeName", out var compositeName)
@@ -1239,7 +1244,12 @@ public static class ModelValidation
                     NumberStyles.None,
                     CultureInfo.InvariantCulture,
                     out var equipmentSlot)
-                || equipmentSlot > 10U)
+                || equipmentSlot > 10U
+                || (activateHeld && releaseHeld)
+                || (activateHeld && activation != "true")
+                || (releaseHeld && release != "true")
+                || ((activateHeld || releaseHeld) && (equipmentSlot != 9U || compositeName !=
+                    @"Required_Assets\Archetypes\Equipment\Flare_Held")))
             {
                 throw new ProtocolException(
                     "REMOTE_EQUIPMENT_PROVISION parameters are invalid.");

@@ -209,6 +209,37 @@ bool IsWritable(void* address, const std::size_t bytes) noexcept {
     return CheckPages(address, bytes, true);
 }
 
+namespace {
+// TryCopy is called thousands of times per frame (AISync, WorldSync,
+// PlayerSync). A VirtualQuery syscall per read dominated the engine thread on
+// a fragmented 32-bit address space. Remember recently verified committed,
+// readable, non-guard regions per thread. The copy itself stays under SEH, so
+// a region freed after caching still fails safely (access violation caught);
+// entries expire quickly so a reprotected region is re-queried.
+struct ReadableRegion { std::uintptr_t begin{}, end{}; ULONGLONG tick{}; };
+thread_local ReadableRegion tRegions[16]{};
+thread_local unsigned tNextRegion{};
+constexpr ULONGLONG kRegionLifetimeMs = 250;
+bool CachedReadable(const void* address, const std::size_t bytes) noexcept {
+    if (address == nullptr) return false;
+    const auto begin = reinterpret_cast<std::uintptr_t>(address);
+    if (begin > std::numeric_limits<std::uintptr_t>::max() - bytes) return false;
+    const auto end = begin + bytes;
+    const auto now = GetTickCount64();
+    for (const auto& region : tRegions)
+        if (region.end != 0 && begin >= region.begin && end <= region.end && now - region.tick < kRegionLifetimeMs) return true;
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(address, &info, sizeof(info)) != sizeof(info) || info.State != MEM_COMMIT ||
+        !HasReadAccess(info.Protect)) return false;
+    const auto regionBegin = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+    if (regionBegin > std::numeric_limits<std::uintptr_t>::max() - info.RegionSize) return false;
+    const auto regionEnd = regionBegin + info.RegionSize;
+    if (end > regionEnd) return IsReadable(address, bytes); // Spans regions: exact slow path.
+    tRegions[tNextRegion++ % 16U] = {regionBegin, regionEnd, now};
+    return true;
+}
+}
+
 bool TryCopy(
     void* destination,
     const void* source,
@@ -216,7 +247,7 @@ bool TryCopy(
     if (bytes == 0) {
         return true;
     }
-    if (destination == nullptr || !IsReadable(source, bytes)) {
+    if (destination == nullptr || !CachedReadable(source, bytes)) {
         return false;
     }
 #if defined(_MSC_VER)

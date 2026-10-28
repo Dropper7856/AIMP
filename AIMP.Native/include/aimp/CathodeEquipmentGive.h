@@ -42,6 +42,8 @@ struct Record final {
     std::uint32_t exceptionCode{};
     bool giveStarted{};
     bool outputQuerySucceeded{};
+    bool activateHeldRequested{}, activateHeldDispatched{};
+    bool releaseHeldRequested{}, releaseHeldDispatched{};
     // One-shot Give policy, never a per-update refill. The record is retained
     // after Equipped, so retrying/polling an already-given item cannot refill it.
     bool initialResourcesCompleted{};

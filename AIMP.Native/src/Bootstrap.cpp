@@ -973,7 +973,7 @@ DWORD Bootstrap::RunImpl() {
         const bool ready = validation.hashMatch && aiSyncLifetimesReady &&
             gameThreadHooks != nullptr && gameThreadHooks->ManagerUpdateHookInstalled();
         const bool installed = ready && ai_sync::Install(moduleBase, *hooks,
-            *levelGenerations, *gameThreadDispatcher, aiError);
+            *levelGenerations, *gameThreadDispatcher, aiError, worldRegistry.get());
         diagnostics.Log(installed ? "info" : "error", "aisync_v2_install",
             installed ? "AISync V2 installed by default; retail until multiplayer authority. Live toggle: Performance Isolation / AISync. High-level Character convergence, action identity and resolved interaction carriers are synchronized; retail/CATHODE regenerate animation, audio and consequences locally."
                 : (aiError.empty() ? "AISync requires exact build, both destruction hooks and CharacterManagerUpdate." : aiError));
@@ -1683,6 +1683,11 @@ DWORD Bootstrap::RunImpl() {
         // HookManager::~HookManager would otherwise remove the pending-release
         // boundary. Small process-lifetime retention is deliberate and bounded.
         hooks.release();
+    }
+    if (retainAISyncHooks) {
+        // A pre-shutdown scripted admission can still own a resolver lease.
+        // Keep its resolver service alive with the resident AISync callbacks.
+        worldRegistry.release();
     }
     if (safeToUnload) crash_guard::UninstallUnhandledExceptionRecorder();
     diagnostics.Shutdown();

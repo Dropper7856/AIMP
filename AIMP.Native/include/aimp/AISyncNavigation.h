@@ -7,10 +7,6 @@
 
 namespace aimp::ai_sync::navigation {
 
-struct Sample final {
-    NavigationGoalState goal{};
-    std::uintptr_t request{}; // local observation only
-};
 struct Counters final {
     std::uint64_t captured{}, submitted{}, updated{}, completed{}, failed{}, cancelled{}, expired{};
     std::uint64_t gaitApplied{};
@@ -25,43 +21,10 @@ struct HeadObservation final {
 };
 // Local observation only. The portable goal owns no Ref, action or request
 // address; Character/runtimeId are remapped to an Actor birth before transport.
-struct SubmissionObservation final {
-    std::uintptr_t character{};
-    std::uint32_t runtimeId{};
-    std::uint64_t epoch{}, sequence{};
-    NavigationGoalState goal{};
-};
-using SubmissionGuard = bool(*)(std::uintptr_t character) noexcept;
-
-// Engine-thread only. References are owned independently of Character lifetime.
+// Read-only diagnostics. All executable navigation belongs to AISyncNativeRequestAdapter.
 bool Initialize(std::uintptr_t base, std::string& error);
-// Passive observers retain the world endpoint before retail turns it into a
-// heading/distance request. They call the original producer exactly once.
-bool InstallGoalObservers(HookManager& hooks, std::string& error);
-// The guard must certify Host, stable world/session, admitted Character and
-// engine thread. Call ObserveSubmission after an ACCEPTED retail Submit while
-// its caller still owns the request Ref. +18 need not have been set yet.
-void SetSubmissionGuard(SubmissionGuard guard) noexcept;
-void ObserveSubmission(std::uintptr_t request, std::uint32_t requestRevision = 1U) noexcept;
-bool TryPopSubmission(SubmissionObservation& observation) noexcept;
-// Call on session/world/role resets. Epoch filtering never dereferences stale
-// Characters, and Reset(false/true) also invalidates pending observations.
-void ResetSubmissionObservations() noexcept;
-Sample Capture(std::uintptr_t character) noexcept;
 HeadObservation InspectHead(std::uintptr_t character) noexcept;
-bool Apply(std::uintptr_t character, const NavigationGoalState& goal,
-    std::uint64_t expiresAt, std::string& error, bool convergence = false) noexcept;
-// Retail movement producers author this separately from their Move request.
-// Keep local pathfinding/steering; replicate only the Host-selected gait.
-bool ApplyGait(std::uintptr_t character, std::uint32_t moveType) noexcept;
-void Cancel(std::uintptr_t character) noexcept;
-// Retiring a movement owner must not cancel a replacement installed by a
-// different owner during the same engine tick.
-bool CancelOwned(std::uintptr_t character, bool convergence,
-    std::uint32_t requestRevision) noexcept;
-void Reset(bool cancelNative) noexcept;
-void Pump(std::uint64_t now) noexcept;
-Counters Snapshot() noexcept;
+Counters Snapshot() noexcept; // Reserved diagnostic fields from older snapshots.
 inline constexpr std::uint32_t kLiveGoal = 1U, kWorldEndpoint = 2U;
 inline constexpr std::uint32_t kPointRequest = 1U, kTurnRequest = 4U, kStanceRequest = 7U,
     kDirectedRequest = 9U;

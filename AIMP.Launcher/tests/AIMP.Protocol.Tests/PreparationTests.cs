@@ -21,6 +21,14 @@ internal static class PreparationTests
         AssertEx.True(originalToken != Guid.Empty);
         var hostReport = Report(host, host.HostPeerId, originalToken);
         await host.SetHostPreparationAsync(hostReport, timeout.Token).ConfigureAwait(false);
+        await client.SendLobbyPreparationAsync(Report(host,client.PeerId,originalToken) with {Level="TECH_HUB"},timeout.Token);
+        // A following frame proves the wrong-level report was processed.
+        await client.SetReadyAsync(false,timeout.Token);
+        await WaitUntilAsync(()=>client.Snapshot?.Players.Any(p=>p.PeerId==client.PeerId&&!p.Ready)==true);
+        AssertEx.False(client.Snapshot!.Preparations!.Any(p=>p.PeerId==client.PeerId));
+        await client.SetReadyAsync(true,timeout.Token);
+        await WaitUntilAsync(()=>client.Snapshot?.Players.Any(p=>p.PeerId==client.PeerId&&p.Ready)==true);
+        AssertEx.False(host.CanStart,"A different level name must not satisfy preparation.");
         var wrongContent = Report(host, client.PeerId, originalToken) with
         {
             ManifestSha256 = new string('D', 64)
@@ -29,8 +37,7 @@ internal static class PreparationTests
         await WaitUntilAsync(() => client.Snapshot?.Preparations?.Any(report =>
             report.PeerId == client.PeerId && report.ManifestSha256 == wrongContent.ManifestSha256) == true)
             .ConfigureAwait(false);
-        AssertEx.False(host.CanStart, "Different runtime content digests must block launch.");
-        await AssertStartRejectedAsync(host, timeout.Token).ConfigureAwait(false);
+        AssertEx.True(host.CanStart, "The same level name must allow different manifest hashes.");
 
         var wrongMap = Report(host, client.PeerId, originalToken) with
         {
@@ -40,8 +47,7 @@ internal static class PreparationTests
         await WaitUntilAsync(() => client.Snapshot?.Preparations?.Any(report =>
             report.PeerId == client.PeerId && report.Manifest == wrongMap.Manifest) == true)
             .ConfigureAwait(false);
-        AssertEx.False(host.CanStart, "Equal digests cannot substitute for matching manifest identity.");
-        await AssertStartRejectedAsync(host, timeout.Token).ConfigureAwait(false);
+        AssertEx.True(host.CanStart, "The same level name must allow different compiled manifest identities.");
 
         await client.SendLobbyPreparationAsync(Report(host, client.PeerId, originalToken), timeout.Token)
             .ConfigureAwait(false);

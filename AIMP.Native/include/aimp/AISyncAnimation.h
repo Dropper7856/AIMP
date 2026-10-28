@@ -1,5 +1,6 @@
 #pragma once
 
+#include "aimp/AISyncInteraction.h"
 #include <array>
 #include <cstdint>
 #include <string>
@@ -71,14 +72,16 @@ struct Callbacks final {
 
 struct Counters final {
     std::uint64_t sourceUpdates{}, coupledPlayerUpdates{}, humanAlignmentUpdates{};
+    std::uint64_t humanGraphInitializations{}, humanVictimGraphInitializations{};
     std::uint64_t markerCallbacks{}, markerCallbacksSkipped{}, markerDispatches{};
     std::uint64_t boundedListenerScans{};
     std::uint64_t scriptedCaptured{}, scriptedUnsupported{}, scriptedApplied{}, scriptedFailed{};
     std::uint32_t lastSourceUpdateCallerRva{}, lastMarker{}, lastMarkerCallerRva{};
 };
 
-// Correct only the certified 006556D0 participant classification. The native
-// function performs all root motion/collision work. The other hooks observe
+// Correct the certified graph initialization, coupling and alignment human
+// classifications. Native functions perform all root motion/collision work.
+// The other hooks observe
 // existing updates and marker delivery; they never schedule a cycle or marker.
 bool Install(std::uintptr_t base, HookManager& hooks,
     const Callbacks& callbacks, std::string& error);
@@ -93,5 +96,18 @@ bool CaptureScripted(std::uintptr_t character, ScriptedState& state) noexcept;
 bool ApplyScripted(std::uintptr_t character, const ScriptedState& state,
     std::string& error) noexcept;
 Counters Snapshot() noexcept;
+
+// Same local resource lookup used by native paired admission: source manager
+// selector -> definition -> bone name -> actual victim skeleton attachment.
+// No graph name, animation pointer, or Host skeleton index is imported.
+bool ResolvePairDefinition(std::uintptr_t source, std::uint32_t sourceRuntimeId,
+    std::uintptr_t victim, std::uint32_t victimRuntimeId, std::uint32_t selector,
+    interactions::Definition&) noexcept;
+bool InspectPair(std::uintptr_t source, std::uint32_t sourceRuntimeId,
+    interactions::PairState&) noexcept;
+// The caller must additionally prove published session/world/ownership. This
+// predicate is independent of scheduler TLS, health and arbitrary deadlines.
+bool OwnsPairSource(std::uintptr_t source, std::uint32_t sourceRuntimeId,
+    std::uintptr_t expectedCycle = 0U) noexcept;
 
 } // namespace aimp::ai_sync::animation

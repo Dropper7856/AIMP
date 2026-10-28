@@ -36,8 +36,14 @@ internal static class LauncherTests
         AssertEx.Equal("Ready to start", LobbyReadiness.Status(lobby with { Preparations = new[] { ready, peer } }));
         AssertEx.Equal("Client: Missing manifest", LobbyReadiness.Status(lobby with
             { Preparations = new[] { ready, peer with { Ready = false, Error = "Missing manifest" } } }));
-        AssertEx.Equal("Level manifest mismatch: Client", LobbyReadiness.Status(lobby with
+        AssertEx.Equal("Ready to start", LobbyReadiness.Status(lobby with
             { Preparations = new[] { ready, peer with { ManifestSha256 = new string('b', 64) } } }));
+        AssertEx.Equal("Ready to start", LobbyReadiness.Status(lobby with
+            { Preparations = new[] { ready, peer with { Level = "tech_comms", Manifest = identity with { MapContentId = new WorldEntityId(3,4) } } } }));
+        AssertEx.Equal("Level mismatch: Client", LobbyReadiness.Status(lobby with
+            { Preparations = new[] { ready, peer with { Level = "TECH_HUB" } } }));
+        AssertEx.Equal("Verifying Client's level", LobbyReadiness.Status(lobby with
+            { Preparations = new[] { ready, peer with { SessionId = Guid.NewGuid() } } }));
         return Task.CompletedTask;
     }
 

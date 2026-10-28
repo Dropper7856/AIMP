@@ -76,6 +76,13 @@ struct DamageObservation final {
 struct DamageReplayCursor final {
     std::uint32_t revision{};
     bool invoked{};
+    // Pin the local incarnation and immutable event at irreversible entry.
+    // A recycled Character address or conflicting resend cannot inherit it.
+    std::uintptr_t character{};
+    std::uint32_t runtimeId{};
+    Source source{};
+    DamageEvent admitted{};
+    bool busy{};
 };
 struct Counters final {
     std::uint64_t captured{}, captureRefused{}, commits{}, applied{}, alreadyMatched{};

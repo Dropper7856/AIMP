@@ -1,4 +1,5 @@
 #include "aimp/AISync.h"
+#include "aimp/AISyncProfiling.h"
 #include "aimp/VoiceSync.h"
 #include "aimp/GameThreadObservationHooks.h"
 
@@ -202,6 +203,8 @@ ReadyRecordSnapshot ReadRecordFromReadySink(
 }
 
 std::uint32_t __cdecl MainThreadCharacterProcessingDetour() noexcept {
+    const ai_sync::profiling::Timer timing(ai_sync::profiling::Section::EngineCallback);
+    ai_sync::profiling::EngineCadence();
     ActiveDetour active;
     const auto threadId = GetCurrentThreadId();
     const auto performanceCounter = PerformanceCounter();
@@ -223,7 +226,10 @@ std::uint32_t __cdecl MainThreadCharacterProcessingDetour() noexcept {
 
     const auto original = reinterpret_cast<MainThreadCallback>(
         gMainThreadTrampoline.load(std::memory_order_acquire));
+    const auto retailStart=ai_sync::profiling::Clock();
     const auto result = original == nullptr ? 0U : original();
+    ai_sync::profiling::End(ai_sync::profiling::Section::EngineOriginal,retailStart);
+    const ai_sync::profiling::Timer workTiming(ai_sync::profiling::Section::Dispatcher);
 
     // The loading hold skips CharacterManagerUpdate, including its creation
     // queue. Only advance that queue here; keep gameplay simulation held.

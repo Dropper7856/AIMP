@@ -1,6 +1,7 @@
 #pragma once
 
 #include "aimp/CathodeEquipmentGive.h"
+#include "aimp/CharacterIncarnation.h"
 
 #include <atomic>
 #include <cstdint>
@@ -32,6 +33,7 @@ struct SpawnCharacterTrackingSnapshot {
     std::uintptr_t recordAddress{};
     SpawnCharacterTrackingState state{SpawnCharacterTrackingState::None};
     bool hookInstalled{};
+    character_incarnations::Ticket creation{};
 };
 
 struct RemoteEquipmentProvisionResult {
@@ -89,7 +91,7 @@ public:
             std::uint32_t equipmentOutputShortGuid,
             std::uint32_t spawnSchedulerParameterShortGuid,
             std::uint32_t spawnTargetInputShortGuid,
-            std::uint32_t equipmentSlot);
+            std::uint32_t equipmentSlot, bool activateHeld = false, bool releaseHeld = false);
 
     [[nodiscard]] SpawnCharacterTrackingSnapshot Snapshot() const noexcept;
     [[nodiscard]] bool HookInstalled() const noexcept;
@@ -102,7 +104,8 @@ private:
         std::uint32_t spawnKey,
         std::uintptr_t characterAddress,
         std::uintptr_t recordAddress,
-        SpawnCharacterTrackingState state) noexcept;
+        SpawnCharacterTrackingState state,
+        const character_incarnations::Ticket& creation = {}) noexcept;
     void ClearRemoteEquipmentRecords() noexcept;
     void ReapDestroyedRemoteEquipmentRecords() noexcept;
 
@@ -119,6 +122,8 @@ private:
     std::atomic<std::uint32_t> spawnKey_{0};
     std::atomic<std::uintptr_t> characterAddress_{0};
     std::atomic<std::uintptr_t> recordAddress_{0};
+    std::atomic<std::uint64_t> creationSerial_{0};
+    std::atomic<std::uint32_t> creationRuntime_{0};
     std::atomic<SpawnCharacterTrackingState> state_{
         SpawnCharacterTrackingState::None};
     std::atomic<bool> hookInstalled_{false};

@@ -84,6 +84,19 @@ bool IsKnownMessageType(const std::uint16_t raw) noexcept {
     case MessageType::VoicePcmFrame:
     case MessageType::ThrowableConfigure:
     case MessageType::ThrowableEvent:
+    case MessageType::AISyncTransactionObservation:
+    case MessageType::AISyncExecutionBinding:
+    case MessageType::AISyncExecutionBatch:
+    case MessageType::AISyncExecutionReceipt:
+    case MessageType::AISyncExecutionRetry:
+    case MessageType::AISyncHostBinding:
+    case MessageType::AISyncHostBatch:
+    case MessageType::AISyncHostControl:
+    case MessageType::AISyncHostState:
+    case MessageType::AISyncClientState:
+    case MessageType::AISyncHostRoute:
+    case MessageType::AISyncClientRoute:
+    case MessageType::CharacterIncarnationState:
     case MessageType::MissionSignalProduced:
     case MessageType::TestModeConfigure:
     case MessageType::CapabilityQuery:

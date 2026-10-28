@@ -87,6 +87,9 @@ internal static class RemoteEquipmentDefinitions
             4 => "npc-flamethrower",
             5 => "boltgun",
             6 => "npc-motion-tracker",
+            // Semantic inventory identities supplied by the native observer.
+            // Lit/unlit use the same composite; activation is a public input.
+            32 or 33 => "flare-held",
             _ => string.Empty
         };
         return equipmentId.Length != 0;
@@ -218,6 +221,14 @@ internal static class RemoteEquipmentCatalogCompiler
         if (spawnVariables.Length != 1)
         {
             diagnostic = $"'{root.name}' exposes {spawnVariables.Length} SPAWN variables; exactly one is required.";
+            return null;
+        }
+
+        if (definition.Id == "flare-held" && root.GetEntities().OfType<VariableEntity>()
+                .Count(variable => variable.name.AsUInt32 ==
+                    ShortGuidUtils.Generate("ACTIVATE_HELD").AsUInt32) != 1)
+        {
+            diagnostic = $"'{root.name}' does not expose one ACTIVATE_HELD public input.";
             return null;
         }
 

@@ -130,12 +130,18 @@ private:
     void PublishWorldReplicationTraffic();
     void PublishPlayerSyncTraffic();
     void PublishPlayerLifecycleTraffic();
+    void PublishCharacterIncarnationTraffic();
     void PublishItemSyncTraffic();
     void PublishMissionSyncTraffic();
     void PublishItemSyncSpawnTraffic();
     void PublishThrowableTraffic();
     void PublishAISyncTraffic();
+    void PublishAISyncTransactionTraffic();
+    void PublishAISyncExecutionTraffic();
+    void PublishAISyncHostTraffic();
     bool HandleAISyncFrame(const protocol::Frame& frame);
+    bool HandleAISyncExecutionFrame(const protocol::Frame& frame);
+    bool HandleAISyncHostFrame(const protocol::Frame& frame);
     bool TryConnect();
     void Disconnect(std::string_view reason) noexcept;
     bool ReceiveAvailable();
@@ -171,6 +177,8 @@ private:
     std::uint32_t processId_{};
     std::uint64_t aiSyncRejectedFrames_{}; // IPC-worker only, retained across reconnects.
     std::uint64_t publishedDeathSequence_{}; // IPC-worker only.
+    std::array<std::uint8_t,40> publishedCharacterIncarnation_{}; // IPC-worker only.
+    bool characterIncarnationPublished_{};
     bool buildValidated_{};
     std::string profileId_;
     std::string resolutionMode_;
@@ -232,6 +240,7 @@ private:
         (std::numeric_limits<std::uint64_t>::max)()};
     std::atomic<std::uint64_t> lastPublishedSpawnTrackerVersion_{
         (std::numeric_limits<std::uint64_t>::max)()};
+    std::atomic<std::uint64_t> lastPublishedSpawnCreationSerial_{0};
     std::atomic<std::uint64_t> lastPublishedPlayerSyncRevision_{
         (std::numeric_limits<std::uint64_t>::max)()};
 

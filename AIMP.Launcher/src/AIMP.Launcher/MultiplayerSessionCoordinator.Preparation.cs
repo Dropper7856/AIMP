@@ -24,6 +24,11 @@ internal sealed partial class MultiplayerSessionCoordinator
     private DateTimeOffset _nextManifestPreloadUtc;
     private Guid _loadingOverlayConnection;
     private DateTimeOffset _nextPreparationProgressUtc;
+    private DateTimeOffset? _worldQuiescenceWaitSinceUtc;
+    private DateTimeOffset _loadingHoldStartedUtc;
+    // Failsafe: the loading screen is removed automatically after this delay, whatever the barrier state.
+    private static readonly TimeSpan LoadingHoldMaximumDuration = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan WorldQuiescenceTimeout = TimeSpan.FromSeconds(8);
 
     private void ReportSessionPreparationProgress(NativeRuntimeSnapshot runtime, DateTimeOffset now, string positionError)
     {
@@ -131,10 +136,10 @@ internal sealed partial class MultiplayerSessionCoordinator
                 var failure = _lobby.Preparations?.FirstOrDefault(value => !value.Ready && !string.IsNullOrWhiteSpace(value.Error));
                 if (failure is not null) throw new InvalidOperationException($"A player's level preparation failed: {failure.Error}");
                 var mismatch = _lobby.Preparations?.FirstOrDefault(value => value.Ready
-                    && (value.Manifest != _preflightManifest.Identity
-                        || !string.Equals(value.ManifestSha256, _preflightManifest.Sha256, StringComparison.OrdinalIgnoreCase)));
+                    && value.SessionId == snapshot.SessionId && value.PreparationToken == snapshot.PreparationToken
+                    && !string.Equals(value.Level, snapshot.Level, StringComparison.OrdinalIgnoreCase));
                 if (mismatch is not null)
-                    throw new InvalidOperationException("Players have different level files. Prepare the same game version and level modifications on every installation before starting.");
+                    throw new InvalidOperationException($"Players selected different levels. Everyone must prepare {snapshot.Level} before starting.");
             }
             if (DateTimeOffset.UtcNow >= deadline) throw new InvalidOperationException("Waiting for all players to verify this level and become Ready. Try Start again when they are ready.");
             await Task.Delay(100, _lifetime.Token).ConfigureAwait(false);
@@ -209,6 +214,33 @@ internal sealed partial class MultiplayerSessionCoordinator
         LobbyHost? host;
         LobbyClient? client;
         bool release;
+        LobbyStartPayload? expired = null;
+        lock (_stateGate)
+        {
+            if (_loadingHoldStart is { } held && _start?.SessionId == held.SessionId
+                && _start.LevelGeneration == held.LevelGeneration
+                && !_sessionReleaseRunning
+                && DateTimeOffset.UtcNow - _loadingHoldStartedUtc >= LoadingHoldMaximumDuration)
+            {
+                _sessionReleaseRunning = true;
+                expired = held;
+            }
+        }
+        if (expired is not null)
+        {
+            try
+            {
+                _diagnostics.Log("Preparation", "Loading screen timeout reached; releasing it automatically.");
+                await SetSessionLoadingHoldAsync(expired, false, _lifetime.Token).ConfigureAwait(false);
+                await SendSessionLoadingAsync(expired, false, "Ready").ConfigureAwait(false);
+                lock (_stateGate)
+                    if (ReferenceEquals(_loadingHoldStart, expired)) _loadingHoldStart = null;
+            }
+            catch (Exception exception) when (exception is not OutOfMemoryException)
+            { if (!_lifetime.IsCancellationRequested) _diagnostics.Log("Preparation", "Loading screen timeout release failed: " + exception.Message); }
+            finally { lock (_stateGate) _sessionReleaseRunning = false; }
+            return;
+        }
         lock (_stateGate)
         {
             if (_loadingHoldStart is not { } current || _start?.SessionId != current.SessionId
@@ -227,7 +259,15 @@ internal sealed partial class MultiplayerSessionCoordinator
                 || loaded.Native != runtime.LevelGeneration || loaded.Process != runtime.ProcessId)) return;
             if (_worldSyncEnabledForSession && GetWorldBusLifecycleStateLocked() != WorldBusLifecycleState.Active) return;
             if (_worldSyncEnabledForSession && (_activeWorldTransaction is not null
-                || _worldResultDispatches.Count != 0 || Volatile.Read(ref _queuedWorldIntents) != 0)) return;
+                || _worldResultDispatches.Count != 0 || Volatile.Read(ref _queuedWorldIntents) != 0))
+            {
+                // On large levels the Host streams world transactions continuously during loading,
+                // so the world is never idle and the barrier would hold forever ("Preparing
+                // multiplayer" never disappears). Wait for quiescence, but only for a bounded time.
+                var waitingSince = _worldQuiescenceWaitSinceUtc ??= DateTimeOffset.UtcNow;
+                if (DateTimeOffset.UtcNow - waitingSince < WorldQuiescenceTimeout) return;
+            }
+            else _worldQuiescenceWaitSinceUtc = null;
             start = current; host = _host; client = _client;
             release = _sessionReleaseAuthorized;
             if (release)

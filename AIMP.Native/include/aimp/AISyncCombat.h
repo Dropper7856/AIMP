@@ -65,6 +65,10 @@ struct Observation final {
 struct ReplayCursor final {
     std::uint32_t revision{};
     bool invoked{}, failed{};
+    std::uintptr_t character{};
+    std::uint32_t runtimeId{};
+    ShotEvent admitted{};
+    bool busy{};
 };
 struct Counters final {
     std::uint64_t captured{}, dropped{}, decisionsBlocked{}, stateApplied{}, shotsApplied{};
