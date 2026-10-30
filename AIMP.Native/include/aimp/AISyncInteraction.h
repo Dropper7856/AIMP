@@ -7,6 +7,11 @@
 
 namespace aimp::ai_sync::interactions {
 
+// Retail pair payload byte 4 is a boolean; bytes 5..7 are not authored by
+// 0067DCD0/006DC310. Preserve invalid byte values for the admission guard.
+[[nodiscard]] constexpr std::uint32_t DecodePairPayloadHigh(
+    const std::uint32_t rawHigh) noexcept { return rawHigh & 0xFFU; }
+
 // Logical values only. A native definition selector is scoped to the exact
 // actor template/resource set certified by the embedding capability adapter.
 struct Participant {

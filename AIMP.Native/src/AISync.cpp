@@ -9,6 +9,7 @@
 #include "aimp/AISyncRouteRuntime.h"
 #include "aimp/AISyncRouteExecution.h"
 #include "aimp/AISyncHostProducer.h"
+#include "aimp/AISyncHybridMotion.h"
 #include "aimp/AISyncInteraction.h"
 #include "aimp/AISyncInteractionRuntime.h"
 #include "aimp/AISyncPairRetirement.h"
@@ -104,7 +105,6 @@ using NativeDamage = void(__thiscall*)(void*, std::uint32_t, std::uintptr_t, std
 // It notifies the health state machine and Character callbacks (007AD730).
 using NativeHealthCommit = void(__thiscall*)(void*, std::uint32_t, std::uintptr_t);
 using Hostility = std::uint32_t(__thiscall*)(void*, std::uintptr_t);
-using ThePlayerResolver = std::uintptr_t(__cdecl*)();
 // Both certified functions take ECX only and use plain RET. The record
 // validator returns AL (true means discard), not a defined full EAX.
 using TargetEligibility = std::uint32_t(__thiscall*)(void*);
@@ -194,6 +194,12 @@ struct PoseSample final {
 };
 struct Actor {
     bool initialPlacementReady{};
+    hybrid_motion::Timeline hybridTimeline{};
+    transactions::Scope hybridScope{};
+    std::uint32_t hybridBirth{};
+    std::uint64_t hybridResumeAfter{},hybridLastAppliedTick{},hybridInputTick{},hybridArrival{},hybridStaleTick{};
+    bool hybridArmed{};
+    std::uint32_t hybridHold{}; // 0 ready,1 context,2 action,3 native owner,4 sample,5 stale,6 native boundary
     transactions::Scope spawnDiagnosticScope{};
     std::uint32_t spawnDiagnosticBirth{};
     ULONGLONG lastSpawnDiagnostic{};
@@ -334,6 +340,10 @@ struct PresentationProbe final {
     navigation::HeadObservation navigationHead{};
     std::uint32_t authorityMoveType{}, requestedMoveType{0xFFFFFFFFU}, effectiveMoveType{0xFFFFFFFFU};
     float authorityIntensity{};
+    std::uint32_t hybridHold{};
+    bool hybridNativeArmed{};
+    std::uint64_t hybridSampleAge{},hybridNativeHooks{},hybridNativeWrites{},hybridNativeFailures{};
+    std::array<float,20> hybridProbe{};std::array<std::uint64_t,6> hybridBranches{};
     std::uint16_t victimHp{};
     std::uint32_t victimHealthState{};
     bool victimHealthReadable{};
@@ -477,6 +487,7 @@ struct PairAdmissionFailure {
     std::uint32_t entityA{},entityB{},birth{},pairRevision{},result{},phase{},site{},stage{},reason{};
     bool registered{},transitionEntered{};
     std::uint32_t refusal{},decision{}; // RefusalSite; decision 1 retry, 2 abandoned, 3 scope fenced
+    std::uint32_t rawPayloadHigh{},decodedPayloadHigh{};
 };
 std::array<PairAdmissionFailure,32> gPairAdmissionFailures{};
 std::size_t gPairFailureRead{},gPairFailureCount{};
@@ -743,6 +754,7 @@ std::atomic<std::uint64_t> gMissing{};
 std::atomic<std::uint64_t> gManagerUpdates{}, gAdmitted{}, gIdentityRejected{}, gTreeUnavailable{}, gOwnerMismatch{};
 std::atomic<std::uint64_t> gRemoteQueued{};
 std::atomic<std::uint64_t> gPoseCaptured{}, gPoseApplied{}, gPoseRejected{};
+std::atomic<std::uint64_t> gHybridSamples{},gHybridApplied{},gHybridSuspended{},gHybridLogicalMoves{},gHybridStale{},gHybridRefused{};
 std::atomic<std::uint64_t> gIntentCaptured{}, gIntentApplied{}, gIntentRejected{}, gIntentRecoveries{};
 std::atomic<std::uint64_t> gActionCaptured{}, gActionTransitions{};
 std::atomic<std::uint64_t> gActionReferencesCaptured{},gActionReferencesUnbound{};
@@ -953,7 +965,12 @@ bool Valid(const State& s) noexcept {
     if (s.interactionParticipantIncarnation!=0U&&((s.stateFlags&InteractionValid)==0U||
         (s.interactionFlags&InteractionTargetIsParticipant)==0U||s.interactionTargetPeer==0U))return false;
     if (!ValidCycleCall(s.transition)) return false;
-    if (s.version != 15U || s.nativeGeneration == 0U || s.sessionCookie == 0U ||
+    if((s.motionFlags&~7U)!=0U)return false;
+    for(const auto velocity:s.motionVelocity)if(!std::isfinite(velocity)||std::abs(velocity)>128.0F)return false;
+    if((s.motionFlags&1U)!=0U) {
+        if(!s.motionTick||(s.stateFlags&PoseValid)==0U)return false;
+    } else if(s.motionTick||s.motionFlags||s.motionVelocity[0]!=0.0F||s.motionVelocity[1]!=0.0F||s.motionVelocity[2]!=0.0F)return false;
+    if (s.version != 16U || s.nativeGeneration == 0U || s.sessionCookie == 0U ||
         s.worldGeneration == 0U || (s.entityA == 0U && s.entityB == 0U) ||
         s.birth == 0U || s.revision == 0U || !AICharacterClass(s.characterClass) ||
         (s.stateFlags & ~kStateFlags) != 0U || s.moveType > 3U ||
@@ -1311,11 +1328,7 @@ std::uintptr_t LivingAiParticipant(const std::uintptr_t owner,
     return selected;
 }
 
-std::uintptr_t __cdecl ThePlayerDetour() noexcept {
-    const auto original = reinterpret_cast<ThePlayerResolver>(
-        gThePlayerOriginal.load(std::memory_order_acquire));
-    if (original == nullptr) return 0U;
-    const auto retailPlayer = original();
+std::uintptr_t __cdecl ResolveAiPlayerQuery(const std::uintptr_t retailPlayer) noexcept {
     if (gRole.load(std::memory_order_acquire) != Role::Host ||
         !EngineThread() || !Stable() || gAiPlayerQueryOwner == 0U ||
         retailPlayer == 0U || !TerminalDeadCharacter(retailPlayer)) return retailPlayer;
@@ -1330,6 +1343,31 @@ std::uintptr_t __cdecl ThePlayerDetour() noexcept {
     gAiPlayerQueryRemaps.fetch_add(1U, std::memory_order_relaxed);
     gLastAiPlayerQueryPeer.store(peer, std::memory_order_relaxed);
     return survivor;
+}
+__declspec(naked) std::uintptr_t __cdecl ThePlayerDetour() noexcept {
+    // 0078EAF0 keeps its receiver in EDX across 0078BAF0, then writes
+    // [EDX+3BC4]. The retail getter touches EAX/ECX/flags only. A normal C++
+    // detour may destroy EDX and SIMD state despite its cdecl declaration.
+    // Run the original first, then preserve its complete output state while
+    // the AI-context mapper changes only the returned player in EAX.
+    __asm {
+        call dword ptr [gThePlayerTrampoline]
+        pushfd
+        pushad
+        mov ebx, esp
+        sub esp, 528
+        and esp, 0FFFFFFF0h
+        fxsave [esp]
+        push eax
+        call ResolveAiPlayerQuery
+        add esp, 4
+        mov [ebx + 28], eax
+        fxrstor [esp]
+        mov esp, ebx
+        popad
+        popfd
+        ret
+    }
 }
 void CacheLivingPlayerAlliance() noexcept {
     if (gLivingPlayerAllianceKnown) return;
@@ -2862,9 +2900,21 @@ void CaptureExecutionCycle(Actor& actor) noexcept {
 }
 
 
+bool HybridLocomotionCycle(const std::uint32_t type,const std::uint32_t state) noexcept {
+    return HybridLocomotionCycleAllowed(type,static_cast<std::uint8_t>(state))||
+        // Host Turn is ordinary heading authority, supplied by replicated yaw.
+        // It must not suspend the motor as if it owned a scripted displacement.
+        (type==0xEAC040U&&state==0x39U);
+}
+void SuspendHybridMotion(Actor& actor) noexcept {
+    if(actor.hybridArmed) {
+        static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
+        actor.hybridArmed=false;++gHybridSuspended;
+    }
+}
 void CapturePose(Actor& actor, const ULONGLONG now) noexcept {
-    // Pose is recovery/lifecycle evidence only. Continuous AI movement is
-    // captured independently from the native locomotion-intent tap below.
+    // The Host's physical displacement is authoritative. It is NOT a goal,
+    // a pathfinding request or the animation's differently-scaled input vector.
     if (actor.hasLastPosition && now - actor.lastPoseSample < kSendPeriod) return;
     float position[3]{}, yaw{};
     if (!Read(actor.character + kPositionOffset, position[0]) ||
@@ -2874,10 +2924,14 @@ void CapturePose(Actor& actor, const ULONGLONG now) noexcept {
         !FiniteCoordinate(position[0]) || !FiniteCoordinate(position[1]) ||
         !FiniteCoordinate(position[2]) || !std::isfinite(yaw) || std::abs(yaw) > 3.3F) {
         actor.desired.stateFlags &= ~PoseValid;
+        actor.desired.motionTick=0;actor.desired.motionFlags=0;
+        std::fill(std::begin(actor.desired.motionVelocity),std::end(actor.desired.motionVelocity),0.0F);
         gPoseRejected.fetch_add(1U, std::memory_order_relaxed);
         return;
     }
 
+    actor.desired.motionTick=now;actor.desired.motionFlags=1U;
+    std::fill(std::begin(actor.desired.motionVelocity),std::end(actor.desired.motionVelocity),0.0F);
     if (actor.hasLastPosition && now > actor.lastPoseSample) {
         const auto elapsed = now - actor.lastPoseSample;
         const auto dx = position[0] - actor.lastPosition[0];
@@ -2887,8 +2941,16 @@ void CapturePose(Actor& actor, const ULONGLONG now) noexcept {
         if (elapsed <= 500ULL && std::isfinite(spatialDistance) &&
             (spatialDistance >= kLifecycleDiscontinuityDistance ||
              std::abs(dy) >= kLifecycleVerticalDiscontinuity)) {
+            actor.desired.motionFlags|=4U;
             MarkLifecycle(actor, LifecycleSpatialDiscontinuity |
                 (actor.traversalAction ? LifecycleTraversalAction : 0U));
+        }
+        if(elapsed<=500ULL&&(actor.desired.motionFlags&4U)==0U) {
+            const float scale=1000.0F/static_cast<float>(elapsed);
+            for(std::size_t i=0;i<3;++i) {
+                const float velocity=(position[i]-actor.lastPosition[i])*scale;
+                actor.desired.motionVelocity[i]=std::isfinite(velocity)&&std::abs(velocity)<=128.0F?velocity:0.0F;
+            }
         }
     }
     for (std::size_t i = 0U; i < 3U; ++i) {
@@ -2914,20 +2976,18 @@ void CapturePose(Actor& actor, const ULONGLONG now) noexcept {
     actor.desired.yaw = yaw;
     actor.desired.stateFlags |= PoseValid;
 
-    // The pre-transform intent tap only runs for the retail Move cycle. A Host
-    // transition to Idle therefore closes the current intention here rather
-    // than relying solely on the Client lease timeout.
     std::uintptr_t cycle{};
-    std::uint8_t cycleState{};
-    if (Read(actor.character + 0x36CU, cycle) && cycle != 0U &&
-        Read(cycle + 0x1AU, cycleState) && cycleState != 0x38U &&
-        (actor.desired.stateFlags & Moving) != 0U) {
-        actor.desired.stateFlags &= ~Moving;
-        actor.desired.velocityX = actor.desired.velocityZ = 0.0F;
-        actor.desired.locomotionIntensity = 0.0F;
-        ++actor.desired.locomotionRevision;
-        if (actor.desired.locomotionRevision == 0U) actor.desired.locomotionRevision = 1U;
-    }
+    std::uintptr_t cycleType{},movement{};std::uint8_t cycleState{};std::uint32_t gait{};
+    if(!Read(actor.character+0x36CU,cycle)||!cycle||!Read(cycle,cycleType)||cycleType<gBase||
+        !Read(cycle+0x1AU,cycleState)||!HybridLocomotionCycle(static_cast<std::uint32_t>(cycleType-gBase),cycleState)||
+        (actor.desired.executionFlags&ExecutionPaired)!=0U)actor.desired.motionFlags|=2U;
+    if(Read(actor.character+0x42A8U,movement)&&movement&&Read(movement+0x198U,gait)&&gait<=3U)
+        actor.desired.moveType=gait;
+    const float speed=std::hypot(actor.desired.motionVelocity[0],actor.desired.motionVelocity[2]);
+    actor.desired.velocityX=actor.desired.motionVelocity[0];actor.desired.velocityZ=actor.desired.motionVelocity[2];
+    actor.desired.locomotionIntensity=speed>0.02F?1.0F:0.0F;
+    if(speed>0.02F)actor.desired.stateFlags|=Moving;else actor.desired.stateFlags&=~Moving;
+    ++actor.desired.locomotionRevision;if(!actor.desired.locomotionRevision)++actor.desired.locomotionRevision;
     gPoseCaptured.fetch_add(1U, std::memory_order_relaxed);
 }
 
@@ -4429,6 +4489,11 @@ void TraceHostCommand(const transactions::Record& record) noexcept {
     RecordMotionTrace(sample);
 }
 void TraceClientCommand(const transactions::Record& record,const std::uintptr_t character,const std::uint32_t outcome) noexcept {
+    if(character&&execution::ProfileForKind(record.nativeKind)==execution::kProfileLifecycle) {
+        if(auto* actor=Find(character)) {
+            SuspendHybridMotion(*actor);actor->hybridResumeAfter=actor->received.motionTick;
+        }
+    }
     MotionTraceSample sample{};sample.type=3U;
     FillMotion(character,sample);
     FillCommand(record,sample);
@@ -4482,6 +4547,14 @@ void SamplePresentation(Actor& actor, const ULONGLONG now, const std::uint32_t p
     sample.navigationHead = navigation::InspectHead(actor.character);
     sample.movementOwner = static_cast<std::uint32_t>(actor.movementOwner);
     sample.authorityMoveType = state.moveType; sample.authorityIntensity = state.locomotionIntensity;
+    if(Client()) {
+        const auto follower=character_direct_step_runtime::Snapshot(actor.character);
+        sample.hybridHold=actor.hybridHold;sample.hybridNativeArmed=follower.armed;
+        sample.hybridSampleAge=actor.hybridArrival&&now>=actor.hybridArrival?now-actor.hybridArrival:0;
+        sample.hybridNativeHooks=follower.hookHits;sample.hybridNativeWrites=follower.requestApplications;
+        sample.hybridNativeFailures=follower.protectedFailures;
+        sample.hybridProbe=follower.hybridProbe;sample.hybridBranches=follower.hybridBranches;
+    }
     std::uintptr_t movement{};
     if (Read(actor.character + 0x42A8U, movement) && movement != 0U) {
         static_cast<void>(Read(movement + 0x194U, sample.requestedMoveType));
@@ -4821,6 +4894,9 @@ bool CharacterReady(const Actor& actor) noexcept {
 }
 bool Release(Actor& actor) noexcept {
     if (!UnownedCleanupAllowed(actor)) return false;
+    SuspendHybridMotion(actor);
+    actor.hybridTimeline.Reset();actor.hybridScope={};actor.hybridBirth=0;
+    actor.hybridInputTick=actor.hybridArrival=actor.hybridResumeAfter=actor.hybridStaleTick=0;
     RestoreAlienSuppression(actor);
     if (PairSourceBusy(actor.character)) return true;
     combat::Cancel(actor.character);
@@ -4834,7 +4910,9 @@ bool Release(Actor& actor) noexcept {
     actor.lastNavigationAttempt = 0U;
     actor.poseCount = 0U; actor.poseRevision = 0U; actor.poseInterpolating = false;
     if (actor.character != 0U && Client()) {
-        static_cast<void>(character_direct_step_runtime::Stop(actor.character));
+        // Dropping replication must not manufacture Idle over an action that
+        // owns native motion. The next scope needs a fresh Host sample.
+        static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
         // A Client role/task can outlive the BT leaf that created it. Always
         // retire that executor through the retail cleanup before authority is
         // released, otherwise an old task can keep fighting future PoseSync.
@@ -4863,10 +4941,19 @@ interactions::LocalParticipant LocalPairActor(const PairIdentity& value) noexcep
             interactions::Perspective::LocalPlayer:interactions::Perspective::RemotePlayer),
         value.creationSerial,value.participantIncarnation};
 }
+// The source left this pair natively (its retail Idle was requested and its
+// current cycle is no longer the admitted paired cycle). The remaining
+// release proofs concern the victim (a dead player keeps its 4F graph); they
+// must not hold the source's later Host orders (the Alien froze for good).
+bool PairSourceLeft(const PairTransaction& pair) noexcept {
+    std::uintptr_t current{};
+    return pair.sourceExitRequested&&pair.source.character&&Read(pair.source.character+0x36CU,current)&&
+        current!=pair.receipt.native.sourceCycle;
+}
 bool PairReservedCharacter(const std::uintptr_t c) noexcept {
     if(!gPairRuntimeInitialized||!c)return false;
     for(const auto& pair:gPairTransactions)if(pair.used&&!pair.receipt.resourcesReleased&&
-        (pair.source.character==c||pair.victim.character==c))return true;
+        ((pair.source.character==c&&!PairSourceLeft(pair))||pair.victim.character==c))return true;
     return false;
 }
 bool PairTransactionCandidate(const State& state) noexcept {
@@ -4883,7 +4970,8 @@ bool PairTransactionReserved(const transactions::Scope& scope,const transactions
         gIncomingOutcomes[i].front().state.entityB==owner.entityB&&gIncomingOutcomes[i].front().state.birth==owner.birth&&
         globalSeq>gIncomingOutcomes[i].front().through){gReservedByOutcome.fetch_add(1U,std::memory_order_relaxed);return true;}
     for(const auto& pair:gPairTransactions)if(pair.used&&!pair.receipt.resourcesReleased&&pair.key.scope==scope&&
-        ((pair.carrier.entityA==owner.entityA&&pair.carrier.entityB==owner.entityB&&pair.carrier.birth==owner.birth)||
+        ((pair.carrier.entityA==owner.entityA&&pair.carrier.entityB==owner.entityB&&pair.carrier.birth==owner.birth&&
+          !PairSourceLeft(pair))||
          (pair.victim.peer==0U&&pair.victim.entityA==owner.entityA&&pair.victim.entityB==owner.entityB&&
           pair.victim.authoritativeBirth==owner.birth))) {
         // Orders the Host issued BEFORE its attack action must still run: the
@@ -5032,7 +5120,8 @@ void RecordPairRefusal(const PairTransaction& pair,const State& carrier,const st
         carrier.entityA,carrier.entityB,carrier.birth,carrier.interactionPairRevision,
         result,static_cast<std::uint32_t>(receipt.phase),
         receipt.failureSite,receipt.native.stage,receipt.failureReason,receipt.pairEntered,receipt.transitionEntered,
-        interactions::RefusalSite(),decision};
+        interactions::RefusalSite(),decision,carrier.interactionPayloadHigh,
+        interactions::DecodePairPayloadHigh(carrier.interactionPayloadHigh)};
     const std::lock_guard lock(gPairFailureMutex);
     if(gPairFailureCount<gPairAdmissionFailures.size())
         gPairAdmissionFailures[(gPairFailureRead+gPairFailureCount++)%gPairAdmissionFailures.size()]=failure;
@@ -5049,6 +5138,7 @@ bool PairConsumedAction(const transactions::Record& r) noexcept {
     return false;
 }
 bool PublishTransactionOutcome(Actor& actor,PairTransaction& pair) noexcept {
+    SuspendHybridMotion(actor);
     const auto previous=actor.desired;actor.desired=pair.carrier;
     const bool published=PublishOutcomeBinding(actor,pair.victim.character);
     actor.desired=previous;if(!published)return false;
@@ -5146,8 +5236,11 @@ void AdvanceEndedPairSource(PairTransaction& pair) noexcept {
             ++gDeferredSourceEndsForwarded;RecordPairExit(pair,4U);
         }
     }
+    // Rejected only means the admitted graph no longer matches; its exact
+    // identity (serial, 4E, flags|6) is still rechecked below. Treating it as
+    // terminal kept the source in 4E forever and held every later Host order.
     const auto exit=interactions::CheckSourceExit(memory,pair.binding.source,pair.receipt.native,cycle);
-    if(exit!=interactions::Check::Ready){RecordPairExit(pair,pair.sourceEndActionObserved?3U:2U,exit);return;}
+    if(exit!=interactions::Check::Ready&&exit!=interactions::Check::Rejected){RecordPairExit(pair,pair.sourceEndActionObserved?3U:2U,exit);return;}
     std::uintptr_t current{},owner{},type{},schedulerOwner{};
     std::uint8_t serial{},state{},flags{};std::uint32_t idleArgument{};
     if(!cycle||!Read(character+0x36CU,current)||current!=cycle||!Read(cycle, type)||
@@ -5159,7 +5252,6 @@ void AdvanceEndedPairSource(PairTransaction& pair) noexcept {
     const character_direct_step_runtime::MovementResourceLease resources(character);
     const auto idle=reinterpret_cast<void(__thiscall*)(void*,std::uint32_t)>(gPairedIdleOriginal.load(std::memory_order_acquire));
     if(!resources||!idle||!PairIdentityLive(pair.source)||
-        interactions::CheckSourceExit(memory,pair.binding.source,pair.receipt.native,cycle)!=interactions::Check::Ready||
         !Read(character+0x36CU,current)||current!=cycle||!Read(cycle+0x19U,serial)||
         serial!=pair.receipt.native.sourceSerial||!Read(cycle+8U,flags)||(flags&6U)!=6U)return;
     // Same ECX/stack contract and argument source as 00687690's normal Idle.
@@ -5273,7 +5365,7 @@ void PumpPairTransactions() noexcept {
             // Preserve the Host's semantic flag. NativePairAdapter resolves
             // the source definition through AnimatedCharacter and the bone
             // against THIS victim; there is no second local decision here.
-            pair.binding.localPairFlagsHigh=carrier.interactionPayloadHigh;
+            pair.binding.localPairFlagsHigh=interactions::DecodePairPayloadHigh(carrier.interactionPayloadHigh);
         }
         if(!PublishTransactionOutcome(actor,pair))continue;
         // Publish the earned start permission BEFORE callback-capable native
@@ -5923,6 +6015,13 @@ void __fastcall ControlStanceFallbackDetour(void* cycle,void*) noexcept {
 // A wire contract selects a locally certified native ABI. No address, observed
 // cycle state, or Character pointer received over the network selects a call.
 struct NativeIntentEntry { std::uint32_t entry{},type{},state{},arity{}; };
+// Exact 00d6 wrappers. The scheduler kind5 only reserves the cycle created
+// here; replaying that reservation cannot construct these actions.
+constexpr std::array<NativeIntentEntry,3U> kPassageIntents{{
+    {0x24A8A0U,0xDBB2A0U,0x4BU,1U}, // borrowed XYZ, retail RET4
+    {0x24A9C0U,0xDBB1B8U,0x4DU,0U}, // fixed zero-duration initializer
+    {0x24AA50U,0xDBB1B8U,0x4DU,1U}, // authored float duration, retail RET4
+}};
 NativeIntentEntry NativeIntentContract(const std::uint32_t id) noexcept {
     if(id>=1U&&id<=7U) {
         const auto& c=kExecutionTransitions[id-1U];
@@ -5931,6 +6030,7 @@ NativeIntentEntry NativeIntentContract(const std::uint32_t id) noexcept {
     if(id>=8U&&id<=19U) {
         const auto& c=kExecutionTransitionContracts[id-8U];return {c.rva,c.typeRva,c.state,c.arity};
     }
+    if(id>=21U&&id<=23U)return kPassageIntents[id-21U];
     return id==20U?NativeIntentEntry{0x2579F0U,0xEADB58U,0x12U,2U}:NativeIntentEntry{};
 }
 bool NativeIntentActorCurrent(const transactions::Record& record,const execution::LocalActorBinding& binding) noexcept {
@@ -5944,12 +6044,32 @@ bool NativeIntentActorCurrent(const transactions::Record& record,const execution
         registry.Find(gCurrent.nativeGeneration,binding.character,ticket)==character_incarnations::Result::Ok&&
         ticket.runtimeId==runtime&&ticket.serial==binding.creationSerial&&registry.Current(ticket);
 }
+bool HybridLocomotionIntent(const transactions::Record& record) noexcept {
+    return record.nativeKind==native_intent::kKind&&
+        (record.intent.words[0]==1U||record.intent.words[0]==2U||record.intent.words[0]==7U);
+}
+bool CanConsumeHybridConstructor(const transactions::Record& record,const execution::LocalActorBinding& binding) noexcept {
+    std::uintptr_t cycle{},owner{},type{};std::uint8_t state{};
+    return HybridLocomotionIntent(record)&&Read(binding.character+0x36CU,cycle)&&cycle&&
+        Read(cycle+4U,owner)&&owner==binding.character&&Read(cycle,type)&&type>=gBase&&
+        Read(cycle+0x1AU,state)&&HybridMayConsumeConstructor(record.intent.words[0],static_cast<std::uint32_t>(type-gBase),state);
+}
+execution::Readiness CheckHybridMovement(const transactions::Record& record,const execution::LocalActorBinding& binding) noexcept {
+    return NativeIntentActorCurrent(record,binding)?execution::Readiness::Ready:execution::Readiness::Rejected;
+}
+transactions::NativeOutcome ConsumeHybridMovement(const transactions::Record& record,const execution::LocalActorBinding& binding) noexcept {
+    if(!NativeIntentActorCurrent(record,binding))return transactions::NativeOutcome::Rejected;
+    ++gHybridLogicalMoves;return transactions::NativeOutcome::Admitted;
+}
 execution::Readiness CheckNativeIntent(const transactions::Record& record,const execution::LocalActorBinding& binding) noexcept {
     if(!execution::ValidateExecutable(record)||native_intent::Empty(record.intent)||
         !NativeIntentActorCurrent(record,binding))return execution::Readiness::Rejected;
     const auto* actor=Find(binding.character);
     if(!actor||health::Terminal(actor->desired.health))return execution::Readiness::Rejected;
-    if(actor->reactionCycle) {
+    if(CanConsumeHybridConstructor(record,binding))return execution::Readiness::Ready;
+    // An exact ordered Host exit may replace its old reaction. Waiting for
+    // that local reaction to finish would block the operation that exits it.
+    if(actor->reactionCycle&&!HybridLocomotionIntent(record)) {
         std::uintptr_t current{};std::uint8_t serial{},flags{};
         if(!Read(binding.character+0x36CU,current)||!Read(current+0x19U,serial)||!Read(current+8U,flags))
             return execution::Readiness::Waiting;
@@ -5986,6 +6106,11 @@ bool DispatchNativeIntent(const std::uintptr_t cycle,const NativeIntentEntry ent
 transactions::NativeOutcome InvokeNativeIntent(const transactions::Record& record,const execution::LocalActorBinding& binding) noexcept {
     using transactions::NativeOutcome;
     if(CheckNativeIntent(record,binding)!=execution::Readiness::Ready)return NativeOutcome::Unknown;
+    if(CanConsumeHybridConstructor(record,binding))return ConsumeHybridMovement(record,binding);
+    if(auto* actor=Find(binding.character)) {
+        SuspendHybridMotion(*actor);
+        actor->hybridResumeAfter=actor->received.motionTick;
+    }
     // Constructors destroy the previous cycle before initializing the new one.
     // A readiness probe releases its temporary Ref before that destruction;
     // keep the retail movement resource alive across callbacks and readback.
@@ -6036,7 +6161,8 @@ transactions::NativeOutcome InvokeNativeIntent(const transactions::Record& recor
     // The operation is the exact call, never an obligation to force its final
     // sampled class/state. Only the still-current class's explicit failure is
     // attributable to this constructor.
-    if(type==gBase+entry.type&&state==entry.state&&(flags&4U)!=0U){++gCycleCallsReplayFailed;return NativeOutcome::Rejected;}
+    if(type==gBase+entry.type&&state==entry.state&&(flags&4U)!=0U&&
+        !native_intent::CompletesAtConstruction(record.intent)){++gCycleCallsReplayFailed;return NativeOutcome::Rejected;}
     // Exact local provenance, not a replicated cycle snapshot. An instruction
     // may legitimately run before scheduler ownership exists. Its resulting
     // live cycle must not later be mistaken for a competing local decision.
@@ -6045,6 +6171,7 @@ transactions::NativeOutcome InvokeNativeIntent(const transactions::Record& recor
     if(auto* actor=Find(binding.character)) {
         actor->replayedCycle={record.scope,record.owner,
             {binding.character,binding.runtimeId,gCurrent.nativeGeneration,binding.creationSerial},current,serial};
+        if(HybridLocomotionIntent(record))actor->reactionCycle=0U;
     } else return NativeOutcome::Unknown;
     ++gCycleCallsReplayed;return NativeOutcome::Admitted;
 }
@@ -6236,10 +6363,47 @@ bool ApplyCommandAction(Actor& actor, const ULONGLONG now) noexcept {
         actor.reactionCycle=0U;
     }
     actor.replayedExecutionRevision = 0U;
-    actor.movementOwner = MovementOwner::Neutral;
+    actor.movementOwner = actor.hybridArmed?MovementOwner::Intent:MovementOwner::Neutral;
     actor.completedRevision = actor.desired.revision;
     actor.lastProxyRefresh = now;
     return true;
+}
+void PumpHybridMotion(Actor& actor,const ULONGLONG now) noexcept {
+    const auto& source=actor.received;
+    transactions::Scope scope{};character_incarnations::Ticket ticket{};
+    auto& incarnations=character_incarnations::NativeRegistry();
+    const bool qualified=actor.character&&!actor.duplicate&&!actor.faulted&&actor.initialPlacementReady&&
+        actor.remoteBirth&&actor.remoteBirth==source.birth&&source.sessionCookie==gCurrent.sessionCookie&&
+        source.worldGeneration==gCurrent.worldGeneration&&execution_runtime::CurrentScope(scope)&&
+        actor.hybridScope==scope&&actor.hybridBirth==source.birth&&
+        incarnations.Find(gCurrent.nativeGeneration,actor.character,ticket)==character_incarnations::Result::Ok&&
+        ticket.runtimeId==actor.runtimeId&&incarnations.Current(ticket);
+    if(!qualified){actor.hybridHold=1U;SuspendHybridMotion(actor);return;}
+    if(health::Terminal(source.health)||ProxyWithdrawn(source)||
+        PairReservedCharacter(actor.character)||PairSourceBusy(actor.character)||
+        (source.motionFlags&2U)!=0U||source.motionTick<=actor.hybridResumeAfter||actor.reactionCycle) {
+        actor.hybridHold=2U;SuspendHybridMotion(actor);return;
+    }
+    const execution::ActorLifetime lifetime{actor.character,actor.runtimeId,gCurrent.nativeGeneration,ticket.serial};
+    if(!execution_runtime::OrdinaryMotionAvailable(lifetime)){actor.hybridHold=3U;SuspendHybridMotion(actor);return;}
+    hybrid_motion::Target target{};
+    if(!actor.hybridTimeline.SampleAt(now,target)||target.nativeAction){actor.hybridHold=4U;SuspendHybridMotion(actor);return;}
+    if(target.stale) {
+        actor.hybridHold=5U;
+        // Do not rearm with an old packet and do not chase its last pose.
+        // The native follower's independently bounded input lease stops it.
+        if(actor.hybridStaleTick!=actor.hybridInputTick){actor.hybridStaleTick=actor.hybridInputTick;++gHybridStale;}
+        return;
+    }
+    std::string error;
+    const float speed=std::hypot(target.velocity[0],target.velocity[2]);
+    if(!character_direct_step_runtime::ArmAIHybridReplication(actor.character,target.velocity[0],target.velocity[2],
+        speed>0.02F?1.0F:0.0F,target.position[0],target.position[1],target.position[2],target.yaw,
+        source.moveType,error,actor.hybridArrival+kMotionLease)) {
+        actor.hybridHold=6U;SuspendHybridMotion(actor);++gHybridRefused;return;
+    }
+    actor.hybridHold=0U;actor.hybridArmed=true;actor.hybridLastAppliedTick=target.tick;actor.movementOwner=MovementOwner::Intent;
+    ++gHybridApplied;
 }
 
 ConsequenceSource CaptureConsequenceSource(const health::Source source) noexcept {
@@ -6534,6 +6698,8 @@ void PumpHostCarriers() noexcept {
 }
 
 bool SameState(const State& a, const State& b) noexcept {
+    if(a.motionTick!=b.motionTick||a.motionFlags!=b.motionFlags||
+        std::memcmp(a.motionVelocity,b.motionVelocity,sizeof(a.motionVelocity))!=0)return false;
     if (std::memcmp(&a.combat, &b.combat, sizeof(a.combat)) != 0 ||
         std::memcmp(&a.shot, &b.shot, sizeof(a.shot)) != 0) return false;
     if (a.healthPairRevision != b.healthPairRevision) return false;
@@ -6657,6 +6823,7 @@ void Publish(Actor& actor) noexcept {
         state.lifecycleFlags = binding.state.lifecycleFlags &
             ~(LifecycleWithdrawn | LifecycleWithdrawState2 | LifecycleHostDormant | LifecycleCharacterBackstage);
         state.stateFlags |= PoseValid;
+        if((state.motionFlags&1U)!=0U)state.motionFlags|=2U; // Prepared native pair pose.
     }
     // Native reads can fail during lifecycle changes. Validate the complete
     // carrier before publishing/acknowledging it, just as the Launcher does.
@@ -8200,6 +8367,8 @@ void __fastcall FrontstageEventDetour(void* animated,void*) noexcept {
 // cycle. No last-cycle slot, sampled state, or retry timer can create a call.
 std::array<std::atomic<void*>,kExecutionTransitionContracts.size()> gCycleCallOriginal{};
 std::array<void*,kExecutionTransitionContracts.size()> gCycleCallTrampoline{};
+std::array<std::atomic<void*>,3U> gPassageIntentOriginal{};
+std::array<void*,3U> gPassageIntentTrampoline{};
 std::array<std::atomic<void*>,6U> gSimpleIntentOriginal{};
 std::array<void*,6U> gSimpleIntentTrampoline{};
 std::atomic<void*> gScriptIntentOriginal{};
@@ -8278,6 +8447,13 @@ bool CaptureNativeIntentCall(const std::uint32_t id,const std::uintptr_t cycle,
             } else fail(7U); // No heuristic pointer/value classification.
             w[1]|=static_cast<std::uint32_t>(encoded)<<(4U*i);
         }
+    } else if(id==21U) {
+        w[1]=static_cast<std::uint32_t>(ExecutionArgKind::Vector);
+        // 00401770 ->004013F0 reads XYZ only. The fourth word is padding,
+        // not an input: do not read beyond the Host's twelve-byte carrier.
+        if(!crash_guard::TryCopy(w.data()+8U,reinterpret_cast<const void*>(raw[0]),12U))fail(6U);
+    } else if(id==23U) {
+        w[1]=static_cast<std::uint32_t>(ExecutionArgKind::Value);w[2]=raw[0];
     } else if(id==20U) {
         std::array<std::uint32_t,22U> parameters{};
         if(!crash_guard::TryCopy(parameters.data(),reinterpret_cast<const void*>(raw[0]),sizeof(parameters)))fail(1U);
@@ -8357,6 +8533,22 @@ template<std::size_t I> void* CycleCallDetour() noexcept {
     if constexpr(kExecutionTransitionContracts[I].arity==1U) return reinterpret_cast<void*>(&CycleCallDetour1<I>);
     else return reinterpret_cast<void*>(&CycleCallDetour2<I>);
 }
+template<std::size_t I> void __fastcall PassageIntentDetour(void* cycle,void*,const std::uint32_t argument) noexcept {
+    const auto original=reinterpret_cast<void(__thiscall*)(void*,std::uint32_t)>(gPassageIntentOriginal[I].load(std::memory_order_acquire));
+    if(!original)return;
+    const std::uint32_t raw[2]{argument,0U};
+    static_cast<void>(CaptureNativeIntentCall(static_cast<std::uint32_t>(21U+I),reinterpret_cast<std::uintptr_t>(cycle),raw,
+        static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(_ReturnAddress())-gBase)));
+    original(cycle,argument);
+}
+void __fastcall PassageIdleIntentDetour(void* cycle,void*) noexcept {
+    const auto original=reinterpret_cast<void(__thiscall*)(void*)>(gPassageIntentOriginal[1].load(std::memory_order_acquire));
+    if(!original)return;
+    const std::uint32_t raw[2]{};
+    static_cast<void>(CaptureNativeIntentCall(22U,reinterpret_cast<std::uintptr_t>(cycle),raw,
+        static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(_ReturnAddress())-gBase)));
+    original(cycle);
+}
 template<std::size_t... I> bool HookCycleCalls(HookManager& hooks,std::string& error,std::index_sequence<I...>) {
     static const std::array<void*,sizeof...(I)> detours{CycleCallDetour<I>()...};
     for(std::size_t i=0;i<kExecutionTransitionContracts.size();++i) {
@@ -8382,6 +8574,11 @@ bool HookExecutionCycleCalls(HookManager& hooks,std::string& error) {
     for(std::size_t i=0;i<detours.size();++i)
         if(!Hook(hooks,"aisync native zero argument intention",kExecutionTransitions[i].entryRva,detours[i],
             {0x56,0x8B,0xF1,0x8A,0x46,0x1A},&gSimpleIntentTrampoline[i],&gSimpleIntentOriginal[i],error))return false;
+    const std::array<void*,3U> passageDetours{reinterpret_cast<void*>(&PassageIntentDetour<0U>),
+        reinterpret_cast<void*>(&PassageIdleIntentDetour),reinterpret_cast<void*>(&PassageIntentDetour<2U>)};
+    for(std::size_t i=0;i<kPassageIntents.size();++i)
+        if(!Hook(hooks,"aisync native passage intention",kPassageIntents[i].entry,passageDetours[i],
+            {0x6A,0xFF,0x68,0xC1,0x3F,0x12,0x01},&gPassageIntentTrampoline[i],&gPassageIntentOriginal[i],error,0xD23FC1U))return false;
     CallRedirectRequest fallback{"AISync native control-to-stance fallback",reinterpret_cast<void*>(gBase+0x2799DFU),
         reinterpret_cast<void*>(gBase+0x25BDD0U),reinterpret_cast<void*>(&ControlStanceFallbackDetour)};
     return hooks.InstallCallRedirect(fallback,error)&&Hook(hooks,"aisync native scripted intention",0x2579F0U,reinterpret_cast<void*>(&ScriptIntentDetour),
@@ -8800,6 +8997,7 @@ bool Install(const std::uintptr_t base, HookManager& hooks, LevelGenerationTrack
     execution::SetConsumedAction(&PairConsumedAction);
     execution::SetWaitTrace(&TraceClientWait);
     execution::SetNativeIntentAdapter(&CheckNativeIntent,&InvokeNativeIntent);
+    execution::SetHybridMovementAdapter(&CheckHybridMovement,&ConsumeHybridMovement);
     host_producer::SetNativeSchedulerObserver(&ObserveNativeScheduler);
     host_producer::SetCommandTrace(&TraceHostCommand);
     execution::SetHostPoseQuery(&HostPoseForOwner);
@@ -8954,7 +9152,12 @@ void BeginExecutionCarrierScope(const transactions::Scope& scope) noexcept {
     const std::lock_guard lock(gMailboxMutex);
     gIncomingUsed.fill(false); gInitialPlacementUsed.fill(false);
     for(auto& pending:gIncomingOutcomes)pending.clear();gIncomingOutcomeCount=0;
-    for(auto& actor:gActors)if(actor.character){actor.received={};actor.streamRevision=actor.streamBirth=actor.streamCycleState=actor.streamPairRevision=actor.streamCycleType=0U;actor.desired={};actor.pendingRemoteShots.clear();actor.initialPlacementReady=false;actor.lastSpawnDiagnostic=0;}
+    for(auto& actor:gActors)if(actor.character){
+        SuspendHybridMotion(actor);actor.hybridTimeline.Reset();actor.hybridScope={};actor.hybridBirth=0;
+        actor.hybridInputTick=actor.hybridArrival=actor.hybridResumeAfter=actor.hybridStaleTick=0;
+        actor.received={};actor.streamRevision=actor.streamBirth=actor.streamCycleState=actor.streamPairRevision=actor.streamCycleType=0U;
+        actor.desired={};actor.pendingRemoteShots.clear();actor.initialPlacementReady=false;actor.lastSpawnDiagnostic=0;
+    }
     gCausalScope=scope;
 }
 bool PrepareInitialPlacement(Actor& actor,const State& baseline,const ULONGLONG now) noexcept {
@@ -8972,7 +9175,7 @@ bool PrepareInitialPlacement(Actor& actor,const State& baseline,const ULONGLONG 
     actor.initialPlacementReady=true;actor.appliedLifecycleRevision=baseline.lifecycleRevision;
     RecordSpawnPlacement(actor,baseline,true);return true;
 }
-bool ApplyExecutionCarrier(const State& state,std::uint64_t through) noexcept {
+bool ApplyExecutionCarrier(const State& state,std::uint64_t through,std::uint64_t arrivalTick) noexcept {
     if(!EngineThread()||!Stable()||!Client())return false;
     // Zero is a valid prefix (baseline before the first command), so presence
     // comes from the queue, never a sentinel value in this sequence number.
@@ -8984,6 +9187,23 @@ bool ApplyExecutionCarrier(const State& state,std::uint64_t through) noexcept {
     if(!actor||actor->duplicate||actor->faulted||actor->characterClass!=state.characterClass||state.birth<actor->remoteBirth||
         (state.birth==actor->remoteBirth&&state.revision<actor->remoteRevision))return true;
     actor->received=state;
+    transactions::Scope motionScope{};
+    if((state.motionFlags&1U)!=0U&&execution_runtime::CurrentScope(motionScope)) {
+        if(actor->hybridScope!=motionScope||actor->hybridBirth!=state.birth) {
+            SuspendHybridMotion(*actor);actor->hybridTimeline.Reset();
+            actor->hybridScope=motionScope;actor->hybridBirth=state.birth;
+            actor->hybridInputTick=actor->hybridArrival=actor->hybridResumeAfter=actor->hybridStaleTick=0;
+        }
+        hybrid_motion::Sample sample{state.motionTick,
+            {state.position[0],state.position[1],state.position[2]},
+            {state.motionVelocity[0],state.motionVelocity[1],state.motionVelocity[2]},state.yaw,state.motionFlags};
+        // Preserve IPC intake time: an engine backlog cannot renew authority.
+        const auto arrival=arrivalTick;
+        if(actor->hybridTimeline.Push(sample,arrival)&&sample.tick>actor->hybridInputTick) {
+            actor->hybridInputTick=sample.tick;actor->hybridArrival=arrival;++gHybridSamples;
+        }
+        if((state.motionFlags&2U)!=0U)SuspendHybridMotion(*actor);
+    }
     if(state.executionRevision!=0U&&state.executionRevision!=actor->arrivalExecRevision){
         actor->arrivalExecRevision=state.executionRevision;actor->arrivalExecTick=GetTickCount64();actor->arrivalExecUtc=UtcMs();
     }
@@ -9332,6 +9552,9 @@ void PumpOnEngineThread() noexcept {
             static_cast<void>(ApplyAuthoritativeParticipantDamage(actor, actor.desired));
             static_cast<void>(ApplyAuthoritativeCombat(actor, actor.desired, now));
         }
+    // Local native preparation must not hold the incoming IPC mailbox.
+    lock.unlock();
+    for(auto& actor:gActors)if(actor.character)PumpHybridMotion(actor,now);
 }
 void ObservePlayerRepresentationSpawn(const std::uint32_t spawnKey) noexcept {
     if (spawnKey == 0U || gGenerations == nullptr) return;
@@ -9791,7 +10014,9 @@ void LogDiagnostics(Diagnostics& diagnostics) {
              {"phase",Diagnostics::Unsigned(sample.phase),true},{"adapterSite",Diagnostics::Unsigned(sample.site),true},
              {"stage",Diagnostics::Unsigned(sample.stage),true},{"reasonMask",Diagnostics::Unsigned(sample.reason),true},{"registered",Diagnostics::Boolean(sample.registered),true},
              {"transitionEntered",Diagnostics::Boolean(sample.transitionEntered),true},
-             {"refusalSite",Diagnostics::Unsigned(sample.refusal),true},{"decision",Diagnostics::Unsigned(sample.decision),true}});
+             {"refusalSite",Diagnostics::Unsigned(sample.refusal),true},{"decision",Diagnostics::Unsigned(sample.decision),true},
+             {"rawPayloadHigh",Diagnostics::Unsigned(sample.rawPayloadHigh),true},
+             {"decodedPayloadHigh",Diagnostics::Unsigned(sample.decodedPayloadHigh),true}});
     }
     route_runtime::ClientFailure failure{};
     for(std::size_t i=0;i<64&&route_runtime::PopClientFailure(failure);++i) {
@@ -9939,7 +10164,15 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"intakeHeldByHealth", Diagnostics::Unsigned(gIntakeHeldByHealth.load()), true},
          {"intakeHeldByParticipantDamage", Diagnostics::Unsigned(gIntakeHeldByParticipant.load()), true},
          {"intakeHeldByCombat", Diagnostics::Unsigned(gIntakeHeldByCombat.load()), true}});
-    diagnostics.Log("info", "aisync_typed_execution", "Experimental typed replay and route admission counters; no in-game certification.",
+    diagnostics.Log("info","aisync_hybrid_motion","Host physical motion with native no-snap locomotion; native actions own their displacement.",
+        {{"samples",Diagnostics::Unsigned(gHybridSamples.load()),true},
+         {"followerPublications",Diagnostics::Unsigned(gHybridApplied.load()),true},
+         {"actionSuspensions",Diagnostics::Unsigned(gHybridSuspended.load()),true},
+         {"logicalMovementOperations",Diagnostics::Unsigned(gHybridLogicalMoves.load()),true},
+         {"staleSamples",Diagnostics::Unsigned(gHybridStale.load()),true},
+         {"nativeBoundaryWaits",Diagnostics::Unsigned(gHybridRefused.load()),true},
+         {"correctionTeleportsEnabled",Diagnostics::Boolean(false),true}});
+    diagnostics.Log("info", "aisync_typed_execution", "Typed native action replay; ordinary locomotion uses the hybrid motion carrier.",
         {{"enabled", Diagnostics::Boolean(Installed()), true},
          {"hostSourceBound", Diagnostics::Boolean(host_producer::EngineProducer().Bound()), true},
          {"hostCoverageLosses", Diagnostics::Unsigned(host_producer::Coverage().losses), true},
@@ -10386,6 +10619,14 @@ void LogDiagnostics(Diagnostics& diagnostics) {
              {"movementOwner", Diagnostics::Unsigned(sample.movementOwner), true},
              {"authorityMoveType", Diagnostics::Unsigned(sample.authorityMoveType), true},
              {"authorityIntensity", std::to_string(sample.authorityIntensity), true},
+             {"hybridHold",Diagnostics::Unsigned(sample.hybridHold),true},
+             {"hybridNativeArmed",Diagnostics::Boolean(sample.hybridNativeArmed),true},
+             {"hybridSampleAgeMs",Diagnostics::Unsigned(sample.hybridSampleAge),true},
+             {"hybridNativeHooks",Diagnostics::Unsigned(sample.hybridNativeHooks),true},
+             {"hybridNativeWrites",Diagnostics::Unsigned(sample.hybridNativeWrites),true},
+             {"hybridNativeFailures",Diagnostics::Unsigned(sample.hybridNativeFailures),true},
+             {"hybridProbe",[&]{std::string text;for(const auto value:sample.hybridProbe){if(!text.empty())text+=' ';text+=std::to_string(value);}return text;}()},
+             {"hybridBranches",[&]{std::string text;for(const auto value:sample.hybridBranches){if(!text.empty())text+=' ';text+=std::to_string(value);}return text;}()},
              {"requestedMoveType", Diagnostics::Unsigned(sample.requestedMoveType), true},
              {"effectiveMoveType", Diagnostics::Unsigned(sample.effectiveMoveType), true},
              {"navigationRevision", Diagnostics::Unsigned(sample.navigation.revision), true},

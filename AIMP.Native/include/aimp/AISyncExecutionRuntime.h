@@ -49,6 +49,9 @@ void Retire() noexcept;
     const transactions::OwnerKey&, const execution::ActorLifetime&, std::size_t* blockingRequests = nullptr,
     bool admittedHistory = false) noexcept;
 [[nodiscard]] std::size_t ActorRequests(std::uintptr_t) noexcept; // Value-only engine query.
+// Hybrid follower may coexist with a fully granted scheduler capability, but
+// must not restart locomotion while its initial drain or a native action runs.
+[[nodiscard]] bool OrdinaryMotionAvailable(const execution::ActorLifetime&) noexcept;
 [[nodiscard]] execution::NavigationOwnership IdentifyNavigation(std::uintptr_t n,std::uintptr_t b,
     execution::NavigationBinding&) noexcept;
 [[nodiscard]] bool Matches(const transactions::Scope&) noexcept; // Copied IPC values only.

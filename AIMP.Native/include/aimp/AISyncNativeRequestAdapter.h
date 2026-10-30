@@ -23,6 +23,10 @@ using DependencyGate = Readiness(*)(void*, const transactions::Record&) noexcept
 using IntentCheck = Readiness(*)(const transactions::Record&,const LocalActorBinding&) noexcept;
 using IntentInvoke = transactions::NativeOutcome(*)(const transactions::Record&,const LocalActorBinding&) noexcept;
 void SetNativeIntentAdapter(IntentCheck,IntentInvoke) noexcept;
+// Hybrid AISync consumes navigation/ordinary-turn/control contracts as causal bookkeeping.
+// Its single pose follower owns ordinary locomotion; no second native path
+// request is allocated. The embedding still validates scope/incarnation.
+void SetHybridMovementAdapter(IntentCheck,IntentInvoke) noexcept;
 // Diagnostic trace of one native Character lifecycle event (placement,
 // backstage, frontstage). Host stages: 1 capture guard closed, 2 actor not
 // tracked, 3 nested call skipped, 4 emitted, 5 emission failed. Client

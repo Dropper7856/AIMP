@@ -38,8 +38,21 @@ public static class AISyncNativeIntentCodec
     {
         if (value.Length != WordCount) throw new ProtocolException("Invalid native intent word count.");
         var id = value[0];
-        var valid = id is >= 1 and <= 20 and not (11 or 14 or 18) && value[35] == 0;
-        if (valid && id == 20)
+        var valid = id is >= 1 and <= 23 and not (11 or 14 or 18) && value[35] == 0;
+        if (valid && id == 21)
+        {
+            // 0064A8A0 (RET4) ->00401770 ->004013F0 copies only XYZ.
+            // The fourth vector lane is padding and must remain zero.
+            valid = value[1] == 4 && Zero(value, 2, 8) && value[11] == 0 && Zero(value, 12, 35);
+            for (var i = 8; i < 11; ++i) valid &= float.IsFinite(BitConverter.UInt32BitsToSingle(value[i]));
+        }
+        else if (valid && id == 22)
+            // 0064A9C0 takes no arguments and supplies zero duration internally.
+            valid = Zero(value, 1, 35);
+        else if (valid && id == 23)
+            // 0064AA50 (RET4) forwards one float duration to00401520.
+            valid = value[1] == 1 && float.IsFinite(BitConverter.UInt32BitsToSingle(value[2])) && Zero(value, 3, 35);
+        else if (valid && id == 20)
         {
             valid = (value[1] & ~15U) == 0 && Zero(value, 2, 12) && value[20] == 0 && value[21] != 0 && value[22] != 0
                 && Integer(value[23], 1000000) && Integer(value[24], 1000000) && Integer(value[25], 65535)

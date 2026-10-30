@@ -26,6 +26,7 @@ internal static class Program
         new("Throwable carrier validation", ThrowableSyncTests.CodecAsync),
         new("Throwable ownership, native admission and generation lifetime", ThrowableSyncTests.LobbyAsync),
         new("AISync authority codec", AISyncCodecTests.AuthorityStateRoundTripAsync),
+        new("AISync hybrid motion carrier", AISyncCodecTests.HybridMotionAsync),
         new("AISync transaction shared canonical fixture", AISyncTransactionTests.CanonicalFixtureAsync),
         new("AISync transaction malformed records", AISyncTransactionTests.MalformedRecordsAsync),
         new("AISync transaction validation limits", AISyncTransactionTests.LimitsAsync),

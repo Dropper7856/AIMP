@@ -19,6 +19,7 @@ set(AIMP_CORE_SOURCES
     src/VoiceSync.cpp
     src/VoiceNativeAudio.cpp
     src/AISync.cpp
+    src/AISyncHybridMotion.cpp
     src/AISyncTransactions.cpp
     src/AISyncMovement.cpp
     src/AISyncNativeMovement.cpp
@@ -318,6 +319,12 @@ if(BUILD_TESTING)
     set_target_properties(AIMP.VoiceNativeAudioTests PROPERTIES
         VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
     add_test(NAME VoiceNativeAudioContracts COMMAND AIMP.VoiceNativeAudioTests)
+    add_executable(AIMP.AISyncHybridMotionTests tests/AISyncHybridMotionTests.cpp src/AISyncHybridMotion.cpp)
+    target_include_directories(AIMP.AISyncHybridMotionTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_options(AIMP.AISyncHybridMotionTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.AISyncHybridMotionTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME AISyncHybridMotion COMMAND AIMP.AISyncHybridMotionTests)
     add_executable(AIMP.AISyncTests tests/AISyncPortableTests.cpp)
     set_target_properties(AIMP.AISyncTests PROPERTIES
         VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
