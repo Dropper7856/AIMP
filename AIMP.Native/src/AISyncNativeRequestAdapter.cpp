@@ -1,6 +1,7 @@
 #include "aimp/AISyncNativeRequestAdapter.h"
 #include "aimp/AISyncExecutionCodec.h"
 #include "aimp/CharacterResourceAdmission.h"
+#include "aimp/CharacterDirectStepRuntime.h"
 #include <Windows.h>
 #include <algorithm>
 #include <atomic>
@@ -11,6 +12,17 @@ namespace aimp::ai_sync::execution {
 namespace {
 std::atomic<IntentCheck> gIntentCheck{};
 std::atomic<IntentInvoke> gIntentInvoke{};
+std::atomic<IntentCheck> gHybridCheck{};
+std::atomic<IntentInvoke> gHybridInvoke{};
+bool HybridMovement(const transactions::Record& r) noexcept {
+    // Turn(4) can remain admitted while the Host is already in Move(38).
+    // A separate Client Turn both creates cycle39 and leaves a scheduler lease
+    // that blocks OrdinaryMotionAvailable. The hybrid motor already owns yaw;
+    // preserve these operations causally without allocating that second owner.
+    return gHybridCheck.load(std::memory_order_acquire) &&
+        (r.nativeKind==1U||r.nativeKind==3U||r.nativeKind==4U||r.nativeKind==9U||r.nativeKind==6U||r.nativeKind==11U||
+            (r.nativeKind==5U&&(r.mode==1U||r.mode==3U||r.mode==0x37U||r.mode==0x38U||r.mode==0x39U||r.mode==0x3BU)));
+}
 using namespace transactions;
 constexpr std::uintptr_t kScheduler = 0x2CD0;
 constexpr std::uintptr_t kTurnFactory = 0x00282450, kStanceFactory = 0x002823F0, kActionFactory = 0x00282410;
@@ -171,7 +183,7 @@ Readiness NativeRequestAdapter::Resources(std::uintptr_t character) noexcept {
     waitReason_=4U;return Readiness::Waiting;
 }
 bool NativeRequestAdapter::Resolve(const Record& r, LocalActorBinding& actor) noexcept {
-    const bool lifecycle=ProfileForKind(r.nativeKind)==kProfileLifecycle||r.nativeKind==native_intent::kKind;
+    const bool lifecycle=ProfileForKind(r.nativeKind)==kProfileLifecycle||r.nativeKind==native_intent::kKind||HybridMovement(r);
     const auto resolver=lifecycle&&lifecycleResolver_?lifecycleResolver_:resolve_;
     if (base_ == 0 || permission_ == nullptr || resolve_ == nullptr || !permission_(context_, r) ||
         !resolver(context_, r.owner, actor) || !actor.exclusiveExecution || actor.character == 0 || actor.runtimeId == 0) return false;
@@ -193,6 +205,10 @@ void SetLifecycleTrace(LifecycleTrace trace) noexcept { gLifecycleTrace = trace;
 void SetNativeIntentAdapter(IntentCheck check,IntentInvoke invoke) noexcept {
     gIntentInvoke.store(invoke,std::memory_order_release);gIntentCheck.store(check,std::memory_order_release);
 }
+void SetHybridMovementAdapter(IntentCheck check,IntentInvoke invoke) noexcept {
+    gHybridInvoke.store(invoke,std::memory_order_release);
+    gHybridCheck.store(check,std::memory_order_release);
+}
 void SetCommandTrace(CommandTrace trace) noexcept { gCommandTrace.store(trace,std::memory_order_release); }
 void SetConsumedAction(ConsumedAction query) noexcept { gConsumedAction.store(query,std::memory_order_release); }
 std::uint64_t ConsumedActions() noexcept { return gConsumedActions.load(std::memory_order_relaxed); }
@@ -202,6 +218,15 @@ Readiness NativeRequestAdapter::Check(const Record& r) noexcept {
     if (busy_ || retiring_ || !ValidateExecutable(r)) return Readiness::Rejected;
     const BusyScope callbackGuard(busy_);
     if(Consumed(r))return Readiness::Ready;
+    if(HybridMovement(r)) {
+        // These records never enter the scheduler, so a pair cannot need to
+        // reserve them. They still retain their exact ordered ledger lifetime.
+        if(r.opcode==Op::Cancel||r.opcode==Op::Stop||r.opcode==Op::Release)
+            return permission_&&permission_(context_,r)?Readiness::Ready:Readiness::Rejected;
+        LocalActorBinding hybridActor{};
+        if(!Resolve(r,hybridActor)){waitReason_=3U;return Readiness::Waiting;}
+        return gHybridCheck.load(std::memory_order_acquire)(r,hybridActor);
+    }
     if(dependencyGate_) {
         const auto gate=dependencyGate_(context_,r);
         if(gate==Readiness::Waiting)waitReason_=2U;
@@ -244,6 +269,21 @@ NativeOutcome NativeRequestAdapter::Invoke(const Record& input) noexcept {
         return NativeOutcome::Rejected;
     }
     busy_ = true;
+    if(HybridMovement(r)) {
+        NativeOutcome outcome=NativeOutcome::Admitted;
+        std::uintptr_t character{};
+        if(r.opcode!=Op::Cancel&&r.opcode!=Op::Stop&&r.opcode!=Op::Release) {
+            LocalActorBinding hybridActor{};
+            const auto invoke=gHybridInvoke.load(std::memory_order_acquire);
+            if(!Resolve(r,hybridActor)||!invoke)outcome=NativeOutcome::Rejected;
+            else {character=hybridActor.character;outcome=invoke(r,hybridActor);}
+        }
+        busy_=false;
+        // A zero Character intentionally distinguishes logical consumption
+        // from native scheduler entry in the existing diagnostic contract.
+        static_cast<void>(character);
+        TraceCommand(r,0U,outcome);return outcome;
+    }
     if(Consumed(r)) {
         // Already executed by the entered interaction: acknowledge, no call.
         if(r.opcode==Op::Submit) {
@@ -278,6 +318,8 @@ NativeOutcome NativeRequestAdapter::Invoke(const Record& input) noexcept {
         // Character-level native calls do not depend on a live locomotion M.
         // In particular a backstage exit must run before movement can resume.
         float before[3]{};
+        if(gHybridCheck.load(std::memory_order_acquire))
+            static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
         Read(actor.character+0x70,before[0]);Read(actor.character+0x74,before[1]);Read(actor.character+0x78,before[2]);
         invokingRecord_=&r;result=InvokeLifecycle(r,actor);invokingRecord_=nullptr;
         if(result==NativeOutcome::Admitted)++lifecycleEvents_;
@@ -383,6 +425,9 @@ NativeOutcome NativeRequestAdapter::InvokePinned(const Record& r, const LocalAct
     }
 }
 void NativeRequestAdapter::PlaceAtTransition(const Record& r,const LocalActorBinding& actor) noexcept {
+    // No extra correction teleport. Explicit Host-authored lifecycle calls
+    // below remain native game events, separately identified on the wire.
+    if(gHybridCheck.load(std::memory_order_acquire))return;
     if((r.flags&HasGoal)==0)return;
     float x{},y{},z{},yaw{};
     if(Read(actor.character+0x70,x)&&Read(actor.character+0x74,y)&&Read(actor.character+0x78,z)&&Read(actor.character+0x174,yaw)) {

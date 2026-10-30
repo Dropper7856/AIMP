@@ -26,6 +26,109 @@ internal static class AISyncCodecTests
     }
 
 
+    internal static Task HybridMotionAsync()
+    {
+        AssertEx.Equal(16U, AIMP.Protocol.AISyncCodec.StateVersion);
+        AssertEx.Equal(840, AIMP.Protocol.AISyncCodec.NativeStateBytes);
+        AssertEx.Equal(856, AIMP.Protocol.AISyncCodec.NetworkStateBytes);
+        AssertEx.Equal(1U, AIMP.Protocol.AISyncCodec.MotionValidSample);
+        AssertEx.Equal(2U, AIMP.Protocol.AISyncCodec.MotionNativeActionOwnsMotion);
+        AssertEx.Equal(4U, AIMP.Protocol.AISyncCodec.MotionDiscontinuity);
+        var session = Guid.NewGuid();
+        var absent = ValidState(session); // Native compatibility fixtures append zeroes.
+        AIMP.Protocol.AISyncCodec.ValidateNative(absent);
+        AssertEx.True(absent.AsSpan(816, 24).IndexOfAnyExcept((byte)0) < 0);
+        AssertEx.SequenceEqual(absent, AIMP.Protocol.AISyncCodec.DecodeNetwork(
+            AIMP.Protocol.AISyncCodec.EncodeNetwork(session, absent), session).ToArray());
+
+        var sample = absent.ToArray();
+        const ulong tick = 0x0102030405060708UL;
+        BinaryPrimitives.WriteUInt64LittleEndian(sample.AsSpan(816), tick);
+        F32(sample, 824, 1.5F); F32(sample, 828, -2.25F); F32(sample, 832, 0.125F);
+        foreach (var flags in new uint[] { 1, 3, 5, 7 })
+        {
+            U32(sample, 836, flags); // Native action and discontinuity can accompany a sample.
+            AIMP.Protocol.AISyncCodec.ValidateNative(sample);
+            var network = AIMP.Protocol.AISyncCodec.EncodeNetwork(session, sample);
+            AssertEx.Equal(856, network.Length);
+            var decoded = AIMP.Protocol.AISyncCodec.DecodeNetwork(network, session).ToArray();
+            AssertEx.SequenceEqual(sample, decoded);
+            AssertEx.SequenceEqual(absent.AsSpan(0, 816).ToArray(), decoded.AsSpan(0, 816).ToArray());
+            AssertEx.Equal(tick, BinaryPrimitives.ReadUInt64LittleEndian(decoded.AsSpan(816)));
+            AssertEx.Equal(flags, U32(decoded, 836));
+        }
+        U32(sample, 836, 1U);
+        // The Host's monotonic tick has no assumed relationship to this PC's clock.
+        foreach (var hostTick in new[] { 1UL, ulong.MaxValue })
+        {
+            var valid = sample.ToArray();
+            BinaryPrimitives.WriteUInt64LittleEndian(valid.AsSpan(816), hostTick);
+            AIMP.Protocol.AISyncCodec.ValidateNative(valid);
+        }
+        foreach (var velocity in new[] { -128F, 0F, 128F })
+        {
+            var valid = sample.ToArray();
+            foreach (var offset in new[] { 824, 828, 832 }) F32(valid, offset, velocity);
+            AIMP.Protocol.AISyncCodec.ValidateNative(valid);
+        }
+        foreach (var offset in new[] { 824, 828, 832 })
+        foreach (var velocity in new[] { float.NaN, float.PositiveInfinity, float.NegativeInfinity, -128.001F, 128.001F })
+        {
+            var invalid = sample.ToArray(); F32(invalid, offset, velocity);
+            AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.ValidateNative(invalid));
+            AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.EncodeNetwork(session, invalid));
+        }
+        foreach (var flags in new uint[] { 8, 9, 0x80000001U, uint.MaxValue })
+        {
+            var invalid = sample.ToArray(); U32(invalid, 836, flags);
+            AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.ValidateNative(invalid));
+        }
+        var noTick = sample.ToArray(); noTick.AsSpan(816, 8).Clear();
+        AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.ValidateNative(noTick));
+        var noPose = absent.ToArray(); U32(noPose, 40, U32(noPose, 40) & ~3U);
+        AIMP.Protocol.AISyncCodec.ValidateNative(noPose); // Establish that only the sample makes it invalid.
+        sample.AsSpan(816, 24).CopyTo(noPose.AsSpan(816));
+        AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.ValidateNative(noPose));
+
+        // With ValidSample clear, every new field (including each tick half) must be zero.
+        foreach (var offset in new[] { 816, 820, 824, 828, 832 })
+        {
+            var invalid = absent.ToArray(); U32(invalid, offset, 1U);
+            AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.ValidateNative(invalid));
+        }
+        foreach (var flags in new uint[] { 2, 4, 6 })
+        {
+            var invalid = absent.ToArray(); U32(invalid, 836, flags);
+            AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.ValidateNative(invalid));
+        }
+        foreach (var offset in new[] { 824, 828, 832 })
+        {
+            var invalid = absent.ToArray(); U32(invalid, offset, 0x80000000U); // Negative zero is not zero padding.
+            AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.ValidateNative(invalid));
+        }
+        var oldVersion = absent.ToArray(); U32(oldVersion, 0, 15U);
+        AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.ValidateNative(oldVersion));
+        var oldNative = oldVersion.AsSpan(0, 816).ToArray();
+        AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.ValidateNative(oldNative));
+        var validNetwork = AIMP.Protocol.AISyncCodec.EncodeNetwork(session, sample);
+        var oldNetwork = AIMP.Protocol.AISyncCodec.EncodeNetwork(session, absent);
+        U32(oldNetwork, 16, 15U);
+        AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.DecodeNetwork(oldNetwork, session));
+        for (var length = 0; length < sample.Length; ++length)
+        {
+            var truncated = sample.AsSpan(0, length).ToArray();
+            AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.ValidateNative(truncated));
+        }
+        for (var length = 0; length < validNetwork.Length; ++length)
+        {
+            var truncated = validNetwork.AsSpan(0, length).ToArray();
+            AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.DecodeNetwork(truncated, session));
+        }
+        var badNetwork = validNetwork.ToArray(); U32(badNetwork, 16 + 836, 9U);
+        AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.DecodeNetwork(badNetwork, session));
+        return Task.CompletedTask;
+    }
+
     private static void ValidateIndependentEventHistory(Guid session)
     {
         var history = new AIMP.Launcher.AISyncEventHistory();

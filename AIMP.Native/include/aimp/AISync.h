@@ -126,7 +126,7 @@ struct ExecutionCycleCall final {
     std::uint32_t cycleSerial{};
 };
 struct State final {
-    std::uint32_t version{15U};
+    std::uint32_t version{16U};
     std::uint32_t nativeGeneration{}; // informational: generations differ per process
     std::uint64_t sessionCookie{};
     std::uint32_t worldGeneration{};
@@ -211,6 +211,11 @@ struct State final {
     // All zero is explicitly uncorrelated, never a replay permission.
     action_correlation::Reference executionAction{};
     ExecutionCycleCall transition{};
+    // v16: Host physical motion, independent of navigation goals and the
+    // animation's control vector. Monotonic Host time, never local/UTC time.
+    std::uint64_t motionTick{};
+    float motionVelocity[3]{};
+    std::uint32_t motionFlags{}; // 1 valid, 2 native action owns motion, 4 discontinuity
 };
 struct ImpactEvent final {
     // v2 targetBirth is the Host's portable AISync incarnation, never +50.
@@ -252,7 +257,8 @@ static_assert(offsetof(State, interactionTargetBirth) == 544U);
 static_assert(offsetof(State, combat) == 552U && offsetof(State, shot) == 588U);
 static_assert(offsetof(State, healthPairRevision) == 636U);
 static_assert(offsetof(State,interactionParticipantIncarnation)==640U&&offsetof(State,interactionSession)==644U&&
-    offsetof(State,interactionAuthority)==660U&&offsetof(State,interactionCommand)==668U&&offsetof(State,executionAction)==676U&&offsetof(State,transition)==764U&&sizeof(State) == 816U);
+    offsetof(State,interactionAuthority)==660U&&offsetof(State,interactionCommand)==668U&&offsetof(State,executionAction)==676U&&offsetof(State,transition)==764U&&
+    offsetof(State,motionTick)==816U&&offsetof(State,motionVelocity)==824U&&offsetof(State,motionFlags)==836U&&sizeof(State) == 840U);
 static_assert(sizeof(ImpactEvent) == 64U);
 static_assert(offsetof(Configuration,localBinding)==40U && offsetof(Configuration,participants)==72U);
 static_assert(sizeof(Configuration) == 1096U);
@@ -263,7 +269,7 @@ bool Install(std::uintptr_t moduleBase, HookManager& hooks,
 bool Configure(std::span<const std::byte> payload) noexcept;
 bool QueueRemote(std::span<const std::byte> payload, std::uint64_t through = 0) noexcept;
 void BeginExecutionCarrierScope(const transactions::Scope&) noexcept;
-bool ApplyExecutionCarrier(const State&,std::uint64_t through) noexcept;
+bool ApplyExecutionCarrier(const State&,std::uint64_t through,std::uint64_t arrivalTick) noexcept;
 bool QueueRemoteImpact(std::span<const std::byte> payload) noexcept;
 bool TryPopObservedImpact(ImpactEvent& impact) noexcept;
 void PumpOnEngineThread() noexcept;

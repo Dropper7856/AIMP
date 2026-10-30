@@ -53,6 +53,7 @@ constexpr float kFollowerLateralCorrectionStart = 0.025F;
 constexpr float kFollowerLateralCorrectionFull = 0.60F;
 constexpr float kFollowerMaximumLateralBlend = 0.55F;
 constexpr float kFollowerSettleDistance = 0.080F;
+constexpr float kHybridSettleResumeDistance = 0.160F;
 constexpr float kFollowerInitialPlacementTolerance = 0.05F;
 constexpr float kFollowerMaximumMagnitude = 8.0F;
 // v13 keeps retail locomotion for normal motion, but allows a lagging proxy to
@@ -90,6 +91,13 @@ using TeleportCharacterFn = void(__thiscall*)(
     void* registryEntry,
     const float* position);
 using ExecutionTransitionFn = void(__thiscall*)(void* cycle);
+using NativeTurnLimitsFn = void(__thiscall*)(void*, float, float*, float*);
+using NativeFrameDeltaFn = double(__cdecl*)(float, float);
+
+enum class FollowerPolicy : std::uint8_t {
+    Default,
+    AIHybridNativeOnly,
+};
 
 struct MovementSlot final {
     std::atomic<std::uintptr_t> characterAddress{0U};
@@ -105,6 +113,7 @@ struct MovementSlot final {
     std::atomic<std::uint32_t> networkYBits{0U};
     std::atomic<std::uint32_t> networkZBits{0U};
     std::atomic<std::uint32_t> replicatedYawBits{0U};
+    std::atomic<std::uint32_t> hybridAngularVelocityBits{0U};
     std::atomic<std::uint32_t> moveType{1U};
     std::atomic<std::uint32_t> appliedMoveType{kInvalidMoveType};
     std::atomic<std::uint64_t> lastMoveTypeValidationTickMs{0U};
@@ -125,6 +134,7 @@ struct MovementSlot final {
     std::atomic<bool> worldSpace{false};
     std::atomic<bool> hasNetworkTransform{false};
     std::atomic<bool> aiReplicationProfile{false};
+    std::atomic<FollowerPolicy> followerPolicy{FollowerPolicy::Default};
     std::atomic<std::uint64_t> aiDivergenceSinceTickMs{0U};
     std::atomic<bool> hasReplicatedYaw{false};
     std::atomic<bool> applyPhysicalStep{false};
@@ -172,7 +182,35 @@ struct MovementSlot final {
     std::atomic<std::uint64_t> stopApplications{0U};
     std::atomic<std::uint64_t> protectedFailures{0U};
     std::atomic<std::uintptr_t> lastCharacter{0U};
+    // Diagnostics only: last hybrid locomotion hook values and branch counts.
+    std::array<std::atomic<std::uint32_t>, 20> hybridProbe{};
+    std::array<std::atomic<std::uint64_t>, 6> hybridBranches{};
+    std::atomic<std::uint32_t> preparedBranch{0U};
+    std::atomic<std::uint32_t> preparedPlanarErrorBits{0U};
+    std::atomic<std::uint32_t> probeLastXBits{0U}, probeLastZBits{0U};
+    std::atomic<std::uint64_t> probeLastTickMs{0U};
 };
+// hybridProbe indices
+enum HybridProbe : std::size_t {
+    ProbeBranch, ProbePlanarError, ProbeDemandMagnitude, ProbeDemandIntensity,
+    ProbeRetailMagnitude, ProbeRetailHeading, ProbeRetailIntensity, ProbeRetailAngular,
+    ProbeControlMagnitude, ProbeControlHeading, ProbeControlIntensity,
+    ProbeYaw, ProbeTargetYaw, ProbeTurnMaximum, ProbeTurnAcceleration, ProbeFrameDelta, ProbeAngularWritten,
+    ProbeMeasuredSpeed, ProbeFacingStatus, ProbeInputSpeed
+};
+void StoreProbe(MovementSlot& slot, const HybridProbe index, const float value) noexcept {
+    slot.hybridProbe[index].store(std::bit_cast<std::uint32_t>(value), std::memory_order_relaxed);
+}
+
+bool UsesAIHybridReplication(const MovementSlot& slot) noexcept {
+    return slot.followerPolicy.load(std::memory_order_acquire) ==
+        FollowerPolicy::AIHybridNativeOnly;
+}
+
+bool ReplicationLeaseExpired(const MovementSlot& slot) noexcept {
+    const auto lease = slot.leaseExpiresAtTickMs.load(std::memory_order_acquire);
+    return lease != 0U && GetTickCount64() >= lease;
+}
 
 std::atomic<bool> gInstalled{false};
 std::atomic<NativeAIIntentObserver> gNativeAIIntentObserver{nullptr};
@@ -182,6 +220,8 @@ std::atomic<std::uintptr_t> gLastArmedCharacter{0U};
 std::atomic<std::uint64_t> gStaleGrappleReleases{0U};
 std::atomic<PairedVictimHeldQuery> gPairedVictimHeldQuery{nullptr};
 std::uintptr_t gModuleBase{};
+NativeTurnLimitsFn gNativeTurnLimits{};
+NativeFrameDeltaFn gNativeFrameDelta{};
 std::uintptr_t gGlobalStateRootAddress{};
 ActivateLocomotionCycleFn gActivateLocomotionCycle{};
 EnterIdleCycleFn gEnterIdleCycle{};
@@ -435,6 +475,7 @@ void ResetPayload(MovementSlot& slot) noexcept {
     slot.networkYBits.store(0U, std::memory_order_relaxed);
     slot.networkZBits.store(0U, std::memory_order_relaxed);
     slot.replicatedYawBits.store(0U, std::memory_order_relaxed);
+    slot.hybridAngularVelocityBits.store(0U, std::memory_order_relaxed);
     slot.moveType.store(1U, std::memory_order_relaxed);
     slot.appliedMoveType.store(kInvalidMoveType, std::memory_order_relaxed);
     slot.lastMoveTypeValidationTickMs.store(0U, std::memory_order_relaxed);
@@ -452,6 +493,7 @@ void ResetPayload(MovementSlot& slot) noexcept {
     slot.worldSpace.store(false, std::memory_order_release);
     slot.hasNetworkTransform.store(false, std::memory_order_release);
     slot.aiReplicationProfile.store(false, std::memory_order_release);
+    slot.followerPolicy.store(FollowerPolicy::Default, std::memory_order_release);
     slot.aiDivergenceSinceTickMs.store(0U, std::memory_order_release);
     slot.hasReplicatedYaw.store(false, std::memory_order_release);
     slot.applyPhysicalStep.store(false, std::memory_order_release);
@@ -488,6 +530,9 @@ void ResetCounters(MovementSlot& slot) noexcept {
     slot.followerApplications.store(0U, std::memory_order_relaxed);
     slot.effectiveMoveTypeApplications.store(0U, std::memory_order_relaxed);
     slot.hookHits.store(0U, std::memory_order_relaxed);
+    for (auto& value : slot.hybridProbe) value.store(0U, std::memory_order_relaxed);
+    for (auto& value : slot.hybridBranches) value.store(0U, std::memory_order_relaxed);
+    slot.probeLastTickMs.store(0U, std::memory_order_relaxed);
     slot.finalSubmissions.store(0U, std::memory_order_relaxed);
     slot.requestApplications.store(0U, std::memory_order_relaxed);
     slot.transformApplications.store(0U, std::memory_order_relaxed);
@@ -559,6 +604,7 @@ void ReleaseSlot(MovementSlot& slot) noexcept {
     slot.lastHardResyncProbeTickMs.store(0U, std::memory_order_release);
     slot.hasNetworkTransform.store(false, std::memory_order_release);
     slot.aiReplicationProfile.store(false, std::memory_order_release);
+    slot.followerPolicy.store(FollowerPolicy::Default, std::memory_order_release);
     slot.aiDivergenceSinceTickMs.store(0U, std::memory_order_release);
     slot.hasReplicatedYaw.store(false, std::memory_order_release);
     slot.applyPhysicalStep.store(false, std::memory_order_release);
@@ -692,6 +738,16 @@ bool RetailOwnsPhysicalCycle(const std::uintptr_t characterAddress) noexcept {
     return GuardedReadValue(characterAddress + 0x32CU, health) && health >= 3U;
 }
 
+bool AIHybridCanOwnCurrentCycle(const std::uintptr_t characterAddress) noexcept {
+    std::uintptr_t cycle{}, type{};
+    std::uint8_t state{};
+    return gModuleBase != 0U && !RetailOwnsPhysicalCycle(characterAddress) &&
+        ReadNativeCycle(characterAddress, cycle, state) &&
+        GuardedReadValue(cycle, type) && type >= gModuleBase &&
+        ai_sync::HybridLocomotionCycleAllowed(
+            static_cast<std::uint32_t>(type - gModuleBase), state);
+}
+
 bool PairedCycleState(const std::uint8_t state) noexcept {
     return state == 0x16U || state == 0x42U || state == 0x4EU || state == 0x4FU || state == 0x47U;
 }
@@ -722,9 +778,12 @@ bool ReleaseStalePairedHold(MovementSlot& slot, const std::uintptr_t characterAd
     if (!GuardedWriteValue(characterAddress + 0x297U, kClear) ||
         !GuardedWriteValue(characterAddress + 0x29AU, kClear)) return false;
     slot.pairedHoldReleaseRequested.store(false, std::memory_order_release);
-    // Converge on the latest network transform instead of resuming in place.
+    // Hybrid resumes through native locomotion from the current transform;
+    // legacy player replication retains its placement recovery policy.
     slot.idleConverged.store(false, std::memory_order_release);
-    slot.initialPlacementPending.store(true, std::memory_order_release);
+    slot.initialPlacementPending.store(!UsesAIHybridReplication(slot), std::memory_order_release);
+    if (UsesAIHybridReplication(slot))
+        slot.preparedTargetRevision.store(0U, std::memory_order_release);
     slot.targetRevision.fetch_add(1U, std::memory_order_release);
     gStaleGrappleReleases.fetch_add(1U, std::memory_order_relaxed);
     AppendLocomotionFlight("paired_hold_released", slot, characterAddress, cycle, state, grappled);
@@ -1023,6 +1082,91 @@ float LoadFloat(const std::atomic<std::uint32_t>& bits) noexcept {
     return std::bit_cast<float>(bits.load(std::memory_order_relaxed));
 }
 
+// v338-v342 animated facing (angular graph input) never turned nor moved the
+// Client AI (measured speed 0 in v340-v342). v337 behaviour restored: the
+// Host facing is applied to the Character yaw each PRE/POST (never position).
+constexpr bool kHybridAnimatedFacing = false;
+// Below this facing error no turn is requested (3 degrees).
+constexpr float kHybridFacingDeadband = 0.0523598776F;
+// Turn rate per radian of facing error (1/s): proportional, not "this frame".
+constexpr float kHybridFacingGain = 3.0F;
+bool HybridFacingActive(const MovementSlot& slot, const std::uintptr_t character) noexcept {
+    if (!UsesAIHybridReplication(slot) || ReplicationLeaseExpired(slot) ||
+        !slot.hasReplicatedYaw.load(std::memory_order_acquire)) return false;
+    float yaw{};
+    if (!ReadReplicatedYaw(character, yaw)) return false;
+    const auto error=std::remainder(LoadFloat(slot.replicatedYawBits)-yaw,6.28318530717958647692F);
+    return std::isfinite(error) && (std::abs(error)>kHybridFacingDeadband ||
+        std::abs(LoadFloat(slot.hybridAngularVelocityBits))>0.01F);
+}
+
+bool BuildHybridAngularVelocity(const float error, const float previous,
+    const float dt, const float maximum, const float acceleration, float& velocity) noexcept {
+    if (!std::isfinite(error)||!std::isfinite(previous)||!std::isfinite(dt)||dt<=0.0F||
+        !std::isfinite(maximum)||maximum<=0.0F||!std::isfinite(acceleration)||acceleration<=0.0F)
+        return false;
+    // Same angular units and speed/acceleration tables as 0044D4F0. The Host
+    // supplies facing; the local animation graph supplies the resulting turn.
+    // v338 asked to close the whole error within one frame, so every request
+    // saturated at the native maximum: the graph stayed in its turn and never
+    // translated (measured speed 0 with a 9 m/s demand, facing already right).
+    const auto desired=std::abs(error)<=kHybridFacingDeadband?0.0F:
+        std::clamp(error*kHybridFacingGain,-maximum,maximum);
+    velocity=std::clamp(desired,previous-acceleration*dt,previous+acceleration*dt);
+    velocity=std::clamp(velocity,-maximum,maximum);
+    return std::isfinite(velocity);
+}
+
+bool ApplyHybridNativeFacing(MovementSlot& slot, const std::uintptr_t character,
+    const std::uintptr_t cycle, const std::uintptr_t movement, const float speed) noexcept {
+    if (!UsesAIHybridReplication(slot)) return true;
+    StoreProbe(slot,ProbeTargetYaw,LoadFloat(slot.replicatedYawBits));
+    if (!kHybridAnimatedFacing) {
+        float yaw{};if (ReadReplicatedYaw(character,yaw)) StoreProbe(slot,ProbeYaw,yaw);
+        StoreProbe(slot,ProbeFacingStatus,6.0F);return true; // retail angular untouched
+    }
+    if (gNativeTurnLimits==nullptr||gNativeFrameDelta==nullptr||movement==0U) {StoreProbe(slot,ProbeFacingStatus,1.0F);return false;}
+    float current{}, maximum{}, acceleration{}, velocity{};
+    std::uintptr_t liveMovement{};
+    if (!ReadReplicatedYaw(character,current)||
+        !GuardedReadValue(character+kMovementActionObjectOffset,liveMovement)||liveMovement!=movement)
+        {StoreProbe(slot,ProbeFacingStatus,2.0F);return false;}
+    StoreProbe(slot,ProbeYaw,current);
+    float retailAngular{};
+    if (GuardedReadValue(cycle+0x48U,retailAngular)) StoreProbe(slot,ProbeRetailAngular,retailAngular);
+    // While travelling, retail steering already turns the Character toward the
+    // requested travel heading (cycle+48 nonzero). Overwriting it with the
+    // Host facing kept the graph from aligning, so it never translated
+    // (v338-v341: measured speed 0). Host facing only drives standing turns.
+    if (speed>kMoveRequestEpsilon) {
+        slot.hybridAngularVelocityBits.store(0U,std::memory_order_relaxed);
+        StoreProbe(slot,ProbeFacingStatus,5.0F);StoreProbe(slot,ProbeAngularWritten,retailAngular);
+        return true;
+    }
+#if defined(_MSC_VER) && defined(_M_IX86)
+    __try {
+        gNativeTurnLimits(reinterpret_cast<void*>(movement),speed,&maximum,&acceleration);
+        const auto dt=static_cast<float>(gNativeFrameDelta(0.0027777778F,0.041666668F));
+        StoreProbe(slot,ProbeTurnMaximum,maximum);StoreProbe(slot,ProbeTurnAcceleration,acceleration);StoreProbe(slot,ProbeFrameDelta,dt);
+        const auto error=std::remainder(LoadFloat(slot.replicatedYawBits)-current,6.28318530717958647692F);
+        if (!BuildHybridAngularVelocity(error,LoadFloat(slot.hybridAngularVelocityBits),
+                dt,maximum,acceleration,velocity)) {StoreProbe(slot,ProbeFacingStatus,3.0F);return false;}
+        if (ReplicationLeaseExpired(slot)) velocity=0.0F;
+        // 006618C0 normally copies M+14 to cycle+48. 0066D4B0 copies that to
+        // +70 (graph parameter "angularVelocity") before our hook, then passes
+        // +48/+58 through 00689200 to native root-motion correction. Update
+        // both scalar inputs; never write Character yaw or graph output.
+        *reinterpret_cast<float*>(cycle+0x48U)=velocity;
+        *reinterpret_cast<float*>(cycle+0x70U)=velocity;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { StoreProbe(slot,ProbeFacingStatus,4.0F); return false; }
+    StoreProbe(slot,ProbeFacingStatus,0.0F);StoreProbe(slot,ProbeAngularWritten,velocity);
+#else
+    return false;
+#endif
+    slot.hybridAngularVelocityBits.store(std::bit_cast<std::uint32_t>(velocity),std::memory_order_relaxed);
+    return true;
+}
+
 bool WriteNativeCycleControl(
     const std::uintptr_t cycleAddress,
     const NativeCycleControlPlan& plan) noexcept {
@@ -1141,6 +1285,8 @@ struct FollowerDemand final {
     float directionX{};
     float directionZ{};
     float intensity{};
+    std::uint32_t branch{}; // diagnostics, see hybridBranches
+    float planarError{};
 };
 
 bool LoadNetworkTarget(
@@ -1160,6 +1306,9 @@ bool LoadNetworkTarget(
 bool ApplyHardNetworkResync(
     MovementSlot& slot,
     const std::uintptr_t characterAddress) noexcept {
+    // This policy is selected before the first target is published, including
+    // a rebind after a native action. Divergence never authorizes a hybrid snap.
+    if (UsesAIHybridReplication(slot)) return false;
     if (slot.initialPlacementPending.load(std::memory_order_acquire)) return false;
     float approachX{}, approachY{}, approachZ{};
     if (player_posture::ApproachTarget(characterAddress, approachX, approachY, approachZ)) return false;
@@ -1250,8 +1399,7 @@ bool BuildFollowerDemand(
         !std::isfinite(intensity))
         return false;
 
-    const auto lease = slot.leaseExpiresAtTickMs.load(std::memory_order_acquire);
-    const auto stale = lease != 0U && GetTickCount64() >= lease;
+    const auto stale = ReplicationLeaseExpired(slot);
     float approachX{}, approachY{}, approachZ{};
     const auto approaching = player_posture::ApproachTarget(characterAddress, approachX, approachY, approachZ);
     if (stale || approaching) {
@@ -1287,9 +1435,11 @@ bool BuildFollowerDemand(
         }
     }
     demand.networkFollower = hasTarget;
+    demand.planarError = planarError;
 
     if (demand.inputMoving) {
-        if (slot.aiReplicationProfile.load(std::memory_order_acquire) && hasTarget) {
+        if (slot.aiReplicationProfile.load(std::memory_order_acquire) &&
+            !UsesAIHybridReplication(slot) && hasTarget) {
             // NPC intent is sampled native displacement, rather than human
             // input. Follow the buffered path with bounded positional feedback
             // in both axes; the human forward-only/lateral-blend policy leaves
@@ -1305,6 +1455,7 @@ bool BuildFollowerDemand(
                 velocityZ *= kAiFollowerMaximumMagnitude / magnitude;
             }
             demand.drive = magnitude > kMoveRequestEpsilon;
+            demand.branch = 5U;
             demand.directionX = velocityX; demand.directionZ = velocityZ;
             demand.intensity = demand.drive ? intensity : 0.0F;
             return true;
@@ -1359,10 +1510,11 @@ bool BuildFollowerDemand(
             : 1.0F;
         const auto magnitude = std::clamp(
             inputMagnitude * catchupMultiplier,
-            0.35F,
+            UsesAIHybridReplication(slot) ? 0.0F : 0.35F,
             slot.aiReplicationProfile.load(std::memory_order_acquire)
                 ? kAiFollowerMaximumMagnitude : kFollowerMaximumMagnitude);
         demand.drive = true;
+        demand.branch = 1U;
         demand.directionX = headingX * magnitude;
         demand.directionZ = headingZ * magnitude;
         demand.intensity = intensity;
@@ -1371,20 +1523,29 @@ bool BuildFollowerDemand(
 
     // Once the remote player has stopped, finish the remaining network error
     // through the native locomotion cycle instead of applying a final snap.
-    if (hasTarget && planarError > kFollowerSettleDistance) {
+    // A settled hybrid actor needs a larger error to restart than to stop.
+    // PRE and POST otherwise toggle Idle/Move in one frame at the same .08m
+    // boundary, rebuilding the native graph for millimetres of pose noise.
+    const auto settleDistance=UsesAIHybridReplication(slot)&&!slot.moveActive.load(std::memory_order_acquire)
+        ? kHybridSettleResumeDistance : kFollowerSettleDistance;
+    if (hasTarget && planarError > settleDistance) {
         const auto magnitude = std::clamp(
             planarError * 2.5F,
             kFollowerMinimumSettlingMagnitude,
             slot.aiReplicationProfile.load(std::memory_order_acquire)
                 ? kAiFollowerMaximumSettlingMagnitude : kFollowerMaximumSettlingMagnitude);
         demand.drive = true;
+        demand.branch = 2U;
         demand.directionX = errorX / planarError * magnitude;
         demand.directionZ = errorZ / planarError * magnitude;
         demand.intensity = std::max(intensity, 1.0F);
         return true;
     }
 
-    demand.drive = false;
+    // A stationary Host can turn. Keep the native locomotion graph, with zero
+    // linear velocity, until its angular input has settled; do not spin its pose.
+    demand.drive = kHybridAnimatedFacing && !stale && HybridFacingActive(slot,characterAddress);
+    demand.branch = demand.drive ? 3U : 4U;
     demand.intensity = 0.0F;
     return true;
 }
@@ -1405,6 +1566,8 @@ void StorePreparedFollowerDemand(
     slot.preparedNetworkFollower.store(
         demand.networkFollower, std::memory_order_relaxed);
     slot.preparedDrive.store(demand.drive, std::memory_order_relaxed);
+    slot.preparedBranch.store(demand.branch, std::memory_order_relaxed);
+    slot.preparedPlanarErrorBits.store(std::bit_cast<std::uint32_t>(demand.planarError), std::memory_order_relaxed);
     slot.preparedTargetRevision.store(targetRevision, std::memory_order_release);
 }
 
@@ -1412,6 +1575,10 @@ bool LoadPreparedFollowerDemand(
     const MovementSlot& slot,
     const std::uint64_t targetRevision,
     FollowerDemand& demand) noexcept {
+    // A lease can expire between PRE and the retail hook without changing the
+    // target revision. Never let that cached demand keep chasing an old pose.
+    if (UsesAIHybridReplication(slot) && ReplicationLeaseExpired(slot))
+        return false;
     if (targetRevision == 0U ||
         slot.preparedTargetRevision.load(std::memory_order_acquire) !=
             targetRevision)
@@ -1423,6 +1590,8 @@ bool LoadPreparedFollowerDemand(
     demand.directionX = LoadFloat(slot.preparedDirectionXBits);
     demand.directionZ = LoadFloat(slot.preparedDirectionZBits);
     demand.intensity = LoadFloat(slot.preparedIntensityBits);
+    demand.branch = slot.preparedBranch.load(std::memory_order_relaxed);
+    demand.planarError = LoadFloat(slot.preparedPlanarErrorBits);
     return std::isfinite(demand.directionX) &&
         std::isfinite(demand.directionZ) &&
         std::isfinite(demand.intensity);
@@ -1522,7 +1691,8 @@ bool SubmitStopRequest(
         0.0F,
         0.0F);
     auto physicalStopped = true;
-    if (slot.applyPhysicalStep.load(std::memory_order_acquire)) {
+    if (!UsesAIHybridReplication(slot) &&
+        slot.applyPhysicalStep.load(std::memory_order_acquire)) {
         physicalStopped = ApplyPhysicalDelta(
             characterAddress,
             0.0F,
@@ -1578,6 +1748,11 @@ void __fastcall ActivateLocomotionCycleDetour(
     const auto hasState = GuardedReadValue(
         cycleAddress + kNpcLocomotionCycleStateOffset, state);
     if (RetailOwnsPhysicalCycle(owner)) return;
+    if (UsesAIHybridReplication(*slot) && !AIHybridCanOwnCurrentCycle(owner)) {
+        ReleaseSlot(*slot);
+        original(cycle);
+        return;
+    }
     if (slot->driveRequested.load(std::memory_order_acquire) &&
         (!hasState || state != kNpcLocomotionMoveState)) {
         original(cycle);
@@ -1627,6 +1802,11 @@ void __fastcall EnterIdleCycleDetour(
         original(cycle); // permit retail attack completion/death cleanup
         return;
     }
+    if (UsesAIHybridReplication(*slot) && !AIHybridCanOwnCurrentCycle(owner)) {
+        ReleaseSlot(*slot);
+        original(cycle);
+        return;
+    }
     // During a network Move, CIVILIAN AI cannot tear down 0x38 underneath the
     // remote controller. Once the network wants Idle, allowing the engine's
     // own Idle transition is harmless and keeps the animation graph natural;
@@ -1657,6 +1837,8 @@ void __cdecl ApplyReplicatedEffectiveMoveType(
         return;
     }
     if (RetailOwnsPhysicalCycle(
+            slot->characterAddress.load(std::memory_order_acquire))) return;
+    if (UsesAIHybridReplication(*slot) && !AIHybridCanOwnCurrentCycle(
             slot->characterAddress.load(std::memory_order_acquire))) return;
 
     const auto moveType = slot->moveType.load(std::memory_order_acquire);
@@ -1790,6 +1972,29 @@ void __cdecl ApplyAtNpcLocomotionPreTransform(
         slot->protectedFailures.fetch_add(1U, std::memory_order_relaxed);
         return;
     }
+    if (UsesAIHybridReplication(*slot)) {
+        // Diagnostics only: what this frame asks and what retail prepared.
+        slot->hybridBranches[std::min<std::size_t>(demand.branch,5U)].fetch_add(1U,std::memory_order_relaxed);
+        StoreProbe(*slot,ProbeBranch,static_cast<float>(demand.branch));
+        StoreProbe(*slot,ProbePlanarError,demand.planarError);
+        StoreProbe(*slot,ProbeDemandMagnitude,std::hypot(demand.directionX,demand.directionZ));
+        StoreProbe(*slot,ProbeDemandIntensity,demand.intensity);
+        StoreProbe(*slot,ProbeInputSpeed,std::hypot(LoadFloat(slot->directionXBits),LoadFloat(slot->directionZBits)));
+        float retail{};
+        if (GuardedReadValue(cycleAddress+NativeCycleOffsets().magnitude,retail)) StoreProbe(*slot,ProbeRetailMagnitude,retail);
+        if (GuardedReadValue(cycleAddress+NativeCycleOffsets().worldHeading,retail)) StoreProbe(*slot,ProbeRetailHeading,retail);
+        if (GuardedReadValue(cycleAddress+NativeCycleOffsets().intensity,retail)) StoreProbe(*slot,ProbeRetailIntensity,retail);
+        float x{},y{},z{};
+        const auto now=GetTickCount64();
+        if (ReadTransform(characterAddress,x,y,z)) {
+            const auto last=slot->probeLastTickMs.exchange(now,std::memory_order_relaxed);
+            const auto lastX=LoadFloat(slot->probeLastXBits),lastZ=LoadFloat(slot->probeLastZBits);
+            slot->probeLastXBits.store(std::bit_cast<std::uint32_t>(x),std::memory_order_relaxed);
+            slot->probeLastZBits.store(std::bit_cast<std::uint32_t>(z),std::memory_order_relaxed);
+            if (last!=0U&&now>last&&now-last<500U)
+                StoreProbe(*slot,ProbeMeasuredSpeed,std::hypot(x-lastX,z-lastZ)*1000.0F/static_cast<float>(now-last));
+        }
+    }
 
     NativeCycleControlPlan control{};
     if (demand.drive) {
@@ -1803,7 +2008,13 @@ void __cdecl ApplyAtNpcLocomotionPreTransform(
                 return;
             }
             float nativeOrientation = 0.0F;
-            const auto replicatedYaw = LoadFloat(slot->replicatedYawBits);
+            auto replicatedYaw = LoadFloat(slot->replicatedYawBits);
+            // Hybrid facing is now animation-owned. Translate world travel
+            // using the actual current yaw, not the requested future facing.
+            if (kHybridAnimatedFacing && UsesAIHybridReplication(*slot) && !ReadReplicatedYaw(characterAddress,replicatedYaw)) {
+                slot->protectedFailures.fetch_add(1U,std::memory_order_relaxed);
+                return;
+            }
             if (!GuardedReadValue(
                     orientationObject + kNativeOrientationOffset,
                     nativeOrientation) ||
@@ -1851,10 +2062,23 @@ void __cdecl ApplyAtNpcLocomotionPreTransform(
     // Retail overwrites +4C/+50/+5C during its own preprocessing, so the
     // values still must be restored at this exact hook. The write is now one
     // SEH-guarded direct block instead of three VirtualQuery-backed writes.
+    if (!ApplyHybridNativeFacing(*slot,characterAddress,cycleAddress,orientationObject,control.magnitude)) {
+        // A missing/zero turn resource must not discard the Host's linear
+        // movement or leave an old angular request active.
+        slot->protectedFailures.fetch_add(1U,std::memory_order_relaxed);
+        slot->hybridAngularVelocityBits.store(0U,std::memory_order_relaxed);
+        static_cast<void>(GuardedWriteValue(cycleAddress+0x48U,0.0F));
+        static_cast<void>(GuardedWriteValue(cycleAddress+0x70U,0.0F));
+    }
     if (!WriteNativeCycleControl(cycleAddress, control)) {
         slot->protectedFailures.fetch_add(1U, std::memory_order_relaxed);
         slot->certifiedCycleAddress.store(0U, std::memory_order_release);
         return;
+    }
+    if (UsesAIHybridReplication(*slot)) {
+        StoreProbe(*slot,ProbeControlMagnitude,control.magnitude);
+        StoreProbe(*slot,ProbeControlHeading,control.worldHeading);
+        StoreProbe(*slot,ProbeControlIntensity,control.intensity);
     }
     slot->appliedControlRevision.store(
         slot->controlRevision.load(std::memory_order_acquire),
@@ -1864,7 +2088,8 @@ void __cdecl ApplyAtNpcLocomotionPreTransform(
         slot->requestApplications.fetch_add(1U, std::memory_order_relaxed);
     }
 
-    if (slot->applyPhysicalStep.load(std::memory_order_acquire)) {
+    if (!UsesAIHybridReplication(*slot) &&
+        slot->applyPhysicalStep.load(std::memory_order_acquire)) {
         const auto directionX = LoadFloat(slot->directionXBits);
         const auto directionY = LoadFloat(slot->directionYBits);
         const auto directionZ = LoadFloat(slot->directionZBits);
@@ -1917,7 +2142,9 @@ bool ArmCore(
     const std::uint32_t moveType,
     const bool applyPhysicalStep,
     const std::uint32_t frameCount,
-    std::string& error) noexcept {
+    std::string& error,
+    const FollowerPolicy followerPolicy = FollowerPolicy::Default,
+    const std::uint64_t authorityDeadlineMs = 0U) noexcept {
     if (!runtime_features::Enabled(
             runtime_features::Feature::RemoteMovementRuntime)) {
         error = "remote movement runtime disabled by performance isolation";
@@ -1957,12 +2184,33 @@ bool ArmCore(
     }
     if (frameCount == 0U && !hasNetworkTransform) return Stop(characterAddress);
 
+    const auto hybrid = followerPolicy == FollowerPolicy::AIHybridNativeOnly;
+    if (hybrid && !AIHybridCanOwnCurrentCycle(characterAddress)) {
+        error = "AI hybrid locomotion requires a qualified ordinary native cycle";
+        return false;
+    }
+
     const auto wasKnown = FindSlot(characterAddress) != nullptr;
     auto* slot = FindOrAllocateSlot(characterAddress);
     if (slot == nullptr) {
         error = "No free remote-player locomotion slot is available";
         return false;
     }
+
+    // An AI caller must never arm with the player placement policy and change
+    // profiles afterwards. Select the policy before any control/pose publication
+    // or preparation can observe this slot. Hybrid callers run on the engine
+    // thread, so no native pump can interleave the remaining payload stores.
+    const auto previousPolicy = slot->followerPolicy.exchange(
+        followerPolicy, std::memory_order_acq_rel);
+    const auto policyChanged = previousPolicy != followerPolicy;
+    if (hybrid || policyChanged) {
+        slot->aiReplicationProfile.store(hybrid, std::memory_order_release);
+        slot->initialPlacementPending.store(false, std::memory_order_release);
+        slot->aiDivergenceSinceTickMs.store(0U, std::memory_order_release);
+        slot->preparedTargetRevision.store(0U, std::memory_order_release);
+    }
+    const auto renewedHybridLease = hybrid && ReplicationLeaseExpired(*slot);
 
     auto targetChanged = PublishControlPayload(
         *slot,
@@ -1973,6 +2221,7 @@ bool ArmCore(
         intensity,
         worldSpace,
         applyPhysicalStep);
+    targetChanged = targetChanged || policyChanged || renewedHybridLease;
 
     const auto networkXBits = std::bit_cast<std::uint32_t>(networkX);
     const auto networkYBits = std::bit_cast<std::uint32_t>(networkY);
@@ -2015,7 +2264,8 @@ bool ArmCore(
 
     slot->leaseExpiresAtTickMs.store(
         hasNetworkTransform
-            ? GetTickCount64() + kReplicationLeaseMilliseconds
+            ? (followerPolicy==FollowerPolicy::AIHybridNativeOnly&&authorityDeadlineMs
+                ? authorityDeadlineMs : GetTickCount64() + kReplicationLeaseMilliseconds)
             : 0U,
         std::memory_order_release);
     slot->stopPending.store(false, std::memory_order_release);
@@ -2031,7 +2281,7 @@ bool ArmCore(
             frameCount, std::memory_order_acq_rel) != frameCount) {
         targetChanged = true;
     }
-    if (!wasKnown && hasNetworkTransform) {
+    if (!wasKnown && hasNetworkTransform && !hybrid) {
         slot->initialPlacementPending.store(true, std::memory_order_release);
         targetChanged = true;
     }
@@ -2154,6 +2404,13 @@ void PumpSlotOnEngineThread(
         slot.characterAddress.load(std::memory_order_acquire);
     if (characterAddress == 0U || characterAddress == kReservedSlot) return;
 
+    if (UsesAIHybridReplication(slot) && !AIHybridCanOwnCurrentCycle(characterAddress)) {
+        // Never replace a scripted/reaction/traversal cycle with Move or Idle.
+        // Dropping this mailbox does not touch the native action or transform.
+        ReleaseSlot(slot);
+        return;
+    }
+
     // Lighting follows the actor even while traversal/paired cycles own motion.
     if (phase == EnginePumpPhase::PostCharacterManager)
         player_torch::PumpOnEngineThread(characterAddress);
@@ -2185,7 +2442,10 @@ void PumpSlotOnEngineThread(
     if (phase == EnginePumpPhase::PreCharacterManager)
         static_cast<void>(ReleaseStalePairedHold(slot, characterAddress));
     if (RetailOwnsPhysicalCycle(characterAddress)) {
-        if (slot.stopPending.load(std::memory_order_acquire)) ReleaseSlot(slot);
+        // A paired/death cycle retires the hybrid mailbox entirely. Only a
+        // newly qualified Host update may rearm it after native completion.
+        if (UsesAIHybridReplication(slot) ||
+            slot.stopPending.load(std::memory_order_acquire)) ReleaseSlot(slot);
         return;
     }
 
@@ -2204,6 +2464,8 @@ void PumpSlotOnEngineThread(
         slot.targetRevision.load(std::memory_order_acquire);
     const auto preparedRevision =
         slot.preparedTargetRevision.load(std::memory_order_acquire);
+    const auto hybridLeaseExpired = UsesAIHybridReplication(slot) &&
+        ReplicationLeaseExpired(slot);
 
     if (phase == EnginePumpPhase::PostCharacterManager) {
         // PRE already prepared the frame that retail just consumed. POST only
@@ -2214,12 +2476,13 @@ void PumpSlotOnEngineThread(
         const auto nativeReconcileNeeded =
             moveActive && !slot.nativeStateActive.load(std::memory_order_acquire);
         if (targetRevision == preparedRevision && !nativeReconcileNeeded &&
+            !(hybridLeaseExpired && slot.driveRequested.load(std::memory_order_acquire)) &&
             !slot.initialPlacementPending.load(std::memory_order_acquire)) {
             // Preserve replicated yaw ownership after the retail tick, even
             // for a converged idle proxy: retail may touch Character orientation.
             // This is now one direct SEH-guarded scalar write, not a
             // VirtualQuery-backed TryWrite plus a second full follower pass.
-            if (slot.hasReplicatedYaw.load(std::memory_order_acquire)) {
+            if ((!kHybridAnimatedFacing || !UsesAIHybridReplication(slot)) && !hybridLeaseExpired && slot.hasReplicatedYaw.load(std::memory_order_acquire)) {
                 const auto yaw = LoadFloat(slot.replicatedYawBits);
                 if (!WriteReplicatedYaw(characterAddress, yaw)) {
                     slot.protectedFailures.fetch_add(
@@ -2242,14 +2505,15 @@ void PumpSlotOnEngineThread(
         slot.idleConverged.store(false, std::memory_order_release);
     }
 
-    if (slot.hasReplicatedYaw.load(std::memory_order_acquire)) {
+    if ((!kHybridAnimatedFacing || !UsesAIHybridReplication(slot)) && !hybridLeaseExpired && slot.hasReplicatedYaw.load(std::memory_order_acquire)) {
         const auto yaw = LoadFloat(slot.replicatedYawBits);
         if (!WriteReplicatedYaw(characterAddress, yaw)) {
             slot.protectedFailures.fetch_add(1U, std::memory_order_relaxed);
         }
     }
 
-    if (slot.initialPlacementPending.load(std::memory_order_acquire)) {
+    if (!UsesAIHybridReplication(slot) &&
+        slot.initialPlacementPending.load(std::memory_order_acquire)) {
         float targetX = 0.0F;
         float targetY = 0.0F;
         float targetZ = 0.0F;
@@ -2446,6 +2710,10 @@ RuntimeSnapshot SnapshotSlot(const MovementSlot& slot) noexcept {
     result.effectiveMoveTypeApplications =
         slot.effectiveMoveTypeApplications.load(std::memory_order_relaxed);
     result.hookHits = slot.hookHits.load(std::memory_order_relaxed);
+    for (std::size_t i = 0U; i < result.hybridProbe.size(); ++i)
+        result.hybridProbe[i] = LoadFloat(slot.hybridProbe[i]);
+    for (std::size_t i = 0U; i < result.hybridBranches.size(); ++i)
+        result.hybridBranches[i] = slot.hybridBranches[i].load(std::memory_order_relaxed);
     result.finalSubmissions =
         slot.finalSubmissions.load(std::memory_order_relaxed);
     result.requestApplications =
@@ -2593,7 +2861,19 @@ bool Install(
         return false;
     }
 
+    constexpr std::array<std::uint8_t,11> turnPrefix{
+        0xF3U,0x0FU,0x10U,0x44U,0x24U,0x04U,0x33U,0xC0U,0x8DU,0x51U,0x4CU};
+    constexpr std::array<std::uint8_t,4> framePrefix{0xF2U,0x0FU,0x10U,0x05U};
+    std::uintptr_t frameClock{};
+    if (!ValidateBytes(moduleBase+0x000404A0U,turnPrefix)||
+        !ValidateBytes(moduleBase+0x0037D440U,framePrefix)||
+        !GuardedReadValue(moduleBase+0x0037D444U,frameClock)||frameClock!=moduleBase+0x012410C0U) {
+        error="Native locomotion turn limits/frame clock identity does not match";
+        return false;
+    }
     gModuleBase = moduleBase;
+    gNativeTurnLimits=reinterpret_cast<NativeTurnLimitsFn>(moduleBase+0x000404A0U);
+    gNativeFrameDelta=reinterpret_cast<NativeFrameDeltaFn>(moduleBase+0x0037D440U);
     gGlobalStateRootAddress = reinterpret_cast<std::uintptr_t>(globalStateRootAddress);
     gSubmitLocomotion = reinterpret_cast<SubmitLocomotionFn>(submitAddress);
     gTeleportCharacter =
@@ -2868,6 +3148,25 @@ bool ReleaseAIIntentOwnership(const std::uintptr_t characterAddress) noexcept {
     if (slot == nullptr) return true;
     ReleaseSlot(*slot);
     return true;
+}
+
+bool ArmAIHybridReplication(
+    const std::uintptr_t characterAddress,
+    const float velocityX,
+    const float velocityZ,
+    const float intensity,
+    const float targetX,
+    const float targetY,
+    const float targetZ,
+    const float yaw,
+    const std::uint32_t moveType,
+    std::string& error,
+    const std::uint64_t authorityDeadlineMs) noexcept {
+    return ArmCore(
+        characterAddress, velocityX, 0.0F, velocityZ, 0.0F, intensity,
+        true, true, targetX, targetY, targetZ, true, yaw, true, moveType,
+        false, kPersistentReplicationFrames, error,
+        FollowerPolicy::AIHybridNativeOnly,authorityDeadlineMs);
 }
 
 bool ArmWorldReplication(

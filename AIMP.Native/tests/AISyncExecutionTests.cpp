@@ -265,6 +265,33 @@ void NativeIntentAdapter() {
     Require(adapter.Invoke(r)==NativeOutcome::Admitted&&probe.calls==1,"logical intent release invoked native constructor again");
     SetNativeIntentAdapter(nullptr,nullptr);gIntentProbe=nullptr;
 }
+void HybridMovementConsumption() {
+    FakeImage image;SyntheticActor actor;NativeRequestAdapter adapter;
+    Require(adapter.Initialize(image.Base(),true,&SyntheticActor::Permit,&SyntheticActor::Resolve,&actor),"hybrid adapter initialization");
+    SetHybridMovementAdapter(
+        [](const Record&,const LocalActorBinding&) noexcept{return Readiness::Ready;},
+        [](const Record&,const LocalActorBinding&) noexcept{return NativeOutcome::Admitted;});
+    // The synthetic actor has no movement resource or callable native factory.
+    // Entering a second executor would fail rather than pass this regression.
+    for(const auto kind:{1U,3U,4U,9U,6U,11U,5U}) {
+        auto r=Command(Op::Submit);r.nativeKind=kind;r.flags=r.mode=0;
+        r.goalX=r.goalY=r.goalZ=r.distance=r.stopDistance=r.aux=0;
+        if(kind==1U||kind==3U){r.movement.version=r.movement.parts=1;r.movement.navigation=movement::Navigation::LocalNative;}
+        if(kind==5U)r.mode=0x38U;
+        for(const auto op:{Op::Submit,Op::Update,Op::Cancel,Op::Release}) {
+            auto operation=r;operation.opcode=op;
+            if(op==Op::Cancel||op==Op::Release){operation.mode=0;operation.movement={};}
+            Require(adapter.Check(operation)==Readiness::Ready&&adapter.Invoke(operation)==NativeOutcome::Admitted&&
+                adapter.ActiveCount()==0U,"hybrid movement created a second native motor or blocked causal cleanup");
+        }
+        if(kind==5U) {
+            r.mode=0x39U;
+            Require(adapter.Check(r)==Readiness::Ready&&adapter.Invoke(r)==NativeOutcome::Admitted&&adapter.ActiveCount()==0U,
+                "explicit ordinary Turn cycle created a second heading owner");
+        }
+    }
+    SetHybridMovementAdapter(nullptr,nullptr);
+}
 void SchedulerControlAdapter() {
     struct Calls {
         std::array<std::uint8_t,0x50> request{};
@@ -711,7 +738,7 @@ void RuntimeOwnership(bool commandAdmission) {
 int main(int argc, char** argv) {
     try {
         Require(argc == 2 || (argc == 3 && std::string(argv[2]) == "--command-admission"), "expected shared execution fixture path");
-        CodecGuards(); Fixture(argv[1]); SessionGuards(); ActionCoordinationGuards(); DelayedInteractionReservation(); ActionSequenceScenarios(); NativeReadiness(); NativeIntentAdapter(); SchedulerControlAdapter(); RuntimeOwnership(argc == 3);
+        CodecGuards(); Fixture(argv[1]); SessionGuards(); ActionCoordinationGuards(); DelayedInteractionReservation(); ActionSequenceScenarios(); NativeReadiness(); NativeIntentAdapter(); HybridMovementConsumption(); SchedulerControlAdapter(); RuntimeOwnership(argc == 3);
         std::cout << "PASS AIEX codec, canonical C++/C# fixture and qualified session guards (no game execution)\n";
         return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

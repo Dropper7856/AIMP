@@ -33,7 +33,7 @@ int main() {
     Check(!aimp::player_torch::BuildYawTransform(0.0F,
         {std::numeric_limits<float>::infinity(), 3.0F, 4.0F}, light) && light == previousLight,
         "Reject invalid torch position");
-    static_assert(aimp::kProtocolVersion == 24U);
+    static_assert(aimp::kProtocolVersion == 27U);
     using namespace aimp::player_posture;
     State value{};
     Check(Decode("0,0,0,0,0,0,0", value), "Standing state");

@@ -30,13 +30,13 @@ internal static class AISyncMovementTests
         AssertEx.SequenceEqual(ReadFixture(), packet);
         var receipt = new AISyncExecutionReceipt(scope, 1, move, AISyncExecutionStage.Waiting, AISyncExecutionResult.OwnerBusy);
         var bytes = AISyncExecutionCodec.EncodeReceipt(receipt);
-        AssertEx.Equal(AISyncExecutionCodec.MaximumReceiptBytes, bytes.Length); AssertEx.Equal(receipt, AISyncExecutionCodec.DecodeReceipt(bytes, scope));
+        AssertEx.Equal(AISyncExecutionCodec.ReceiptBytes + AISyncExecutionCodec.ExtendedRecordBytes - AISyncTransactionCodec.RecordBytes, bytes.Length); AssertEx.Equal(receipt, AISyncExecutionCodec.DecodeReceipt(bytes, scope));
         foreach (var length in Enumerable.Range(0, packet.Length))
             AssertEx.Throws<ProtocolException>(() => AISyncExecutionCodec.DecodeBatch(packet[..length]));
         foreach (var length in Enumerable.Range(0, bytes.Length))
             AssertEx.Throws<ProtocolException>(() => AISyncExecutionCodec.DecodeReceipt(bytes[..length]));
         var maximum = new AISyncExecutionBatch(scope, 1, Enumerable.Repeat(move, 16).ToArray());
-        AssertEx.Equal(AISyncExecutionCodec.MaxBatchBytes, AISyncExecutionCodec.EncodeBatch(maximum).Length);
+        AssertEx.Equal(72 + 16 * AISyncExecutionCodec.ExtendedRecordBytes, AISyncExecutionCodec.EncodeBatch(maximum).Length);
         var stop = move with { NativeKind = 3, Movement = move.Movement with { Parts = 1, Companion = default,
             CompanionFlags = 0, CompanionRetainedAfter = 0, PrimaryFlags = 2, After = move.Movement.Before } };
         AssertEx.Equal(stop, AISyncExecutionCodec.DecodeBatch(AISyncExecutionCodec.EncodeBatch(new(scope, 2, new[] { stop }))).Records.Single());

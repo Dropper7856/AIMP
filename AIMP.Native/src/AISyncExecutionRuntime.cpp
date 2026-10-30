@@ -201,11 +201,11 @@ bool Route(void*,std::span<const std::uint8_t> bytes,const transactions::Scope& 
     route_runtime::Pump(); // Install value points before the next causal work item.
     return true;
 }
-bool Carrier(void*,std::span<const std::uint8_t> bytes,const transactions::Scope& current) noexcept {
+bool Carrier(void*,std::span<const std::uint8_t> bytes,const transactions::Scope& current,std::uint64_t arrivalTick) noexcept {
     transactions::Scope scope{};std::uint64_t serial{},through{};State state{};
     if(!gMailbox.Current(current,gNativeGeneration)||!gQualify(current,gNativeGeneration)||
         !causal_state::Decode(bytes,scope,serial,through,state)||scope!=current||through!=gSession->AcceptedThrough())return false;
-    return ApplyExecutionCarrier(state,through);
+    return ApplyExecutionCarrier(state,through,arrivalTick);
 }
 execution::Readiness PermitRetirement(void*, const execution::RetirementIdentity& identity) noexcept {
     if (!gSession->Retired() || identity.scope != gScope || !gRetirementQualify ||
@@ -326,6 +326,21 @@ bool CurrentScope(transactions::Scope& output) noexcept {
     output=gScope;return true;
 }
 std::size_t ActorRequests(std::uintptr_t c) noexcept {return Available()?gSession->ActorRequests(c):0U;}
+bool OrdinaryMotionAvailable(const execution::ActorLifetime& actor) noexcept {
+    transactions::Scope scope{};
+    if(!CurrentScope(scope)||gRetireRequested.load(std::memory_order_acquire)||
+        gSession->OperationInProgress()||gOwnership->InTransition()||
+        actor.nativeGeneration!=gNativeGeneration||!actor.creationSerial||
+        gSession->ActorRequests(actor.character)!=0U)return false;
+    for(std::size_t i=0;i<gOwnership->Count();++i) {
+        execution::OwnershipToken token{};execution::OwnershipPhase phase{};
+        if(!gOwnership->Read(i,token,phase))return false;
+        if(token.actor.character!=actor.character)continue;
+        if(token.actor!=actor||token.scope!=scope)return false;
+        if(phase!=execution::OwnershipPhase::Owned&&phase!=execution::OwnershipPhase::Released)return false;
+    }
+    return true;
+}
 action_correlation::Readiness ActionReadiness(const action_correlation::Reference& reference,
     const transactions::OwnerKey& owner,const execution::ActorLifetime& actor,std::size_t* blockingRequests,bool admittedHistory) noexcept {
     using Ready=action_correlation::Readiness;
