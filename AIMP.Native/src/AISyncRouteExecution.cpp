@@ -801,7 +801,7 @@ void Pump() noexcept {
         if(slot.actorDestroyed||slot.worldRevoked)static_cast<void>(RetireDestroyedRoute(slot));
         // Quiet route/history still take the normal verified destruction path.
         // Non-quiet orphan results must not permanently fence the next round.
-        if(QuarantineDestroyedWorldSlot(value))continue;
+        if(!Quiet(slot,false)&&QuarantineDestroyedWorldSlot(value))continue;
         if(!slot.retirementFault&&!slot.retiring&&Quiet(slot,false)) {
             // Exact B removal, empty route, both raw-B lists and no-worker
             // provenance. Only history remains; native erase retains sentinel.
@@ -865,6 +865,9 @@ bool HybridBinding(std::uintptr_t character,execution::NavigationBinding& output
 void BeginScope(const transactions::Scope& scope) noexcept {
     if(!gState||!gEngine||!gEngine())return;
     for(auto& entry:gState->hybrid)if(entry.used&&entry.binding.command.scope!=scope)entry={};
+    // After the prior scope passed its retirement gate, old portable graphs
+    // must not consume the finite cache needed by the next round.
+    for(auto& entry:gState->cache)if(entry.graph&&entry.graph->key.scope!=scope)entry.graph.reset();
 }
 bool CommandRetired(const transactions::Scope& scope,const transactions::OwnerKey& owner,std::uint64_t command) noexcept {
     if(!gState||!gEngine||!gEngine())return false;
