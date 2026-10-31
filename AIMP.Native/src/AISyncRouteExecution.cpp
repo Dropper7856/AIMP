@@ -155,7 +155,14 @@ bool Guard(void* context,const Key& key,const LocalContext& local,
         local.navigation==slot.local.navigation&&local.block==slot.local.block&&!local.result&&!local.resultControl);
 }
 bool Reject(const execution::NavigationBinding& binding) noexcept {
-    if(gState&&Qualified(binding)) {
+    // A route may fail after native cancellation already invalidated its
+    // executable binding. Remember the Host-authorized failure independently
+    // of the temporary route/lease qualification: otherwise the failed request
+    // is retired before the client fallback can ever observe it.
+    // BeginScope/actor destruction revoke the remembered identity.
+    if(gState&&binding.policy==movement::Navigation::HostRoute&&
+        binding.command.command!=0U&&binding.command.actor.character!=0U&&
+        binding.command.actor.creationSerial!=0U) {
         Hybrid* available{};bool found{};
         for(auto& entry:gState->hybrid) {
             if(entry.used&&!gQualify(entry.binding.command.scope))entry={};
@@ -785,7 +792,10 @@ bool Retired(const transactions::Scope& scope) noexcept {
 bool HybridBinding(std::uintptr_t character,execution::NavigationBinding& output) noexcept {
     if(!gState||!gEngine||!gEngine())return false;
     for(auto& entry:gState->hybrid)if(entry.used) {
-        if(!Qualified(entry.binding)){entry={};continue;}
+        // A temporarily unqualified native request is precisely the situation
+        // for which recovery is needed. Do not destroy its copied identity
+        // here; the real scope/actor lifetime boundaries revoke it.
+        if(!Qualified(entry.binding))continue;
         if(entry.binding.command.actor.character==character){output=entry.binding;return true;}
     }
     return false;
