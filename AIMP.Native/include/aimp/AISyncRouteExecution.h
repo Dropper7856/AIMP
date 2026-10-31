@@ -42,7 +42,7 @@ void BeginScope(const transactions::Scope&) noexcept;
 using HostPose = bool(*)(const transactions::OwnerKey&, std::array<float,3>&) noexcept;
 void SetHostPoseQuery(HostPose) noexcept;
 // Diagnostic: retained route slots and the first slot's native quiet checks.
-struct SlotReport { std::uint32_t total{}, local{}, quietMask{}, quarantined{}; }; // local is always zero.
+struct SlotReport { std::uint32_t total{}, local{}, quietMask{}, quarantined{}, destroyed{}, revoked{}; }; // local is always zero.
 [[nodiscard]] SlotReport LiveSlots() noexcept;
 struct Counters {
     std::uint64_t suppressed{},published{},installed{},replacements{},rejected{},retired{},failureCommand{};
