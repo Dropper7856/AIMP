@@ -9546,8 +9546,14 @@ void PumpOnEngineThread() noexcept {
     // configuration still waits for the old context. Otherwise that very
     // configuration gate prevents its prerequisite route retirement forever.
     route_execution::Pump();
+    // NativeIdle counts deliberately pinned old-world observations. They are
+    // not executable after RetireNative(false), and must not keep triggering
+    // RetireHost(): that increments the Host source revision and overwrites a
+    // freshly queued second-round Offer with Close before PumpHost sees it.
+    // Retire only when an unfenced native observation still needs cleanup.
     if (Installed() && !host_producer::EngineProducer().Bound() &&
-        !host_producer::NativeIdle() && gGeneration == gGenerations->CurrentGeneration())
+        host_producer::NativeNeedsLiveWorldRetirement() &&
+        gGeneration == gGenerations->CurrentGeneration())
         host_producer::RetireNative(true);
     combat::Pump(GetTickCount64());
     // Own native path-query references independently of Characters. Maintain
@@ -10464,6 +10470,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"hostSourceBound", Diagnostics::Boolean(host_producer::EngineProducer().Bound()), true},
          {"hostNativeRetainedLeases", Diagnostics::Unsigned(host_producer::RetainedNativeLeases()), true},
          {"hostNativeFencedLeases", Diagnostics::Unsigned(host_producer::FencedOldNativeLeases()), true},
+         {"hostNativeNeedsRetirement", Diagnostics::Boolean(host_producer::NativeNeedsLiveWorldRetirement()), true},
          {"hostCoverageLosses", Diagnostics::Unsigned(host_producer::Coverage().losses), true},
          {"hostFirstLossSite", Diagnostics::Unsigned(host_producer::Coverage().firstSite), true},
          {"hostLastLossSite", Diagnostics::Unsigned(host_producer::Coverage().lastSite), true},
