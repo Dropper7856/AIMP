@@ -25,6 +25,7 @@ std::atomic<std::uint64_t> gFailureCommand{};
 constexpr ULONGLONG kRouteWaitMilliseconds=2000;
 std::atomic<std::uint32_t> gFailureSite{},gFailureResult{},gImportStage{},gContextCheck{};
 std::atomic<std::uint64_t> gAppendPublished{},gContinuationPublished{},gCompoundRequests{};
+std::atomic<std::uint64_t> gOrphanQuarantined{},gOrphanQuarantineRejected{};
 std::atomic<std::uint32_t> gLastAdmissionMode{},gLastIncomingCount{},gLastCompoundParts{};
 bool gPumping{};
 template<class T> bool Read(std::uintptr_t at,T& value) noexcept {
@@ -63,6 +64,11 @@ struct Cached {std::unique_ptr<Graph> graph;};
 struct Hybrid {bool used{};execution::NavigationBinding binding{};};
 struct State {
     std::array<std::unique_ptr<Slot>,kCapacity> slots;
+    // Confirmed dead-world requests can retain native M/R/mesh refs after the
+    // retail destructor has made their usual release callbacks impossible.
+    // Keep those refs alive without treating them as executable in a new world.
+    // Capacity is deliberately finite: exhaustion blocks rather than frees.
+    std::array<std::unique_ptr<Slot>,kCapacity> quarantined;
     std::array<Cached,kCapacity> cache;
     std::array<Hybrid,kCapacity> hybrid;
 };
@@ -760,12 +766,42 @@ bool RetireDestroyedRoute(Slot& slot) noexcept {
     // through retail list/Ref destructors; do not wait for a dead actor to tick.
     return Drain(slot,true);
 }
+// After the original Character destructor has returned, a worker-free Host
+// result can remain in N forever: the native owner which would consume/cancel
+// it no longer exists. No native Ref can be destructed or cleared on a guess.
+// A *confirmed* destroyed owner, no B users, and a pinned exact M instead let
+// this one inert request be quarantined for the remainder of the process.
+// Quarantine is not memory reclamation and never invokes a CATHODE callback.
+bool QuarantineDestroyedWorldSlot(std::unique_ptr<Slot>& value) noexcept {
+    if(!value||!value->actorDestroyed||!value->worldRevoked||!value->skipped||
+        value->installing||value->retiring||value->retirementFault||!value->pin||
+        !value->pin->movement||!*value->pin->movement||
+        value->pin->movement->Object()+0xC4!=value->local.navigation)return false;
+    const auto n=value->local.navigation;
+    if(!EmptyRing(n,0x28)||!EmptyRing(n,0x34))return false;
+    // All route parts sharing N must be confirmed destroyed. A live B or new
+    // request must never be hidden from the old-scope retirement barrier.
+    for(const auto& other:gState->slots)if(other&&other.get()!=value.get()&&
+        other->local.navigation==n&&(!other->actorDestroyed||!other->worldRevoked))return false;
+    std::uintptr_t result{};
+    if(!Read(n+0x5C,result)||(result&&result!=value->local.result))return false;
+    for(auto& spare:gState->quarantined)if(!spare) {
+        spare=std::move(value);
+        ++gOrphanQuarantined;
+        return true;
+    }
+    ++gOrphanQuarantineRejected;
+    return false;
+}
 void Pump() noexcept {
     if(!gState||!gEngine||!gEngine()||gFrame||gAdmission||gPumping)return;
     struct PumpGuard {PumpGuard(){gPumping=true;}~PumpGuard(){gPumping=false;}} pumping;
     for(auto& value:gState->slots)if(value) {
         auto& slot=*value;
         if(slot.actorDestroyed||slot.worldRevoked)static_cast<void>(RetireDestroyedRoute(slot));
+        // Quiet route/history still take the normal verified destruction path.
+        // Non-quiet orphan results must not permanently fence the next round.
+        if(QuarantineDestroyedWorldSlot(value))continue;
         if(!slot.retirementFault&&!slot.retiring&&Quiet(slot,false)) {
             // Exact B removal, empty route, both raw-B lists and no-worker
             // provenance. Only history remains; native erase retains sentinel.
@@ -847,6 +883,9 @@ void SetHostPoseQuery(HostPose) noexcept {}
 SlotReport LiveSlots() noexcept {
     SlotReport report{};
     if(!gState)return report;
+    report.quarantined=static_cast<std::uint32_t>(std::count_if(
+        gState->quarantined.begin(),gState->quarantined.end(),
+        [](const auto& slot) noexcept {return static_cast<bool>(slot);}));
     for(const auto& slot:gState->slots)if(slot) {
         if(!report.total) {
             const auto n=slot->local.navigation;std::uintptr_t head{},cursor{};
