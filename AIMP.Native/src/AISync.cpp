@@ -10348,6 +10348,8 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"routeSlots", Diagnostics::Unsigned(route_execution::LiveSlots().total), true},
          {"routeSlotsLocal", Diagnostics::Unsigned(route_execution::LiveSlots().local), true},
          {"routeSlotsQuarantined", Diagnostics::Unsigned(route_execution::LiveSlots().quarantined), true},
+         {"routeSlotsDestroyed", Diagnostics::Unsigned(route_execution::LiveSlots().destroyed), true},
+         {"routeSlotsRevoked", Diagnostics::Unsigned(route_execution::LiveSlots().revoked), true},
          {"routeFirstQuietMask", Diagnostics::Unsigned(route_execution::LiveSlots().quietMask), true}});
     for(std::size_t index=0;index<profiling::kNames.size();++index) {
         const auto sample=profiling::Read(static_cast<profiling::Section>(index));
