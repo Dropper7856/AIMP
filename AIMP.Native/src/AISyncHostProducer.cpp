@@ -24,6 +24,8 @@ std::uint32_t gPendingGeneration{};
 std::uint64_t gRevision{}, gApplied{};
 QualifyHost gQualify{};
 bool gPumping{}; // Qualified engine-thread reentry barrier.
+std::atomic<std::uint64_t> gOffersQueued{},gOffersCancelled{},gQualificationRejected{},gConfigurationRejected{},gReadyProduced{};
+std::uint64_t gLastUnqualifiedRevision{},gLastRejectedConfigureRevision{};
 }
 bool Producer::ControlLocked(execution::ControlKind kind, std::uint32_t value, std::uint64_t through) noexcept {
     if (count_ == kPackets || token_ == UINT64_MAX ||
@@ -301,7 +303,9 @@ bool QueueBindingHost(std::span<const std::uint8_t> bytes, std::uint32_t generat
     const std::lock_guard lock(gBindingGate);
     if (!gQualify || gRevision == UINT64_MAX) return false;
     if (control.kind != execution::ControlKind::Offer && control.scope != gPending.scope) return false;
-    gPending = control; gPendingGeneration = generation; ++gRevision; return true;
+    gPending = control; gPendingGeneration = generation; ++gRevision;
+    if(control.kind==execution::ControlKind::Offer)++gOffersQueued;
+    return true;
 }
 void PumpHost() noexcept {
     if (gPumping) return;
@@ -319,6 +323,10 @@ void PumpHost() noexcept {
     }
     if (!qualify(control.scope,generation)) {
         const std::lock_guard lock(gBindingGate);
+        if(revision==gRevision && control.kind==execution::ControlKind::Offer &&
+            revision!=gLastUnqualifiedRevision) {
+            gLastUnqualifiedRevision=revision;++gQualificationRejected;
+        }
         if (revision == gRevision && gSource.Bound()) gSource.Retire();
         return;
     }
@@ -327,13 +335,24 @@ void PumpHost() noexcept {
     const std::lock_guard lock(gBindingGate);
     if (revision != gRevision) return;
     if (gApplied == revision) return;
-    if (control.kind==execution::ControlKind::Checkpoint ? gSource.Checkpoint(control,generation) : gSource.Configure(control,generation))
-        gApplied = revision;
+    const bool configured=control.kind==execution::ControlKind::Checkpoint ?
+        gSource.Checkpoint(control,generation) : gSource.Configure(control,generation);
+    if(configured) {
+        gApplied=revision;
+        if(control.kind==execution::ControlKind::Offer)++gReadyProduced;
+    } else if(control.kind==execution::ControlKind::Offer && revision!=gLastRejectedConfigureRevision) {
+        gLastRejectedConfigureRevision=revision;++gConfigurationRejected;
+    }
 }
 void RetireHost() noexcept {
     const std::lock_guard lock(gBindingGate);
+    if(gPending.kind==execution::ControlKind::Offer&&gRevision!=gApplied)++gOffersCancelled;
     if (gRevision != UINT64_MAX) ++gRevision;
     gPending.kind = execution::ControlKind::Close; gSource.Retire();
+}
+BindingPumpDiagnostics BindingPumpStatus() noexcept {
+    return {gOffersQueued.load(),gOffersCancelled.load(),gQualificationRejected.load(),
+        gConfigurationRejected.load(),gReadyProduced.load()};
 }
 bool PeekHost(HostPacket& packet) noexcept { return gSource.Peek(packet); }
 bool CommitHost(std::uint64_t token) noexcept { return gSource.Commit(token); }
