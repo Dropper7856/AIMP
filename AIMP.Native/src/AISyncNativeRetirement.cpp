@@ -41,7 +41,7 @@ RetirementProgress NativeRequestAdapter::RetirementState() const noexcept {
 }
 bool NativeRequestAdapter::RetirementLive(const Lease& lease) const noexcept {
     std::uint32_t runtime{},status{}; std::uintptr_t owner{}; LONG strong{};
-    return (lease.kind == 1 || lease.kind == 3 || lease.kind == 4 || lease.kind == 5 || lease.kind == 7 || lease.kind == 9 ||
+    return (lease.kind == 1 || lease.kind == 2 || lease.kind == 3 || lease.kind == 4 || lease.kind == 5 || lease.kind == 7 || lease.kind == 9 ||
         scheduler_control::Supported(lease.kind)) && lease.actor.exclusiveExecution &&
         Read(lease.ref.control + 4, strong) && strong > 0 &&
         Read(lease.ref.object + 0xC,status) && status <= 6U &&
@@ -75,10 +75,10 @@ void NativeRequestAdapter::ConfirmActorDestroyed(const LocalActorBinding& actor)
 void NativeRequestAdapter::DrainDestroyedLease(Lease& lease) noexcept {
     if(!lease.refCertified||lease.releaseEntered)return;
     std::uintptr_t type{};std::uint32_t status{};LONG strong{};
-    const auto expected=lease.kind==1?0xEB1A70U:lease.kind==3?0xEB1A50U:lease.kind==4?0xEB19CCU:
+    const auto expected=lease.kind==1?0xEB1A70U:lease.kind==2?0xEB1A60U:lease.kind==3?0xEB1A50U:lease.kind==4?0xEB19CCU:
         lease.kind==5?0xEB198CU:lease.kind==7?0xEB19BCU:lease.kind==9?0xEB19ACU:
         scheduler_control::Supported(lease.kind)?scheduler_control::kTypeRva:0U;
-    const auto destructor=lease.kind==1?0x282B10U:lease.kind==3?0x282B50U:0x27F830U;
+    const auto destructor=lease.kind==1?0x282B10U:(lease.kind==2||lease.kind==3)?0x282B50U:0x27F830U;
     std::uintptr_t actualDestructor{};
     // Only the strongly retained request is read here. The Character and its
     // scheduler are gone. Native 00688410/00686C80 drained both scheduler lists;

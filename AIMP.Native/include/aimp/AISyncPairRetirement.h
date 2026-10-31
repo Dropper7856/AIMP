@@ -39,6 +39,9 @@ using Qualifier = bool(*)(const interactions::Key&, const interactions::Binding&
 // Prevents new tracking of this construction. Existing return tokens and
 // independently tracked source/victim cleanup evidence remain valid.
 void Invalidate(const interactions::LocalParticipant&) noexcept;
+// Drop only value-only tracking from older, revoked native worlds. No native
+// destructor/finish proof is manufactured; late return tokens cannot match.
+[[nodiscard]] bool ResetForWorld(std::uint32_t currentNativeGeneration) noexcept;
 
 // Ready releases AIMP's value-only reservation. It is not a worker-join or a
 // license to free engine graphs, native Refs, resources or callback storage.

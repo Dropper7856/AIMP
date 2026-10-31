@@ -14,6 +14,9 @@ struct LocalActorBinding {
     bool operator==(const LocalActorBinding&) const noexcept = default;
 };
 using ResolveActor = bool(*)(void*, const transactions::OwnerKey&, LocalActorBinding&) noexcept;
+using MarkerResolve = bool(*)(const transactions::Record&, std::uint32_t& localMarker) noexcept;
+void SetMarkerResolver(MarkerResolve) noexcept;
+enum class MarkerInitialization : std::uint8_t { Unowned, Applied, Rejected };
 using Permission = bool(*)(void*, const transactions::Record&) noexcept;
 enum class Readiness : std::uint8_t { Ready, Waiting, Rejected };
 // Temporary capability ownership is a dependency, not an authority failure.
@@ -23,10 +26,6 @@ using DependencyGate = Readiness(*)(void*, const transactions::Record&) noexcept
 using IntentCheck = Readiness(*)(const transactions::Record&,const LocalActorBinding&) noexcept;
 using IntentInvoke = transactions::NativeOutcome(*)(const transactions::Record&,const LocalActorBinding&) noexcept;
 void SetNativeIntentAdapter(IntentCheck,IntentInvoke) noexcept;
-// Hybrid AISync consumes navigation/ordinary-turn/control contracts as causal bookkeeping.
-// Its single pose follower owns ordinary locomotion; no second native path
-// request is allocated. The embedding still validates scope/incarnation.
-void SetHybridMovementAdapter(IntentCheck,IntentInvoke) noexcept;
 // Diagnostic trace of one native Character lifecycle event (placement,
 // backstage, frontstage). Host stages: 1 capture guard closed, 2 actor not
 // tracked, 3 nested call skipped, 4 emitted, 5 emission failed. Client
@@ -50,8 +49,8 @@ void SetCommandTrace(CommandTrace) noexcept;
 using ConsumedAction = bool(*)(const transactions::Record&) noexcept;
 void SetConsumedAction(ConsumedAction) noexcept;
 [[nodiscard]] std::uint64_t ConsumedActions() noexcept;
-// Latest authoritative Host pose of this owner, as already received in the
-// ordered stream. Used only to keep the Client from running AHEAD of the Host.
+// Compatibility diagnostic hook. Native requests never query a Host pose to
+// authorize admission, alter a goal, catch up or restart a route.
 using HostPoseQuery = bool(*)(const transactions::OwnerKey&, std::array<float,3>&) noexcept;
 void SetHostPoseQuery(HostPoseQuery) noexcept;
 // True while another native executor (paired interaction source/victim)
@@ -110,10 +109,10 @@ public:
     // Diagnostic only: which native dependency the last Waiting Check reported.
     // 2 dependency gate, 3 actor/ownership, 4 locomotion resources,
     // 5 Host route provider, 6 goal edit not yet accepted natively,
-    // 7 ended Move awaiting native restart, 8 Host has not started this Move yet.
+    // 7 ended Move awaiting native restart. Pose is never an admission gate.
     [[nodiscard]] std::uint32_t LastWaitReason() const noexcept { return waitReason_; }
     void ClearWaitReason() noexcept { waitReason_ = 0; }
-    // Backstage/frontstage transitions that needed the Host pose applied.
+    // Retained diagnostic: synthetic transition pose placements are disabled.
     [[nodiscard]] std::uint64_t TransitionPlacements() const noexcept { return transitionPlacements_; }
     [[nodiscard]] std::uint64_t LifecycleEvents() const noexcept { return lifecycleEvents_; }
     [[nodiscard]] transactions::NativeOutcome Invoke(const transactions::Record&) noexcept;
@@ -121,6 +120,10 @@ public:
     [[nodiscard]] std::size_t ActiveCount() const noexcept;
     [[nodiscard]] std::size_t ActiveCount(const transactions::OwnerKey&) const noexcept;
     [[nodiscard]] std::size_t ActorRequests(std::uintptr_t character, const transactions::Record* compatibleAction = nullptr) const noexcept;
+    // Between mailbox calls, the embedding first qualifies scope/world/thread.
+    // Matches the exact current scheduler head and a live admitted typed kind8
+    // lease through the local ownership resolver, never wire-call permission.
+    [[nodiscard]] bool IsOwnedPlacement(std::uintptr_t scheduler,RetirementIdentity* identity = nullptr) const noexcept;
     // Native seam correlation only. The embedding owner first qualifies its
     // current scope/world/thread. Unlike wire dispatch permission, the local
     // ownership resolver is valid between mailbox operations. Admitting means
@@ -128,6 +131,14 @@ public:
     // Unknown typed ownership must never run a local solver.
     [[nodiscard]] NavigationOwnership IdentifyNavigation(std::uintptr_t navigation,
         std::uintptr_t block, NavigationBinding&, bool currentLifetime = true) noexcept;
+    // Replace only 00681810; rejected ownership must never run the original.
+    [[nodiscard]] MarkerInitialization InitializeMarker(std::uintptr_t request,
+        std::uintptr_t character, bool currentLifetime) noexcept;
+    // Engine-qualified local route refusal, with no invented wire operation.
+    // Cancels the exact retained command (both parts), keeps its strong Refs
+    // for authoritative Release and fences future Submit/Update. False leaves
+    // busy, stale or uncertain work with the caller; never broadens ownership.
+    [[nodiscard]] bool RejectNavigation(const NavigationBinding&) noexcept;
     // Compatibility entry point; HostRoute movement is executed by the native
     // route importer. This method no longer generates intermediate goals.
     void SteerMovements() noexcept;
@@ -155,21 +166,19 @@ private:
         std::uint32_t kind{}, revision{}, admission{};
         bool used{}, admitted{}, cancelled{}, unknown{}, secondary{};
         bool refCertified{}, releaseEntered{}, actorDestroyed{};
+        bool routeRejected{};
         movement::Bundle movement{};
+        native_intent::Payload markerPayload{};
+        transactions::Record* markerRecord{}; // Borrows this slot's retained operation below.
+        std::uint32_t localMarker{};
+        bool markerInitializing{}, markerInitialized{};
         Ref movementResource{};
-        // Host-guided Move: last goal written natively and path progress.
-        std::array<float,3> steeredGoal{};
-        std::uint32_t steerRoute{};
-        std::uint32_t steerParameters{};
-        std::size_t steerSegment{};
-        bool steerFinal{}, steerStopApplied{};
     };
     [[nodiscard]] Lease* Find(const transactions::Record&) noexcept;
     [[nodiscard]] bool Resolve(const transactions::Record&, LocalActorBinding&) noexcept;
     [[nodiscard]] bool Live(const Lease&, const LocalActorBinding&) const noexcept;
     [[nodiscard]] transactions::NativeOutcome InvokePinned(const transactions::Record&, const LocalActorBinding&) noexcept;
     [[nodiscard]] transactions::NativeOutcome InvokeLifecycle(const transactions::Record&, const LocalActorBinding&) noexcept;
-    void PlaceAtTransition(const transactions::Record&, const LocalActorBinding&) noexcept;
     [[nodiscard]] Readiness CheckMovement(const transactions::Record&, const LocalActorBinding&) noexcept;
     [[nodiscard]] Readiness Resources(std::uintptr_t character) noexcept;
     [[nodiscard]] transactions::NativeOutcome InvokeMovement(const transactions::Record&, const LocalActorBinding&) noexcept;
@@ -179,6 +188,10 @@ private:
     [[nodiscard]] bool MovementStop(Lease&, float, std::uint8_t) noexcept;
     [[nodiscard]] bool MovementParameters(Lease&, const movement::Parameters&, bool initial) noexcept;
     [[nodiscard]] bool MovementRevalidate(const transactions::Record&, Lease&) noexcept;
+    [[nodiscard]] bool MarkerInsert(Lease&) noexcept;
+    [[nodiscard]] bool MarkerFields(Lease&, bool after) noexcept;
+    [[nodiscard]] bool MarkerRevalidate(const Lease&) noexcept;
+    [[nodiscard]] bool NavigationRevalidate(const Lease&) noexcept;
     [[nodiscard]] bool RestartMovement(Lease&, const transactions::Record&, const LocalActorBinding&) noexcept;
     void MovementUnknown(const transactions::Record&) noexcept;
     [[nodiscard]] bool CheckImage() const noexcept;
@@ -191,6 +204,9 @@ private:
     void DrainDestroyedLease(Lease&) noexcept;
     void DrainLease(Lease&, RetirementGuard, void* context) noexcept;
     std::array<Lease, kCapacity> leases_{};
+    // Separate ownership keeps Lease trivially destructible at the native SEH
+    // boundaries. Reused slots replace their copy; storage stays bounded.
+    std::array<std::unique_ptr<transactions::Record>, kCapacity> markerRecords_{};
     std::uintptr_t base_{};
     Permission permission_{};
     DependencyGate dependencyGate_{};
@@ -213,6 +229,10 @@ private:
     bool (*movementAdmission_)(void*,std::uintptr_t,std::uint32_t,bool&) noexcept{};
     bool (*movementGoal_)(void*,std::uintptr_t,const float*,bool) noexcept{};
     bool (*movementStop_)(void*,std::uintptr_t,float,std::uint8_t) noexcept{};
+    bool (*movementRoutesAvailable_)() noexcept{};
+    bool (*movementRouteQuiet_)(void*,const transactions::Record&) noexcept{}; // Private native-call test seam.
+    bool (*markerGoal_)(void*,std::uintptr_t,const float*) noexcept{};
+    bool (*markerInsertion_)(void*,std::uintptr_t,std::uintptr_t) noexcept{};
 };
 // Host Updates accepted as no-op because the local Move had already ended.
 [[nodiscard]] std::uint64_t UpdatesAfterLocalEnd() noexcept;

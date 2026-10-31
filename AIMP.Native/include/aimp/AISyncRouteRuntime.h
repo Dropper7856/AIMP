@@ -17,10 +17,14 @@ struct Packet {
 void Disable() noexcept; // Stops path capture and value admission.
 [[nodiscard]] bool QueueClient(std::span<const std::uint8_t>) noexcept;
 void Pump() noexcept; // Engine thread only, no IPC locks held.
+// Producer's immediate callback after complete Submit/Update finalization.
+// Caller retains and revalidates the exact request/M owner for this N/B.
+// Consumes only metadata observed at the native post-install capture seam.
+void ObserveHostNavigation(std::uintptr_t navigation,std::uintptr_t block) noexcept;
 // Copied diagnostic, any thread. Command fence covers both parts and Updates;
 // no native ownership or completion is inferred from this value.
 [[nodiscard]] bool CommandBlocked(const route::Key&,route::Failure&) noexcept;
-// Commands the Host published without a capturable path (Client plans natively).
+// Commands the Host published without a capturable path (command-local refusal).
 [[nodiscard]] std::uint64_t HostRoutesUnavailable() noexcept;
 [[nodiscard]] std::uint64_t LocalPlanningFallbacks() noexcept;
 // Host-route requests planned natively because the Client was off the route start / replanned it.
@@ -41,6 +45,7 @@ struct Counters {
     std::uint32_t queuedPackets{},lastQueueRejection{},lastQueryOwnership{},lastQueryPolicy{},lastQueryKind{};
     std::uint64_t hostCaptureDeferred{};
     std::uint32_t hostCaptureCheck{};
+    std::uint32_t hostCaptureNode{UINT32_MAX},hostMarkerIndex{UINT32_MAX},hostMarkerKind{UINT32_MAX},hostMarkerTypeRva{UINT32_MAX};
 };
 [[nodiscard]] Counters Diagnostics() noexcept;
 // Bounded value-only failure records, copied on the engine thread and drained

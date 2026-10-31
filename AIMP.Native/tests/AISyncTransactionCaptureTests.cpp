@@ -456,7 +456,7 @@ void TestTypedMovement(const char* path) {
     Require(host_producer::InstallNative(base,hooks,nativeContext,[]()noexcept{return true;},
         [](const Scope&,const OwnerKey&,std::uintptr_t,std::uint32_t)noexcept{return true;},error),"Move source install failed");
     auto& producer=host_producer::EngineProducer();auto scope=ContextValue().scope;
-    Require(producer.Configure({scope,execution::ControlKind::Offer,23},1),"Move source bind failed");
+    Require(producer.Configure({scope,execution::ControlKind::Offer,23U|execution::kProfileRoutes},1),"Move source bind failed");
     host_producer::HostPacket packet{};Require(producer.Peek(packet)&&producer.Commit(packet.token),"Move source Ready missing");
     for(std::size_t i=0;i<2;++i) {
         auto& r=requests[i];const auto address=reinterpret_cast<std::uintptr_t>(r.data());
@@ -487,7 +487,7 @@ void TestTypedMovement(const char* path) {
     Require(producer.Peek(packet)&&!packet.control&&execution::DecodeBatch(std::span(packet.bytes).first(packet.size),scope,batch)&&batch.count==2,
         "bracketed Move did not emit Begin/Submit");
     const auto& b=batch.records[1].movement;
-    Require(b.parts==2&&b.before.flags90==0x21&&b.after.flags90==5&&b.after.stopDistance==.5F&&
+    Require(b.navigation==movement::Navigation::HostRoute&&b.parts==2&&b.before.flags90==0x21&&b.after.flags90==5&&b.after.stopDistance==.5F&&
         b.companion.retained==0&&b.companionRetainedAfter==1&&b.companionFlags==2&&b.gait==3,"Move submission phases were flattened");
     Require(gNativeStrong==2&&controls[0][1]==2&&controls[1][1]==2&&producer.Commit(packet.token),"Move source refs not pinned");
     host_producer::BeginNativeMove(character,stateAddress);
@@ -614,16 +614,43 @@ void TestTypedControls(const char* path) {
     Require(host_producer::InstallNative(base,hooks,context,[]()noexcept{return true;},
         [](const Scope&,const OwnerKey&,std::uintptr_t,std::uint32_t)noexcept{return true;},error),"control source install failed");
     auto& producer=host_producer::EngineProducer();const auto scope=ContextValue().scope;
-    Require(producer.Configure({scope,execution::ControlKind::Offer,execution::kProfileSchedulerControl},1),"control source configure failed");
+    Require(producer.Configure({scope,execution::ControlKind::Offer,execution::kProfileSchedulerControl|execution::kProfilePlacement},1),"control source configure failed");
     host_producer::HostPacket packet{};Require(producer.Peek(packet)&&producer.Commit(packet.token),"control Ready missing");
     unsigned runs{};
-    for(const auto kind:{6U,11U})for(const auto admission:{0U,1U,2U})for(const auto status:{3U,5U})
+    // A configured profile alone never enables native kind8 capture.
+    Require(!execution::PlacementDedupReady(),"placement gate enabled before integration proof");
+    {
+        std::array<std::uint32_t,16> request{};
+        request[0]=static_cast<std::uint32_t>(base+scheduler_control::kTypeRva);request[4]=8;request[5]=static_cast<std::uint32_t>(scheduler);
+        const auto address=reinterpret_cast<std::uintptr_t>(request.data());
+        host_producer::BeforeNativeAdmission(address,0);host_producer::ObserveNativeAdmission(address,true);host_producer::PumpNative();
+        Require(host_producer::NativeIdle()&&!producer.Peek(packet)&&host_producer::UncoveredKind(8)>0,"placement captured before dedup proof");
+    }
+    execution::SetPlacementDedupReady(true); // Test process only; no game is executed.
+    for(const auto branch:{2U,255U}) {
+        std::array<std::uint32_t,16> request{};
+        request[0]=static_cast<std::uint32_t>(base+scheduler_control::kTypeRva);request[4]=8;
+        request[5]=static_cast<std::uint32_t>(scheduler);
+        reinterpret_cast<std::uint8_t*>(request.data())[0x2C]=static_cast<std::uint8_t>(branch);
+        const auto address=reinterpret_cast<std::uintptr_t>(request.data());
+        const auto uncovered=host_producer::UncoveredKind(8),losses=host_producer::Coverage().losses;
+        host_producer::BeforeNativeAdmission(address,0);host_producer::ObserveNativeAdmission(address,true);
+        host_producer::PumpNative();
+        Require(producer.Bound()&&host_producer::Coverage().losses==losses&&host_producer::NativeIdle()&&
+            host_producer::UncoveredKind(8)>uncovered&&!producer.Peek(packet),
+            "unsupported placement branch closed source or acquired a native Ref");
+    }
+    for(const auto kind:{6U,8U,11U})for(const auto admission:{0U,1U,2U})for(const auto status:{3U,5U})
         for(const auto before:{0U,1U})for(const auto after:{0U,1U}) {
         std::array<std::uint32_t,16> request{};std::array<LONG,3> control{0,1,1};
         const auto address=reinterpret_cast<std::uintptr_t>(request.data());
         request[0]=static_cast<std::uint32_t>(base+scheduler_control::kTypeRva);
         request[1]=static_cast<std::uint32_t>(address);request[2]=reinterpret_cast<std::uint32_t>(control.data());
         request[3]=0;request[4]=kind;request[5]=static_cast<std::uint32_t>(scheduler);request[6]=before;
+        if(kind==execution::kPlacementKind) {
+            const float pose[]{1.25F,-2.5F,3.75F,-1.25F};std::memcpy(request.data()+7,pose,sizeof(pose));
+            reinterpret_cast<std::uint8_t*>(request.data())[0x2C]=static_cast<std::uint8_t>(admission&1U);
+        }
         host_producer::BeforeNativeAdmission(address,admission);
         request[3]=2;request[6]=after;host_producer::ObserveNativeAdmission(address,true);
         // Real00683470 receives a strong Ref and turns3/5 into6 when not
@@ -638,7 +665,12 @@ void TestTypedControls(const char* path) {
             for(std::size_t i=0;i<batch.count;++i) {
                 const auto& operation=batch.records[i];Require(operation.nativeKind==kind,"control kind converted");
                 observed.push_back(operation.opcode);
-                if(operation.opcode==Op::Submit){Require(operation.admission==admission,"control queue order changed");retention=operation.scalarRetention;}
+                if(operation.opcode==Op::Submit){
+                    Require(operation.admission==admission,"control queue order changed");retention=operation.scalarRetention;
+                    if(kind==execution::kPlacementKind)Require(operation.flags==HasGoal&&operation.mode==(admission&1U)&&
+                        operation.goalX==1.25F&&operation.goalY==-2.5F&&operation.goalZ==3.75F&&operation.aux==-1.25F,
+                        "kind8 capture changed authored pose/yaw/branch");
+                }
             }
             Require(producer.Commit(packet.token),"control commit failed");
         }
@@ -647,7 +679,65 @@ void TestTypedControls(const char* path) {
         ++runs;
     }
     Require(gNativeRelease==runs&&producer.Bound(),"control source leaked or closed coverage");
+    execution::SetPlacementDedupReady(false);
     Require(hooks.UninstallAll(error)&&hooks.ReleaseRetiredTrampolines(true,error),"control hook rollback failed");
+}
+void TestTypedMarkers(const char* path) {
+    DataImage image(path);const auto base=image.Base();
+    TestThunk(base+0x6D8F0,reinterpret_cast<std::uintptr_t>(&TestStrong));
+    TestThunk(base+0xD770,reinterpret_cast<std::uintptr_t>(&TestRelease));
+    gNativeStrong=gNativeRelease=0;
+    std::vector<std::uint8_t> actor(0x42B0);std::array<std::uint32_t,0x198/4> motion{};
+    std::array<std::uint32_t,64> request{};std::array<LONG,3> control{0,1,1},motionControl{0,1,1};
+    const auto character=reinterpret_cast<std::uintptr_t>(actor.data()),at=reinterpret_cast<std::uintptr_t>(request.data());
+    *reinterpret_cast<std::uint32_t*>(actor.data()+0x50)=19;
+    *reinterpret_cast<std::uintptr_t*>(actor.data()+0x2CD0)=character;
+    *reinterpret_cast<std::uintptr_t*>(actor.data()+0x42A8)=reinterpret_cast<std::uintptr_t>(motion.data());
+    *reinterpret_cast<std::uintptr_t*>(actor.data()+0x42AC)=reinterpret_cast<std::uintptr_t>(motionControl.data());
+    request[0]=base+0xEB1A60;request[1]=at;request[2]=reinterpret_cast<std::uintptr_t>(control.data());
+    request[3]=1;request[4]=2;request[5]=character+0x2CD0;request[0xB0/4]=17;
+    reinterpret_cast<std::uint8_t*>(request.data())[0xB4]=1;
+    aimp::HookManager hooks(true,true);std::string error;
+    Require(host_producer::InstallNative(base,hooks,[](std::uintptr_t c,OwnerKey& owner)noexcept{
+        if(*reinterpret_cast<std::uint32_t*>(c+0x50)!=19)return false;owner=ContextValue().owner;return true;
+    },[]()noexcept{return true;},[](const Scope&,const OwnerKey&,std::uintptr_t,std::uint32_t)noexcept{return true;},error),"marker capture hooks failed");
+    host_producer::SetNativeMarkerCapture([](std::uint32_t local,native_intent::Payload& p)noexcept{
+        if(local!=17)return false;p={};p.words[0]=24;p.words[1]=1;p.words[2]=7;p.words[10]=1;p.words[11]=3;return true;
+    });
+    auto& source=host_producer::EngineProducer();const auto scope=ContextValue().scope;
+    Require(source.Configure({scope,execution::ControlKind::Offer,execution::kProfileMarker|execution::kProfileRoutes},1),"marker source bind failed");
+    host_producer::HostPacket packet{};Require(source.Peek(packet)&&source.Commit(packet.token),"marker Ready missing");
+    host_producer::BeforeNativeAdmission(at,1);host_producer::ObserveNativeAdmission(at,true);
+    host_producer::PumpNative();Require(!source.Peek(packet),"marker published uninitialized local geometry");
+    auto* bytes=reinterpret_cast<std::uint8_t*>(request.data());
+    const std::array<float,3> goal{12,3,-4};std::memcpy(bytes+0x1C,goal.data(),12);
+    *reinterpret_cast<float*>(bytes+0x48)=1.75F;bytes[0xAC]=0x1C;
+    *reinterpret_cast<float*>(bytes+0x74)=8.25F;
+    host_producer::BeforeNativeMarkerInsertion(reinterpret_cast<std::uintptr_t>(motion.data())+0xC4,at+0x1C);
+    request[6]=1;host_producer::PumpNative();execution::Batch batch{};
+    Require(source.Peek(packet)&&execution::DecodeBatch(std::span(packet.bytes).first(packet.size),scope,batch)&&batch.count==2,
+        "marker Begin/Submit missing");
+    const auto initial=batch.records[1];
+    Require(initial.nativeKind==2&&initial.intent.words[10]==1&&initial.intent.words[11]==3&&initial.intent.words[12]==1&&
+        initial.movement.before.goal==goal&&initial.movement.before.query[0]==8.25F&&initial.movement.before.retained==0&&
+        initial.movement.after.retained==1&&source.Commit(packet.token),"marker identity/authoring/retention flattened");
+    host_producer::CommandIdentity identity{};std::uint32_t part{};
+    Require(host_producer::IdentifyNativeNavigation(reinterpret_cast<std::uintptr_t>(motion.data())+0xC4,at+0x1C,identity,part)&&
+        identity.nativeKind==2&&part==0,"marker route correlation missing");
+    // A later native cursor edit must NOT become a new authoritative goal.
+    *reinterpret_cast<float*>(bytes+0x1C)=999;bytes[0xB4]=0;
+    host_producer::PumpNative();
+    Require(source.Peek(packet)&&execution::DecodeBatch(std::span(packet.bytes).first(packet.size),scope,batch)&&batch.count==1&&
+        batch.records[0].opcode==Op::Update&&batch.records[0].intent.words[13]==0&&batch.records[0].movement.after.goal==goal&&
+        source.Commit(packet.token),"marker byte update replaced authored geometry");
+    request[3]=3;host_producer::PumpNative();
+    Require(source.Peek(packet)&&execution::DecodeBatch(std::span(packet.bytes).first(packet.size),scope,batch)&&
+        batch.records[0].opcode==Op::Complete&&source.Commit(packet.token),"marker Complete missing");
+    Require(source.Peek(packet)&&execution::DecodeBatch(std::span(packet.bytes).first(packet.size),scope,batch)&&
+        batch.records[0].opcode==Op::Release&&source.Commit(packet.token),"marker Release missing");
+    Require(gNativeStrong==1&&gNativeRelease==1&&control[1]==1&&host_producer::NativeIdle(),"marker observer Ref leaked");
+    host_producer::SetNativeMarkerCapture(nullptr);
+    Require(hooks.UninstallAll(error)&&hooks.ReleaseRetiredTrampolines(true,error),"marker hook rollback failed");
 }
 void TestTypedInstallation(const char* path, bool corrupt, bool shared = false) {
     using namespace aimp::ai_sync;
@@ -655,9 +745,9 @@ void TestTypedInstallation(const char* path, bool corrupt, bool shared = false) 
     auto registry = std::make_unique<route_identity::Registry>(); route::NativeRouteResult nativeRoute;
     Require(nativeRoute.Initialize(base,true,*registry),"native route ABI checks rejected the rebased original PE");
     aimp::HookManager hooks(true,true); std::string error;
-    constexpr std::array<std::uintptr_t,9> sites{0x2777E0,0x283470,0x288510,0x30A940,0x283C10,0x283550,0x27D0D0,0x30AAEA,0x362417};
-    constexpr std::array<std::size_t,9> lengths{5,5,6,7,6,6,5,5,5};
-    std::array<std::array<std::uint8_t,7>,9> before{};
+    constexpr std::array<std::uintptr_t,11> sites{0x281810,0x28192F,0x2777E0,0x283470,0x288510,0x30A940,0x283C10,0x283550,0x27D0D0,0x30AAEA,0x362417};
+    constexpr std::array<std::size_t,11> lengths{6,5,5,5,6,7,6,6,5,5,5};
+    std::array<std::array<std::uint8_t,7>,11> before{};
     for (std::size_t i = 0; i < sites.size(); ++i)
         std::memcpy(before[i].data(),reinterpret_cast<const void*>(base+sites[i]),lengths[i]);
     if (corrupt) *reinterpret_cast<std::uint8_t*>(base+sites.back()) = 0x90;
@@ -676,7 +766,7 @@ void TestTypedInstallation(const char* path, bool corrupt, bool shared = false) 
         Require(!installed && !error.empty() && hooks.InstalledCount() == 0,"typed hook suffix did not roll back atomically");
         *reinterpret_cast<std::uint8_t*>(base+sites.back()) = before.back()[0];
     } else {
-        Require(installed && hooks.InstalledCount() == (shared ? 12U : sites.size()),"typed native hook prefixes/ABI rejected");
+        Require(installed && hooks.InstalledCount() == (shared ? 14U : sites.size()),"typed native hook prefixes/ABI rejected");
         Require(hooks.UninstallAll(error),"typed hook uninstall failed");
     }
     for (std::size_t i = 0; i < sites.size(); ++i)
@@ -907,6 +997,9 @@ int main(int argc, char** argv) {
             const std::string mode = argv[2];
             if(mode=="mesh-storage") {
                 TestMeshStorage(argv[1]);std::cout<<"Native mesh owned storage, reload pin and hook rollback PASS (offline)\n";return 0;
+            }
+            if(mode=="typed-markers") {
+                TestTypedMarkers(argv[1]);std::cout<<"Marker capture and retained native route identity PASS (offline)\n";return 0;
             }
             if(mode=="typed-movement") {
                 TestTypedMovement(argv[1]);std::cout<<"Move source phases, pending goal, companion and observer lifetime PASS (offline)\n";return 0;

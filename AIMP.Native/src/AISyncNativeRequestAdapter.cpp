@@ -1,28 +1,15 @@
 #include "aimp/AISyncNativeRequestAdapter.h"
 #include "aimp/AISyncExecutionCodec.h"
 #include "aimp/CharacterResourceAdmission.h"
-#include "aimp/CharacterDirectStepRuntime.h"
 #include <Windows.h>
 #include <algorithm>
 #include <atomic>
-#include <cmath>
 #include <initializer_list>
 
 namespace aimp::ai_sync::execution {
 namespace {
 std::atomic<IntentCheck> gIntentCheck{};
 std::atomic<IntentInvoke> gIntentInvoke{};
-std::atomic<IntentCheck> gHybridCheck{};
-std::atomic<IntentInvoke> gHybridInvoke{};
-bool HybridMovement(const transactions::Record& r) noexcept {
-    // Turn(4) can remain admitted while the Host is already in Move(38).
-    // A separate Client Turn both creates cycle39 and leaves a scheduler lease
-    // that blocks OrdinaryMotionAvailable. The hybrid motor already owns yaw;
-    // preserve these operations causally without allocating that second owner.
-    return gHybridCheck.load(std::memory_order_acquire) &&
-        (r.nativeKind==1U||r.nativeKind==3U||r.nativeKind==4U||r.nativeKind==9U||r.nativeKind==6U||r.nativeKind==11U||
-            (r.nativeKind==5U&&(r.mode==1U||r.mode==3U||r.mode==0x37U||r.mode==0x38U||r.mode==0x39U||r.mode==0x3BU)));
-}
 using namespace transactions;
 constexpr std::uintptr_t kScheduler = 0x2CD0;
 constexpr std::uintptr_t kTurnFactory = 0x00282450, kStanceFactory = 0x002823F0, kActionFactory = 0x00282410;
@@ -30,6 +17,7 @@ constexpr std::uintptr_t kTurnType = 0x00EB19CC, kStanceType = 0x00EB19BC, kActi
 // Kind5 overrides the generic status method 006777E0 with 006799F0.
 constexpr std::uintptr_t kActionStatus = 0x002799F0;
 constexpr std::uintptr_t kDirectedFactory = 0x002823B0, kDirectedType = 0x00EB19AC, kDirectedStatus = 0x002815A0;
+constexpr std::uintptr_t kPlacementFactory = 0x00282430, kPlacementType = 0x00EB199C;
 constexpr std::uintptr_t kSubmit = 0x00283CE0, kCancel = 0x00283DB0, kRelease = 0x0000D770;
 struct BusyScope {
     bool& flag;
@@ -53,10 +41,18 @@ bool ControlImage(std::uintptr_t base,std::uint32_t kind) noexcept {
         Read(base+scheduler_control::kTypeRva+8U,status)&&status==base+scheduler_control::kStatusRva&&
         Match(status,{0xC2,0x0C,0x00});
 }
+bool PlacementImage(std::uintptr_t base) noexcept {
+    std::uintptr_t eligibility{},status{},tick{};
+    return Match(base+kPlacementFactory,{0x51,0x56,0x8B,0x74,0x24,0x0C,0x56})&&
+        Match(base+kPlacementFactory+0x18,{0xC2,0x04,0x00})&&
+        Read(base+kPlacementType+4,eligibility)&&eligibility==base+0xAA70F0U&&Match(eligibility,{0xB0,0x01,0xC3})&&
+        Read(base+kPlacementType+8,status)&&status==base+0x248BB0U&&Match(status,{0xC2,0x0C,0x00})&&
+        Read(base+kPlacementType+12,tick)&&tick==base+0x74D3F0U&&Match(tick,{0xC2,0x04,0x00});
+}
 std::uintptr_t Type(std::uint32_t kind) noexcept {
     if (scheduler_control::Supported(kind)) return scheduler_control::kTypeRva;
-    switch(kind) { case 1: return 0xEB1A70; case 3: return 0xEB1A50;
-        case 4: return kTurnType; case 7: return kStanceType; case 5: return kActionType; case 9: return kDirectedType; default: return 0; }
+    switch(kind) { case 1: return 0xEB1A70; case 2: return 0xEB1A60; case 3: return 0xEB1A50;
+        case 4: return kTurnType; case 7: return kStanceType; case 5: return kActionType; case 8: return kPlacementType; case 9: return kDirectedType; default: return 0; }
 }
 LifecycleTrace gLifecycleTrace{};
 std::atomic<CommandTrace> gCommandTrace{};
@@ -93,7 +89,13 @@ bool WriteParameters(std::uintptr_t request, const Record& r) noexcept {
         // The allocation for6/11 ends after the base request. Writing Turn
         // fields here would corrupt adjacent storage rather than author data.
         if (scheduler_control::Supported(r.nativeKind)) return true;
-        if (r.nativeKind == 7) *reinterpret_cast<std::uint32_t*>(request + 0x1C) = r.mode;
+        if (r.nativeKind == kPlacementKind) {
+            *reinterpret_cast<float*>(request + 0x1C) = r.goalX;
+            *reinterpret_cast<float*>(request + 0x20) = r.goalY;
+            *reinterpret_cast<float*>(request + 0x24) = r.goalZ;
+            *reinterpret_cast<float*>(request + 0x28) = r.aux;
+            *reinterpret_cast<std::uint8_t*>(request + 0x2C) = static_cast<std::uint8_t>(r.mode);
+        } else if (r.nativeKind == 7) *reinterpret_cast<std::uint32_t*>(request + 0x1C) = r.mode;
         else if (r.nativeKind == kDirectedKind) {
             // Same value writes as 00686860; +34 rebases at the LOCAL Character.
             *reinterpret_cast<float*>(request + 0x1C) = r.aux;
@@ -131,7 +133,7 @@ bool NativeRequestAdapter::Initialize(std::uintptr_t base, bool exact, Permissio
     permission_ = permission; resolve_ = resolve; lifecycleResolver_=lifecycleResolver; context_ = context; dependencyGate_=dependencyGate; return true;
 }
 bool NativeRequestAdapter::CheckImage() const noexcept {
-    std::uintptr_t turn{}, stance{}, action{}, directed{};
+    std::uintptr_t turn{}, stance{}, action{}, directed{}, markerEligibility{}, markerStatus{};
     // Factories and status methods corroborated by the existing navigation
     // adapter. Submit/Cancel may already be detoured by mandatory AISync hooks;
     // the bootstrap's exact-build proof is therefore also required.
@@ -147,6 +149,14 @@ bool NativeRequestAdapter::CheckImage() const noexcept {
         Match(base_ + kDirectedFactory, {0x51,0x56,0x8B,0x74,0x24,0x0C,0x56}) &&
         Match(base_ + kDirectedFactory + 0x18, {0xC2,0x04,0x00}) &&
         Read(base_ + kDirectedType + 8, directed) && directed == base_ + kDirectedStatus &&
+        // 00d6 saved00683530/00677800 and complete native00682560. The
+        // initializer itself is parent-detoured; the callback stays native.
+        Match(base_+0x283530U,{0x51,0x56,0x8B,0x74,0x24,0x0C,0x56}) &&
+        Match(base_+0x283548U,{0xC2,0x04,0x00}) &&
+        Read(base_+0xEB1A64U,markerEligibility) && markerEligibility==base_+0x277800U &&
+        Match(markerEligibility,{0x33,0xC0,0x83,0xB9,0xB0,0x00,0x00,0x00,0xFF,0x0F,0x95,0xC0,0xC3}) &&
+        Read(base_+0xEB1A68U,markerStatus) && markerStatus==base_+0x282560U &&
+        Match(markerStatus+0x49U,{0xE8,0x62,0xF2,0xFF,0xFF}) &&
         Match(base_ + kRelease, {0x56,0x8B,0x71,0x04});
 }
 std::size_t NativeRequestAdapter::ActiveCount() const noexcept {
@@ -183,7 +193,7 @@ Readiness NativeRequestAdapter::Resources(std::uintptr_t character) noexcept {
     waitReason_=4U;return Readiness::Waiting;
 }
 bool NativeRequestAdapter::Resolve(const Record& r, LocalActorBinding& actor) noexcept {
-    const bool lifecycle=ProfileForKind(r.nativeKind)==kProfileLifecycle||r.nativeKind==native_intent::kKind||HybridMovement(r);
+    const bool lifecycle=ProfileForKind(r.nativeKind)==kProfileLifecycle||r.nativeKind==native_intent::kKind;
     const auto resolver=lifecycle&&lifecycleResolver_?lifecycleResolver_:resolve_;
     if (base_ == 0 || permission_ == nullptr || resolve_ == nullptr || !permission_(context_, r) ||
         !resolver(context_, r.owner, actor) || !actor.exclusiveExecution || actor.character == 0 || actor.runtimeId == 0) return false;
@@ -192,22 +202,38 @@ bool NativeRequestAdapter::Resolve(const Record& r, LocalActorBinding& actor) no
         Read(actor.character + kScheduler, schedulerOwner) && schedulerOwner == actor.character;
 }
 bool NativeRequestAdapter::Live(const Lease& lease, const LocalActorBinding& actor) const noexcept {
-    std::uintptr_t scheduler{}, type{};Ref resource{};
+    std::uintptr_t scheduler{}, type{};std::uint32_t kind{};Ref resource{};
     return lease.actor.character == actor.character && lease.actor.runtimeId == actor.runtimeId &&
         lease.actor.creationSerial==actor.creationSerial&&
         lease.ref.object != 0 && lease.ref.control != 0 &&
         Read(lease.ref.object + 0x14, scheduler) && scheduler == actor.character + kScheduler &&
         Read(lease.ref.object, type) && type == base_ + Type(lease.kind) &&
-        ((lease.kind!=1&&lease.kind!=3)||(Read(actor.character+0x42A8,resource)&&resource.object!=0&&resource.control!=0&&
+        ((lease.kind!=kPlacementKind&&lease.kind!=2)||(Read(lease.ref.object+0x10,kind)&&kind==lease.kind))&&
+        ((lease.kind!=1&&lease.kind!=2&&lease.kind!=3)||(Read(actor.character+0x42A8,resource)&&resource.object!=0&&resource.control!=0&&
             resource.object==lease.movementResource.object&&resource.control==lease.movementResource.control));
+}
+bool NativeRequestAdapter::IsOwnedPlacement(std::uintptr_t scheduler,RetirementIdentity* identity) const noexcept {
+    if(!base_||retiring_||!PlacementDedupReady()||!resolve_)return false;
+    std::uintptr_t character{},head{},first{},request{},control{};std::uint32_t count{},status{},runtime{},strong{};
+    if(!Read(scheduler,character)||!character||scheduler!=character+kScheduler||
+        !Read(character+0x50,runtime)||!runtime||!Read(scheduler+4,head)||!head||
+        !Read(scheduler+8,count)||!count||!Read(head,first)||!first||first==head||
+        !Read(first+8,request)||!Read(first+12,control)||!control||
+        !Read(request+0xC,status)||(status!=1U&&status!=2U))return false;
+    for(const auto& lease:leases_)if(lease.used&&!lease.secondary&&lease.kind==kPlacementKind&&lease.admitted&&
+        !lease.unknown&&!lease.cancelled&&lease.ref.object==request&&lease.ref.control==control&&
+        lease.actor.character==character&&lease.actor.runtimeId==runtime) {
+        LocalActorBinding actor{};
+        if(!resolve_(context_,lease.owner,actor)||!actor.exclusiveExecution||!Live(lease,actor)||
+            !Read(control+4,strong)||!strong)return false;
+        if(identity)*identity={lease.scope,lease.owner,lease.command,lease.actor,lease.kind,lease.revision};
+        return true;
+    }
+    return false;
 }
 void SetLifecycleTrace(LifecycleTrace trace) noexcept { gLifecycleTrace = trace; }
 void SetNativeIntentAdapter(IntentCheck check,IntentInvoke invoke) noexcept {
     gIntentInvoke.store(invoke,std::memory_order_release);gIntentCheck.store(check,std::memory_order_release);
-}
-void SetHybridMovementAdapter(IntentCheck check,IntentInvoke invoke) noexcept {
-    gHybridInvoke.store(invoke,std::memory_order_release);
-    gHybridCheck.store(check,std::memory_order_release);
 }
 void SetCommandTrace(CommandTrace trace) noexcept { gCommandTrace.store(trace,std::memory_order_release); }
 void SetConsumedAction(ConsumedAction query) noexcept { gConsumedAction.store(query,std::memory_order_release); }
@@ -216,17 +242,19 @@ Readiness NativeRequestAdapter::Check(const Record& r) noexcept {
     if (!busy_ && !retiring_ && ProfileForKind(r.nativeKind)==kProfileLifecycle && !ValidateExecutable(r))
         TraceLifecycle(10U,r,0,nullptr,0U);
     if (busy_ || retiring_ || !ValidateExecutable(r)) return Readiness::Rejected;
+    // Schema/profile support never grants local safety for duplicated native
+    // lifecycle children. Cleanup of an existing lease remains possible if
+    // the integration proof is withdrawn while a session is retiring.
+    if(r.nativeKind==kPlacementKind&&(!PlacementDedupReady()||!PlacementImage(base_))&&
+        r.opcode!=Op::Cancel&&r.opcode!=Op::Stop&&r.opcode!=Op::Release)return Readiness::Rejected;
     const BusyScope callbackGuard(busy_);
+    const bool cleanup=r.opcode==Op::Cancel||r.opcode==Op::Stop||r.opcode==Op::Release;
+    // A route can fail asynchronously after its Submit was acknowledged. If
+    // native cancellation then has an unknown outcome, another command of the
+    // SAME owner must not enter a second executor. Other actors remain usable.
+    if(!cleanup)for(const auto& lease:leases_)if(lease.used&&lease.unknown&&
+        lease.scope==r.scope&&lease.owner==r.owner)return Readiness::Rejected;
     if(Consumed(r))return Readiness::Ready;
-    if(HybridMovement(r)) {
-        // These records never enter the scheduler, so a pair cannot need to
-        // reserve them. They still retain their exact ordered ledger lifetime.
-        if(r.opcode==Op::Cancel||r.opcode==Op::Stop||r.opcode==Op::Release)
-            return permission_&&permission_(context_,r)?Readiness::Ready:Readiness::Rejected;
-        LocalActorBinding hybridActor{};
-        if(!Resolve(r,hybridActor)){waitReason_=3U;return Readiness::Waiting;}
-        return gHybridCheck.load(std::memory_order_acquire)(r,hybridActor);
-    }
     if(dependencyGate_) {
         const auto gate=dependencyGate_(context_,r);
         if(gate==Readiness::Waiting)waitReason_=2U;
@@ -245,7 +273,7 @@ Readiness NativeRequestAdapter::Check(const Record& r) noexcept {
     }
     if(ProfileForKind(r.nativeKind)==kProfileLifecycle)
         return r.opcode==Op::Submit?Readiness::Ready:Readiness::Rejected;
-    if ((r.nativeKind == 1 || r.nativeKind == 3)) return CheckMovement(r,actor);
+    if ((r.nativeKind == 1 || r.nativeKind == 2 || r.nativeKind == 3)) return CheckMovement(r,actor);
     if (auto* lease = Find(r)) {
         if (lease->unknown || lease->kind != r.nativeKind || lease->admission!=r.admission || !Live(*lease, actor)) return Readiness::Rejected;
         if (r.opcode == Op::Release && !lease->cancelled) {
@@ -269,21 +297,6 @@ NativeOutcome NativeRequestAdapter::Invoke(const Record& input) noexcept {
         return NativeOutcome::Rejected;
     }
     busy_ = true;
-    if(HybridMovement(r)) {
-        NativeOutcome outcome=NativeOutcome::Admitted;
-        std::uintptr_t character{};
-        if(r.opcode!=Op::Cancel&&r.opcode!=Op::Stop&&r.opcode!=Op::Release) {
-            LocalActorBinding hybridActor{};
-            const auto invoke=gHybridInvoke.load(std::memory_order_acquire);
-            if(!Resolve(r,hybridActor)||!invoke)outcome=NativeOutcome::Rejected;
-            else {character=hybridActor.character;outcome=invoke(r,hybridActor);}
-        }
-        busy_=false;
-        // A zero Character intentionally distinguishes logical consumption
-        // from native scheduler entry in the existing diagnostic contract.
-        static_cast<void>(character);
-        TraceCommand(r,0U,outcome);return outcome;
-    }
     if(Consumed(r)) {
         // Already executed by the entered interaction: acknowledge, no call.
         if(r.opcode==Op::Submit) {
@@ -318,8 +331,6 @@ NativeOutcome NativeRequestAdapter::Invoke(const Record& input) noexcept {
         // Character-level native calls do not depend on a live locomotion M.
         // In particular a backstage exit must run before movement can resume.
         float before[3]{};
-        if(gHybridCheck.load(std::memory_order_acquire))
-            static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
         Read(actor.character+0x70,before[0]);Read(actor.character+0x74,before[1]);Read(actor.character+0x78,before[2]);
         invokingRecord_=&r;result=InvokeLifecycle(r,actor);invokingRecord_=nullptr;
         if(result==NativeOutcome::Admitted)++lifecycleEvents_;
@@ -341,7 +352,7 @@ NativeOutcome NativeRequestAdapter::Invoke(const Record& input) noexcept {
 NativeOutcome NativeRequestAdapter::InvokePinned(const Record& r, const LocalActorBinding& actor) noexcept {
     if(ProfileForKind(r.nativeKind)==kProfileLifecycle)
         return InvokeLifecycle(r,actor);
-    if ((r.nativeKind == 1 || r.nativeKind == 3)) return InvokeMovement(r,actor);
+    if ((r.nativeKind == 1 || r.nativeKind == 2 || r.nativeKind == 3)) return InvokeMovement(r,actor);
     auto* lease = Find(r);
     __try {
         if (r.opcode == Op::Submit) {
@@ -424,23 +435,6 @@ NativeOutcome NativeRequestAdapter::InvokePinned(const Record& r, const LocalAct
         return NativeOutcome::Unknown;
     }
 }
-void NativeRequestAdapter::PlaceAtTransition(const Record& r,const LocalActorBinding& actor) noexcept {
-    // No extra correction teleport. Explicit Host-authored lifecycle calls
-    // below remain native game events, separately identified on the wire.
-    if(gHybridCheck.load(std::memory_order_acquire))return;
-    if((r.flags&HasGoal)==0)return;
-    float x{},y{},z{},yaw{};
-    if(Read(actor.character+0x70,x)&&Read(actor.character+0x74,y)&&Read(actor.character+0x78,z)&&Read(actor.character+0x174,yaw)) {
-        const auto dx=x-r.goalX,dy=y-r.goalY,dz=z-r.goalZ;
-        if(dx*dx+dy*dy+dz*dz<=0.0001F&&std::abs(std::remainder(yaw-r.aux,6.283185307F))<=0.01F)return;
-    }
-    // 007C6330 mode1: the retail Character placement carrier used by vent
-    // exits; it requests physical reconciliation of the hidden body.
-    alignas(16) const float position[]{r.goalX,r.goalY,r.goalZ,0.0F};
-    reinterpret_cast<void(__thiscall*)(void*,const float*,float,std::uint32_t)>(base_+0x3C6330U)(
-        reinterpret_cast<void*>(actor.character),position,r.aux,1U);
-    ++transitionPlacements_;
-}
 NativeOutcome NativeRequestAdapter::InvokeLifecycle(const Record& r,const LocalActorBinding& actor) noexcept {
     __try {
         if(r.opcode!=Op::Submit)return NativeOutcome::Rejected;
@@ -455,11 +449,10 @@ NativeOutcome NativeRequestAdapter::InvokeLifecycle(const Record& r,const LocalA
                 reinterpret_cast<void(__thiscall*)(void*,const float*,float,std::uint32_t,std::uint32_t)>(base_+0x3C2710U)(
                     reinterpret_cast<void*>(actor.character),position,r.aux,r.mode,r.nativeKind==kDirectForcedRelocateKind?1U:0U);
         } else if(r.nativeKind==kBackstageKind) {
-            // Hidden while placed: enter backstage first, leave it last.
-            if(r.mode==0U)PlaceAtTransition(r,actor);
+            // Pose observations on this event never synthesize a placement.
+            // Explicit relocation has its own independently ordered kind.
             reinterpret_cast<void(__thiscall*)(void*,std::uint8_t)>(base_+0x38B140U)(
                 reinterpret_cast<void*>(actor.character),static_cast<std::uint8_t>(r.mode));
-            if(r.mode!=0U)PlaceAtTransition(r,actor);
         } else {
             std::uintptr_t table{},getter{};
             if(!Read(actor.character,table)||!Read(table+0x1C,getter)||getter<base_+0x1000U||getter>=base_+0xD9E13BU)
@@ -468,7 +461,6 @@ NativeOutcome NativeRequestAdapter::InvokeLifecycle(const Record& r,const LocalA
             LocalActorBinding current{};
             if(!animated||!Resolve(r,current)||current.character!=actor.character||current.runtimeId!=actor.runtimeId||
                 current.creationSerial!=actor.creationSerial)return NativeOutcome::Unknown;
-            PlaceAtTransition(r,actor);
             reinterpret_cast<void(__thiscall*)(void*)>(base_+0x3C0220U)(reinterpret_cast<void*>(animated));
         }
         LocalActorBinding after{};

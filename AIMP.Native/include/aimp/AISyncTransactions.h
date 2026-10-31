@@ -10,12 +10,12 @@
 #include "aimp/AISyncNativeIntent.h"
 
 namespace aimp::ai_sync::transactions {
-// Queue controls have effects even if they finish before the next snapshot.
+// Queue controls and kind8 placement have effects even if they finish before the next snapshot.
 // Like direct native calls, their admission/retention operations must not be
 // discarded as an obsolete movement goal. This predicate grants no capability;
 // executable payloads and profiles are still validated separately.
 [[nodiscard]] constexpr bool PreserveNativeOperations(std::uint32_t kind) noexcept {
-    return kind == 5U || kind >= 0x100U || scheduler_control::Supported(kind);
+    return kind == 2U || kind == 5U || kind == 8U || kind >= 0x100U || scheduler_control::Supported(kind);
 }
 
 inline constexpr std::uint32_t kMagic = 0x58544941U;

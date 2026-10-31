@@ -30,6 +30,9 @@ public static class AISyncNativeIntentCodec
 {
     public const uint Kind = 0x200, Profile = 128;
     public const int Bytes = 144, WordCount = 36;
+    // words2..9: resource SHA256 LE;10: one-based cover;11: zero-based marker;
+    // 12/13: opaque R+B4 before/after admission;14..35: zero.
+    public const uint MarkerContract = 24, MarkerSchema = 1, MarkerMaxOrdinal = 1000000;
     public static void Validate(AISyncNativeIntent? value)
     {
         if (value is not null) ValidateWords(value.Words);
@@ -38,6 +41,15 @@ public static class AISyncNativeIntentCodec
     {
         if (value.Length != WordCount) throw new ProtocolException("Invalid native intent word count.");
         var id = value[0];
+        if (id == MarkerContract)
+        {
+            var digest = false;
+            for (var i = 2; i < 10; ++i) digest |= value[i] != 0;
+            if (value[1] != MarkerSchema || !digest || value[10] is 0 or > MarkerMaxOrdinal
+                || value[11] > MarkerMaxOrdinal || value[12] > 1 || value[13] > 1 || !Zero(value, 14, 36))
+                throw new ProtocolException("Invalid level-marker identity or opaque bytes.");
+            return;
+        }
         var valid = id is >= 1 and <= 23 and not (11 or 14 or 18) && value[35] == 0;
         if (valid && id == 21)
         {

@@ -430,10 +430,29 @@ void CallbackPublication() {
     CHECK(h.runtime.Release(receipt.key,&Harness::Proof,&h,receipt)==Result::Released);
     CHECK(h.registrations==1U&&h.transitions==1U);
 }
+void KillReservationCannotCrossWorlds() {
+    Harness h; Receipt receipt{};
+    h.binding.nativeGeneration=1U;
+    CHECK(h.Submit(receipt)==Result::Admitted);
+    const auto oldKey=receipt.key;const auto oldSerial=receipt.serial;
+    auto next=Scope();++next.worldEpoch;++next.consumerEpoch;
+    CHECK(h.runtime.Configure(next,99U,3U)==Result::Waiting);
+    CHECK(!h.runtime.ResetForWorld(1U)); // Same live world is not a cleanup proof.
+    CHECK(h.runtime.ResetForWorld(3U));
+    CHECK(h.proofs==0U); // Revocation never invoked or manufactured release.
+    CHECK(h.runtime.Configure(next,99U,3U)==Result::Admitted);
+    h.state.worldGeneration=3U;
+    h.binding.nativeGeneration=3U;
+    ++h.binding.source.creationSerial;++h.binding.victim.creationSerial;
+    CHECK(h.Submit(receipt)==Result::Admitted && receipt.serial>oldSerial);
+    CHECK(h.runtime.Observe(oldKey,oldSerial,h.binding.source,h.native.sourceCycle,h.native.sourceSerial,
+        FinishCause::NativeGraphEnd,receipt)==Result::WrongScope);
+    CHECK(h.registrations==2U&&h.transitions==2U);
+}
 }
 int main() {
     CarrierAndAdmission(); PartialEntryAndRevocation(); SourceLifetimeAndRelease();
     ExactCallbacksAndReuse(); AcceptedEndExitBoundary();BoundedCommands(); OutcomeProgressAndEvidence();
-    PlayerLifeBindingAndDelayedPreparation();KillToNextWorldSequence();SourceGraphInitializesAfterAdmission();CallbackPublication();
+    PlayerLifeBindingAndDelayedPreparation();KillToNextWorldSequence();SourceGraphInitializesAfterAdmission();CallbackPublication();KillReservationCannotCrossWorlds();
     std::cout << "State/native adapter bridge and modeled source lifetime passed. No game execution or native release proof claimed.\n";
 }

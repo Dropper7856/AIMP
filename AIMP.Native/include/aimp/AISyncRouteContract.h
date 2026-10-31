@@ -1,11 +1,21 @@
 #pragma once
 #include "aimp/AISyncRouteCodec.h"
 #include <cmath>
+#include <bit>
 
 namespace aimp::ai_sync::route {
+[[nodiscard]] inline bool HybridResumeCurrent(std::uint64_t rejectedCommand,std::uint32_t rejectedRevision,
+    std::uint64_t installedCommand,std::uint32_t installedRevision) noexcept {
+    return installedCommand>rejectedCommand||(installedCommand==rejectedCommand&&installedRevision>=rejectedRevision);
+}
 // Local-only contract checks. No new wire fields or inferred bridge nodes.
 [[nodiscard]] inline bool SameRouteCommand(const Key& a,const Key& b) noexcept {
     return a.scope==b.scope&&a.owner==b.owner&&a.commandId==b.commandId&&a.part==b.part;
+}
+[[nodiscard]] inline bool NewerRoute(const Key& previous,const Key& next) noexcept {
+    return SameRouteCommand(previous,next)&&
+        (next.parameterRevision>previous.parameterRevision||
+         (next.parameterRevision==previous.parameterRevision&&next.routeRevision>previous.routeRevision));
 }
 [[nodiscard]] inline bool SameNodeIdentity(const Node& a,const Node& b) noexcept {
     return a.type==b.type&&a.resourceIndex==b.resourceIndex&&a.ordinal==b.ordinal&&a.markers==b.markers;
@@ -14,6 +24,23 @@ namespace aimp::ai_sync::route {
     if(a.resourceCount!=b.resourceCount||a.resourceCount>kMaxResources)return false;
     for(std::size_t i=0;i<a.resourceCount;++i)if(a.resources[i]!=b.resources[i])return false;
     return true;
+}
+// Pre-reset compound proof. A later native append shares the preceding B's
+// terminal node; positional proximity cannot substitute for that identity.
+[[nodiscard]] inline bool AppendSharesTail(const Graph& previous,const Graph& next) noexcept {
+    if(!previous.nodeCount||previous.nodeCount>kMaxNodes||!next.nodeCount||next.nodeCount>kMaxNodes)return false;
+    const auto& tail=previous.nodes[previous.nodeCount-1];const auto& first=next.nodes[0];
+    if(tail.resourceIndex>=previous.resourceCount||first.resourceIndex>=next.resourceCount||
+        previous.resourceCount>kMaxResources||next.resourceCount>kMaxResources||
+        previous.resources[tail.resourceIndex]!=next.resources[first.resourceIndex]||
+        tail.type!=first.type||tail.ordinal!=first.ordinal)return false;
+    for(std::size_t i=0;i<9;++i)if(std::bit_cast<std::uint32_t>(tail.vectors[i])!=std::bit_cast<std::uint32_t>(first.vectors[i]))return false;
+    auto markers=tail.markers;
+    if(next.nodeCount==1) {
+        unsigned shift{};for(auto tags=markers;tags;tags>>=8)shift+=8;
+        if(shift>=32)return false;markers|=11U<<shift;
+    }
+    return markers==first.markers;
 }
 // CaptureInstalled observes the remaining Host suffix. Endpoint-only edits
 // must retain the first admitted prefix for a Client which has not consumed it.

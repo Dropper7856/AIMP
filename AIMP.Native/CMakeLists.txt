@@ -19,8 +19,8 @@ set(AIMP_CORE_SOURCES
     src/VoiceSync.cpp
     src/VoiceNativeAudio.cpp
     src/AISync.cpp
-    src/AISyncHybridMotion.cpp
     src/AISyncTransactions.cpp
+    src/AISyncMarkerIdentity.cpp
     src/AISyncMovement.cpp
     src/AISyncNativeMovement.cpp
     src/AISyncTransactionCapture.cpp
@@ -175,6 +175,12 @@ if(BUILD_TESTING)
     set_target_properties(AIMP.AISyncNativeRouteTests PROPERTIES
         VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
     add_test(NAME AISyncNativeRoute COMMAND AIMP.AISyncNativeRouteTests)
+    add_executable(AIMP.AISyncRouteHandoffTests tests/AISyncRouteHandoffTests.cpp)
+    target_include_directories(AIMP.AISyncRouteHandoffTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_options(AIMP.AISyncRouteHandoffTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.AISyncRouteHandoffTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME AISyncRouteHandoff COMMAND AIMP.AISyncRouteHandoffTests)
     add_executable(AIMP.AISyncLifecycleTests tests/AISyncLifecycleTests.cpp)
     target_link_libraries(AIMP.AISyncLifecycleTests PRIVATE AIMP.Core)
     target_compile_options(AIMP.AISyncLifecycleTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
@@ -242,6 +248,29 @@ if(BUILD_TESTING)
     set_target_properties(AIMP.AISyncNativeIntentCodecTests PROPERTIES
         VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
     add_test(NAME AISyncNativeIntentCodec COMMAND AIMP.AISyncNativeIntentCodecTests)
+    add_executable(AIMP.AISyncMarkerCodecTests tests/AISyncMarkerCodecTests.cpp
+        src/AISyncTransactions.cpp src/AISyncMovement.cpp src/AISyncExecutionCodec.cpp)
+    target_include_directories(AIMP.AISyncMarkerCodecTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_options(AIMP.AISyncMarkerCodecTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    add_test(NAME AISyncMarkerCodec COMMAND AIMP.AISyncMarkerCodecTests)
+    add_executable(AIMP.AISyncMarkerIdentityTests tests/AISyncMarkerIdentityTests.cpp src/AISyncMarkerIdentity.cpp src/HookManager.cpp src/CrashGuard.cpp src/BuildProfile.cpp)
+    target_include_directories(AIMP.AISyncMarkerIdentityTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_options(AIMP.AISyncMarkerIdentityTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    target_link_libraries(AIMP.AISyncMarkerIdentityTests PRIVATE bcrypt version)
+    target_compile_definitions(AIMP.AISyncMarkerIdentityTests PRIVATE AIMP_MARKER_IDENTITY_TESTING NOMINMAX)
+    add_test(NAME AISyncMarkerIdentity COMMAND AIMP.AISyncMarkerIdentityTests "${CMAKE_CURRENT_SOURCE_DIR}/../AI.exe")
+    add_executable(AIMP.AISyncNativeMarkerTests tests/AISyncNativeMarkerTests.cpp)
+    target_link_libraries(AIMP.AISyncNativeMarkerTests PRIVATE AIMP.Core)
+    target_compile_options(AIMP.AISyncNativeMarkerTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    add_test(NAME AISyncNativeMarkers COMMAND AIMP.AISyncNativeMarkerTests)
+    add_executable(AIMP.AISyncRouteRecoveryTests tests/AISyncRouteRecoveryTests.cpp)
+    target_link_libraries(AIMP.AISyncRouteRecoveryTests PRIVATE AIMP.Core)
+    target_compile_options(AIMP.AISyncRouteRecoveryTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.AISyncRouteRecoveryTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME AISyncRouteRecovery COMMAND AIMP.AISyncRouteRecoveryTests)
+    add_test(NAME AISyncTypedHostMarkers COMMAND AIMP.AISyncTransactionCaptureTests
+        "${CMAKE_CURRENT_SOURCE_DIR}/../AI.exe" typed-markers)
     add_executable(AIMP.AISyncTransactionExecutorTests
         tests/AISyncTransactionExecutorTests.cpp src/AISyncTransactionExecutor.cpp src/AISyncTransactions.cpp src/AISyncMovement.cpp)
     target_include_directories(AIMP.AISyncTransactionExecutorTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")

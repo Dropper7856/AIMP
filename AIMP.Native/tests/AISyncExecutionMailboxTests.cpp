@@ -1,7 +1,6 @@
 #include "aimp/AISyncExecutionMailbox.h"
 #include "aimp/AISyncExecutionRuntime.h"
 #include "aimp/AISyncCausalState.h"
-#include "aimp/AISyncHybridMotion.h"
 #include <algorithm>
 #include <fstream>
 #include <iostream>
@@ -285,19 +284,27 @@ void CarrierArrivalLease() {
     const auto after=GetTickCount64();Sleep(20);box->Pump(api);
     Check(arrival.calls==1&&arrival.tick>=before&&arrival.tick<=after&&arrival.tick<GetTickCount64(),
         "carrier rebased immutable intake time at engine apply");
-    hybrid_motion::Timeline timeline;
-    hybrid_motion::Sample sample{1000,{0,0,0},{1,0,0},0,hybrid_motion::Valid};
-    Check(timeline.Push(sample,arrival.tick),"delayed carrier timeline");
-    hybrid_motion::Target target{};
-    Check(timeline.SampleAt(arrival.tick+600,target)&&target.stale&&target.velocity[0]==0,
-        "delayed first carrier renewed motion authority");
-    sample.tick=1100;
-    Check(timeline.Push(sample,arrival.tick+100)&&timeline.SampleAt(arrival.tick+700,target)&&target.stale,
-        "delayed established carrier renewed motion authority");
+}
+void OldWorldRetirementPreservesNewOffer() {
+    auto box=std::make_unique<ExecutionMailbox>(); Engine engine{box.get()}; Bind(*box,engine);
+    box->RetireGeneration(6); Check(box->Bound(ScopeValue(),7),"unrelated world retired current binding");
+    box->RetireGeneration(7); Check(!box->Bound(ScopeValue(),7),"old-world binding remained active");
+    auto next=ScopeValue(); ++next.worldEpoch; ++next.consumerEpoch;
+    Check(box->QueueBinding({next,ControlKind::Offer,3},9),"new-world offer refused");
+    box->RetireGeneration(7); // IPC's next offer may arrive before the engine reset.
+    auto api=engine.Api();
+    api.bind=[](void*,const Scope&,std::uint32_t generation) noexcept {return generation==9?Result::Ok:Result::WrongScope;};
+    box->Pump(api);
+    Check(box->Bound(next,9),"old-world reset discarded a new-world offer");
+    MailboxPacket packet{}; Control ready{};
+    Check(box->Peek(packet)&&DecodeControl(std::span(packet.bytes).first(packet.size),ready)&&
+        ready.kind==ControlKind::Ready&&ready.scope==next,"new-world ready acknowledgement lost");
+    auto old=BatchValue();std::vector<std::uint8_t> bytes;
+    Check(EncodeBatch(old,bytes)&&!box->QueueBatch(bytes),"old-world batch entered the new round");
 }
 }
 int main(int argc, char** argv) {
-    try { Check(argc == 2,"expected control fixture"); ControlFixture(argv[1]); Guards(); WorldRollbackAndDelayedWork(); PendingRetirementBinding(); FailureAndRetry(); Bounds(); MovementEcho(); Checkpoint(); RouteNegotiation(); ConcurrentBindingReads(); CarrierArrivalLease();
+    try { Check(argc == 2,"expected control fixture"); ControlFixture(argv[1]); Guards(); WorldRollbackAndDelayedWork(); PendingRetirementBinding(); FailureAndRetry(); Bounds(); MovementEcho(); Checkpoint(); RouteNegotiation(); ConcurrentBindingReads(); CarrierArrivalLease(); OldWorldRetirementPreservesNewOffer();
         std::cout << "PASS execution mailbox binding, retirement, receipts, retry and bounds (offline only)\n"; return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

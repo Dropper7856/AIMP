@@ -68,6 +68,10 @@ public:
     // are not destruction evidence. May only retire an existing token.
     void ConfirmDestroyed(const ActorLifetime&) noexcept;
     void ReleaseDestroyed() noexcept;
+    // Caller has revoked this native world. Forget value-only permissions
+    // without restoring an old Character or claiming native destruction.
+    // Request/route references are owned and retired independently.
+    void ForgetGeneration(std::uint32_t nativeGeneration) noexcept;
     [[nodiscard]] OwnershipResult Release(const transactions::OwnerKey&) noexcept;
     [[nodiscard]] bool ResolveOwned(const transactions::Scope&, const transactions::OwnerKey&, ActorLifetime&,
         bool cleanup = false) noexcept;

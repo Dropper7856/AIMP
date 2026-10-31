@@ -54,7 +54,8 @@ public static class AISyncExecutionCodec
     public const int ReceiptBytes = HeaderBytes + AISyncTransactionCodec.RecordBytes + 8;
     public const int MaximumReceiptBytes = HeaderBytes + NativeIntentRecordBytes + 8;
     public const uint NativeIntentKind = AISyncNativeIntentCodec.Kind;
-    public const uint ActionKind = 5, ActionNoState = 0x5D, DirectedKind = 9,
+    public const uint MarkerKind = 2, MarkerProfile = 1024;
+    public const uint ActionKind = 5, ActionNoState = 0x5D, PlacementKind = 8, DirectedKind = 9,
         RelocateKind = 0x100, BackstageKind = 0x101, FrontstageKind = 0x102, ForcedRelocateKind = 0x103, DirectRelocateKind = 0x104, DirectForcedRelocateKind = 0x105;
     public const float MaxCoordinate = 100000F;
     public const float MaxTurnAngle = 6.4F;
@@ -174,6 +175,9 @@ public static class AISyncExecutionCodec
     /// [-6.4,6.4] (XYZ=+0), Distance is turn tolerance [0,6.4]. Coordinates
     /// are finite with abs&lt;=100000. Stop=+0, Gait=0, no HasGait/HasStop.
     /// Kind7 stance uses Mode 0..2, flags=0, all floats=+0, Gait=0.
+    /// Kind8 scheduler placement uses HasGoal, XYZ position, Aux yaw[-6.4,6.4],
+    /// Mode branch0/1, Distance/Stop=+0, Gait=0, no extension. It preserves
+    /// native admission, retention and lifecycle; it is not a direct placement call.
     /// Kind6/11 scheduler control uses flags/mode/gait=0, all floats=+0,
     /// with no movement or native intent payload.
     /// All executable records reserve NativeStatus=0 and forbid Accepted,
@@ -187,12 +191,37 @@ public static class AISyncExecutionCodec
         AISyncTransactionCodec.Validate(value);
         if (value.Opcode is AISyncTransactionOpcode.Oracle or AISyncTransactionOpcode.CoverageLost
             || (value.Flags & ~AISyncTransactionFlags.HasGoal) != 0
-            || AISyncExecutionControlCodec.ProfileForKind(value.NativeKind) == 0 || value.NativeStatus != 0
+            || (value.NativeKind != MarkerKind && AISyncExecutionControlCodec.ProfileForKind(value.NativeKind) == 0) || value.NativeStatus != 0
             || (value.Gait != 0 && value.NativeKind != ActionKind)
             || value.NativeAdmission > 2 || value.ScalarRetention > 3)
             throw new ProtocolException("Unsupported AISync executable operation, profile or flags.");
+        if (value.NativeKind == MarkerKind)
+        {
+            if (value.Flags != 0 || value.Mode != 0 || value.Gait != 0 || !EmptyPayload(value) || value.ScalarRetention != 3)
+                throw new ProtocolException("Marker requires canonical scalar parameters.");
+            if (value.Opcode is AISyncTransactionOpcode.Begin or AISyncTransactionOpcode.Submit or AISyncTransactionOpcode.Update)
+            {
+                if (value.NativeIntent?.ContractId != AISyncNativeIntentCodec.MarkerContract)
+                    throw new ProtocolException("Marker requires contract24.");
+                AISyncNativeIntentCodec.Validate(value.NativeIntent);
+                var m = value.Movement;
+                AISyncMovementCodec.Validate(m);
+                if (AISyncMovementCodec.IsEmpty(m) || m.Version != 1 || m.Parts != 1
+                    || m.Navigation != AISyncMovementNavigation.HostRoute || m.PrimaryFlags != 0)
+                    throw new ProtocolException("Marker requires a single HostRoute movement bundle.");
+                // BEFORE is authored before0044D190; AFTER may change retained only.
+                var geometry = AISyncMovementCodec.Encode(m);
+                if (!geometry.AsSpan(20, 68).SequenceEqual(geometry.AsSpan(92, 68)))
+                    throw new ProtocolException("Marker geometry changed across admission.");
+            }
+            else if (value.NativeIntent is not null || !AISyncMovementCodec.IsEmpty(value.Movement))
+                throw new ProtocolException("Marker terminal requires empty extensions.");
+            return;
+        }
         if (value.NativeKind == NativeIntentKind)
         {
+            if (value.NativeIntent?.ContractId == AISyncNativeIntentCodec.MarkerContract)
+                throw new ProtocolException("Contract24 is reserved for native kind2.");
             if (value.NativeAdmission != 1 || value.ScalarRetention != 3 || value.Flags != 0 || value.Mode != 0
                 || value.Gait != 0 || !EmptyPayload(value) || !AISyncMovementCodec.IsEmpty(value.Movement))
                 throw new ProtocolException("Native intent requires canonical append-call parameters.");
@@ -236,6 +265,15 @@ public static class AISyncExecutionCodec
             // Native kind5 scheduler hold: +1C action cycle state, +20/+21/+22 flags in Gait bits0..2.
             if (value.Flags != 0 || value.Mode > 0xFF || value.Mode == ActionNoState || value.Gait > 7 || !EmptyPayload(value))
                 throw new ProtocolException("Invalid AISync executable action parameters.");
+            return;
+        }
+        if (value.NativeKind == PlacementKind)
+        {
+            if (value.Flags != AISyncTransactionFlags.HasGoal || value.Mode > 1
+                || MathF.Abs(value.GoalX) > MaxCoordinate || MathF.Abs(value.GoalY) > MaxCoordinate
+                || MathF.Abs(value.GoalZ) > MaxCoordinate || MathF.Abs(value.Aux) > MaxTurnAngle
+                || !PositiveZero(value.Distance) || !PositiveZero(value.Stop))
+                throw new ProtocolException("Invalid AISync executable scheduler placement parameters.");
             return;
         }
         if (value.NativeKind is RelocateKind or ForcedRelocateKind or DirectRelocateKind or DirectForcedRelocateKind)
@@ -294,8 +332,8 @@ public static class AISyncExecutionCodec
     private static int Stride(ushort version) => version == NativeIntentVersion ? NativeIntentRecordBytes
         : version == MovementVersion ? ExtendedRecordBytes : AISyncTransactionCodec.RecordBytes;
     private static int Stride(ReadOnlySpan<byte> bytes) => Stride(U16(bytes, 4));
-    private static bool Intent(AISyncTransaction value) => value.NativeKind == NativeIntentKind || value.NativeIntent is not null;
-    private static bool Extended(AISyncTransaction value) => value.NativeKind is 1 or 3 || value.NativeAdmission != 0 || value.ScalarRetention != 3;
+    private static bool Intent(AISyncTransaction value) => value.NativeKind is MarkerKind or NativeIntentKind || value.NativeIntent is not null;
+    private static bool Extended(AISyncTransaction value) => value.NativeKind is MarkerKind or 1 or 3 || value.NativeAdmission != 0 || value.ScalarRetention != 3;
     public static byte[] EncodeOperation(AISyncTransaction operation)
     {
         ValidateExecutable(operation);
@@ -321,10 +359,10 @@ public static class AISyncExecutionCodec
         if (bytes.Length is ExtendedRecordBytes or NativeIntentRecordBytes)
             value = value with { NativeAdmission=U32(bytes,160),ScalarRetention=U32(bytes,164),
                 Movement = AISyncMovementCodec.Decode(bytes.Slice(AISyncTransactionCodec.RecordBytes+8, AISyncMovementCodec.Bytes)) };
-        else if (value.NativeKind is 1 or 3) throw new ProtocolException("Move requires execution envelope v2.");
+        else if (value.NativeKind is MarkerKind or 1 or 3) throw new ProtocolException("Move requires execution envelope v2.");
         if (bytes.Length == NativeIntentRecordBytes)
             value = value with { NativeIntent = AISyncNativeIntentCodec.Decode(bytes[ExtendedRecordBytes..]) };
-        else if (value.NativeKind == NativeIntentKind) throw new ProtocolException("Native intent requires execution envelope v3.");
+        else if (value.NativeKind is MarkerKind or NativeIntentKind) throw new ProtocolException("Native intent requires execution envelope v3.");
         return value;
     }
     private static bool EmptyPayload(AISyncTransaction value) => PositiveZero(value.GoalX)

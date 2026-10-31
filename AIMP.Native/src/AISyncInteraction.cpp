@@ -171,6 +171,15 @@ Result NativePairAdapter::Configure(const transactions::Scope& scope) noexcept {
     scope_ = scope; configured_ = true; count_ = 0U;
     return Result::Admitted;
 }
+bool NativePairAdapter::ResetForWorld(const std::uint32_t current) noexcept {
+    if (busy_ || current == 0U) return false;
+    for (std::size_t i = 0; i < count_; ++i)
+        if (leases_[i].binding.nativeGeneration == 0U || leases_[i].binding.nativeGeneration >= current)
+            return false;
+    ++revocation_;
+    leases_ = {}; count_ = 0U; scope_ = {}; configured_ = false;
+    return true;
+}
 NativePairAdapter::Lease* NativePairAdapter::FindLease(const Key& key) noexcept {
     for (std::size_t i = 0; i < count_; ++i) if (leases_[i].command.key == key) return &leases_[i];
     return nullptr;
