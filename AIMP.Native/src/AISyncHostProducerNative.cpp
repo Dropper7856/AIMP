@@ -813,7 +813,11 @@ bool NativeReadyForNewWorld(const transactions::Scope& scope) noexcept {
         EngineProducer().Bound()||
         gNativeCallDepth.load(std::memory_order_acquire)!=0U||gMoveDepth||gMoveOverflow)return false;
     for(const auto& lease:gLeases)if(lease.used) {
-        if(!lease.unknown||lease.producerActive||lease.admissionActive||
+        // producerActive/admissionActive are historical bits of the dead
+        // world's request; at a completed engine-thread generation boundary
+        // they cannot grant a new-world native callback. The global native
+        // call/Move-frame barriers above still forbid any in-flight call.
+        if(!lease.unknown||
             lease.scope.session!=scope.session||lease.scope.worldEpoch==0U||
             lease.scope.worldEpoch>=scope.worldEpoch)return false;
     }
