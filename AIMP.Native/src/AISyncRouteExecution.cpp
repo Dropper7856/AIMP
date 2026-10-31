@@ -165,7 +165,10 @@ bool Reject(const execution::NavigationBinding& binding) noexcept {
         binding.command.actor.creationSerial!=0U) {
         Hybrid* available{};bool found{};
         for(auto& entry:gState->hybrid) {
-            if(entry.used&&!gQualify(entry.binding.command.scope))entry={};
+            // Qualification may disappear while an earlier native request is
+            // being rejected/retired. Only explicit scope or actor retirement
+            // invalidates these copied recovery tickets.
+            if(entry.used&&entry.binding.command.scope!=binding.command.scope)continue;
             if(entry.used&&entry.binding.command.scope==binding.command.scope&&
                 entry.binding.command.owner==binding.command.owner&&entry.binding.command.actor==binding.command.actor) {
                 if(HybridResumeCurrent(entry.binding.command.command,entry.binding.command.revision,
