@@ -803,6 +803,35 @@ void RetireNative(bool liveWorld) noexcept {
     RetireHost();
 }
 bool NativeIdle() noexcept { for (const auto& lease : gLeases) if (lease.used) return false; return true; }
+// A world transition retires the source BEFORE the prior CATHODE requests
+// necessarily release their independent strong Refs. RetireNative(false)
+// explicitly fences those observations as unknown without dereferencing old
+// Characters. Their slots must stay pinned, but they cannot represent an
+// active command in a strictly newer Host world.
+bool NativeReadyForNewWorld(const transactions::Scope& scope) noexcept {
+    if(!gInstalled||scope.worldEpoch==0U||scope.consumerEpoch!=1U||
+        EngineProducer().Bound()||
+        gNativeCallDepth.load(std::memory_order_acquire)!=0U||gMoveDepth||gMoveOverflow)return false;
+    for(const auto& lease:gLeases)if(lease.used) {
+        if(!lease.unknown||lease.producerActive||lease.admissionActive||
+            lease.scope.session!=scope.session||lease.scope.worldEpoch==0U||
+            lease.scope.worldEpoch>=scope.worldEpoch)return false;
+    }
+    // Retained references are *not* released, recycled, or declared quiet:
+    // future source leases occupy distinct free slots and retain the new
+    // scope/lifetime. Exhaustion continues to fail closed at kCommands.
+    return true;
+}
+std::uint32_t RetainedNativeLeases() noexcept {
+    std::uint32_t total{};
+    for(const auto& lease:gLeases)if(lease.used)++total;
+    return total;
+}
+std::uint32_t FencedOldNativeLeases() noexcept {
+    std::uint32_t total{};
+    for(const auto& lease:gLeases)if(lease.used&&lease.unknown)++total;
+    return total;
+}
 CoverageDiagnostics Coverage() noexcept {
     return {gCoverageLosses.load(std::memory_order_relaxed),gFirstLossSite.load(std::memory_order_relaxed),
         gLastLossSite.load(std::memory_order_relaxed)};
