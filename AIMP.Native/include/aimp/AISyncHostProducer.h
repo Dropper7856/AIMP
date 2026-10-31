@@ -194,6 +194,10 @@ void RetireNative(bool liveWorld) noexcept;
     std::uint8_t state,std::uint8_t serial,std::uint32_t executionRevision,action_correlation::Reference&) noexcept;
 void InvalidateNativeActor(std::uintptr_t character, std::uint32_t runtime) noexcept;
 [[nodiscard]] bool NativeIdle() noexcept;
+// Only live, not-yet-fenced request observations may trigger a live-world
+// native retirement. Previously fenced old-world refs remain pinned, but must
+// never replace a pending new-world Offer with an unsolicited Close.
+[[nodiscard]] bool NativeNeedsLiveWorldRetirement() noexcept;
 // New-world startup may ignore ONLY old-world, terminally fenced native
 // observations. Their strong Refs remain pinned and cannot be reused as new
 // requests. Same-world restart and active/unknown current-world work still
