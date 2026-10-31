@@ -125,7 +125,11 @@ internal sealed class AISyncExecutionBridge : IDisposable
         if (_nativeBinding is not null && (_capture() != _nativeBinding
             || Volatile.Read(ref _lossEpoch) == _nativeBinding.Epoch
             || (_waitingReady && Environment.TickCount64 - _openedAt > ReadyTimeoutMilliseconds)))
+        {
+            if (_waitingReady && Environment.TickCount64 - _openedAt > ReadyTimeoutMilliseconds)
+                _log($"Native execution Ready timeout: round={_nativeBinding.WorldGeneration}, native={_nativeBinding.NativeGeneration}, authority={_scope?.AuthorityEpoch}.");
             await RetireAsync(AISyncExecutionRecovery.RestartRequired).ConfigureAwait(false);
+        }
         for (var n = 0; n < 32 && _queue.Reader.TryRead(out var work); n++)
         {
             try { await ProcessAsync(work).ConfigureAwait(false); }
@@ -251,7 +255,8 @@ internal sealed class AISyncExecutionBridge : IDisposable
             current.WorldGeneration <= 0 || (ulong)current.WorldGeneration != control.Scope.WorldEpoch ||
             current.ConnectionIdentity == Guid.Empty || current.ProcessId <= 0 ||
             current.NativeGeneration <= 0) return false;
-        if (Environment.TickCount64 - work.Tick > OfferDeferMilliseconds) return false;
+        if (Environment.TickCount64 - work.Tick > OfferDeferMilliseconds ||
+            (_scope is not null && control.Scope.AuthorityEpoch < _scope.Value.AuthorityEpoch)) return false;
         _deferredOffer = work;
         return true;
     }
@@ -270,7 +275,9 @@ internal sealed class AISyncExecutionBridge : IDisposable
         if (!current.Active) return;
         _deferredOffer = null;
         var restored = pending with { Binding = current };
-        if (!OfferMatches(AISyncExecutionControlCodec.Decode(restored.Bytes), current)) return;
+        var offer = AISyncExecutionControlCodec.Decode(restored.Bytes);
+        if ((_scope is not null && offer.Scope.AuthorityEpoch < _scope.Value.AuthorityEpoch) ||
+            !OfferMatches(offer, current)) return;
         _log($"Deferred execution Offer resumed for world={current.WorldGeneration}, native={current.NativeGeneration}.");
         await ProcessControlAsync(restored).ConfigureAwait(false);
     }
