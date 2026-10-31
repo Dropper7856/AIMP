@@ -130,6 +130,12 @@ using QualifyHost = bool(*)(const transactions::Scope&, std::uint32_t generation
 [[nodiscard]] bool QueueBindingHost(std::span<const std::uint8_t>, std::uint32_t nativeGeneration) noexcept;
 void PumpHost() noexcept;
 void RetireHost() noexcept;
+// Engine-side handshake counters, independent of timeout/network logs.
+// A queued Offer is not a Ready and cannot grant native ownership.
+struct BindingPumpDiagnostics {
+    std::uint64_t queued{},cancelled{},qualificationRejected{},configurationRejected{},readyProduced{};
+};
+[[nodiscard]] BindingPumpDiagnostics BindingPumpStatus() noexcept;
 [[nodiscard]] bool PeekHost(HostPacket&) noexcept;
 [[nodiscard]] bool CommitHost(std::uint64_t token) noexcept;
 [[nodiscard]] bool HostScope(transactions::Scope&) noexcept;
