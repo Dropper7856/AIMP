@@ -9519,6 +9519,10 @@ void PumpOnEngineThread() noexcept {
             !execution_runtime::RevokePreviousWorld(static_cast<std::uint32_t>(currentWorld)) ||
             (gPairRuntimeInitialized && !gPairRuntime.ResetForWorld(static_cast<std::uint32_t>(currentWorld))) ||
             !pair_retirement::ResetForWorld(static_cast<std::uint32_t>(currentWorld))) return;
+        // The prior world's route M/mesh remain strongly pinned by the route
+        // executor. Close only paths that have lost every B/R/worker owner,
+        // before the new-world configuration waits on their retirement.
+        route_execution::RevokePreviousWorld();
         for (auto& actor : gActors) if (actor.character != 0U)
             static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
         // Reset in place: aggregate assignment of 256 carriers materializes
