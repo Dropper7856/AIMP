@@ -194,6 +194,13 @@ void RetireNative(bool liveWorld) noexcept;
     std::uint8_t state,std::uint8_t serial,std::uint32_t executionRevision,action_correlation::Reference&) noexcept;
 void InvalidateNativeActor(std::uintptr_t character, std::uint32_t runtime) noexcept;
 [[nodiscard]] bool NativeIdle() noexcept;
+// New-world startup may ignore ONLY old-world, terminally fenced native
+// observations. Their strong Refs remain pinned and cannot be reused as new
+// requests. Same-world restart and active/unknown current-world work still
+// require the ordinary NativeIdle proof.
+[[nodiscard]] bool NativeReadyForNewWorld(const transactions::Scope&) noexcept;
+[[nodiscard]] std::uint32_t RetainedNativeLeases() noexcept;
+[[nodiscard]] std::uint32_t FencedOldNativeLeases() noexcept;
 // Resolve a real native N/B pair to its already accepted logical command.
 // part=0 primary, part=1 companion. Local pointers never leave this boundary.
 [[nodiscard]] bool IdentifyNativeNavigation(std::uintptr_t navigation, std::uintptr_t block,
