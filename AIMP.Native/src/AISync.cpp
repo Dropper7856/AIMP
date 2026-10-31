@@ -206,8 +206,8 @@ struct Actor {
     // capability execution. Never used for placement or acknowledged as applied.
     State received{};
     State recoveryPose{};
-    ULONGLONG recoveryPoseAt{},recoveryLastTick{};
-    bool recoveryFollowing{};
+    ULONGLONG recoveryPoseAt{},recoveryLastTick{},recoveryLastHardSnap{};
+    bool recoveryFollowing{},recoveryNativeArmed{};
     // Latest Host state in causal stream order (never an older queued carrier).
     std::uint32_t streamRevision{}, streamBirth{}, streamCycleState{}, streamPairRevision{}, streamCycleType{};
     // Execution latency trace (diagnostics only).
@@ -776,6 +776,7 @@ std::atomic<std::uint64_t> gManagerUpdates{}, gAdmitted{}, gIdentityRejected{}, 
 std::atomic<std::uint64_t> gRemoteQueued{};
 std::atomic<std::uint64_t> gPoseCaptured{}, gPoseApplied{}, gPoseRejected{};
 std::atomic<std::uint64_t> gHybridEntries{},gHybridResumes{},gHybridApplications{},gHybridPaused{},gHybridFailures{};
+std::atomic<std::uint64_t> gHybridNativeArms{},gHybridNativeRefusals{},gHybridHardSnaps{};
 std::atomic<std::uint64_t> gIntentCaptured{}, gIntentApplied{}, gIntentRejected{}, gIntentRecoveries{};
 std::atomic<std::uint64_t> gActionCaptured{}, gActionTransitions{};
 std::atomic<std::uint64_t> gActionReferencesCaptured{},gActionReferencesUnbound{};
@@ -9332,7 +9333,8 @@ void BeginExecutionCarrierScope(const transactions::Scope& scope) noexcept {
     for(auto& actor:gActors)if(actor.character){
         actor.received={};actor.streamRevision=actor.streamBirth=actor.streamCycleState=actor.streamPairRevision=actor.streamCycleType=0U;
         actor.desired={};actor.pendingRemoteShots.clear();actor.initialPlacementReady=false;actor.lastSpawnDiagnostic=0;
-        actor.recoveryPose={};actor.recoveryPoseAt=actor.recoveryLastTick=0;actor.recoveryFollowing=false;
+        actor.recoveryPose={};actor.recoveryPoseAt=actor.recoveryLastTick=actor.recoveryLastHardSnap=0;
+        actor.recoveryFollowing=actor.recoveryNativeArmed=false;
     }
     route_execution::BeginScope(scope);
     gCausalScope=scope;
@@ -9740,42 +9742,78 @@ void PumpOnEngineThread() noexcept {
             static_cast<void>(ApplyAuthoritativeParticipantDamage(actor, actor.desired));
             static_cast<void>(ApplyAuthoritativeCombat(actor, actor.desired, now));
         }
-    // Recovery uses only the latest authenticated carrier; an old queued
-    // consequence cannot move an NPC backwards. Never hold IPC across physics.
+    // Recovery follows the latest authenticated Host carrier only after a
+    // HostRoute has actually failed. Prefer the certified native locomotion
+    // motor: repeated Character position writes made the client Alien slide
+    // independently of its CATHODE movement/animation cycles.
     lock.unlock();
     for(auto& actor:gActors) {
         if(!actor.character||actor.duplicate||actor.faulted||!actor.initialPlacementReady)continue;
+        const auto releaseNative=[&]() noexcept {
+            if(!actor.recoveryNativeArmed)return;
+            static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
+            actor.recoveryNativeArmed=false;
+        };
         execution::NavigationBinding binding{};
         const bool needed=route_execution::HybridBinding(actor.character,binding);
         if(!needed) {
+            releaseNative();
             if(actor.recoveryFollowing){actor.recoveryFollowing=false;++gHybridResumes;}
-            actor.recoveryLastTick=0;continue;
+            actor.recoveryLastTick=actor.recoveryLastHardSnap=0;
+            continue;
         }
         if(!actor.recoveryFollowing){actor.recoveryFollowing=true;++gHybridEntries;}
         const auto& pose=actor.recoveryPose;
         execution::ActorLifetime lifetime{};
         if(!actor.recoveryPoseAt||now<actor.recoveryPoseAt||now-actor.recoveryPoseAt>600U||
             pose.birth!=binding.command.owner.birth||pose.sessionCookie!=gCurrent.sessionCookie||
-            pose.worldGeneration!=gCurrent.worldGeneration||(pose.stateFlags&PoseValid)==0U||ProxyWithdrawn(pose)||health::Terminal(pose.health)||
-            (pose.executionFlags&ExecutionPaired)!=0U||
+            pose.worldGeneration!=gCurrent.worldGeneration||(pose.stateFlags&PoseValid)==0U||
+            ProxyWithdrawn(pose)||health::Terminal(pose.health)||
+            (pose.executionFlags&ExecutionPaired)!=0U||(pose.motionFlags&6U)!=0U||
             ResolveTransactionActor(nullptr,binding.command.scope,binding.command.owner,lifetime)!=execution::OwnershipCheck::Ready||
             lifetime.character!=binding.command.actor.character||lifetime.runtimeId!=binding.command.actor.runtimeId||
             lifetime.creationSerial!=binding.command.actor.creationSerial||
             PairReservedCharacter(actor.character)||PairSourceBusy(actor.character)||
             execution::MovementExecutionOwned(actor.character)||!execution_runtime::RecoveryMotionAvailable(lifetime)) {
+            releaseNative();
             actor.recoveryLastTick=0;++gHybridPaused;continue;
         }
-        float current[3]{};std::array<float,3> target{};float yaw{};
-        if(!ReadCharacterPosition(actor.character,current)||!Read(actor.character+kYawOffset,yaw)) {++gHybridFailures;continue;}
-        const auto elapsed=actor.recoveryLastTick&&now>=actor.recoveryLastTick?now-actor.recoveryLastTick:50U;
-        actor.recoveryLastTick=now;
-        float distance{};
-        for(std::size_t i=0;i<3;++i){const auto d=pose.position[i]-current[i];distance+=d*d;}
-        const auto blend=distance>4.0F?1.0F:std::clamp(static_cast<float>(elapsed)*0.035F,0.0F,1.0F);
-        for(std::size_t i=0;i<3;++i)target[i]=current[i]+(pose.position[i]-current[i])*blend;
-        yaw=std::remainder(yaw+std::remainder(pose.yaw-yaw,6.28318530718F)*blend,6.28318530718F);
-        if(character_direct_step_runtime::ApplyAIRecoveryTransform(actor.character,target.data(),yaw)) {
-            ++gHybridApplications;++gPoseApplied;
+        float current[3]{};float yaw{};
+        if(!ReadCharacterPosition(actor.character,current)||!Read(actor.character+kYawOffset,yaw)) {
+            releaseNative();++gHybridFailures;continue;
+        }
+        float squaredDistance{};
+        for(std::size_t i=0;i<3;++i){const float delta=pose.position[i]-current[i];squaredDistance+=delta*delta;}
+        const bool nativeMotion=(pose.motionFlags&1U)!=0U&&pose.moveType<=3U&&
+            std::isfinite(pose.motionVelocity[0])&&std::isfinite(pose.motionVelocity[2])&&
+            std::isfinite(pose.yaw)&&std::fabs(pose.yaw)<=3.3F;
+        bool armed=false;
+        if(nativeMotion) {
+            const float speed=std::hypot(pose.motionVelocity[0],pose.motionVelocity[2]);
+            std::string reason;
+            armed=std::isfinite(speed)&&character_direct_step_runtime::ArmAIHybridReplication(
+                actor.character,pose.motionVelocity[0],pose.motionVelocity[2],speed,
+                pose.position[0],pose.position[1],pose.position[2],pose.yaw,
+                pose.moveType,reason,actor.recoveryPoseAt+600U);
+            if(armed){actor.recoveryNativeArmed=true;++gHybridNativeArms;++gHybridApplications;}
+            else ++gHybridNativeRefusals;
+        }
+        if(armed) {
+            // Only catastrophic divergence may bypass animation-driven
+            // locomotion. Never blend position every frame while the native
+            // motor owns the character.
+            if(squaredDistance<=25.0F||now<actor.recoveryLastHardSnap||
+                now-actor.recoveryLastHardSnap<1000U)continue;
+        } else {
+            releaseNative();
+            // When the native cycle is not representable, a bounded discrete
+            // correction is preferable to leaving an invisible/stale Alien.
+            // Do not turn a minor jitter into continuous animationless motion.
+            if(squaredDistance<0.36F||now<actor.recoveryLastHardSnap||
+                now-actor.recoveryLastHardSnap<350U)continue;
+        }
+        if(character_direct_step_runtime::ApplyAIRecoveryTransform(actor.character,pose.position,pose.yaw)) {
+            actor.recoveryLastHardSnap=now;++gHybridHardSnaps;++gPoseApplied;
         } else ++gHybridFailures;
     }
 }
@@ -10412,6 +10450,9 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"hybridRecoveryEntries",Diagnostics::Unsigned(gHybridEntries.load()),true},
          {"hybridRecoveryResumes",Diagnostics::Unsigned(gHybridResumes.load()),true},
          {"hybridRecoveryApplications",Diagnostics::Unsigned(gHybridApplications.load()),true},
+         {"hybridNativeArms",Diagnostics::Unsigned(gHybridNativeArms.load()),true},
+         {"hybridNativeRefusals",Diagnostics::Unsigned(gHybridNativeRefusals.load()),true},
+         {"hybridHardSnaps",Diagnostics::Unsigned(gHybridHardSnaps.load()),true},
          {"hybridRecoveryPaused",Diagnostics::Unsigned(gHybridPaused.load()),true},
          {"hybridRecoveryFailures",Diagnostics::Unsigned(gHybridFailures.load()),true}});
     diagnostics.Log("info", "aisync_typed_execution", "Typed Host commands and authoritative routes execute with native CATHODE locomotion.",
