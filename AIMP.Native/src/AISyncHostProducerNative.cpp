@@ -803,6 +803,13 @@ void RetireNative(bool liveWorld) noexcept {
     RetireHost();
 }
 bool NativeIdle() noexcept { for (const auto& lease : gLeases) if (lease.used) return false; return true; }
+bool NativeNeedsLiveWorldRetirement() noexcept {
+    // A retained old-world strong Ref is *not* a live request. Calling
+    // RetireHost for it every frame clears the new Pending Offer before
+    // PumpHost can configure the next world, so no Ready can ever be sent.
+    for(const auto& lease:gLeases)if(lease.used&&!lease.unknown)return true;
+    return false;
+}
 // A world transition retires the source BEFORE the prior CATHODE requests
 // necessarily release their independent strong Refs. RetireNative(false)
 // explicitly fences those observations as unknown without dereferencing old
