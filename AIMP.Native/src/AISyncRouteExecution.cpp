@@ -890,6 +890,8 @@ SlotReport LiveSlots() noexcept {
         gState->quarantined.begin(),gState->quarantined.end(),
         [](const auto& slot) noexcept {return static_cast<bool>(slot);}));
     for(const auto& slot:gState->slots)if(slot) {
+        if(slot->actorDestroyed)++report.destroyed;
+        if(slot->worldRevoked)++report.revoked;
         if(!report.total) {
             const auto n=slot->local.navigation;std::uintptr_t head{},cursor{};
             if(EmptyRing(n,0))report.quietMask|=1U;
