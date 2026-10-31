@@ -32,6 +32,12 @@ internal sealed class AISyncExecutionBridge : IDisposable
     private long _diagnosticTick, _maxQueueAge, _maxIpcSend, _maxReceiptAge;
     private ulong _diagnosticWork, _diagnosticWaiting, _diagnosticAdmitted, _diagnosticDropped;
     private bool _waitingReady;
+    // A network Offer can arrive while the new round is still configuring
+    // native AISync. Preserve this exact scope instead of silently dropping
+    // its work item when the local binding epoch changes during startup.
+    private Work? _deferredOffer;
+    private const long ReadyTimeoutMilliseconds = 12000;
+    private const long OfferDeferMilliseconds = 15000;
     // Native operations waiting on a local dependency (actor order, resources,
     // reservation). Retried here on the next bridge tick, in each actor's
     // order, instead of waiting one Host network round trip per operation:
@@ -115,9 +121,10 @@ internal sealed class AISyncExecutionBridge : IDisposable
     private async Task TickAsync()
     {
         LogLatency();
+        await FlushDeferredOfferAsync().ConfigureAwait(false);
         if (_nativeBinding is not null && (_capture() != _nativeBinding
             || Volatile.Read(ref _lossEpoch) == _nativeBinding.Epoch
-            || (_waitingReady && Environment.TickCount64 - _openedAt > 2000)))
+            || (_waitingReady && Environment.TickCount64 - _openedAt > ReadyTimeoutMilliseconds)))
             await RetireAsync(AISyncExecutionRecovery.RestartRequired).ConfigureAwait(false);
         for (var n = 0; n < 32 && _queue.Reader.TryRead(out var work); n++)
         {
@@ -150,7 +157,14 @@ internal sealed class AISyncExecutionBridge : IDisposable
     }
     private async Task ProcessAsync(Work work)
     {
-        if (work.Binding != _capture()) return;
+        if (work.Binding != _capture())
+        {
+            // The transition from FrozenClient to Client can invalidate the
+            // captured epoch AFTER the Host has sent its first round Offer.
+            // Preserve that Offer only for this exact connected session/round.
+            if (work.Kind == WorkKind.Control) DeferCurrentOffer(work);
+            return;
+        }
         ++_diagnosticWork;
         _maxQueueAge = Math.Max(_maxQueueAge, Environment.TickCount64 - work.Tick);
         if (Environment.TickCount64 - work.Tick > 2000)
@@ -203,11 +217,62 @@ internal sealed class AISyncExecutionBridge : IDisposable
         }
         if (control.Kind != AISyncExecutionControlKind.Offer)
         { if (_scope == control.Scope) await RetireAsync(AISyncExecutionRecovery.RestartRequired).ConfigureAwait(false); return; }
-        if (!OfferMatches(control, work.Binding)) { await RefuseAsync(work).ConfigureAwait(false); return; }
+        if (!OfferMatches(control, work.Binding))
+        {
+            if (DeferCurrentOffer(work)) return;
+            await RefuseAsync(work).ConfigureAwait(false); return;
+        }
+        if (_scope == control.Scope && _nativeBinding == work.Binding)
+        {
+            // An exact duplicate Offer is not a new authority. Re-sending its
+            // native binding is idempotent; never retire a healthy session.
+            if (_waitingReady)
+                await SendAsync(MessageType.AISyncExecutionBinding, work.Binding, work.Bytes, _shutdown.Token).ConfigureAwait(false);
+            return;
+        }
         if (_scope is not null) await RetireAsync(AISyncExecutionRecovery.RestartRequired).ConfigureAwait(false);
         _scope = control.Scope; _profiles = control.Value; _nativeBinding = work.Binding; _localWaiting.Clear();
         _waitingReady = true; _openedAt = Environment.TickCount64;
         await SendAsync(MessageType.AISyncExecutionBinding, work.Binding, work.Bytes, _shutdown.Token).ConfigureAwait(false);
+    }
+    // The Host can offer before the new Character/world authority becomes
+    // active locally. Keep only one bounded, authenticated-by-current-lobby
+    // candidate; its full scope is revalidated before any native IPC send.
+    private bool DeferCurrentOffer(Work work)
+    {
+        if (work.Kind != WorkKind.Control) return false;
+        AISyncExecutionControl control;
+        try { control = AISyncExecutionControlCodec.Decode(work.Bytes); }
+        catch (Exception) { return false; }
+        if (control.Kind != AISyncExecutionControlKind.Offer) return false;
+        var current = _capture();
+        if (!ReferenceEquals(current.Client, _client) || current.Client is null ||
+            current.Session == Guid.Empty || current.Session != control.Scope.Session ||
+            current.WorldGeneration <= 0 || (ulong)current.WorldGeneration != control.Scope.WorldEpoch ||
+            current.ConnectionIdentity == Guid.Empty || current.ProcessId <= 0 ||
+            current.NativeGeneration <= 0) return false;
+        if (Environment.TickCount64 - work.Tick > OfferDeferMilliseconds) return false;
+        _deferredOffer = work;
+        return true;
+    }
+    private async Task FlushDeferredOfferAsync()
+    {
+        var pending = _deferredOffer;
+        if (pending is null) return;
+        var current = _capture();
+        if (Environment.TickCount64 - pending.Tick > OfferDeferMilliseconds ||
+            !ReferenceEquals(current.Client, pending.Binding.Client) ||
+            current.Session != pending.Binding.Session ||
+            current.WorldGeneration != pending.Binding.WorldGeneration)
+        {
+            _deferredOffer = null; return;
+        }
+        if (!current.Active) return;
+        _deferredOffer = null;
+        var restored = pending with { Binding = current };
+        if (!OfferMatches(AISyncExecutionControlCodec.Decode(restored.Bytes), current)) return;
+        _log($"Deferred execution Offer resumed for world={current.WorldGeneration}, native={current.NativeGeneration}.");
+        await ProcessControlAsync(restored).ConfigureAwait(false);
     }
     private bool OfferMatches(AISyncExecutionControl control, AISyncExecutionBinding binding) =>
         binding.Active && ReferenceEquals(binding.Client, _client) && binding.Session == control.Scope.Session
@@ -256,6 +321,7 @@ internal sealed class AISyncExecutionBridge : IDisposable
         if (control.Kind != AISyncExecutionControlKind.Ready || control.Value != _profiles || !_waitingReady) return;
         if (!work.Binding.Client!.AcceptAISyncExecution(control.Scope)) throw new ProtocolException("Execution readiness rejected.");
         _waitingReady = false;
+        _log($"Native execution Ready acknowledged: world={control.Scope.WorldEpoch}, authority={control.Scope.AuthorityEpoch}, consumer={control.Scope.ConsumerEpoch}.");
     }
     private async Task SendAsync(MessageType type, AISyncExecutionBinding binding, ReadOnlyMemory<byte> bytes, CancellationToken token)
     {
