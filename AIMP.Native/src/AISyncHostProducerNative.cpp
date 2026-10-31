@@ -1,5 +1,7 @@
 #include "aimp/AISyncHostProducer.h"
 #include "aimp/AISyncTransactionCapture.h"
+#include "aimp/AISyncRouteRuntime.h"
+#include "aimp/AISyncExecutionRuntime.h"
 #include "aimp/HookManager.h"
 #include "aimp/CharacterResourceAdmission.h"
 #include <Windows.h>
@@ -21,10 +23,11 @@ struct Lease {
     std::uint32_t runtime{};
     Command parameters{};
     std::uint32_t pendingTerminal{};
-    // Native kind actually observed. A kind2 resolved-path request is emitted
-    // as a kind1 Move to the same destination (LocalNative), but its memory
-    // layout (block +1C, type EB1A60) is read from this source kind.
+    // Native kind actually observed. Kind2 has no certified executable request
+    // contract here and is never flattened into an ordinary kind1 Move.
     std::uint32_t sourceKind{};
+    std::uint32_t markerRetainedBefore{};
+    bool markerInitialized{};
     std::uint64_t order{};
     std::uintptr_t actionCycle{};
     std::uint32_t actionType{};
@@ -43,6 +46,9 @@ std::array<Lease,Producer::kCommands> gLeases{};
 std::uintptr_t gBase{};
 NativeContext gContext{};
 NativeGuard gGuard{};
+NativeMarkerCapture gMarkerCapture{};
+std::atomic<void*> gMarkerInitializeOriginal{};
+void* gMarkerInitializeTrampoline{};
 NativeRetirementGuard gRetirementGuard{};
 std::atomic<void*> gStatusOriginal{}, gTickOriginal{};
 std::atomic<void*> gRetentionOriginal{};
@@ -112,6 +118,15 @@ bool Snapshot(std::uintptr_t request, std::uintptr_t& character, std::uint32_t& 
     p = Command{p.kind};
     p.scalarRetention=retained?3U:0U;
     if (scheduler_control::Supported(p.kind)) return type == gBase + scheduler_control::kTypeRva;
+    if (p.kind == execution::kPlacementKind) {
+        std::uint8_t branch{};
+        p.point=true;
+        if(type!=gBase+0xEB199CU||!Read(request+0x1C,p.x)||!Read(request+0x20,p.y)||
+            !Read(request+0x24,p.z)||!Read(request+0x28,p.heading)||!Read(request+0x2C,branch)||branch>1U)return false;
+        p.mode=branch;
+        return std::isfinite(p.x)&&std::isfinite(p.y)&&std::isfinite(p.z)&&std::isfinite(p.heading)&&
+            std::abs(p.x)<=100000.0F&&std::abs(p.y)<=100000.0F&&std::abs(p.z)<=100000.0F&&std::abs(p.heading)<=6.4F;
+    }
     if (p.kind == 7 && type == gBase + 0xEB19BCU) return Read(request + 0x1C,p.mode);
     if (p.kind == execution::kActionKind && type == gBase + 0xEB198CU) {
         // 0067EC30 layout: +1C cycle state, +20/+21/+22 bytes (00713166..184).
@@ -188,6 +203,17 @@ Lease* Capture(std::uintptr_t request) noexcept {
         gUncoveredKinds[kind].fetch_add(1U,std::memory_order_relaxed);
         return nullptr;
     }
+    if(kind==execution::kPlacementKind&&(!execution::PlacementDedupReady()||
+        (EngineProducer().Profiles()&execution::kProfilePlacement)==0)) {
+        gUncoveredKinds[kind].fetch_add(1U,std::memory_order_relaxed);return nullptr;
+    }
+    if(kind==execution::kPlacementKind) {
+        std::uint8_t branch{};
+        if(!Read(request+0x2C,branch)){Lost(__LINE__);return nullptr;}
+        // An unsupported semantic variant is an uncovered command, not loss
+        // of the entire source. Never normalize its native byte to a bool.
+        if(branch>1U){gUncoveredKinds[kind].fetch_add(1U,std::memory_order_relaxed);return nullptr;}
+    }
     if (!Read(request + 0x10,kind) || execution::ProfileForKind(kind) == 0) {
         gUncoveredKinds[kind & 15U].fetch_add(1U,std::memory_order_relaxed);
         return nullptr;
@@ -231,7 +257,7 @@ bool FinishMovement(Lease& lease) noexcept {
     return true;
 }
 void FinalizeMovement(Lease& lease) noexcept {
-    if(lease.admissionActive)return;
+    if(lease.admissionActive||(lease.parameters.kind==2&&!lease.markerInitialized))return;
     if(lease.unknown||!Live(lease)){Lost(__LINE__);return;}
     if(!lease.submitted) {
         if(!lease.primaryAccepted) {
@@ -259,6 +285,12 @@ void FinalizeMovement(Lease& lease) noexcept {
         }
         // Admission may initialize/progress local path state synchronously.
         // The authoritative initial goal remains the captured producer input.
+        if(lease.parameters.kind==2) {
+            const auto retained=lease.parameters.movement.after.retained;
+            lease.parameters.movement.after=lease.parameters.movement.before;
+            lease.parameters.movement.before.retained=lease.markerRetainedBefore;
+            lease.parameters.movement.after.retained=retained;
+        }
         const auto pendingGoal=lease.parameters.movement.after.goal;
         lease.parameters.movement.after.goal=lease.parameters.movement.before.goal;
         if(lease.parameters.kind==3) {
@@ -279,6 +311,7 @@ void FinalizeMovement(Lease& lease) noexcept {
             }
         }
     } else {
+        if(lease.parameters.kind==2)return; // Marker updates have a dedicated immutable-geometry path.
         auto parameters=lease.parameters;std::uint8_t flags{};std::uint32_t phase{};
         if(!SnapshotGait(lease.character,parameters.movement.gait)||
             !SnapshotMovement(lease.ref.object,SourceKind(lease),parameters.movement.after,true)||
@@ -293,6 +326,24 @@ void FinalizeMovement(Lease& lease) noexcept {
         }
         lease.parameters=parameters;
     }
+    // The full producer bundle and its latest parameter revision must precede
+    // any route packet in the shared causal outbox. A synchronous native path
+    // install can only be recovered now, after Admit established its identity.
+    Ref movement{};
+    if(!Live(lease)||!Read(lease.character+0x42A8U,movement)||!movement.object||!movement.control) {
+        lease.unknown=true;Lost(__LINE__);return;
+    }
+    route_runtime::ObserveHostNavigation(movement.object+0xC4U,
+        lease.ref.object+(SourceKind(lease)==1?0x28U:0x1CU));
+    if(!Live(lease)){lease.unknown=true;Lost(__LINE__);return;}
+    if(lease.companion.object) {
+        // Observe can publish through callbacks. Qualify the second part from
+        // the current owning lease and current M, independently of the first.
+        if(!Read(lease.character+0x42A8U,movement)||!movement.object||!movement.control) {
+            lease.unknown=true;Lost(__LINE__);return;
+        }
+        route_runtime::ObserveHostNavigation(movement.object+0xC4U,lease.companion.object+0x1CU);
+    }
     static_cast<void>(FinishMovement(lease));
 }
 void ObserveStatus(std::uintptr_t request, std::uintptr_t character, std::uint32_t next) noexcept {
@@ -301,7 +352,7 @@ void ObserveStatus(std::uintptr_t request, std::uintptr_t character, std::uint32
     if (!lease && (next == 1 || next == 2)) lease = Capture(request);
     if (!lease) return;
     if (lease->unknown || character != lease->character || !Live(*lease)) { Lost(__LINE__); return; }
-    if((lease->parameters.kind==1||lease->parameters.kind==3)) {
+    if((lease->parameters.kind==1||lease->parameters.kind==2||lease->parameters.kind==3)) {
         if(lease->submitted)static_cast<void>(FinishMovement(*lease));
         return;
     }
@@ -348,7 +399,15 @@ void FinalizePending() noexcept {
         Lease* first{};
         for(auto& lease:gLeases)if(lease.used&&!lease.submitted&&!lease.unknown&&(!first||lease.order<first->order))first=&lease;
         if(!first||first->admissionActive||first->producerActive)return;
-        if(first->parameters.kind==1||first->parameters.kind==3)FinalizeMovement(*first);else FinalizeScalar(*first);
+        if(first->parameters.kind==2&&!first->markerInitialized) {
+            std::uint32_t status{};
+            if(!Read(first->ref.object+0xC,status)){first->unknown=true;Lost(__LINE__);return;}
+            if(!first->primaryAccepted||(status>=3&&status<=6)) {
+                first->unknown=true;if(!ReleaseRef(first->ref)){Lost(__LINE__);return;}*first={};continue;
+            }
+            return; // Geometry is captured when the retail initializer actually runs.
+        }
+        if(first->parameters.kind==1||first->parameters.kind==2||first->parameters.kind==3)FinalizeMovement(*first);else FinalizeScalar(*first);
         if(first->used&&!first->submitted)return;
     }
 }
@@ -432,14 +491,46 @@ void __fastcall GoalUpdateDetour(void* request,void*,const void* goal) noexcept 
     reinterpret_cast<void(__thiscall*)(void*,const void*)>(gBase+0x2C7550)(request,goal);
     ObserveNativeMutation(reinterpret_cast<std::uintptr_t>(request));
 }
+// Exact 00681810 entry, ECX=request, Character stack word, RET4. The
+// original Host initializer stays native. An owned Client uses captured Host
+// geometry before native insertion, so local player context cannot author it.
+void __fastcall MarkerInitializeDetour(void* request,void*,std::uintptr_t character) noexcept {
+    const NativeCallScope frame;
+    const auto ownership=execution_runtime::InitializeMarker(reinterpret_cast<std::uintptr_t>(request),character);
+    if(ownership!=execution::MarkerInitialization::Unowned)return;
+    const auto original=reinterpret_cast<void(__thiscall*)(void*,std::uintptr_t)>(gMarkerInitializeOriginal.load(std::memory_order_acquire));
+    if(original)original(request,character);
 }
+// This wrapper is only the CALL0068192F inside the genuine kind2 initializer.
+// Snapshot before0044D190 changes B.state/list links; no broad offset matching.
+void __fastcall MarkerInsertDetour(void* navigation,void*,std::uintptr_t block) noexcept {
+    const NativeCallScope frame;
+    BeforeNativeMarkerInsertion(reinterpret_cast<std::uintptr_t>(navigation),block);
+    reinterpret_cast<void(__thiscall*)(void*,std::uintptr_t)>(gBase+0x4D190U)(navigation,block);
+    if(gGuard&&gGuard()&&EngineProducer().Bound())FinalizePending();
+}
+}
+void BeforeNativeMarkerInsertion(std::uintptr_t navigation,std::uintptr_t block) noexcept {
+    if(!gInstalled||!gGuard||!gGuard()||!EngineProducer().Bound())return;
+    auto* lease=block>=0x1CU?Find(block-0x1CU):nullptr;
+    if(lease&&lease->parameters.kind==2&&!lease->unknown&&gGuard&&gGuard()&&Live(*lease)) {
+        Ref movement{};movement::Parameters authored{};std::uint32_t marker{};native_intent::Payload key{};
+        auto expected=lease->parameters.intent;expected.words[12]=expected.words[13]=0;
+        if(!Read(lease->ref.object+0xB0,marker)||!gMarkerCapture||!gMarkerCapture(marker,key)||key!=expected||
+            !Read(lease->character+0x42A8U,movement)||!movement.object||
+            navigation!=movement.object+0xC4U||
+            !SnapshotMovement(lease->ref.object,2,authored,false)) {lease->unknown=true;Lost(__LINE__);}
+        else {lease->parameters.movement.before=authored;lease->markerInitialized=true;}
+    }
+}
+void SetNativeMarkerCapture(NativeMarkerCapture capture) noexcept {gMarkerCapture=capture;}
 void SetNativeSchedulerObserver(NativeSchedulerObserver observer) noexcept {
     gSchedulerObserver.store(observer,std::memory_order_release);
 }
 void BeforeNativeRetention(std::uintptr_t scheduler,std::uintptr_t request) noexcept {
     if(!gInstalled||!gGuard||!gGuard()||!EngineProducer().Bound())return;
     const auto* lease=Find(request);std::uintptr_t owner{};std::uint32_t status{};
-    if(lease&&scheduler_control::Supported(lease->parameters.kind)&&
+    if(lease&&(scheduler_control::Supported(lease->parameters.kind)||lease->parameters.kind==2||lease->parameters.kind==execution::kPlacementKind)&&
         Read(request+0x14U,owner)&&owner==scheduler&&Read(request+0xCU,status)&&status>=3U&&status<=5U)
         ObserveStatus(request,lease->character,status);
 }
@@ -461,7 +552,31 @@ void BeforeNativeAdmission(std::uintptr_t request,std::uint32_t admission) noexc
     std::uintptr_t scheduler{},character{};transactions::OwnerKey owner{};
     if(!Read(request+0x14,scheduler)||!Read(scheduler,character)||scheduler!=character+0x2CD0||!gContext(character,owner))return;
     if(admission>2){Lost(__LINE__);return;}
-    if(kind==4||kind==7||kind==execution::kActionKind||kind==execution::kDirectedKind||scheduler_control::Supported(kind)) {
+    if(kind==2) {
+        // A raw Host marker index is process-local. Capture its exact loaded
+        // asset/ordinal key BEFORE native admission; unresolved identity skips
+        // only this request, never closes unrelated actors' publication.
+        native_intent::Payload key{};std::uint32_t marker{};std::uint8_t opaque{},retained{};
+        if((EngineProducer().Profiles()&execution::kProfileMarker)==0||!gMarkerCapture||!Read(request+0xB0,marker)||marker==UINT32_MAX||
+            !Read(request+0xB4,opaque)||opaque>1||!Read(request+0x18,retained)||retained>1||
+            !gMarkerCapture(marker,key)) {gUncoveredKinds[2].fetch_add(1U,std::memory_order_relaxed);return;}
+        if(Find(request)){gUncoveredKinds[2].fetch_add(1U,std::memory_order_relaxed);return;}
+        Lease* lease{};for(auto& item:gLeases)if(!item.used){lease=&item;break;}
+        if(!lease){Lost(__LINE__,execution::Recovery::Capacity);return;}
+        *lease={};lease->used=true;lease->owner=owner;lease->character=character;
+        lease->parameters.kind=lease->sourceKind=2;lease->parameters.admission=admission;
+        lease->parameters.intent=key;lease->parameters.intent.words[12]=opaque;lease->parameters.intent.words[13]=opaque;
+        lease->markerRetainedBefore=retained;lease->admissionActive=true;
+        lease->parameters.movement.version=1;lease->parameters.movement.parts=1;
+        lease->parameters.movement.navigation=movement::Navigation::HostRoute;
+        if(gAdmissionOrder==UINT64_MAX){lease->unknown=true;Lost(__LINE__,execution::Recovery::Capacity);return;}
+        lease->order=++gAdmissionOrder;
+        if(!HostScope(lease->scope)||!Read(character+0x50,lease->runtime)||!Strong(request,lease->ref)||!Live(*lease)) {
+            lease->unknown=true;Lost(__LINE__);
+        }
+        return;
+    }
+    if(kind==4||kind==7||kind==execution::kActionKind||kind==execution::kPlacementKind||kind==execution::kDirectedKind||scheduler_control::Supported(kind)) {
         auto* lease=Capture(request);if(!lease||lease->unknown)return;
         if(lease->submitted){Lost(__LINE__);return;}
         // A kind5 admission can precede execution. Its cycle identity is
@@ -469,7 +584,9 @@ void BeforeNativeAdmission(std::uintptr_t request,std::uint32_t admission) noexc
         // the cycle left by the preceding command.
         lease->parameters.admission=admission;lease->admissionActive=true;return;
     }
-    if(kind!=1&&kind!=2&&kind!=3)return;
+    if(kind!=1&&kind!=3) {
+        gUncoveredKinds[(std::min)(kind,15U)].fetch_add(1U,std::memory_order_relaxed);return;
+    }
     auto* frame=(!gMoveOverflow&&gMoveDepth&&gMoveFrames[gMoveDepth-1].bound&&
         gMoveFrames[gMoveDepth-1].character==character)?&gMoveFrames[gMoveDepth-1]:nullptr;
     if(kind!=3||admission!=1||!frame) {
@@ -477,14 +594,14 @@ void BeforeNativeAdmission(std::uintptr_t request,std::uint32_t admission) noexc
         Lease* lease{};for(auto& candidate:gLeases)if(!candidate.used){lease=&candidate;break;}
         if(!lease){Lost(__LINE__,execution::Recovery::Capacity);return;}
         *lease={};lease->used=true;lease->owner=owner;lease->character=character;
-        lease->parameters.kind=kind==2?1U:kind;lease->sourceKind=kind;
+        lease->parameters.kind=kind;lease->sourceKind=kind;
         if(gAdmissionOrder==UINT64_MAX){lease->unknown=true;Lost(__LINE__,execution::Recovery::Capacity);return;}
         lease->order=++gAdmissionOrder;lease->parameters.admission=admission;
         lease->admissionActive=true;
         auto& b=lease->parameters.movement;b.version=1;b.parts=1;
-        // A Host path is only valid from the Host character's position. The
-        // Client plans natively from its own position to the same Host goal.
-        b.navigation=movement::Navigation::LocalNative;
+        // Capture route choice on the Host. Missing/incompatible route data
+        // must be refused by the importer, never replaced by a Client solve.
+        b.navigation=movement::Navigation::HostRoute;
         if(!HostScope(lease->scope)||!Read(character+0x50,lease->runtime)||
             !SnapshotMovement(request,kind,b.before,false)||!Strong(request,lease->ref)||!Live(*lease)) {
             lease->unknown=true;Lost(__LINE__);return;
@@ -524,6 +641,20 @@ void EndNativeMove() noexcept {
 void ObserveNativeMutation(std::uintptr_t request) noexcept {
     if(!gInstalled||!gGuard||!gGuard()||!EngineProducer().Bound())return;
     auto* lease=Find(request);
+    if(lease&&lease->parameters.kind==execution::kPlacementKind) {
+        if(!execution::PlacementDedupReady()||lease->unknown||!lease->submitted||lease->admissionActive)return;
+        std::uintptr_t character{};std::uint32_t runtime{},status{};Command parameters{};
+        if(!Live(*lease)||!Snapshot(request,character,runtime,parameters)||character!=lease->character||runtime!=lease->runtime||
+            !Read(request+0xC,status)) {lease->unknown=true;Lost(__LINE__);return;}
+        if(status!=1U&&status!=2U)return;
+        parameters.admission=lease->parameters.admission;
+        parameters.scalarRetention=(lease->parameters.scalarRetention&1U)|(parameters.scalarRetention&2U);
+        if(parameters!=lease->parameters) {
+            if(EngineProducer().Update(request,parameters)!=SourceResult::Ok){lease->unknown=true;return;}
+            lease->parameters=parameters;
+        }
+        return;
+    }
     if(!lease||lease->parameters.kind!=1||lease->unknown||!lease->submitted||lease->producerActive||lease->admissionActive)return;
     FinalizeMovement(*lease);
 }
@@ -545,7 +676,9 @@ bool InstallNative(std::uintptr_t base, HookManager& hooks, NativeContext contex
         }
         return hooks.Install(request,error);
     };
-    if (!install("AISync typed Host status",0x2777E0U,reinterpret_cast<void*>(&StatusDetour),
+    if (!install("AISync marker initializer",0x281810U,reinterpret_cast<void*>(&MarkerInitializeDetour),
+            {0x55,0x8B,0xEC,0x83,0xE4,0xF0},&gMarkerInitializeTrampoline,&gMarkerInitializeOriginal) ||
+        !install("AISync typed Host status",0x2777E0U,reinterpret_cast<void*>(&StatusDetour),
             {0x83,0x7C,0x24,0x0C,0x02},&gStatusTrampoline,&gStatusOriginal) ||
         !install("AISync typed Host request retention",0x283470U,reinterpret_cast<void*>(&RetentionDetour),
             {0x53,0x8B,0x5C,0x24,0x08},&gRetentionTrampoline,&gRetentionOriginal) ||
@@ -569,12 +702,22 @@ bool InstallNative(std::uintptr_t base, HookManager& hooks, NativeContext contex
             std::string rollback;if(!hooks.UninstallFrom(before,rollback))error+="; "+rollback;return false;
         }
     }
+    const CallRedirectRequest markerInsert{"AISync marker authored parameters",reinterpret_cast<void*>(base+0x28192FU),
+        reinterpret_cast<void*>(base+0x4D190U),reinterpret_cast<void*>(&MarkerInsertDetour)};
+    if(!hooks.InstallCallRedirect(markerInsert,error)) {
+        std::string rollback;if(!hooks.UninstallFrom(before,rollback))error+="; "+rollback;return false;
+    }
     gInstalled = true; return true;
 }
 void ObserveNativeAdmission(std::uintptr_t request, bool accepted) noexcept {
     if (!gGuard || !gGuard() || !EngineProducer().Bound()) return;
     if(auto* move=Find(request)) {
         if(request==move->ref.object)move->primaryAccepted=accepted;else move->companionAccepted=accepted;
+        if(move->parameters.kind==2) {
+            std::uint8_t opaque{};
+            if(!Read(request+0xB4,opaque)||opaque>1){move->unknown=true;Lost(__LINE__);return;}
+            move->parameters.intent.words[13]=opaque;
+        }
         move->admissionActive=false;
         return;
     }
@@ -596,11 +739,27 @@ void PumpNative() noexcept {
         if (!lease.used || lease.unknown) continue;
         if(!lease.submitted)continue;
         if (!Live(lease)) { lease.unknown = true; Lost(__LINE__); return; }
-        if((lease.parameters.kind==1||lease.parameters.kind==3)) {
+        if((lease.parameters.kind==1||lease.parameters.kind==2||lease.parameters.kind==3)) {
             if(lease.producerActive||lease.admissionActive)continue;
             // Producer-return boundaries capture changes; scheduler execution
             // cursors/flags never create synthetic Host updates.
             if(FinishMovement(lease))continue;
+            if(lease.parameters.kind==2) {
+                auto parameters=lease.parameters;std::uint8_t opaque{},retained{};std::uint32_t marker{};
+                native_intent::Payload key{};
+                if(!Read(lease.ref.object+0xB0,marker)||!Read(lease.ref.object+0xB4,opaque)||opaque>1||
+                    !Read(lease.ref.object+0x18,retained)||retained>1||!gMarkerCapture||!gMarkerCapture(marker,key)) {
+                    lease.unknown=true;Lost(__LINE__);continue;
+                }
+                auto expected=lease.parameters.intent;expected.words[12]=expected.words[13]=0;
+                if(key!=expected){lease.unknown=true;Lost(__LINE__);continue;}
+                parameters.intent.words[13]=opaque;parameters.movement.after.retained=retained;
+                if(parameters!=lease.parameters) {
+                    if(EngineProducer().Update(lease.ref.object,parameters)!=SourceResult::Ok){lease.unknown=true;continue;}
+                    lease.parameters=parameters;
+                }
+                continue;
+            }
             std::uint32_t gait{};
             if(!SnapshotGait(lease.character,gait)){lease.unknown=true;Lost(__LINE__);return;}
             if(gait!=lease.parameters.movement.gait) {
@@ -676,7 +835,7 @@ bool BeforeNativeActorDestruction(std::uintptr_t character,std::uint32_t runtime
 bool IdentifyNativeNavigation(std::uintptr_t navigation,std::uintptr_t block,CommandIdentity& output,std::uint32_t& part) noexcept {
     if(!gGuard||!gGuard()||!navigation||!block)return false;
     for(auto& lease:gLeases)if(lease.used&&lease.submitted&&!lease.unknown&&
-        (lease.parameters.kind==1||lease.parameters.kind==3)) {
+        (lease.parameters.kind==1||lease.parameters.kind==2||lease.parameters.kind==3)) {
         const auto primary=lease.ref.object+(SourceKind(lease)==1?0x28U:0x1CU);
         const auto secondary=lease.companion.object?lease.companion.object+0x1CU:0;
         if(block!=primary&&block!=secondary)continue;
@@ -688,6 +847,27 @@ bool IdentifyNativeNavigation(std::uintptr_t navigation,std::uintptr_t block,Com
         output=identity;part=block==primary?0U:1U;return true;
     }
     return false;
+}
+bool IdentifyNativePlacement(std::uintptr_t scheduler,NativePlacementIdentity& output) noexcept {
+    if(!gInstalled||!execution::PlacementDedupReady()||!gGuard||!gGuard()||!EngineProducer().Bound())return false;
+    std::uintptr_t character{},head{},first{},request{},control{},requestScheduler{},type{};
+    std::uint32_t count{},kind{},status{};
+    if(!Read(scheduler,character)||!character||scheduler!=character+0x2CD0U||
+        !Read(scheduler+4,head)||!head||!Read(scheduler+8,count)||!count||
+        !Read(head,first)||!first||first==head||!Read(first+8,request)||!Read(first+12,control)||!control||
+        !Read(request,type)||type!=gBase+0xEB199CU||!Read(request+0x10,kind)||kind!=execution::kPlacementKind||
+        !Read(request+0x14,requestScheduler)||requestScheduler!=scheduler||
+        !Read(request+0xC,status)||(status!=1U&&status!=2U))return false;
+    auto* lease=Find(request);
+    if(!lease||lease->unknown||!lease->submitted||lease->admissionActive||lease->character!=character||
+        lease->parameters.kind!=execution::kPlacementKind||lease->ref.control!=control||!Live(*lease))return false;
+    std::uintptr_t observedCharacter{};std::uint32_t runtime{};Command parameters{};CommandIdentity identity{};
+    if(!Snapshot(request,observedCharacter,runtime,parameters)||observedCharacter!=character||runtime!=lease->runtime)return false;
+    parameters.admission=lease->parameters.admission;
+    parameters.scalarRetention=(lease->parameters.scalarRetention&1U)|(parameters.scalarRetention&2U);
+    if(parameters!=lease->parameters||!EngineProducer().Identify(request,identity)||identity.scope!=lease->scope||
+        identity.owner!=lease->owner||identity.nativeKind!=execution::kPlacementKind||!Live(*lease))return false;
+    output={identity,scheduler,request,character,runtime,parameters.mode};return true;
 }
 void ObserveNativeActionExecution(std::uintptr_t scheduler) noexcept {
     if(!gInstalled||!gGuard||!gGuard())return;
@@ -791,7 +971,7 @@ bool BootstrapNativeActor(std::uintptr_t character) noexcept {
             const auto* lease = Find(request);
             return lease && lease->submitted && !lease->unknown && EngineProducer().Bound();
         }
-        if (kind != 2 && execution::ProfileForKind(kind) == 0) {
+        if (execution::ProfileForKind(kind) == 0) {
             // Not replicated by any profile: left to the Host, never cancelled.
             if (!Read(node,node)) { Lost(__LINE__); return false; }
             continue;

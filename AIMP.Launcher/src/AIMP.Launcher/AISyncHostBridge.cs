@@ -288,11 +288,21 @@ internal sealed partial class AISyncHostBridge : IDisposable
         if (work.Control is { } control && control.Scope == scope && control.Kind != AISyncExecutionControlKind.Ready)
             throw new ProtocolException($"Client command scope entered recovery: {work.Control?.Kind}, reason={work.Control?.Value}.");
         if (work.Receipt is not { } receipt || receipt.Scope != scope) return;
+        // LobbyHost raises receipts only after its per-peer journal validates
+        // the exact batch/operation echo and legal disposition transition.
+        // A refusal settles retry eligibility, not native ownership or cleanup.
+        var key = (work.Peer, receipt.Operation.GlobalSequence);
         if (receipt.Stage is AISyncExecutionStage.Rejected or AISyncExecutionStage.Unknown)
-            throw new ProtocolException($"Client native command refused: stage={receipt.Stage}, result={receipt.Result}, "
+        {
+            _waiting.Remove(key);
+            _log($"Client native command refused: peer={work.Peer}, stage={receipt.Stage}, result={receipt.Result}, "
                 + $"sequence={receipt.Operation.GlobalSequence}, command={receipt.Operation.CommandId}, "
                 + $"kind={receipt.Operation.NativeKind}, opcode={receipt.Operation.Opcode}.");
-        var key = (work.Peer, receipt.Operation.GlobalSequence);
+            // Leave the final receipt in the consumer journal. In particular,
+            // Unknown cannot authorize a retry, replacement, or checkpoint of
+            // resources whose release has not been proved by native execution.
+            return;
+        }
         if (receipt.Stage == AISyncExecutionStage.Waiting)
             _waiting[key] = new(receipt.Operation, Environment.TickCount64);
         else if (receipt.Stage is AISyncExecutionStage.Entered or AISyncExecutionStage.Admitted

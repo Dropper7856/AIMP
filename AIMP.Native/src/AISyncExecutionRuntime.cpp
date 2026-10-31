@@ -16,6 +16,9 @@ std::unique_ptr<execution::ExecutionSession> gSession;
 std::unique_ptr<execution::OwnershipCoordinator> gOwnership;
 std::atomic<bool> gAvailable{};
 std::atomic<bool> gRetireRequested{};
+struct NavigationRejection { execution::NavigationBinding binding{}; bool used{}; };
+std::array<NavigationRejection,execution::NativeRequestAdapter::kCapacity> gNavigationRejections{};
+bool gRejectingNavigation{};
 QualifyScope gQualify{};
 QualifyScope gRetirementQualify{};
 execution::OwnershipAdapter gOwnershipHooks{};
@@ -135,6 +138,8 @@ bool MutableOwnership(bool admission) noexcept {
 }
 transactions::Result Bind(void*, const transactions::Scope& scope, std::uint32_t generation) noexcept {
     if (!gQualify(scope, generation)) return transactions::Result::WrongScope;
+    // World revocation happens before the legacy context-retirement barrier.
+    // Doing it here was too late: that barrier prevented this Bind entirely.
     if(gContextReady&&!gContextReady(scope))return transactions::Result::OwnerBusy;
     if (((scope != gScope || generation != gNativeGeneration) && !route_runtime::RetirementComplete(gScope)) ||
         gOwnership->CanConfigure(scope, generation) != execution::OwnershipResult::Ready) return transactions::Result::OwnerBusy;
@@ -312,6 +317,18 @@ void BeforeActorDestruction(const execution::ActorLifetime& actor) noexcept {
 void Retire() noexcept {
     gMailbox.Retire(); gRetireRequested.store(true, std::memory_order_release);
 }
+bool RevokePreviousWorld(const std::uint32_t current) noexcept {
+    if (current == 0U) return false;
+    if (!gAvailable.load(std::memory_order_acquire) || gNativeGeneration == 0U ||
+        current == gNativeGeneration) return true;
+    if (current < gNativeGeneration || gSession->OperationInProgress() || gOwnership->InTransition()) return false;
+    gMailbox.RetireGeneration(gNativeGeneration);
+    gRetireRequested.store(true, std::memory_order_release);
+    gOwnership->ForgetGeneration(gNativeGeneration);
+    // No session/route cleanup success is inferred here. In particular the
+    // existing reference-retirement barriers are still required before Bind.
+    return true;
+}
 void AfterActorDestruction(const execution::ActorLifetime& actor) noexcept {
     if(!actor.character||!actor.runtimeId||!actor.nativeGeneration||!actor.creationSerial)return;
     const std::lock_guard lock(gDestroyedMutex);
@@ -324,6 +341,11 @@ execution::MailboxFailure LastMailboxFailure() noexcept {return gMailbox.LastFai
 bool CurrentScope(transactions::Scope& output) noexcept {
     if(!Available()||!gQualify||!gQualify(gScope,gNativeGeneration)||gSession->Retired()||!gMailbox.Bound(gScope,gNativeGeneration))return false;
     output=gScope;return true;
+}
+bool IsOwnedPlacement(std::uintptr_t scheduler) noexcept {
+    transactions::Scope scope{};execution::RetirementIdentity identity{};
+    return CurrentScope(scope)&&!gRetireRequested.load(std::memory_order_acquire)&&
+        gSession->IsOwnedPlacement(scheduler,&identity)&&identity.scope==scope;
 }
 std::size_t ActorRequests(std::uintptr_t c) noexcept {return Available()?gSession->ActorRequests(c):0U;}
 bool OrdinaryMotionAvailable(const execution::ActorLifetime& actor) noexcept {
@@ -340,6 +362,21 @@ bool OrdinaryMotionAvailable(const execution::ActorLifetime& actor) noexcept {
         if(phase!=execution::OwnershipPhase::Owned&&phase!=execution::OwnershipPhase::Released)return false;
     }
     return true;
+}
+bool RecoveryMotionAvailable(const execution::ActorLifetime& actor) noexcept {
+    transactions::Scope scope{};
+    if(!CurrentScope(scope)||gRetireRequested.load(std::memory_order_acquire)||
+        gSession->OperationInProgress()||gOwnership->InTransition()||
+        actor.nativeGeneration!=gNativeGeneration||!actor.creationSerial)return false;
+    bool granted{};
+    for(std::size_t i=0;i<gOwnership->Count();++i) {
+        execution::OwnershipToken token{};execution::OwnershipPhase phase{};
+        if(!gOwnership->Read(i,token,phase))return false;
+        if(token.actor.character!=actor.character)continue;
+        if(token.actor!=actor||token.scope!=scope||phase!=execution::OwnershipPhase::Owned)return false;
+        granted=true;
+    }
+    return granted;
 }
 action_correlation::Readiness ActionReadiness(const action_correlation::Reference& reference,
     const transactions::OwnerKey& owner,const execution::ActorLifetime& actor,std::size_t* blockingRequests,bool admittedHistory) noexcept {
@@ -376,6 +413,12 @@ execution::NavigationOwnership IdentifyNavigation(std::uintptr_t n,std::uintptr_
     const bool current=gQualify&&gQualify(gScope,gNativeGeneration)&&gMailbox.Matches(gScope);
     return gSession->IdentifyNavigation(n,b,output,current);
 }
+execution::MarkerInitialization InitializeMarker(std::uintptr_t request,std::uintptr_t character) noexcept {
+    if(!gAvailable.load(std::memory_order_acquire))return execution::MarkerInitialization::Unowned;
+    const bool current=gQualify&&gQualify(gScope,gNativeGeneration)&&gMailbox.Matches(gScope)&&
+        !gRetireRequested.load(std::memory_order_acquire);
+    return gSession->InitializeMarker(request,character,current);
+}
 bool Matches(const transactions::Scope& scope) noexcept {
     return gAvailable.load(std::memory_order_acquire) && gMailbox.Matches(scope);
 }
@@ -383,12 +426,40 @@ void Fail(const transactions::Scope& scope,execution::Recovery reason) noexcept 
     if (gAvailable.load(std::memory_order_acquire) && gMailbox.Fence(scope,reason))
         gRetireRequested.store(true,std::memory_order_release);
 }
+bool RejectNavigation(const execution::NavigationBinding& binding) noexcept {
+    if(!gAvailable.load(std::memory_order_acquire)||!gQualify||
+        !gQualify(binding.command.scope,gNativeGeneration)||binding.command.scope!=gScope||
+        !gMailbox.Bound(gScope,gNativeGeneration)||binding.policy!=movement::Navigation::HostRoute)return false;
+    NavigationRejection* empty{};
+    for(auto& item:gNavigationRejections) {
+        if(item.used&&item.binding.command.scope!=gScope)item={};
+        if(item.used&&item.binding.command==binding.command)return true;
+        if(!item.used&&!empty)empty=&item;
+    }
+    if(!empty)return false;
+    *empty={binding,true};return true;
+}
+void DrainNavigationRejections() noexcept {
+    if(gRejectingNavigation||gSession->OperationInProgress()||gOwnership->InTransition())return;
+    gRejectingNavigation=true;
+    for(auto& item:gNavigationRejections)if(item.used) {
+        if(item.binding.command.scope!=gScope){item={};continue;}
+        if(!gQualify||!gQualify(gScope,gNativeGeneration)||!gMailbox.Bound(gScope,gNativeGeneration))continue;
+        // Remove before entering native callbacks. A nested failure may queue
+        // its own copied identity; it cannot mutate this borrowed call token.
+        const auto binding=item.binding;item={};
+        static_cast<void>(gSession->RejectNavigation(binding));
+    }
+    gRejectingNavigation=false;
+}
 void Pump(bool includeRetirements) noexcept {
     const profiling::Timer timing(profiling::Section::CommandPump);
     if (gAvailable.load(std::memory_order_acquire)) {
         if (gSession->OperationInProgress() || gOwnership->InTransition()) return;
         if (includeRetirements) PumpRetirements();
+        DrainNavigationRejections();
         gMailbox.Pump({nullptr, &Bind, &Execute, &Retry, &Checkpoint,&Carrier,&Route});
+        DrainNavigationRejections();
         if (!gSession->OperationInProgress() && !gOwnership->InTransition()) { gSession->Steer(); PublishWaits(); }
     }
 }

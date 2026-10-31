@@ -607,7 +607,7 @@ public sealed partial class LobbyClient : IAsyncDisposable
             // The next ReadAsync can observe closure before cancellation.
         }
         catch (Exception exception) when (
-            exception is IOException or SocketException or EndOfStreamException
+            exception is IOException or SocketException or EndOfStreamException or ObjectDisposedException
                 or ProtocolException)
         {
             Log?.Invoke(this, $"Lobby connection ended: {exception.Message}");

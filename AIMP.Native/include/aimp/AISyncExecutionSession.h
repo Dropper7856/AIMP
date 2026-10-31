@@ -41,9 +41,18 @@ public:
     [[nodiscard]] bool Retry(const transactions::Record& exact, std::uint64_t batchId,
         const transactions::Scope& current, bool authenticatedHost, Receipt&) noexcept;
     [[nodiscard]] NativeRequestStatus Inspect(const transactions::Record&) noexcept;
+    // Local navigation failure: native cancellation of this exact retained
+    // command only. It does not fabricate a Host operation or an applied receipt.
+    [[nodiscard]] bool RejectNavigation(const NavigationBinding&) noexcept;
+    [[nodiscard]] bool IsOwnedPlacement(std::uintptr_t scheduler,RetirementIdentity* identity = nullptr) const noexcept {
+        return configured_&&!retired_&&native_.IsOwnedPlacement(scheduler,identity);
+    }
     [[nodiscard]] NavigationOwnership IdentifyNavigation(std::uintptr_t n,std::uintptr_t b,NavigationBinding& out,
         bool currentLifetime = true) noexcept {
         return configured_ ? native_.IdentifyNavigation(n,b,out,currentLifetime&&!retired_) : NavigationOwnership::Unowned;
+    }
+    [[nodiscard]] MarkerInitialization InitializeMarker(std::uintptr_t request,std::uintptr_t character,bool currentLifetime) noexcept {
+        return configured_ ? native_.InitializeMarker(request,character,currentLifetime&&!retired_) : MarkerInitialization::Unowned;
     }
     // Exact retained evidence only; this neither retries nor grants ownership.
     [[nodiscard]] bool IsWaiting(const transactions::Record&) const noexcept;

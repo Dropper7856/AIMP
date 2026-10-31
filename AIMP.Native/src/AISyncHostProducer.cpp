@@ -192,7 +192,7 @@ bool Producer::NextRouteKey(const CommandIdentity& identity,std::uint32_t part,r
     if(!Bound()||identity.scope!=binding_.scope)return false;
     for(const auto& entry:commands_)if(entry.used&&entry.command==identity.command&&entry.owner==identity.owner) {
         if(entry.routeBlocked||entry.cancelled||entry.completed||entry.released||entry.revision!=identity.parameterRevision||
-            entry.parameters.kind!=identity.nativeKind||(identity.nativeKind!=1&&identity.nativeKind!=3)||
+            entry.parameters.kind!=identity.nativeKind||(identity.nativeKind!=1&&identity.nativeKind!=2&&identity.nativeKind!=3)||
             identity.navigation!=movement::Navigation::HostRoute||entry.parameters.movement.navigation!=identity.navigation||
             part>=entry.parameters.movement.parts||part>=entry.routeRevisions.size()||entry.routeRevisions[part]==UINT32_MAX)return false;
         output={binding_.scope,entry.owner,entry.command,entry.revision,entry.routeRevisions[part]+1,part};
@@ -208,7 +208,7 @@ SourceResult Producer::AppendRoute(const route::Graph& graph) noexcept {
     Entry* entry{};
     for(auto& item:commands_)if(item.used&&item.command==graph.key.commandId&&item.owner==graph.key.owner) {entry=&item;break;}
     if(!entry||entry->routeBlocked||entry->cancelled||entry->completed||entry->released||entry->revision!=graph.key.parameterRevision||
-        (entry->parameters.kind!=1&&entry->parameters.kind!=3)||graph.key.part>=entry->parameters.movement.parts||
+        (entry->parameters.kind!=1&&entry->parameters.kind!=2&&entry->parameters.kind!=3)||graph.key.part>=entry->parameters.movement.parts||
         entry->parameters.movement.navigation!=movement::Navigation::HostRoute||
         entry->routeRevisions[graph.key.part]==UINT32_MAX||graph.key.routeRevision!=entry->routeRevisions[graph.key.part]+1) {
         return SourceResult::Conflict;

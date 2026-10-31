@@ -140,10 +140,25 @@ using CommandTrace = void(*)(const transactions::Record&) noexcept;
 void SetCommandTrace(CommandTrace) noexcept;
 using NativeContext = bool(*)(std::uintptr_t character, transactions::OwnerKey&) noexcept;
 using NativeGuard = bool(*)() noexcept;
+// Engine-qualified exact loaded marker identity, never a raw marker index on wire.
+using NativeMarkerCapture = bool(*)(std::uint32_t localMarker,native_intent::Payload&) noexcept;
+void SetNativeMarkerCapture(NativeMarkerCapture) noexcept;
+// Only the certified0068192F pre-insertion seam may supply authored geometry.
+void BeforeNativeMarkerInsertion(std::uintptr_t navigation,std::uintptr_t block) noexcept;
 using NativeSchedulerObserver = void(*)(std::uintptr_t scheduler,bool entering) noexcept;
 void SetNativeSchedulerObserver(NativeSchedulerObserver) noexcept;
 // Exact status before00683470 can overwrite a terminal disposition with6.
 void BeforeNativeRetention(std::uintptr_t scheduler,std::uintptr_t request) noexcept;
+struct NativePlacementIdentity {
+    CommandIdentity command{};
+    std::uintptr_t scheduler{},request{},character{};
+    std::uint32_t runtime{},branch{};
+    bool operator==(const NativePlacementIdentity&) const noexcept = default;
+};
+// Exact current head, held by our live native observer lease. Read-only:
+// returns false for provisional/unpublished/mutated/foreign requests. The
+// caller must refresh pending source parameters before entering mode8.
+[[nodiscard]] bool IdentifyNativePlacement(std::uintptr_t scheduler,NativePlacementIdentity&) noexcept;
 using NativeRetirementGuard = bool(*)(const transactions::Scope&, const transactions::OwnerKey&,
     std::uintptr_t character, std::uint32_t runtime) noexcept;
 // Exact-build native capture. The existing Submit detour forwards successful

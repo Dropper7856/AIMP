@@ -4,6 +4,7 @@
 #include "aimp/AISyncHostProducer.h"
 #include "aimp/AISyncMeshStorage.h"
 #include "aimp/AISyncRouteExecution.h"
+#include "aimp/AISyncRouteContract.h"
 #include "aimp/CrashGuard.h"
 #include "aimp/HookManager.h"
 #include <Windows.h>
@@ -44,6 +45,7 @@ std::atomic<std::uint64_t> gCommandFaults{},gDiscarded{},gGlobalFailures{},gHost
 std::uint64_t HostRoutesUnavailable() noexcept;
 std::atomic<std::uint32_t> gHostFailureSite{},gHostFailureResult{},gHostNavigationNodes{},gHostResultNodes{};
 std::atomic<std::uint32_t> gHostCaptureCheck{};
+std::atomic<std::uint32_t> gHostCaptureNode{UINT32_MAX},gHostMarkerIndex{UINT32_MAX},gHostMarkerKind{UINT32_MAX},gHostMarkerTypeRva{UINT32_MAX};
 std::atomic<std::uint64_t> gHostCaptureDeferred{};
 std::atomic<std::uint32_t> gHostBlockState{},gHostBlockMode{},gHostStopBits{},gHostNodeType{},gHostMetadataBytes{};
 std::mutex gFailureGate;
@@ -59,8 +61,14 @@ std::atomic<std::uint64_t> gFailureDropped{};
 int __cdecl NavigationBatch(void* list,int wait) {
     using Submit=int(__cdecl*)(void*,int);
     transactions::Scope scope{};
+    // Revocation closes new admissions, not ownership of already retained
+    // requests. Keep their task boundary on the engine thread while draining:
+    // moving it back to workers would bypass typed ownership and allow an old
+    // strict request to submit a local solver after the Client was frozen.
+    const bool retained=route_execution::LiveSlots().total!=0U||
+        execution_runtime::RetirementSnapshot().references!=0U;
     const bool authoritative=Available()&&gEngine&&gEngine()&&
-        ((host_producer::HostScope(scope)&&gHost(scope))||
+        (retained||(host_producer::HostScope(scope)&&gHost(scope))||
          (execution_runtime::CurrentScope(scope)&&gClient(scope)));
     if(!authoritative)return reinterpret_cast<Submit>(gBase+0x5E9530U)(list,wait);
     using Step=bool(__thiscall*)(void*);
@@ -130,29 +138,51 @@ struct HostProtection {
     host_producer::CommandIdentity command{};CaptureContext local{};std::uint32_t part{};
     std::array<float,6> auxiliary{};std::array<std::uint32_t,4> statuses{};
 };
-struct HostMetadata {HostProtection value{};bool used{};};
-std::array<HostMetadata,128> gHostMetadata{};
+struct HostMetadata {
+    HostProtection value{};
+    std::unique_ptr<route::Graph> complete;
+    // Provisional observations are value-only and may be consumed only by the
+    // producer's immediate, independently qualified post-Submit callback.
+    std::uintptr_t start{},finish{},cursor{};
+    std::array<float,3> goal{};
+    bool used{},provisional{};
+};
+std::array<HostMetadata,host_producer::Producer::kCommands*2> gHostMetadata{};
+bool SameHostPart(const HostProtection& a,const HostProtection& b) noexcept {
+    return a.local.navigation==b.local.navigation&&a.local.block==b.local.block&&
+        a.command.scope==b.command.scope&&a.command.owner==b.command.owner&&
+        a.command.command==b.command.command&&a.part==b.part;
+}
+HostMetadata* FindHostMetadata(const HostProtection& pin) noexcept {
+    for(auto& item:gHostMetadata)if(item.used&&!item.provisional&&SameHostPart(item.value,pin))return &item;
+    return nullptr;
+}
 bool SaveHostMetadata(const HostProtection& pin) noexcept {
     HostMetadata* empty{};
     for(auto& item:gHostMetadata) {
         if(item.used&&(item.value.command.scope!=pin.command.scope))item={};
-        if(item.used&&item.value.local.navigation==pin.local.navigation){item.value=pin;return true;}
+        if(item.used&&item.value.local.navigation==pin.local.navigation&&item.value.local.block==pin.local.block){
+            if(!SameHostPart(item.value,pin))item={};
+            item.value=pin;item.used=true;item.provisional=false;return true;
+        }
         if(!item.used&&!empty)empty=&item;
     }
     if(!empty)return false;
-    *empty={pin,true};return true;
+    empty->value=pin;empty->used=true;return true;
 }
-struct HostAdmission {HostProtection pin{};std::uintptr_t result{};bool ready{};};
+struct HostAdmission {HostProtection pin{};std::uintptr_t result{};bool ready{},identified{};};
 HostAdmission BeforeHostAdmission(std::uintptr_t n) noexcept {
     HostAdmission input{};auto& pin=input.pin;pin.local.navigation=n;std::uint32_t ready{},status{};
     if(!gEngine||!gEngine()||!Read(n+0x40,pin.local.block)||!Read(n+0x5C,input.result)||!input.result||
-        !Read(input.result+4,ready)||ready!=1||!Read(input.result+0xC,status)||status!=1||
-        !host_producer::IdentifyNativeNavigation(n,pin.local.block,pin.command,pin.part)||!gHost(pin.command.scope)||
-        pin.command.navigation!=movement::Navigation::HostRoute)return input;
+        !Read(input.result+4,ready)||ready!=1||!Read(input.result+0xC,status)||status!=1)return input;
+    input.identified=host_producer::IdentifyNativeNavigation(n,pin.local.block,pin.command,pin.part);
+    if(input.identified) {
+        if(!gHost(pin.command.scope)||pin.command.navigation!=movement::Navigation::HostRoute)return input;
+    } else if(!host_producer::HostScope(pin.command.scope)||!gHost(pin.command.scope))return input;
     pin.local.result=input.result;
     for(std::size_t i=0;i<6;++i)if(!Read(input.result+0x10+i*4,pin.auxiliary[i]))return input;
     for(std::size_t i=0;i<4;++i)if(!Read(input.result+0x28+i*4,pin.statuses[i]))return input;
-    if(!SaveHostMetadata(pin)){static_cast<void>(host_producer::EngineProducer().BlockRoute(pin.command,pin.part,route::Failure::Capacity));return input;}
+    if(input.identified&&!SaveHostMetadata(pin)){static_cast<void>(host_producer::EngineProducer().BlockRoute(pin.command,pin.part,route::Failure::Capacity));return input;}
     input.ready=true;
     return input;
 }
@@ -174,7 +204,7 @@ bool HostGuard(void* opaque,const route::Key& key,const route::LocalContext& loc
         key.scope==pin.command.scope&&key.owner==pin.command.owner&&key.commandId==pin.command.command&&key.part==pin.part&&
         host_producer::IdentifyNativeNavigation(local.navigation,local.block,current,part)&&current==pin.command&&part==pin.part;
 }
-route::Result BuildHostPath(const HostProtection& pin,const mesh_storage::Lease& mesh,route::Graph& graph) noexcept {
+route::Result BuildHostPath(const HostProtection& pin,const mesh_storage::Lease& mesh,route::Graph& graph,bool complete) noexcept {
     if(!gHostRegistry.value||gHostRegistry.scope!=pin.command.scope) {
         gHostRegistry.value=std::make_unique<route_identity::Registry>();gHostRegistry.scope=pin.command.scope;gHostRegistry.load=0;
         if(gHostRegistry.value->BeginWorld(pin.command.scope.worldEpoch)!=route_identity::Result::Ok)return route::Result::LifetimeLost;
@@ -190,24 +220,43 @@ route::Result BuildHostPath(const HostProtection& pin,const mesh_storage::Lease&
     HostRead read{&pin,&mesh};route::Protection protection{mesh.storage,mesh.mesh,0,&HostGuard,&read};
     route::LocalContext local{pin.local.navigation,pin.local.block,0,0};
     route::Graph captured{};
-    const auto result=native.CaptureInstalled(graph.key,local,protection,binding,pin.auxiliary,captured);
-    if(result!=route::Result::Ok&&result!=route::Result::Deferred)gHostCaptureCheck=native.ContextCheck();
+    const auto result=native.CaptureInstalled(graph.key,local,protection,binding,pin.auxiliary,captured,complete);
+    gHostCaptureCheck=native.ContextCheck();gHostCaptureNode=native.CaptureNode();
+    gHostMarkerIndex=native.MarkerIndex();gHostMarkerKind=native.MarkerKind();gHostMarkerTypeRva=native.MarkerTypeRva();
     if(result!=route::Result::Ok)return result;
     captured.statuses=pin.statuses;
+    const auto valid=route::Validate(captured);
+    if(valid!=route::Result::Ok){gHostCaptureCheck=111;return valid;}
     graph=captured;return route::Result::Ok;
 }
-void PublishHostPath(const HostProtection& pin,std::uint32_t site) noexcept {
+void PublishHostPath(const HostProtection& pin,std::uint32_t site,bool admission) noexcept {
     auto& source=host_producer::EngineProducer();
     mesh_storage::Lease mesh{};route::Graph graph{};
     // No flattened fallback: failure cannot silently start a Client solver.
     if(!Mesh(mesh)){HostCaptureFailure(pin.local,1,route::Result::MissingResource);++gBlocked;static_cast<void>(source.BlockRoute(pin.command,pin.part,route::Failure::Unavailable));return;}
     if(!source.NextRouteKey(pin.command,pin.part,graph.key)){HostCaptureFailure(pin.local,3,route::Result::WrongKey);++gBlocked;return;}
-    const auto captured=BuildHostPath(pin,mesh,graph);
+    auto* metadata=FindHostMetadata(pin);
+    if(!metadata||(!admission&&!metadata->complete)) {
+        gHostCaptureCheck=112;HostCaptureFailure(pin.local,site,route::Result::InvalidNativeState);++gBlocked;
+        static_cast<void>(source.BlockRoute(pin.command,pin.part,route::Failure::Unavailable));return;
+    }
+    const auto captured=BuildHostPath(pin,mesh,graph,admission);
     // No route was rejected: the native replacement will publish at its own
     // admission boundary, or Complete will retire an already consumed B.
     if(captured==route::Result::Deferred){++gHostCaptureDeferred;return;}
     if(captured!=route::Result::Ok){HostCaptureFailure(pin.local,site,captured);++gBlocked;static_cast<void>(source.BlockRoute(pin.command,pin.part,route::Failure::Unsupported));return;}
-    if(source.AppendRoute(graph)==host_producer::SourceResult::Ok)++gCaptured;
+    if(!admission) {
+        route::Graph preserved{};
+        if(!route::PreserveEndpointPrefix(*metadata->complete,graph,preserved)) {
+            gHostCaptureCheck=113;HostCaptureFailure(pin.local,site,route::Result::LocalInvalidity);++gBlocked;
+            static_cast<void>(source.BlockRoute(pin.command,pin.part,route::Failure::Unsupported));return;
+        }
+        graph=preserved;
+    }
+    if(source.AppendRoute(graph)==host_producer::SourceResult::Ok) {
+        if(!metadata->complete)metadata->complete=std::make_unique<route::Graph>();
+        *metadata->complete=graph;++gCaptured;
+    }
     else{HostCaptureFailure(pin.local,6,route::Result::InvalidGraph);++gBlocked;}
 }
 void AfterHostAdmission(HostAdmission& input) noexcept {
@@ -216,9 +265,28 @@ void AfterHostAdmission(HostAdmission& input) noexcept {
     std::uintptr_t result{};std::uint32_t state{};
     // Retail can defer admission (mode6). Publish once it installed this path.
     if(!Read(n+0x5C,result)||result||!Read(pin.local.block+0x40,state)||state!=3)return;
+    // 004659D0 released its R. Only copied auxiliary/status values survive.
+    pin.local.result=pin.local.resultControl=0;
     host_producer::CommandIdentity current{};std::uint32_t part{};
-    if(!gHost(pin.command.scope)||!host_producer::IdentifyNativeNavigation(n,pin.local.block,current,part)||current!=pin.command||part!=pin.part)return;
-    PublishHostPath(pin,5);
+    if(!gHost(pin.command.scope))return;
+    if(!input.identified) {
+        // The producer has not published Submit yet. Never identify or retain
+        // a native owner speculatively. Save scalar metadata at this seam and
+        // let ObserveHostNavigation prove the owning lease after finalization.
+        HostMetadata* pending{};
+        for(auto& item:gHostMetadata) {
+            if(item.used&&item.value.command.scope!=pin.command.scope)item={};
+            if(item.used&&item.value.local.navigation==n&&item.value.local.block==pin.local.block){pending=&item;break;}
+            if(!item.used&&!pending)pending=&item;
+        }
+        if(!pending){++gBlocked;return;}
+        *pending={};pending->value=pin;pending->used=pending->provisional=true;
+        if(!Read(pin.local.block+0x38,pending->start)||!Read(pin.local.block+0x3C,pending->finish)||
+            !Read(n+0xC,pending->cursor)||!Read(pin.local.block,pending->goal)) {*pending={};return;}
+        ++gHostCaptureDeferred;return;
+    }
+    if(!host_producer::IdentifyNativeNavigation(n,pin.local.block,current,part)||current!=pin.command||part!=pin.part)return;
+    PublishHostPath(pin,5,true);
 }
 void CaptureHostGoalEdit(std::uintptr_t n,std::uintptr_t b,const std::array<float,3>& before) noexcept {
     std::array<float,3> after{};std::uint32_t state{};std::uintptr_t cursor{},sentinel{};
@@ -228,14 +296,14 @@ void CaptureHostGoalEdit(std::uintptr_t n,std::uintptr_t b,const std::array<floa
     if(!host_producer::IdentifyNativeNavigation(n,b,pin.command,pin.part)||!gHost(pin.command.scope)||
         pin.command.navigation!=movement::Navigation::HostRoute)return;
     bool found{};
-    for(const auto& metadata:gHostMetadata)if(metadata.used&&metadata.value.local.navigation==n&&
+    for(const auto& metadata:gHostMetadata)if(metadata.used&&!metadata.provisional&&metadata.value.local.navigation==n&&metadata.value.local.block==b&&
         metadata.value.command.scope==pin.command.scope&&metadata.value.command.owner==pin.command.owner&&
         metadata.value.command.command==pin.command.command) {
         pin.auxiliary=metadata.value.auxiliary;pin.statuses=metadata.value.statuses;found=true;break;
     }
     if(!found){HostCaptureFailure(pin.local,9,route::Result::InvalidNativeState);++gBlocked;static_cast<void>(host_producer::EngineProducer().BlockRoute(pin.command,pin.part,route::Failure::Unavailable));return;}
     // An in-place endpoint edit: republish the adjusted native corridor.
-    ++gGoalDeferred;PublishHostPath(pin,8);
+    ++gGoalDeferred;PublishHostPath(pin,8,false);
 }
 void __fastcall PendingGoalDetour(void* navigation,void*,void* block) {
     const auto original=reinterpret_cast<PendingGoalCall>(gGoalOriginal.load(std::memory_order_acquire));
@@ -286,6 +354,28 @@ std::uint64_t HostRoutesUnavailable() noexcept{return gHostRoutesUnavailable.loa
 bool AwaitingHostRoute(std::uintptr_t n) noexcept{return route_execution::Awaiting(n);}
 bool RetirementComplete(const transactions::Scope& scope) noexcept{return route_execution::Retired(scope);}
 void Disable() noexcept{gAvailable.store(false,std::memory_order_release);}
+void ObserveHostNavigation(std::uintptr_t n,std::uintptr_t b) noexcept {
+    if(!Available()||!gEngine||!gEngine())return;
+    host_producer::CommandIdentity identity{};std::uint32_t part{};
+    // This is the first operation which can inspect a provisional candidate:
+    // the producer still pins the exact request and independently proves M/N/B.
+    if(!host_producer::IdentifyNativeNavigation(n,b,identity,part)||!gHost(identity.scope)||
+        identity.navigation!=movement::Navigation::HostRoute)return;
+    for(auto& item:gHostMetadata)if(item.used&&item.provisional&&item.value.local.navigation==n&&item.value.local.block==b) {
+        auto pin=item.value;const auto start=item.start,finish=item.finish,cursor=item.cursor;const auto goal=item.goal;
+        item={};
+        if(pin.command.scope!=identity.scope)return;
+        pin.command=identity;pin.part=part;
+        std::uintptr_t actualStart{},actualFinish{},actualCursor{};std::array<float,3> actualGoal{};
+        if(!Read(b+0x38,actualStart)||actualStart!=start||!Read(b+0x3C,actualFinish)||actualFinish!=finish||
+            !Read(n+0xC,actualCursor)||actualCursor!=cursor||!Read(b,actualGoal)||actualGoal!=goal) {
+            gHostCaptureCheck=114;HostCaptureFailure(pin.local,10,route::Result::LocalInvalidity);++gBlocked;
+            static_cast<void>(host_producer::EngineProducer().BlockRoute(identity,part,route::Failure::Unavailable));return;
+        }
+        if(!SaveHostMetadata(pin)){++gBlocked;static_cast<void>(host_producer::EngineProducer().BlockRoute(identity,part,route::Failure::Capacity));return;}
+        PublishHostPath(pin,10,true);return;
+    }
+}
 bool QueueCurrent(std::span<const std::uint8_t> bytes,const route::Key& key) noexcept {
     if(Blocked(key)){++gDiscarded;return true;}
     route::Graph graph{};
@@ -296,9 +386,8 @@ bool QueueCurrent(std::span<const std::uint8_t> bytes,const route::Key& key) noe
         return true;
     }
     if(graph.failure!=route::Failure::None) {
-        // The Host could not describe this command's path. The command itself
-        // remains the Host's instruction: the Client executes it toward the
-        // Host goal with native planning. One route never stops AISync.
+        // A strict HostRoute cannot substitute a Client solve. Fence only the
+        // failed command; independent actors and command lifecycles continue.
         static_cast<void>(RememberFault(key,graph.failure));++gHostRoutesUnavailable;
         return true;
     }
@@ -344,6 +433,9 @@ bool CommandBlocked(const route::Key& key,route::Failure& reason) noexcept {
 void Pump() noexcept {
     const profiling::Timer timing(profiling::Section::RoutePump);
     if(!gState||!gEngine||!gEngine())return;
+    // Provisional metadata is synchronous only: a later frame must never
+    // reinterpret an old N/B address as a new request incarnation.
+    for(auto& metadata:gHostMetadata)if(metadata.provisional)metadata={};
     route_execution::Pump();
     {const std::lock_guard lock(gState->gate);
         for(auto& fault:gState->faults)if(fault.used&&!execution_runtime::Matches(fault.key.scope))fault={};}
@@ -384,5 +476,5 @@ Counters Diagnostics() noexcept{
     gHostBlockState.load(),gHostBlockMode.load(),gHostStopBits.load(),gHostNodeType.load(),gHostMetadataBytes.load(),
     gQueued.load(),gQueueRejected.load(),gEngineQueries.load(),gWorkerQueries.load(),gStrictQueries.load(),gUnownedQueries.load(),gRequeues.load(),
     queued,gLastQueueRejection.load(),gLastQueryOwnership.load(),gLastQueryPolicy.load(),gLastQueryKind.load(),
-    gHostCaptureDeferred.load(),gHostCaptureCheck.load()};}
+    gHostCaptureDeferred.load(),gHostCaptureCheck.load(),gHostCaptureNode.load(),gHostMarkerIndex.load(),gHostMarkerKind.load(),gHostMarkerTypeRva.load()};}
 }

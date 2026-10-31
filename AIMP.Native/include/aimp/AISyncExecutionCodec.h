@@ -42,11 +42,21 @@ struct Receipt {
 };
 // This is an explicit executable contract, NOT a promotion of a P1 observation.
 // Profiles: native Move(1, optional Stop companion3), Stop(3), Turn(4), Stance(7),
-// Action(5), typed native intent(0x200). HostRoute additionally requires bit8.
+// Action(5), Placement(8), typed native intent(0x200). HostRoute additionally requires bit8.
 inline constexpr std::uint32_t kProfileTurn = 1U, kProfileStance = 2U, kProfileMove = 4U,
     kProfileRoutes = 8U, kProfileAction = 16U, kProfileDirected = 32U, kProfileLifecycle = 64U,
     kProfileNativeIntent = native_intent::kProfile, kProfileSchedulerControl = scheduler_control::kProfile,
-    kKnownProfiles = 511U;
+    kProfilePlacement = 512U, kProfileMarker = 1024U, kKnownProfiles = 2047U;
+inline constexpr std::uint32_t kMarkerKind = 2U;
+// Kind8 is a native scheduler placement request, not an ordinary Move or a
+// one-shot lifecycle call. goal=position+1C, aux=yaw+28, mode=branch byte+2C.
+// Only canonical branch values0/1 are admitted; other native bytes are not
+// silently normalized. Lifecycle children require parent-qualified dedup.
+inline constexpr std::uint32_t kPlacementKind = 8U;
+// Local integration proof, never network authority. Remains false until the
+// embedding installs and qualifies both mode8 entry/update dedup boundaries.
+void SetPlacementDedupReady(bool ready) noexcept;
+[[nodiscard]] bool PlacementDedupReady() noexcept;
 // Native kind5 (vtable EB198C) holds the scheduler while the Character's
 // action cycle with state +1C runs; +20 interrupts that cycle on cancel.
 inline constexpr std::uint32_t kActionKind = 5U, kActionNoState = 0x5DU;
@@ -60,8 +70,8 @@ inline constexpr std::uint32_t kDirectedKind = 9U;
 inline constexpr std::uint32_t kRelocateKind = 0x100U, kBackstageKind = 0x101U, kFrontstageKind = 0x102U,
     kForcedRelocateKind = 0x103U, kDirectRelocateKind = 0x104U, kDirectForcedRelocateKind = 0x105U; // 007C63B0 -> 007C2710(...,true); no Client random spawn selection.
 [[nodiscard]] constexpr std::uint32_t ProfileForKind(const std::uint32_t kind) noexcept {
-    return kind == 1U || kind == 3U ? kProfileMove : kind == 4U ? kProfileTurn :
-        kind == 7U ? kProfileStance : kind == kActionKind ? kProfileAction :
+    return kind == kMarkerKind ? kProfileMarker : kind == 1U || kind == 3U ? kProfileMove : kind == 4U ? kProfileTurn :
+        kind == 7U ? kProfileStance : kind == kPlacementKind ? kProfilePlacement : kind == kActionKind ? kProfileAction :
         kind == kDirectedKind ? kProfileDirected : scheduler_control::Supported(kind) ? kProfileSchedulerControl :
         kind == native_intent::kKind ? kProfileNativeIntent :
         kind == kRelocateKind || kind == kBackstageKind || kind == kFrontstageKind || kind == kForcedRelocateKind || kind == kDirectRelocateKind || kind == kDirectForcedRelocateKind ? kProfileLifecycle : 0U;

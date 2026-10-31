@@ -21,6 +21,7 @@
 #include <cwchar>
 #include <cstdio>
 #include <mutex>
+#include <string>
 
 namespace aimp::character_direct_step_runtime {
 namespace {
@@ -183,12 +184,13 @@ struct MovementSlot final {
     std::atomic<std::uint64_t> protectedFailures{0U};
     std::atomic<std::uintptr_t> lastCharacter{0U};
     // Diagnostics only: last hybrid locomotion hook values and branch counts.
-    std::array<std::atomic<std::uint32_t>, 20> hybridProbe{};
+    std::array<std::atomic<std::uint32_t>, 28> hybridProbe{};
     std::array<std::atomic<std::uint64_t>, 6> hybridBranches{};
     std::atomic<std::uint32_t> preparedBranch{0U};
     std::atomic<std::uint32_t> preparedPlanarErrorBits{0U};
     std::atomic<std::uint32_t> probeLastXBits{0U}, probeLastZBits{0U};
     std::atomic<std::uint64_t> probeLastTickMs{0U};
+    std::atomic<std::uint64_t> probeIncarnation{0U};
 };
 // hybridProbe indices
 enum HybridProbe : std::size_t {
@@ -196,7 +198,11 @@ enum HybridProbe : std::size_t {
     ProbeRetailMagnitude, ProbeRetailHeading, ProbeRetailIntensity, ProbeRetailAngular,
     ProbeControlMagnitude, ProbeControlHeading, ProbeControlIntensity,
     ProbeYaw, ProbeTargetYaw, ProbeTurnMaximum, ProbeTurnAcceleration, ProbeFrameDelta, ProbeAngularWritten,
-    ProbeMeasuredSpeed, ProbeFacingStatus, ProbeInputSpeed
+    ProbeMeasuredSpeed, ProbeFacingStatus, ProbeInputSpeed,
+    // Probe v2: previous-frame native root motion (+730..+760), and the
+    // submitted local vector/intensity (+1030..+1040). +1010 is an optional
+    // additive displacement, NOT the animation output (007C67B0).
+    ProbeDeltaX, ProbeDeltaY, ProbeDeltaZ, ProbeDeltaYaw, ProbeLocalX, ProbeLocalZ, ProbeSubmitIntensity, ProbeSubmitAngular
 };
 void StoreProbe(MovementSlot& slot, const HybridProbe index, const float value) noexcept {
     slot.hybridProbe[index].store(std::bit_cast<std::uint32_t>(value), std::memory_order_relaxed);
@@ -216,6 +222,7 @@ std::atomic<bool> gInstalled{false};
 std::atomic<NativeAIIntentObserver> gNativeAIIntentObserver{nullptr};
 std::atomic<NativeAITransitionGuard> gNativeAITransitionGuard{nullptr};
 std::array<MovementSlot, MaximumConcurrentTargets()> gSlots{};
+std::atomic<std::uint64_t> gProbeIncarnation{0U};
 std::atomic<std::uintptr_t> gLastArmedCharacter{0U};
 std::atomic<std::uint64_t> gStaleGrappleReleases{0U};
 std::atomic<PairedVictimHeldQuery> gPairedVictimHeldQuery{nullptr};
@@ -393,6 +400,155 @@ void AppendLocomotionFlight(
         gLocomotionFlightFile, line, static_cast<DWORD>(length), &written, nullptr));
 }
 
+// Diagnostics only (v347): Client AI locomotion that stops translating for a
+// whole game. One baseline while the hybrid follower really moves, then the
+// same memory once it is stuck under a real demand: changed dwords are logged
+// to the flight file, plus one absolute dump of the stuck state.
+constexpr std::size_t kStuckCharacterBytes = 0x1100U, kStuckActionBytes = 0x300U;
+struct StuckProbe {
+    std::uintptr_t character{};
+    std::uint64_t incarnation{};
+    std::array<std::uint8_t, kStuckCharacterBytes> character0{}, characterNow{};
+    std::array<std::uint8_t, kStuckActionBytes> action0{}, actionNow{};
+    bool baseline{}, absoluteDumped{}, demandLogged{}, movingLogged{};
+    std::uint64_t stuckSince{}, baselineTick{};
+    std::uint32_t diffs{};
+};
+// Separate bounded histories: a second AI or a new round must not consume
+// another actor's only dump or compare memory from a recycled Character.
+std::array<StuckProbe, MaximumConcurrentTargets()> gStuckProbes{};
+bool CopyRegion(const std::uintptr_t address, std::uint8_t* out, const std::size_t size) noexcept {
+    if (address == 0U) return false;
+    __try { std::memcpy(out, reinterpret_cast<const void*>(address), size); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+void AppendFlightText(const std::string& text) noexcept {
+    if (!runtime_features::Enabled(runtime_features::Feature::LocomotionFlightRecorder)) return;
+    std::lock_guard lock(gLocomotionFlightMutex);
+    if (!EnsureLocomotionFlightOpenLocked()) return;
+    DWORD written = 0U;
+    static_cast<void>(WriteFile(gLocomotionFlightFile, text.data(), static_cast<DWORD>(text.size()), &written, nullptr));
+}
+template<std::size_t Size>
+void AppendDiff(std::string& out, const char* name, const std::array<std::uint8_t, Size>& before,
+    const std::array<std::uint8_t, Size>& after) {
+    out += ",\""; out += name; out += "\":\"";
+    char item[48]{};
+    std::size_t count{};
+    for (std::size_t offset = 0; offset + 4U <= Size && count < 400U; offset += 4U) {
+        std::uint32_t a{}, b{};
+        std::memcpy(&a, before.data() + offset, 4U); std::memcpy(&b, after.data() + offset, 4U);
+        if (a == b) continue;
+        _snprintf_s(item, sizeof(item), _TRUNCATE, "%X:%08X>%08X ", static_cast<unsigned>(offset), a, b);
+        out += item; ++count;
+    }
+    out += "\"";
+}
+template<std::size_t Size>
+void AppendHex(std::string& out, const char* name, const std::array<std::uint8_t, Size>& bytes) {
+    out += ",\""; out += name; out += "\":\"";
+    char item[4]{};
+    for (const auto value : bytes) { _snprintf_s(item, sizeof(item), _TRUNCATE, "%02X", value); out += item; }
+    out += "\"";
+}
+void AppendMotionGates(std::string& line,
+    const std::array<std::uint8_t, kStuckCharacterBytes>& bytes) {
+    // 007C67B0 applies root displacement only with Character+260 set.
+    // 007C0220 sets it on frontstage admission unless +2F8 blocks that call.
+    // These are observations, never permissions for AIMP to change the flags.
+    std::uint32_t runtime{}, rootX{}, rootY{}, rootZ{}, rootYaw{};
+    std::memcpy(&runtime, bytes.data()+0x50U, 4U);
+    std::memcpy(&rootX, bytes.data()+0x730U, 4U);
+    std::memcpy(&rootY, bytes.data()+0x734U, 4U);
+    std::memcpy(&rootZ, bytes.data()+0x738U, 4U);
+    std::memcpy(&rootYaw, bytes.data()+0x760U, 4U);
+    char fields[512]{};
+    _snprintf_s(fields, sizeof(fields), _TRUNCATE,
+        ",\"probeVersion\":2,\"runtimeId\":%u,\"translationEnabled\":%u,\"rotationEnabled\":%u,"
+        "\"backstage\":%u,\"frontstageBlocked\":%u,\"motionEnabledA\":%u,\"motionEnabledB\":%u,"
+        "\"rootMotionBits\":\"%08X %08X %08X %08X\"",
+        runtime, static_cast<unsigned>(bytes[0x260U]), static_cast<unsigned>(bytes[0x261U]),
+        static_cast<unsigned>(bytes[0x266U]), static_cast<unsigned>(bytes[0x2F8U]),
+        static_cast<unsigned>(bytes[0x2C8U]), static_cast<unsigned>(bytes[0x2CAU]),
+        rootX, rootY, rootZ, rootYaw);
+    line += fields;
+}
+void ProbeStuckLocomotion(MovementSlot& slot, const std::uintptr_t character,
+    const float speed, const float demand, const std::uint64_t now) noexcept {
+    if (!runtime_features::Enabled(runtime_features::Feature::LocomotionFlightRecorder)) return;
+    auto& probe = gStuckProbes[static_cast<std::size_t>(&slot - gSlots.data())];
+    const auto incarnation = slot.probeIncarnation.load(std::memory_order_acquire);
+    if (probe.incarnation != incarnation || probe.character != character) {
+        probe = {};
+        probe.incarnation = incarnation;
+        probe.character = character;
+    }
+    std::uintptr_t action{};
+    static_cast<void>(GuardedReadValue(character + kMovementActionObjectOffset, action));
+    // One real-demand state and one actually-moving state per local binding.
+    // A completely frozen round still has a reference to compare with a good
+    // round; a moving baseline alone would never be logged in that case.
+    const bool firstDemand = demand > 0.3F && !probe.demandLogged;
+    const bool firstMoving = demand > 0.3F && speed > 0.5F && !probe.movingLogged;
+    if ((firstDemand || firstMoving) &&
+        CopyRegion(character, probe.characterNow.data(), kStuckCharacterBytes)) {
+        try {
+            std::string line = "{\"version\":1,\"event\":\"hybrid_motion_gate\",\"tickMs\":";
+            line += std::to_string(now);
+            line += ",\"incarnation\":" + std::to_string(incarnation);
+            line += ",\"character\":" + std::to_string(character);
+            line += ",\"moving\":";
+            line += speed > 0.5F ? "true" : "false";
+            AppendMotionGates(line, probe.characterNow);
+            line += "}\r\n";
+            AppendFlightText(line);
+            probe.demandLogged = true;
+            if (firstMoving) probe.movingLogged = true;
+        } catch (...) {}
+    }
+    if (speed > 0.5F && demand > 0.3F) {
+        if (probe.baseline && probe.character == character && now - probe.baselineTick < 1000U) return;
+        if (CopyRegion(character, probe.character0.data(), kStuckCharacterBytes)) {
+            probe.action0 = {};
+            static_cast<void>(CopyRegion(action, probe.action0.data(), kStuckActionBytes));
+            probe.character = character; probe.baseline = true; probe.baselineTick = now; probe.stuckSince = 0U;
+        }
+        return;
+    }
+    if (demand <= 1.0F || speed >= 0.02F) { probe.stuckSince = 0U; return; }
+    if (probe.stuckSince == 0U) { probe.stuckSince = now; return; }
+    if (now - probe.stuckSince < 1500U) return;
+    probe.stuckSince = now; // at most one record per 1.5 s of continued stall
+    const bool diff = probe.baseline && probe.character == character && probe.diffs < 3U;
+    if (!diff && probe.absoluteDumped) return;
+    if (!CopyRegion(character, probe.characterNow.data(), kStuckCharacterBytes)) return;
+    probe.actionNow = {};
+    static_cast<void>(CopyRegion(action, probe.actionNow.data(), kStuckActionBytes));
+    try {
+        std::string line;
+        char head[256]{};
+        _snprintf_s(head, sizeof(head), _TRUNCATE,
+            "{\"version\":1,\"tickMs\":%llu,\"event\":\"%s\",\"character\":%llu,\"action\":%llu,\"baselineAgeMs\":%llu,\"demand\":%.3f",
+            static_cast<unsigned long long>(now), diff ? "hybrid_stuck_diff" : "hybrid_stuck_dump",
+            static_cast<unsigned long long>(character), static_cast<unsigned long long>(action),
+            static_cast<unsigned long long>(diff ? now - probe.baselineTick : 0U), demand);
+        line = head;
+        line += ",\"incarnation\":" + std::to_string(incarnation);
+        AppendMotionGates(line, probe.characterNow);
+        if (diff) {
+            AppendDiff(line, "characterDiff", probe.character0, probe.characterNow);
+            AppendDiff(line, "actionDiff", probe.action0, probe.actionNow);
+            ++probe.diffs; probe.baseline = false; // next diff needs a fresh moving baseline
+        } else {
+            AppendHex(line, "characterHex", probe.characterNow);
+            AppendHex(line, "actionHex", probe.actionNow);
+            probe.absoluteDumped = true;
+        }
+        line += "}\r\n";
+        AppendFlightText(line);
+    } catch (...) {}
+}
+
 template<std::size_t Size>
 bool ValidateBytes(
     const std::uintptr_t address,
@@ -462,6 +618,9 @@ bool ValidateTeleportFunction(const std::uintptr_t address) noexcept {
 }
 
 void ResetPayload(MovementSlot& slot) noexcept {
+    slot.probeIncarnation.store(
+        gProbeIncarnation.fetch_add(1U, std::memory_order_relaxed)+1U,
+        std::memory_order_release);
     slot.stateAddress.store(0U, std::memory_order_relaxed);
     slot.movementActionAddress.store(0U, std::memory_order_relaxed);
     slot.directionXBits.store(0U, std::memory_order_relaxed);
@@ -1980,6 +2139,12 @@ void __cdecl ApplyAtNpcLocomotionPreTransform(
         StoreProbe(*slot,ProbeDemandMagnitude,std::hypot(demand.directionX,demand.directionZ));
         StoreProbe(*slot,ProbeDemandIntensity,demand.intensity);
         StoreProbe(*slot,ProbeInputSpeed,std::hypot(LoadFloat(slot->directionXBits),LoadFloat(slot->directionZBits)));
+        constexpr std::pair<HybridProbe,std::uintptr_t> kMotion[]{{ProbeDeltaX,0x730U},{ProbeDeltaY,0x734U},{ProbeDeltaZ,0x738U},
+            {ProbeDeltaYaw,0x760U},{ProbeLocalX,0x1030U},{ProbeLocalZ,0x1038U},{ProbeSubmitIntensity,0x1040U},{ProbeSubmitAngular,0x1044U}};
+        for (const auto& [index,offset] : kMotion) {
+            float value{};
+            if (GuardedReadValue(characterAddress+offset,value)) StoreProbe(*slot,index,value);
+        }
         float retail{};
         if (GuardedReadValue(cycleAddress+NativeCycleOffsets().magnitude,retail)) StoreProbe(*slot,ProbeRetailMagnitude,retail);
         if (GuardedReadValue(cycleAddress+NativeCycleOffsets().worldHeading,retail)) StoreProbe(*slot,ProbeRetailHeading,retail);
@@ -1991,8 +2156,11 @@ void __cdecl ApplyAtNpcLocomotionPreTransform(
             const auto lastX=LoadFloat(slot->probeLastXBits),lastZ=LoadFloat(slot->probeLastZBits);
             slot->probeLastXBits.store(std::bit_cast<std::uint32_t>(x),std::memory_order_relaxed);
             slot->probeLastZBits.store(std::bit_cast<std::uint32_t>(z),std::memory_order_relaxed);
-            if (last!=0U&&now>last&&now-last<500U)
-                StoreProbe(*slot,ProbeMeasuredSpeed,std::hypot(x-lastX,z-lastZ)*1000.0F/static_cast<float>(now-last));
+            if (last!=0U&&now>last&&now-last<500U) {
+                const auto speed=std::hypot(x-lastX,z-lastZ)*1000.0F/static_cast<float>(now-last);
+                StoreProbe(*slot,ProbeMeasuredSpeed,speed);
+                ProbeStuckLocomotion(*slot,characterAddress,speed,std::hypot(demand.directionX,demand.directionZ),now);
+            }
         }
     }
 
@@ -3274,6 +3442,14 @@ bool ApplyReplicatedYaw(
     if (WriteReplicatedYaw(characterAddress, yaw)) return true;
     error = "The replicated Character yaw field could not be written safely";
     return false;
+}
+bool ApplyAIRecoveryTransform(std::uintptr_t character,const float* position,float yaw) noexcept {
+    if(!GameplayLoaded()||!character||!position||!std::isfinite(yaw)||std::abs(yaw)>3.3F)return false;
+    for(std::size_t i=0;i<3;++i)if(!std::isfinite(position[i])||std::abs(position[i])>100000.0F)return false;
+    if(!TeleportCharacter(character,position[0],position[1],position[2]))return false;
+    return GuardedWriteValue(character+kCharacterPositionOffset,position[0])&&
+        GuardedWriteValue(character+kCharacterPositionOffset+4,position[1])&&
+        GuardedWriteValue(character+kCharacterPositionOffset+8,position[2])&&WriteReplicatedYaw(character,yaw);
 }
 
 void RequestPairedVictimRelease(const std::uintptr_t characterAddress) noexcept {

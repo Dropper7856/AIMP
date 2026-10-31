@@ -70,6 +70,9 @@ struct Binding {
     // adapter; this layer does not infer a species from Character class.
     std::uint32_t localPairFlagsHigh{};
     bool exclusiveExecution{}, outcomeBound{};
+    // Engine-local world qualification for value-only retirement on reload.
+    // Not serialized; construction tickets still qualify each participant.
+    std::uint32_t nativeGeneration{};
     bool operator==(const Binding&) const noexcept = default;
 };
 struct Definition {
@@ -142,6 +145,9 @@ public:
     [[nodiscard]] bool Initialize(std::uintptr_t imageBase, bool exactBuildValidated,
         Entrypoints, Permission, void* context) noexcept;
     [[nodiscard]] Result Configure(const transactions::Scope&) noexcept;
+    // Discard value-only leases from revoked older worlds; never disposes a
+    // native action or emits a successful completion. Receipt serials persist.
+    [[nodiscard]] bool ResetForWorld(std::uint32_t currentNativeGeneration) noexcept;
     [[nodiscard]] Result Admit(const Command&, const Binding&, Receipt&) noexcept;
     [[nodiscard]] Result Inspect(const Key&, Receipt&) noexcept;
     // Source/victim callbacks are independent facts. A victim finish called

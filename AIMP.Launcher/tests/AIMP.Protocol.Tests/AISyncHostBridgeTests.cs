@@ -6,6 +6,176 @@ namespace AIMP.Protocol.Tests;
 
 internal static class AISyncHostBridgeTests
 {
+    internal static Task UpdateRejectedIsolationAsync() => RefusalIsolationAsync(AISyncExecutionStage.Rejected);
+    internal static Task UnknownIsolationAsync() => RefusalIsolationAsync(AISyncExecutionStage.Unknown);
+
+    private static async Task RefusalIsolationAsync(AISyncExecutionStage stage)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20)); var token = timeout.Token;
+        await using var host = Host(); await using var client = await Client(host, "Dallas", token);
+        var round = await Start(host, new[] { client }, token);
+        var binding = new AISyncHostBinding(host, host.SessionId, round.LevelGeneration, 7, 123, Guid.NewGuid(), 1, true);
+        var controls = new ConcurrentQueue<AISyncExecutionControl>();
+        var clientControls = new ConcurrentQueue<AISyncExecutionControl>();
+        var batches = new ConcurrentQueue<AISyncExecutionBatch>();
+        var retries = new ConcurrentQueue<AISyncExecutionBatch>(); var logs = new ConcurrentQueue<string>();
+        client.AISyncExecutionControlReceived += (_, c) =>
+        {
+            clientControls.Enqueue(c);
+            if (c.Kind == AISyncExecutionControlKind.Offer) client.AcceptAISyncExecution(c.Scope);
+        };
+        client.AISyncExecutionBatchReceived += (_, b) => batches.Enqueue(b);
+        client.AISyncExecutionRetryReceived += (_, b) => retries.Enqueue(b);
+        using var bridge = new AISyncHostBridge(() => binding, (_, _, _, bytes, _) =>
+        { controls.Enqueue(AISyncExecutionControlCodec.Decode(bytes.Span)); return Task.CompletedTask; }, logs.Enqueue);
+        try
+        {
+            bridge.BindHost(host);
+            await Wait(() => controls.Any(c => c.Kind == AISyncExecutionControlKind.Offer), token);
+            var offer = controls.Single(c => c.Kind == AISyncExecutionControlKind.Offer);
+            bridge.ObserveNative(new(binding.ConnectionIdentity, 123, MessageType.AISyncHostControl,
+                AISyncExecutionControlCodec.Encode(offer with { Kind = AISyncExecutionControlKind.Ready })));
+            void Publish(ulong batch, params AISyncTransaction[] records) => bridge.ObserveNative(new(
+                binding.ConnectionIdentity, 123, MessageType.AISyncHostBatch,
+                AISyncExecutionCodec.EncodeBatch(new(offer.Scope, batch, records))));
+            void Receipt(AISyncExecutionBatch batch, int index, AISyncExecutionStage disposition,
+                AISyncExecutionResult result = AISyncExecutionResult.Ok) => AssertEx.True(
+                    client.SendAISyncExecutionReceipt(new(batch.Scope, batch.BatchId, batch.Records[index], disposition, result)));
+
+            Publish(1, Record(offer.Scope), Record(offer.Scope, 2, AISyncTransactionOpcode.Submit),
+                Record(offer.Scope, 3, AISyncTransactionOpcode.Update) with { ParameterRevision = 2 });
+            await Wait(() => batches.Count == 1, token); var first = batches.Single();
+            Receipt(first, 0, AISyncExecutionStage.Received); Receipt(first, 1, AISyncExecutionStage.Admitted);
+            Receipt(first, 2, AISyncExecutionStage.Waiting);
+            await Wait(() => !retries.IsEmpty, token);
+            var refusal = new AISyncExecutionReceipt(first.Scope, first.BatchId, first.Records[2], stage,
+                stage == AISyncExecutionStage.Unknown ? AISyncExecutionResult.OutcomeUnknown : AISyncExecutionResult.Ok);
+            AssertEx.True(client.SendAISyncExecutionReceipt(refusal));
+            await Wait(() => logs.Any(l => l.Contains($"stage={stage}", StringComparison.Ordinal)), token);
+            AssertEx.True(host.TryGetAISyncExecutionReceipt(client.PeerId, first.Scope, 3, out var retained));
+            AssertEx.Equal(refusal, retained!);
+            AssertEx.False(host.RetryAISyncExecution(client.PeerId, 3), "A final refusal must never retry native execution.");
+            await Task.Delay(80, token); var retryCount = retries.Count;
+
+            // Another actor and another command on the same actor still travel
+            // through the real Host/Client journals. Native retains ownership authority.
+            Publish(2,
+                Record(offer.Scope, 4) with { EntityA = 2, CommandId = 2, OwnerSequence = 1 },
+                Record(offer.Scope, 5, AISyncTransactionOpcode.Submit) with { EntityA = 2, CommandId = 2, OwnerSequence = 2 },
+                Record(offer.Scope, 6) with { CommandId = 2, OwnerSequence = 4 },
+                Record(offer.Scope, 7, AISyncTransactionOpcode.Submit) with { CommandId = 2, OwnerSequence = 5 });
+            await Wait(() => batches.Count == 2, token); var independent = batches.Last();
+            Receipt(independent, 0, AISyncExecutionStage.Received); Receipt(independent, 1, AISyncExecutionStage.Admitted);
+            Receipt(independent, 2, AISyncExecutionStage.Received); Receipt(independent, 3, AISyncExecutionStage.Admitted);
+            await Wait(() => host.TryGetAISyncExecutionReceipt(client.PeerId, first.Scope, 7, out var r)
+                && r?.Stage == AISyncExecutionStage.Admitted, token);
+            AssertEx.Equal(2, batches.Count, "Refusal must not synthesize native cleanup or replacement.");
+            Publish(3, Record(offer.Scope, 8, AISyncTransactionOpcode.Cancel) with { OwnerSequence = 6 },
+                Record(offer.Scope, 9, AISyncTransactionOpcode.Release) with { OwnerSequence = 7 });
+            await Wait(() => batches.Count == 3, token); var cleanup = batches.Last();
+            AssertEx.Equal(AISyncTransactionOpcode.Cancel, cleanup.Records[0].Opcode);
+            AssertEx.Equal(AISyncTransactionOpcode.Release, cleanup.Records[1].Opcode);
+            AssertEx.Equal(first.Records[2].CommandId, cleanup.Records[1].CommandId);
+            Receipt(cleanup, 0, AISyncExecutionStage.Admitted); Receipt(cleanup, 1, AISyncExecutionStage.Released);
+            await Wait(() => host.TryGetAISyncExecutionReceipt(client.PeerId, first.Scope, 9, out var r)
+                && r?.Stage == AISyncExecutionStage.Released, token);
+            await Task.Delay(100, token);
+            AssertEx.Equal(retryCount, retries.Count, "Refused operation remained in the bridge retry queue.");
+            AssertEx.Equal(0UL, host.AISyncExecutionSettledThrough(client.PeerId, first.Scope),
+                "Refusal must not become evidence of application or resource release, even after later cleanup.");
+            AssertEx.False(host.CheckpointAISyncExecution(client.PeerId, first.Scope, 9));
+            AssertEx.False(controls.Any(c => c.Kind == AISyncExecutionControlKind.Close));
+            AssertEx.False(clientControls.Any(c => c.Kind is AISyncExecutionControlKind.Close or AISyncExecutionControlKind.Recovery));
+            AssertEx.Equal(0, bridge.Reopens);
+        }
+        finally { bridge.Dispose(); await bridge.Completion.WaitAsync(token); }
+    }
+
+    internal static Task RefusalEchoValidationAsync()
+    {
+        var scope = new AISyncExecutionScope(Guid.NewGuid(), 1, 1, 1);
+        var operation = Record(scope, 2, AISyncTransactionOpcode.Update);
+        var bytes = AISyncExecutionCodec.EncodeBatch(new(scope, 1, new[] { Record(scope), operation }));
+        foreach (var stage in new[] { AISyncExecutionStage.Rejected, AISyncExecutionStage.Unknown })
+        {
+            var exact = new AISyncExecutionReceipt(scope, 1, operation, stage,
+                stage == AISyncExecutionStage.Unknown ? AISyncExecutionResult.OutcomeUnknown : AISyncExecutionResult.Ok);
+            foreach (var forged in new[] { exact with { BatchId = 2 },
+                exact with { Operation = operation with { CommandId = 2 } },
+                exact with { Operation = operation with { EntityA = 2 } },
+                exact with { Operation = operation with { ParameterRevision = 2 } },
+                exact with { Operation = operation with { GlobalSequence = 3, OwnerSequence = 3 } } })
+            {
+                var journal = new AISyncExecutionJournal(scope); journal.Append(bytes);
+                AssertEx.Equal(AISyncExecutionJournalResult.RecoveryRequired, journal.Receive(forged));
+                AssertEx.False(journal.TryGetReceipt(operation.GlobalSequence, out _));
+            }
+            var valid = new AISyncExecutionJournal(scope); valid.Append(bytes);
+            AssertEx.Equal(AISyncExecutionJournalResult.Accepted, valid.Receive(exact));
+            AssertEx.Equal(0UL, valid.SettledThrough());
+            AssertEx.False(valid.Checkpoint(2));
+            AssertEx.Equal(AISyncExecutionJournalResult.RecoveryRequired,
+                valid.Receive(exact with { Stage = AISyncExecutionStage.Admitted, Result = AISyncExecutionResult.Ok }));
+        }
+        return Task.CompletedTask;
+    }
+
+    internal static async Task ForgedRefusalRecoveryAsync()
+    {
+        foreach (var stage in new[] { AISyncExecutionStage.Rejected, AISyncExecutionStage.Unknown })
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15)); var token = timeout.Token;
+            await using var host = Host(); await using var client = await Client(host, "Dallas", token);
+            var round = await Start(host, new[] { client }, token);
+            var binding = new AISyncHostBinding(host, host.SessionId, round.LevelGeneration, 7, 123, Guid.NewGuid(), 1, true);
+            var controls = new ConcurrentQueue<AISyncExecutionControl>();
+            var clientControls = new ConcurrentQueue<AISyncExecutionControl>();
+            var batches = new ConcurrentQueue<AISyncExecutionBatch>(); var receipts = new ConcurrentQueue<AISyncExecutionReceipt>();
+            var logs = new ConcurrentQueue<string>();
+            host.AISyncExecutionReceiptReceived += (_, r) => receipts.Enqueue(r.Receipt);
+            client.AISyncExecutionControlReceived += (_, c) =>
+            {
+                clientControls.Enqueue(c);
+                if (c.Kind == AISyncExecutionControlKind.Offer) client.AcceptAISyncExecution(c.Scope);
+            };
+            client.AISyncExecutionBatchReceived += (_, b) => batches.Enqueue(b);
+            using var bridge = new AISyncHostBridge(() => binding, (_, _, _, bytes, _) =>
+            { controls.Enqueue(AISyncExecutionControlCodec.Decode(bytes.Span)); return Task.CompletedTask; }, logs.Enqueue);
+            try
+            {
+                bridge.BindHost(host);
+                await Wait(() => controls.Any(c => c.Kind == AISyncExecutionControlKind.Offer), token);
+                var offer = controls.Single(c => c.Kind == AISyncExecutionControlKind.Offer);
+                bridge.ObserveNative(new(binding.ConnectionIdentity, 123, MessageType.AISyncHostControl,
+                    AISyncExecutionControlCodec.Encode(offer with { Kind = AISyncExecutionControlKind.Ready })));
+                bridge.ObserveNative(new(binding.ConnectionIdentity, 123, MessageType.AISyncHostBatch,
+                    AISyncExecutionCodec.EncodeBatch(new(offer.Scope, 1, new[] { Record(offer.Scope),
+                        Record(offer.Scope, 2, AISyncTransactionOpcode.Submit) }))));
+                await Wait(() => batches.Count == 1, token); var batch = batches.Single();
+                var forged = new AISyncExecutionReceipt(batch.Scope, batch.BatchId,
+                    batch.Records[1] with { CommandId = 999 }, stage,
+                    stage == AISyncExecutionStage.Unknown ? AISyncExecutionResult.OutcomeUnknown : AISyncExecutionResult.Ok);
+                // Bypass the Client journal to exercise hostile network input at
+                // the actual Host journal, rather than only its local send guard.
+                var connection = typeof(LobbyClient).GetField("_connection",
+                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(client)!;
+                await ((ValueTask)connection.GetType().GetMethod("SendAsync")!.Invoke(connection,
+                    new object[] { MessageType.AISyncExecutionNetworkReceipt,
+                        (ReadOnlyMemory<byte>)AISyncExecutionCodec.EncodeReceipt(forged), token })!).AsTask();
+                await Wait(() => clientControls.Any(c => c.Kind == AISyncExecutionControlKind.Recovery), token);
+                AssertEx.Equal(0, receipts.Count, "Fabricated identity escaped Host journal validation.");
+                AssertEx.False(host.AISyncExecutionReady(client.PeerId, batch.Scope));
+                bridge.ObserveNative(new(binding.ConnectionIdentity, 123, MessageType.AISyncHostBatch,
+                    AISyncExecutionCodec.EncodeBatch(new(offer.Scope, 2,
+                        new[] { Record(offer.Scope, 3, AISyncTransactionOpcode.Cancel) }))));
+                await Wait(() => controls.Any(c => c.Kind == AISyncExecutionControlKind.Close), token);
+                AssertEx.False(logs.Any(l => l.StartsWith("Client native command refused:", StringComparison.Ordinal)),
+                    "Corrupt receipts must not enter the command-local refusal path.");
+            }
+            finally { bridge.Dispose(); await bridge.Completion.WaitAsync(token); }
+        }
+    }
+
     internal static async Task IngressOverflowAsync()
     {
         using var timeout=new CancellationTokenSource(TimeSpan.FromSeconds(15));var token=timeout.Token;

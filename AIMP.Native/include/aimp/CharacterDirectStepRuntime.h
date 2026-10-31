@@ -68,7 +68,7 @@ struct RuntimeSnapshot {
     bool moveActive{};
     bool armed{};
     // Hybrid AI follower probe (last locomotion hook), see HybridProbe indices.
-    std::array<float, 20> hybridProbe{};
+    std::array<float, 28> hybridProbe{};
     // Demand branch frames: 0 other, 1 moving, 2 settle, 3 turn-only, 4 no drive, 5 AI legacy.
     std::array<std::uint64_t, 6> hybridBranches{};
 };
@@ -141,6 +141,9 @@ bool ArmAIHybridReplication(
 // does not force Idle or submit a zero movement request, so a just-replayed
 // retail transition remains fully owned by CATHODE.
 bool ReleaseAIIntentOwnership(std::uintptr_t characterAddress) noexcept;
+// AISync recovery only. Refresh physical registry + Character transform;
+// never selects/reinitializes a locomotion or paired animation cycle.
+bool ApplyAIRecoveryTransform(std::uintptr_t characterAddress,const float* position,float yaw) noexcept;
 
 // Called from CharacterManagerUpdate on the engine thread. PRE owns normal
 // follower preparation and native transitions. POST is a reconciliation pass

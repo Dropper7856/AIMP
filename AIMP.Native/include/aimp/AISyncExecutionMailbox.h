@@ -38,6 +38,8 @@ public:
     [[nodiscard]] bool QueueCarrier(std::span<const std::uint8_t>) noexcept;
     [[nodiscard]] bool QueueRoute(std::span<const std::uint8_t>) noexcept;
     void Retire() noexcept;
+    // Revoke only the old world. A newer Offer queued by IPC must survive.
+    void RetireGeneration(std::uint32_t nativeGeneration) noexcept;
     [[nodiscard]] bool Fence(Recovery) noexcept; // Preserve produced receipts, append terminal recovery.
     [[nodiscard]] bool Fence(const transactions::Scope&, Recovery) noexcept;
     [[nodiscard]] bool Matches(const transactions::Scope&) noexcept;

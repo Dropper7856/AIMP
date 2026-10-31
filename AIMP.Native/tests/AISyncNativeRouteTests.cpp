@@ -1,4 +1,5 @@
 #include "aimp/AISyncNativeRoute.h"
+#include "aimp/AISyncRouteContract.h"
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -43,12 +44,14 @@ struct Harness {
     std::array<std::uint8_t,4096> blob{};
     std::uintptr_t specialLink{};bool wrongSpecial{}, invalidateSpecialOnAppend{};
     std::array<Bytes,12> nodes{}, links{};
+    std::array<Bytes,12> nativeLinks{};
     std::array<Bytes,48> markerObjects{};
     std::array<std::array<std::uintptr_t,8>,12> markerPairs{};
     unsigned markersCreated{};bool failMarkerCreate{},failMarkerAttach{},revokeMarkerAttach{};
     unsigned creates{}, appends{}, releases{};
     bool allowed{true}, quiet{}, adjacent{true}, resolve{true}, failCreate{}, failAppend{}, failRelease{}, reenter{};
     bool revokeAppend{}, guardAfterAppend{true};
+    bool driftAppendCursor{},driftAppendTail{};
     bool detached{true};
     Harness() {
         CHECK(registry->BeginWorld(3) == route_identity::Result::Ok);
@@ -69,6 +72,7 @@ struct Harness {
         local = {Address(navigation),Address(block),Address(result)+0xC,Address(result)};
         Put(local.resultControl+4,1U); Put(local.result,0x400000U+0xDC7288U);
         Put(local.navigation,Address(navSentinel)); Put(Address(navSentinel),Address(navSentinel)); Put(Address(navSentinel)+4,Address(navSentinel));
+        Put(local.navigation+0xC,Address(navSentinel));
         Put(local.navigation+0x28,Address(blockSentinel)); Put(local.navigation+0x2C,1U);
         Put(Address(blockSentinel),Address(blockLink)); Put(Address(blockSentinel)+4,Address(blockLink));
         Put(Address(blockLink),Address(blockSentinel)); Put(Address(blockLink)+4,Address(blockSentinel)); Put(Address(blockLink)+8,local.block);
@@ -119,6 +123,8 @@ struct Harness {
         Put(previous,link); Put(sentinelAt+4,link); Put(resultAt+0x3C,Get<std::uint32_t>(resultAt+0x3C)+1);
         Put(control+4,Get<std::uint32_t>(control+4)+1);
         if(h.invalidateSpecialOnAppend&&h.appends==2)Put(h.specialLink+0x20,0U);
+        if(h.driftAppendCursor)Put(h.local.navigation+0xC,resultAt);
+        if(h.driftAppendTail)Put(Address(h.nodes[1])+12+0xC,42.0F);
         if (h.revokeAppend) CHECK(h.registry->BeginRetire(h.binding) == route_identity::Result::Ok);
         return true;
     }
@@ -150,6 +156,24 @@ struct Harness {
     void Install() {
         Put(local.block+0x40,2U); Put(local.navigation+0x40,local.block);
         Put(local.navigation+0x5C,local.result); Put(local.navigation+0x60,local.resultControl);
+    }
+    void Admit() {
+        const auto head=Address(navSentinel);
+        const auto count=Get<std::uint32_t>(local.result+0x3C);
+        CHECK(count>0&&count<=nativeLinks.size());
+        auto from=Get<std::uintptr_t>(Get<std::uintptr_t>(local.result+0x38));
+        auto previous=head;
+        for(std::uint32_t i=0;i<count;++i) {
+            const auto at=Address(nativeLinks[i]);
+            const auto object=Get<std::uintptr_t>(from+8),control=Get<std::uintptr_t>(from+12);
+            Put(at+8,object);Put(at+12,control);Put(control+4,Get<std::uint32_t>(control+4)+1);
+            Put(previous,at);Put(at+4,previous);previous=at;from=Get<std::uintptr_t>(from);
+        }
+        Put(previous,head);Put(head+4,previous);Put(local.navigation+4,count);Put(local.navigation+0xC,Address(nativeLinks[0]));
+        Put(local.block+0x38,Address(nativeLinks[0]));Put(local.block+0x3C,previous);Put(local.block+0x40,3U);
+        Put(local.navigation+0x40,0U);Put(local.navigation+0x44,0U);Put(local.navigation+0x5C,0U);Put(local.navigation+0x60,0U);
+        for(std::size_t i=0;i<3;++i)Put(local.block+i*4,graph.goal[i]);
+        for(std::size_t i=0;i<3;++i)Put(local.navigation+0x50+i*4,graph.auxiliary[i+3]);
     }
 };
 void Roundtrip() {
@@ -338,6 +362,7 @@ void InstalledHostCapture() {
     Put(b+0x30,0xBF800000U); // Native default must also survive Host goal edits.
     CHECK(h->native.CaptureInstalled(key,local,h->protection,h->binding,h->graph.auxiliary,captured)==Result::Ok);
     auto expected=h->graph;expected.key=key;expected.nodes[0].markers=9;expected.nodes[1].markers=11;CHECK(captured==expected);
+    CHECK(h->native.CaptureInstalled(key,local,h->protection,h->binding,h->graph.auxiliary,captured,true)==Result::Ok&&captured==expected);
     // Native progress is not a solver lease. Export preserves the route and
     // does not clear that progress word or touch the Host's navigation.
     Put(n+0x24,0x12345678U);
@@ -358,6 +383,9 @@ void InstalledHostCapture() {
     Put(n+0xC,Address(h->links[1]));
     CHECK(h->native.CaptureInstalled(key,local,h->protection,h->binding,h->graph.auxiliary,captured)==Result::Ok&&
         captured.nodeCount==1&&captured.nodes[0]==expected.nodes[1]);
+    const auto progressed=captured;
+    CHECK(h->native.CaptureInstalled(key,local,h->protection,h->binding,h->graph.auxiliary,captured,true)==Result::LocalInvalidity&&
+        h->native.ContextCheck()==109&&captured==progressed);
     const auto retained=captured;
     Put(Address(tags[1])+12+0xC,12U);
     CHECK(h->native.CaptureInstalled(key,local,h->protection,h->binding,h->graph.auxiliary,captured)==Result::UnsupportedDomain&&captured==retained);
@@ -381,6 +409,28 @@ void OrderedNativeMarkers() {
         CHECK(bad->Populate()!=Result::Ok&&bad->native.Entered()&&!bad->native.Published());
         CHECK(Get<std::uint32_t>(bad->local.result+4)==0&&bad->Populate()==Result::AlreadyEntered);
     }
+}
+void EndpointRevisionPreservesAdmittedPrefix() {
+    auto h=std::make_unique<Harness>();
+    const auto complete=h->graph;
+    Graph suffix{};suffix.key=complete.key;++suffix.key.parameterRevision;++suffix.key.routeRevision;
+    suffix.auxiliary=complete.auxiliary;suffix.statuses=complete.statuses;
+    suffix.resourceCount=complete.resourceCount;suffix.resources=complete.resources;
+    suffix.nodeCount=1;suffix.nodes[0]=complete.nodes[1];suffix.goal={8,2,9};
+    for(std::size_t i=0;i<9;++i)suffix.nodes[0].vectors[i]=suffix.goal[i%3];
+    Graph retained{};
+    CHECK(PreserveEndpointPrefix(complete,suffix,retained));
+    CHECK(retained.nodeCount==complete.nodeCount&&retained.nodes[0]==complete.nodes[0]&&
+        retained.nodes[1]==suffix.nodes[0]&&retained.key==suffix.key);
+    CHECK(EndpointRevision(complete,retained));
+    const auto unchanged=retained;
+    ++suffix.nodes[0].ordinal;
+    CHECK(!PreserveEndpointPrefix(complete,suffix,retained)&&retained==unchanged);
+    suffix.nodes[0].ordinal=complete.nodes[1].ordinal;suffix.nodes[0].vectors[7]+=1;
+    CHECK(!PreserveEndpointPrefix(complete,suffix,retained)); // Cannot invent portal geometry.
+    CHECK(FullAreaSegment(1,0.0F,1.0F)&&!FullAreaSegment(1,0.1F,1.0F));
+    const std::array<std::uint32_t,2> same{7,7},crossing{7,8};
+    CHECK(SameAreaTrace(0x40000000U,1.0F,7,same)&&!SameAreaTrace(0x40000000U,1.0F,7,crossing));
 }
 void CompleteInstalledRoute() {
     auto host=std::make_unique<Harness>();host->graph.nodeCount=11;
@@ -436,18 +486,189 @@ void PendingReplacementPreservesLiveRoute() {
         }
         h->Install();Put(h->local.block+0x30,2.0F);
         const auto result=h->native.Populate(h->graph,h->local,h->protection,ImportPoint::ReplacementNoWorker);
-        if(result!=(replacing?Result::Ok:Result::InvalidNativeState))
+        if((result==Result::Ok)!=replacing)
             std::cerr<<"replacement variant "<<variant<<" result "<<static_cast<unsigned>(result)<<" context "<<h->native.ContextCheck()<<" stage "<<h->native.ImportStage()<<'\n';
-        CHECK(result==(replacing?Result::Ok:Result::InvalidNativeState));
+        CHECK((result==Result::Ok)==replacing);
         CHECK(h->creates==(replacing?2U:0U));
         CHECK(Get<std::uintptr_t>(head)==a&&Get<std::uintptr_t>(head+4)==b&&Get<std::uint32_t>(n+4)==2);
         CHECK(Get<std::uintptr_t>(n+0xC)==a); // Installer, not importer, owns N replacement.
         CHECK(Get<std::uint32_t>(h->local.result+4)==(replacing?1U:0U));
     }
 }
+void ProgressedReplacementKeepsOldStorage() {
+    auto h=std::make_unique<Harness>();CHECK(h->Populate()==Result::Ok);h->Install();
+    const auto oldKey=h->graph.key;const auto oldLocal=h->local;
+    auto graph=h->graph;++graph.key.routeRevision;graph.nodes[0].ordinal=12;
+    CHECK(NewerRoute(oldKey,graph.key)&&!NewerRoute(graph.key,oldKey)&&!NewerRoute(oldKey,oldKey));
+    auto foreign=graph.key;++foreign.owner.birth;CHECK(!NewerRoute(oldKey,foreign));
+    // A real remaining route and cursor already at its second link. Neither
+    // rearming nor publishing the new R may mutate that old cursor or ring.
+    const auto n=h->local.navigation,head=Address(h->navSentinel);
+    const auto first=Address(h->links[0]),last=Address(h->links[1]);
+    Put(n+4,2U);Put(n+0xC,last);Put(head,first);Put(head+4,last);
+    Put(first+4,head);Put(first,last);Put(last+4,first);Put(last,head);
+    Put(n+0x48,std::uint16_t{0x101});
+    Bytes fresh{},freshHead{};auto local=h->local;
+    local.resultControl=Address(fresh);local.result=Address(fresh)+12;
+    Put(local.resultControl+4,1U);Put(local.result,0x400000U+0xDC7288U);
+    Put(local.result+0x38,Address(freshHead));Put(Address(freshHead),Address(freshHead));Put(Address(freshHead)+4,Address(freshHead));
+    Put(n+0x5C,local.result);Put(n+0x60,local.resultControl);Put(local.block+0x40,2U);
+    CHECK(h->native.Rearm(oldKey,graph,local,h->protection)==Result::Ok);
+    CHECK(Get<std::uintptr_t>(n+0xC)==last&&Get<std::uintptr_t>(head)==first);
+    CHECK(h->native.Populate(graph,local,h->protection,ImportPoint::ReplacementNoWorker)==Result::Ok);
+    CHECK(Get<std::uintptr_t>(n+0xC)==last&&Get<std::uint32_t>(n+4)==2U);
+    CHECK(Get<std::uint32_t>(local.result+4)==1U&&Get<std::uint32_t>(oldLocal.result+4)==1U);
+    CHECK(Get<std::uintptr_t>(oldLocal.result+0x38)==Address(h->sentinel));
+    // Only the native installer may replace the old N range after ready.
+    CHECK(h->creates==4U&&h->appends==4U&&h->releases==4U);
+}
+void CompoundReplacementCannotResetEarlierPart() {
+    auto h=std::make_unique<Harness>();const auto n=h->local.navigation,b0=h->local.block;
+    Bytes second{},link{};const auto b1=Address(second),head=Address(h->blockSentinel),first=Address(h->blockLink),tail=Address(link);
+    Put(first,tail);Put(tail+4,first);Put(tail,head);Put(tail+8,b1);Put(head+4,tail);Put(n+0x2C,2U);
+    Put(b0+0x40,3U);Put(b0+0x44,2U);Put(b1+0x40,3U);
+    const std::array owned{b0,b1};CHECK(ReplacementAffectsOnlyBlocks(n,owned));
+    const std::array duplicate{b0,b0};CHECK(!ReplacementAffectsOnlyBlocks(n,duplicate));
+    const std::array foreign{b0,b1,Address(h->mesh)};CHECK(!ReplacementAffectsOnlyBlocks(n,foreign));
+    CHECK(!ReplacementAffectsOnlyBlock(n,b1)&&!ReplacementAffectsOnlyBlock(n,b0));
+    CHECK(Get<std::uint32_t>(b0+0x40)==3U&&Get<std::uint32_t>(b0+0x44)==2U);
+    Put(b0+0x44,3U);CHECK(ReplacementAffectsOnlyBlock(n,b1));
+    CHECK(!ReplacementAffectsOnlyBlock(n,b0));
+    Put(b0+0x48,1U);CHECK(!ReplacementAffectsOnlyBlock(n,b1));
+    Put(b0+0x48,0U);Put(tail+4,head);CHECK(!ReplacementAffectsOnlyBlock(n,b1));
+}
+void PrepareWriter(NativeRouteResult& writer,Harness& h) {
+    NativeRouteResultTestAccess::Prepare(writer,*h.registry,&h,&Harness::Create,&Harness::Append,&Harness::Release,&Harness::Resolve,&Harness::Adjacent);
+    NativeRouteResultTestAccess::Markers(writer,&Harness::CreateMarker,&Harness::AttachMarker);
+}
+LocalContext FreshResult(Harness& h,Bytes& result,Bytes& head) {
+    auto local=h.local;local.resultControl=Address(result);local.result=Address(result)+12;
+    Put(local.resultControl+4,1U);Put(local.result,0x400000U+0xDC7288U);
+    Put(local.result+0x38,Address(head));Put(Address(head),Address(head));Put(Address(head)+4,Address(head));
+    Put(local.navigation+0x5C,local.result);Put(local.navigation+0x60,local.resultControl);
+    Put(local.navigation+0x40,local.block);Put(local.block+0x40,2U);return local;
+}
+void AuthoritativeAppend() {
+    {auto h=std::make_unique<Harness>();h->Install();AdmissionPlan plan{};
+     CHECK(h->native.CertifyAdmission(h->graph,h->local,h->protection,plan)==Result::Ok&&plan.mode==AdmissionMode::AppendEmpty&&plan.incomingCount==2);
+     CHECK(h->native.Populate(h->graph,h->local,h->protection,ImportPoint::ReplacementNoWorker)==Result::Ok&&h->creates==2);}
+    for(unsigned variant=0;variant<13;++variant) {
+        auto h=std::make_unique<Harness>();h->graph.nodes[1].markers=11;
+        CHECK(h->Populate()==Result::Ok);h->Admit();
+        const auto n=h->local.navigation,tail=Address(h->nativeLinks[1]),first=Address(h->nativeLinks[0]);
+        const auto object=Get<std::uintptr_t>(tail+8),control=Get<std::uintptr_t>(tail+12);
+        auto graph=h->graph;graph.nodes[0]=graph.nodes[1];graph.nodes[1]=h->graph.nodes[0];graph.nodes[1].ordinal=12;
+        graph.nodes[1].markers=0x0B09;
+        Bytes result{},head{},otherBlock{},otherLink{},retiredHead{},historyHead{},historyLink{};
+        const auto local=FreshResult(*h,result,head);
+        if(variant==1)Put(n+0xC,tail);
+        if(variant==2)Put(n+0xC,Address(h->navSentinel));
+        if(variant==3)graph.nodes[0]=h->graph.nodes[0]; // overlap at earlier N node is insufficient
+        if(variant==4)graph.nodes[0].vectors[0]+=1;
+        if(variant==5)graph.nodes[0].markers=0x0B09; // no tag9 on shared tail for a nonempty R
+        if(variant==6||variant==7) {
+            graph.nodeCount=1;graph.nodes[1]={};graph.nodes[0].markers=variant==6?0x0B0B:11;
+        }
+        if(variant==8||variant==9) {
+            const auto bh=Address(h->blockSentinel),bl=Address(h->blockLink),other=Address(otherLink),b=Address(otherBlock);
+            Put(bl,other);Put(other+4,bl);Put(other,bh);Put(other+8,b);Put(bh+4,other);Put(n+0x2C,2U);
+            Put(b+0x40,3U);Put(b+0x38,first);Put(b+0x3C,variant==8?tail:Address(result));
+        }
+        if(variant==10) {
+            const auto bh=Address(retiredHead),bl=Address(otherLink),b=Address(otherBlock);
+            Put(n+0x34,bh);Put(n+0x38,1U);Put(bh,bl);Put(bh+4,bl);Put(bl,bh);Put(bl+4,bh);Put(bl+8,b);
+            Put(b+0x44,3U);Put(b+0x40,6U);Put(n+0x44,b);
+        }
+        if(variant==11)Put(n+0xC,Address(result));
+        if(variant==12) {
+            // 0045A320 copies the consumed Ref to history and erases its N
+            // list entry. The next cursor is now the sole remaining old tail.
+            const auto hh=Address(historyHead),hl=Address(historyLink),nh=Address(h->navSentinel);
+            Put(hh,hl);Put(hh+4,hl);Put(hl,hh);Put(hl+4,hh);
+            Put(hl+8,Get<std::uintptr_t>(first+8));Put(hl+12,Get<std::uintptr_t>(first+12));
+            Put(n+0x10,hh);Put(n+0x14,1U);Put(n+4,1U);Put(n+0xC,tail);Put(nh,tail);Put(tail+4,nh);
+        }
+        const auto savedNavigation=h->navigation,savedTail=h->nativeLinks[1],savedNode=h->nodes[1],savedOther=otherBlock;
+        const auto savedHistoryHead=historyHead,savedHistoryLink=historyLink;
+        const auto refs=Get<std::uint32_t>(control+4);
+        NativeRouteResult writer;PrepareWriter(writer,*h);AdmissionPlan plan{};plan.incomingCount=123;
+        const bool accepted=variant<=2||variant==6||variant==8||variant==10||variant==12;
+        CHECK((writer.CertifyAdmission(graph,local,h->protection,plan)==Result::Ok)==accepted);
+        CHECK(h->creates==2&&h->navigation==savedNavigation&&h->nativeLinks[1]==savedTail&&h->nodes[1]==savedNode);
+        if(!accepted) {CHECK(plan.incomingCount==123&&!writer.Entered());continue;}
+        CHECK(plan.mode==AdmissionMode::Append&&plan.prefixCount==1&&plan.existingNodeCount==(variant==12?1U:2U)&&plan.incomingCount==(variant==6?0U:1U));
+        CHECK(writer.Populate(graph,local,h->protection,ImportPoint::ReplacementNoWorker)==Result::Ok);
+        CHECK(h->creates==(variant==6?2U:3U)&&Get<std::uint32_t>(local.result+0x3C)==plan.incomingCount);
+        CHECK(h->navigation==savedNavigation&&h->nativeLinks[1]==savedTail&&h->nodes[1]==savedNode&&otherBlock==savedOther);
+        CHECK(Get<std::uint32_t>(control+4)==refs&&Get<std::uintptr_t>(tail+8)==object);
+        if(variant==6) {
+            CHECK(plan.tailMarkerDelta==11);std::uintptr_t tag{},tagControl{};
+            CHECK(Harness::CreateMarker(h.get(),11,tag,tagControl)&&Harness::AttachMarker(h.get(),object,tag,tagControl));
+            CHECK(Harness::Release(h.get(),tag,tagControl));std::uint32_t markers{};
+            CHECK(writer.ReadMarkers(object,markers)&&markers==graph.nodes[0].markers);
+        }
+        // Simulate only the proved 00465B4A..00465C6C iterator/ref copies,
+        // with imported-R marker calls bypassed. Never replace the old tail.
+        const auto navHead=Address(h->navSentinel),oldCursor=Get<std::uintptr_t>(n+0xC);
+        auto last=tail;auto from=Get<std::uintptr_t>(Get<std::uintptr_t>(local.result+0x38));
+        for(std::uint32_t i=0;i<plan.incomingCount;++i) {
+            const auto at=Address(h->nativeLinks[i+2]),node=Get<std::uintptr_t>(from+8),ref=Get<std::uintptr_t>(from+12);
+            Put(at+8,node);Put(at+12,ref);Put(ref+4,Get<std::uint32_t>(ref+4)+1);
+            Put(last,at);Put(at+4,last);last=at;from=Get<std::uintptr_t>(from);
+        }
+        Put(last,navHead);Put(navHead+4,last);Put(n+4,plan.existingNodeCount+plan.incomingCount);
+        Put(local.block+0x38,tail);Put(local.block+0x3C,last);Put(local.block+0x40,3U);
+        Put(n+0x40,0U);Put(n+0x44,0U);Put(n+0x5C,0U);Put(n+0x60,0U);
+        if(oldCursor==navHead)Put(n+0xC,first);
+        Graph installed{};const LocalContext installedLocal{n,local.block,0,0};
+        CHECK(writer.CaptureInstalled(graph.key,installedLocal,h->protection,h->binding,graph.auxiliary,installed,true)==Result::Ok&&installed==graph);
+        CHECK(Get<std::uintptr_t>(local.block+0x38)==tail&&Get<std::uint32_t>(control+4)==refs);
+        CHECK(Get<std::uintptr_t>(n+0xC)==(oldCursor==navHead?first:oldCursor));
+        CHECK(otherBlock==savedOther);
+        CHECK(historyHead==savedHistoryHead&&historyLink==savedHistoryLink);
+    }
+}
+void AppendAllocationFence() {
+    for(unsigned fault=0;fault<6;++fault) {
+        auto h=std::make_unique<Harness>();CHECK(h->Populate()==Result::Ok);h->Admit();
+        auto graph=h->graph;graph.nodes[0]=h->graph.nodes[1];graph.nodes[1].ordinal=12;
+        Bytes result{},head{};const auto local=FreshResult(*h,result,head);
+        NativeRouteResult writer;PrepareWriter(writer,*h);
+        h->failCreate=fault==0;h->failAppend=fault==1;h->failRelease=fault==2;h->revokeAppend=fault==3;
+        h->driftAppendCursor=fault==4;h->driftAppendTail=fault==5;
+        CHECK(writer.Populate(graph,local,h->protection,ImportPoint::ReplacementNoWorker)!=Result::Ok&&writer.Entered()&&!writer.Published());
+        CHECK(Get<std::uint32_t>(local.result+4)==0);
+        const auto calls=h->creates+h->appends+h->releases;
+        CHECK(writer.Populate(graph,local,h->protection,ImportPoint::ReplacementNoWorker)==Result::AlreadyEntered&&calls==h->creates+h->appends+h->releases);
+    }
+}
+void ExactSameKeyContinuation() {
+    auto h=std::make_unique<Harness>();h->graph.nodes[0].markers=9;h->graph.nodes[1].markers=11;
+    h->graph.auxiliary[0]=0;h->graph.nodes[1].vectors[0]=0;
+    CHECK(h->Populate()==Result::Ok);h->Admit();const auto installed=LocalContext{h->local.navigation,h->local.block,0,0};
+    Put(installed.navigation+0xC,Address(h->nativeLinks[1]));
+    NativeRouteResult noProof;PrepareWriter(noProof,*h);
+    CHECK(noProof.RearmContinuation(h->graph,installed,h->protection)==Result::InvalidNativeState);
+    const auto tailNode=Address(h->nodes[1])+12;const auto original=Get<float>(tailNode+0xC);
+    Put(tailNode+0xC,original+1);Graph untouched{};untouched.goal={99,98,97};const auto saved=untouched;
+    CHECK(h->native.RetainContinuation(h->graph,installed,h->protection,untouched)==Result::LocalInvalidity&&untouched==saved);
+    Put(tailNode+0xC,original);
+    Graph remaining{};CHECK(h->native.RetainContinuation(h->graph,installed,h->protection,remaining)==Result::Ok);
+    CHECK(remaining.key==h->graph.key&&remaining.auxiliary==h->graph.auxiliary&&remaining.nodeCount==1&&remaining.nodes[0]==h->graph.nodes[1]);
+    Bytes result{},head{};const auto local=FreshResult(*h,result,head);Put(local.navigation+0x48,std::uint8_t{1});
+    auto wrong=remaining;++wrong.key.routeRevision;
+    CHECK(h->native.RearmContinuation(wrong,local,h->protection)==Result::InvalidNativeState);
+    wrong=remaining;wrong.nodes[0].vectors[0]+=1;CHECK(h->native.RearmContinuation(wrong,local,h->protection)==Result::InvalidNativeState);
+    wrong=remaining;wrong.nodes[0].vectors[0]=-0.0F;CHECK(h->native.RearmContinuation(wrong,local,h->protection)==Result::InvalidNativeState);
+    wrong=remaining;wrong.auxiliary[0]=-0.0F;CHECK(h->native.RearmContinuation(wrong,local,h->protection)==Result::InvalidNativeState);
+    h->detached=false;CHECK(h->native.RearmContinuation(remaining,local,h->protection)==Result::LifetimeLost);h->detached=true;
+    CHECK(h->native.RearmContinuation(remaining,local,h->protection)==Result::Ok&&!h->native.Entered());
+    CHECK(h->native.Populate(remaining,local,h->protection,ImportPoint::ReplacementNoWorker)==Result::Ok&&h->creates==3);
+    CHECK(h->native.Identity()==h->graph.key);
+}
 }
 int main() {
     static_assert(sizeof(std::uintptr_t) == 4);
-    Roundtrip(); RetailDefaultCapture(); GuardsAndFaults(); ReplacementContinuation(); InstalledHostCapture(); SpecialRoutes();OrderedNativeMarkers();CompleteInstalledRoute();PendingReplacementPreservesLiveRoute();
+    Roundtrip(); RetailDefaultCapture(); GuardsAndFaults(); ReplacementContinuation(); InstalledHostCapture(); SpecialRoutes();OrderedNativeMarkers();EndpointRevisionPreservesAdmittedPrefix();CompleteInstalledRoute();PendingReplacementPreservesLiveRoute();ProgressedReplacementKeepsOldStorage();CompoundReplacementCannotResetEarlierPart();AuthoritativeAppend();AppendAllocationFence();ExactSameKeyContinuation();
     std::cout << "Native route: real memory validation/publication and injected calls PASS; native admission/game UNPROVEN\n";
 }

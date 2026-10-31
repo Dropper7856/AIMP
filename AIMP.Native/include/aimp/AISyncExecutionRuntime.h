@@ -40,11 +40,16 @@ void AfterActorDestruction(const execution::ActorLifetime&) noexcept;
 [[nodiscard]] bool QueueRoute(std::span<const std::uint8_t>) noexcept;
 [[nodiscard]] bool QueueCarrier(std::span<const std::uint8_t>) noexcept;
 void Retire() noexcept;
+// Engine-thread world revocation, BEFORE waiting for the old context. Drops
+// value-only owner permissions; native request/route Refs still drain normally.
+[[nodiscard]] bool RevokePreviousWorld(std::uint32_t currentNativeGeneration) noexcept;
 [[nodiscard]] bool Available() noexcept;
 [[nodiscard]] execution::MailboxFailure LastMailboxFailure() noexcept;
 // Published by the engine-thread pump; safe to read from the diagnostics writer.
 [[nodiscard]] execution::WaitReport WaitSnapshot() noexcept;
 [[nodiscard]] bool CurrentScope(transactions::Scope&) noexcept; // Qualified engine thread only.
+[[nodiscard]] bool IsOwnedPlacement(std::uintptr_t scheduler) noexcept; // Qualified engine thread only.
+[[nodiscard]] execution::MarkerInitialization InitializeMarker(std::uintptr_t request,std::uintptr_t character) noexcept;
 [[nodiscard]] action_correlation::Readiness ActionReadiness(const action_correlation::Reference&,
     const transactions::OwnerKey&, const execution::ActorLifetime&, std::size_t* blockingRequests = nullptr,
     bool admittedHistory = false) noexcept;
@@ -52,8 +57,15 @@ void Retire() noexcept;
 // Hybrid follower may coexist with a fully granted scheduler capability, but
 // must not restart locomotion while its initial drain or a native action runs.
 [[nodiscard]] bool OrdinaryMotionAvailable(const execution::ActorLifetime&) noexcept;
+// Recovery transform can coexist with retained canceled navigation Refs.
+// It still requires fully granted ownership and no native callback in progress.
+[[nodiscard]] bool RecoveryMotionAvailable(const execution::ActorLifetime&) noexcept;
 [[nodiscard]] execution::NavigationOwnership IdentifyNavigation(std::uintptr_t n,std::uintptr_t b,
     execution::NavigationBinding&) noexcept;
+// Qualified engine-thread copied request; safe from a native callback. The
+// next non-reentrant pump cancels only this command, retaining its native Refs
+// until normal Release. A route refusal never closes other actors' streams.
+[[nodiscard]] bool RejectNavigation(const execution::NavigationBinding&) noexcept;
 [[nodiscard]] bool Matches(const transactions::Scope&) noexcept; // Copied IPC values only.
 void Fail(const transactions::Scope&,execution::Recovery) noexcept;
 void Pump(bool includeRetirements = true) noexcept;

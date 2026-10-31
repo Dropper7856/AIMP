@@ -20,6 +20,11 @@ void ExecutionMailbox::InvalidateLocked() noexcept {
 void ExecutionMailbox::Retire() noexcept {
     std::lock_guard lock(gate_); InvalidateLocked(); requested_ = {}; nativeGeneration_ = 0;
 }
+void ExecutionMailbox::RetireGeneration(const std::uint32_t generation) noexcept {
+    std::lock_guard lock(gate_);
+    if (generation == 0U || nativeGeneration_ != generation) return;
+    InvalidateLocked(); requested_ = {}; nativeGeneration_ = 0;
+}
 bool ExecutionMailbox::Fence(Recovery reason) noexcept {
     std::lock_guard lock(gate_);
     const auto value = static_cast<std::uint32_t>(reason);

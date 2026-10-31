@@ -159,6 +159,12 @@ Result Runtime::Configure(const transactions::Scope& scope, const std::uint64_t 
     entries_ = {}; count_ = 0U; configured_ = true;
     return result;
 }
+bool Runtime::ResetForWorld(const std::uint32_t current) noexcept {
+    if (busy_ || !adapter_.ResetForWorld(current)) return false;
+    entries_ = {}; count_ = 0U; scope_ = {};
+    sessionCookie_ = 0U; worldGeneration_ = 0U; configured_ = false;
+    return true;
+}
 bool Runtime::MatchesCarrier(const State& state) const noexcept {
     return configured_ && state.sessionCookie == sessionCookie_ && state.worldGeneration == worldGeneration_&&
         state.interactionAuthority==scope_.authorityEpoch&&state.interactionCommand!=0U&&

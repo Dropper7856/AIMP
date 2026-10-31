@@ -28,6 +28,52 @@ bool Pair(std::uintptr_t object, std::uintptr_t control) noexcept {
     LONG count{};
     return object != 0 && control != 0 && object == control + 0xC && Read(control+4,count) && count > 0;
 }
+template<std::size_t Size> bool SameFloatBits(const std::array<float,Size>& a,const std::array<float,Size>& b) noexcept {
+    for(std::size_t i=0;i<Size;++i)if(std::bit_cast<std::uint32_t>(a[i])!=std::bit_cast<std::uint32_t>(b[i]))return false;
+    return true;
+}
+bool SameGraphBits(const Graph& a,const Graph& b) noexcept {
+    if(a!=b||!SameFloatBits(a.auxiliary,b.auxiliary)||!SameFloatBits(a.goal,b.goal))return false;
+    for(std::size_t i=0;i<a.nodeCount;++i)if(!SameFloatBits(a.nodes[i].vectors,b.nodes[i].vectors))return false;
+    return true;
+}
+bool RetiredBlock(std::uintptr_t navigation,std::uintptr_t block) noexcept {
+    std::uintptr_t head{},at{},last{},prior{};std::uint32_t count{},matches{};
+    if(!Read(navigation+0x34,head)||!head||!Read(navigation+0x38,count)||!count||count>128||
+        !Read(head,at)||!Read(head+4,last))return false;
+    prior=head;
+    for(std::uint32_t i=0;i<count;++i) {
+        std::uintptr_t before{},next{},candidate{};
+        if(!at||at==head||!Read(at+4,before)||before!=prior||!Read(at,next)||!Read(at+8,candidate))return false;
+        if(candidate==block) {std::uint32_t reason{};if(!Read(block+0x44,reason)||reason!=3)return false;++matches;}
+        prior=at;at=next;
+    }
+    return matches==1&&at==head&&prior==last;
+}
+}
+bool ReplacementAffectsOnlyBlock(std::uintptr_t navigation,std::uintptr_t block) noexcept {
+    return ReplacementAffectsOnlyBlocks(navigation,std::span(&block,1));
+}
+bool ReplacementAffectsOnlyBlocks(std::uintptr_t navigation,std::span<const std::uintptr_t> owned) noexcept {
+    std::uintptr_t head{},at{},prior{},last{};std::uint32_t count{},matches{};
+    if(!navigation||owned.empty()||owned.size()>128||!Read(navigation+0x28,head)||!head||!Read(head,at)||
+        !Read(head+4,last)||!Read(navigation+0x2C,count)||!count||count>128)return false;
+    for(std::size_t i=0;i<owned.size();++i)
+        if(!owned[i]||std::find(owned.begin(),owned.begin()+i,owned[i])!=owned.begin()+i)return false;
+    std::array<std::uintptr_t,128> seen{};
+    prior=head;
+    for(std::uint32_t i=0;i<count;++i) {
+        std::uintptr_t previous{},next{},candidate{};std::uint32_t reason{},mode{},state{};
+        if(!at||at==head||!Read(at+4,previous)||previous!=prior||!Read(at,next)||
+            !Read(at+8,candidate)||!candidate||!Read(candidate+0x44,reason)||
+            !Read(candidate+0x48,mode)||mode||!Read(candidate+0x40,state))return false;
+        if(std::find(seen.begin(),seen.begin()+i,candidate)!=seen.begin()+i)return false;
+        seen[i]=candidate;
+        if(std::find(owned.begin(),owned.end(),candidate)!=owned.end()) {if(reason==3||state!=3)return false;++matches;}
+        else if(reason!=3)return false;
+        prior=at;at=next;
+    }
+    return matches==owned.size()&&at==head&&prior==last;
 }
 bool NativeRouteResult::Initialize(std::uintptr_t base, bool exact, route_identity::Registry& registry) noexcept {
     if (busy_ || entered_ || !exact || base == 0 || base > UINTPTR_MAX - 0x00EC0000U) return false;
@@ -59,7 +105,7 @@ bool NativeRouteResult::Image() const noexcept {
         Match(base_+0x527E6U,{0xC7,0x47,0x0C,4,0,0,0})&&
         Match(base_+0x617D0U,{0x6A,0xFF,0x68})&&Match(base_+0x618A4U,{0xC2,4,0});
 }
-bool NativeRouteResult::Context(const LocalContext& local, bool capturing, std::size_t count, ImportPoint point) const noexcept {
+bool NativeRouteResult::Context(const LocalContext& local, bool capturing, std::size_t count, ImportPoint point,bool allowAppend) const noexcept {
     std::uintptr_t type{}, sentinel{}, next{}, previous{}, bSentinel{}, bFirst{}, bLast{}, b{};
     std::uintptr_t currentB{}, previousB{}, currentR{}, currentControl{};
     std::uint32_t nCount{}, blockCount{}, rCount{}, ready{}, status{}, stop{}, mode{}, blockState{};
@@ -119,7 +165,9 @@ bool NativeRouteResult::Context(const LocalContext& local, bool capturing, std::
     if (((capturing || point != ImportPoint::QueryDispatch) ? (blockState!=1U&&blockState!=2U) : blockState!=1U)) {contextCheck_=33;return false;}
     if (!Read(local.navigation+0x40,currentB)) {contextCheck_=34;return false;}
     if (!Read(local.navigation+0x44,previousB)) {contextCheck_=35;return false;}
-    if (previousB != 0 && (!replacement||std::find(registeredBlocks.begin(),registeredBlocks.begin()+blockCount,previousB)==registeredBlocks.begin()+blockCount)) {contextCheck_=36;return false;}
+    if (previousB != 0 && (!replacement||
+        (std::find(registeredBlocks.begin(),registeredBlocks.begin()+blockCount,previousB)==registeredBlocks.begin()+blockCount&&
+         !RetiredBlock(local.navigation,previousB)))) {contextCheck_=36;return false;}
     if(replacement&&nCount) {
         // 004659D0 has THREE erase predicates: N.reset, current B bit0,
         // or previous B bit7 (00465A7A). Both 00456BD0 and 00456C30 call
@@ -129,7 +177,7 @@ bool NativeRouteResult::Context(const LocalContext& local, bool capturing, std::
         std::uint8_t reset{},flags{},previousFlags{};
         if(!Read(local.navigation+0x48,reset)||!Read(local.block+0x90,flags)||
             (previousB&&!Read(previousB+0x90,previousFlags))||
-            (!reset&&!(flags&1U)&&!(previousFlags&0x80U))) {contextCheck_=61;return false;}
+            (!allowAppend&&!reset&&!(flags&1U)&&!(previousFlags&0x80U))) {contextCheck_=61;return false;}
     }
     if (!Read(local.navigation+0x5C,currentR)) {contextCheck_=37;return false;}
     if (!Read(local.navigation+0x60,currentControl)) {contextCheck_=38;return false;}
@@ -241,16 +289,33 @@ bool NativeRouteResult::Create(Ref& ref) noexcept {
     } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 bool NativeRouteResult::ReadMarkers(std::uintptr_t node,std::uint32_t& output) noexcept {
+    markerIndex_=markerKind_=markerTypeRva_=UINT32_MAX;
     std::uintptr_t begin{},end{};
-    if(!Read(node+0x34,begin)||!Read(node+0x38,end)||end<begin||(end-begin)%8||(end-begin)>32)return false;
+    contextCheck_=1050;
+    if(!Read(node+0x34,begin)||!Read(node+0x38,end))return false;
+    contextCheck_=1051;
+    if(end<begin||(end-begin)%8||(end-begin)>32||(!begin&&end))return false;
     std::uint32_t markers{};unsigned shift{};
     for(auto at=begin;at<end;at+=8,shift+=8) {
+        markerIndex_=shift/8;
         std::uintptr_t object{},control{},type{};std::uint32_t kind{};
-        if(!Read(at,object)||!Read(at+4,control)||!Pair(object,control)||!Read(object,type)||type!=base_+0xDC7224U||
-            !Read(object+0xC,kind)||(kind!=2&&kind!=3&&kind!=4&&kind!=7&&kind!=8&&kind!=9&&kind!=11))return false;
+        contextCheck_=1052;
+        if(!Read(at,object)||!Read(at+4,control))return false;
+        contextCheck_=1053;
+        if(!Pair(object,control))return false;
+        contextCheck_=1054;
+        if(!Read(object,type))return false;
+        if(type>=base_&&type-base_<=UINT32_MAX)markerTypeRva_=static_cast<std::uint32_t>(type-base_);
+        contextCheck_=1055;
+        if(type!=base_+0xDC7224U)return false;
+        contextCheck_=1056;
+        if(!Read(object+0xC,kind))return false;
+        markerKind_=kind;
+        contextCheck_=1057;
+        if(kind!=2&&kind!=3&&kind!=4&&kind!=7&&kind!=8&&kind!=9&&kind!=11)return false;
         markers|=kind<<shift;
     }
-    output=markers;return true;
+    contextCheck_=0;output=markers;return true;
 }
 bool NativeRouteResult::Marker(std::uint32_t kind,Ref& ref) noexcept {
     __try {
@@ -393,12 +458,14 @@ Result NativeRouteResult::Capture(const Key& key, const LocalContext& local, con
     if (!Protected(key,local,protection,std::span(mappings).first(count),GuardPhase::Read) || !Context(local,true)) return Result::LifetimeLost;
     output = graph; return Result::Ok;
 }
-Result NativeRouteResult::CaptureInstalled(const Key& key,const LocalContext& local,const Protection& protection,
-    const route_identity::BindingIncarnation& binding,const std::array<float,6>& auxiliary,Graph& output) noexcept {
+Result NativeRouteResult::CaptureInstalled(const Key& key,const LocalContext& local,const Protection& supplied,
+    const route_identity::BindingIncarnation& binding,const std::array<float,6>& auxiliary,Graph& output,bool requireComplete) noexcept {
+    contextCheck_=0;captureNode_=markerIndex_=markerKind_=markerTypeRva_=UINT32_MAX;
     if(busy_)return Result::Reentrant;
     if(!base_||!registry_)return Result::NotInitialized;
     if(!ValidKey(key))return Result::InvalidKey;
     const Busy lock(busy_);
+    const Protection protection=supplied;
     if(!Protected(key,local,protection,{},GuardPhase::Read))return Result::LifetimeLost;
     contextCheck_=100;
     std::uintptr_t sentinel{},cursor{},link{},previous{},result{},current{},resultControl{},prior{},blockHead{},blockLink{},registered{};std::uint32_t count{},state{},blocks{},mode{},stop{};
@@ -446,6 +513,9 @@ Result NativeRouteResult::CaptureInstalled(const Key& key,const LocalContext& lo
     if(scan!=sentinel||startIndex==UINT32_MAX||endIndex==UINT32_MAX||cursorIndex==UINT32_MAX||
         startIndex>endIndex)return Result::InvalidNativeState;
     if(cursorIndex>endIndex)return Result::Deferred;
+    // Only the immediate post-install seam can certify the first full range.
+    // Later endpoint exports may observe a suffix, joined to the retained graph.
+    if(requireComplete&&cursorIndex>startIndex){contextCheck_=109;return Result::LocalInvalidity;}
     startIndex=(std::max)(startIndex,cursorIndex);
     Graph graph{};graph.key=key;graph.auxiliary=auxiliary;graph.statuses.fill(0x40000000U);
     for(std::size_t i=0;i<3;++i)if(!Read(b+i*4,graph.goal[i])||!Read(n+0x50+i*4,graph.auxiliary[i+3]))return Result::NativeFault;
@@ -456,22 +526,33 @@ Result NativeRouteResult::CaptureInstalled(const Key& key,const LocalContext& lo
         std::uintptr_t before{},next{};
         if(!link||link==sentinel||!Read(link+4,before)||before!=previous||!Read(link,next))return Result::InvalidNativeState;
         if(i>=startIndex&&i<=endIndex) {
+            captureNode_=static_cast<std::uint32_t>(graph.nodeCount);
             contextCheck_=104;
             if(graph.nodeCount>=kMaxNodes)return Result::UnsupportedDomain;
             std::uintptr_t object{},control{},type{},borrowed{},begin{},end{};std::uint32_t kind{},reference{};
-            if(!Read(link+8,object)||!Read(link+12,control)||!Pair(object,control)||!Read(object,type)||type!=base_+kNodeType||
-                !Read(object+4,kind)||kind>2||!Read(object+0x30,borrowed)||!Read(object+0x34,begin)||!Read(object+0x38,end)||
+            contextCheck_=1040;
+            if(!Read(link+8,object)||!Read(link+12,control)||!Pair(object,control))return Result::UnsupportedDomain;
+            contextCheck_=1041;
+            if(!Read(object,type)||type!=base_+kNodeType)return Result::UnsupportedDomain;
+            contextCheck_=1042;
+            if(!Read(object+4,kind)||kind>2)return Result::UnsupportedDomain;
+            contextCheck_=1043;
+            if(!Read(object+0x30,borrowed)||!Read(object+0x34,begin)||!Read(object+0x38,end)||
                 end<begin||(end-begin)%8||(end-begin)>32||!Read(object+8,reference))return Result::UnsupportedDomain;
             contextCheck_=105;
             std::uint32_t markers{};if(!ReadMarkers(object,markers))return Result::UnsupportedDomain;
+            contextCheck_=106;
             for(std::size_t j=0;j<graph.nodeCount;++j)if(seen[j]==object)return Result::UnsupportedDomain;
             seen[graph.nodeCount]=object;
             route_identity::ElementKey portable{};auto& mapping=mappings[graph.nodeCount];
+            contextCheck_=107;
             if(registry_->ExportElement(binding,reference,portable)!=route_identity::Result::Ok||
                 registry_->MapElement(portable,mapping)!=route_identity::Result::Ok)return Result::MissingResource;
             Node capturedNode{};capturedNode.type=kind;
+            contextCheck_=108;
             if(!MatchesNode(protection,capturedNode,mapping,borrowed)||(graph.nodeCount&&!Adjacent(protection,mappings[graph.nodeCount-1].localReference,reference)))return Result::LocalInvalidity;
             if(!graph.resourceCount){graph.resources[0]=portable.resource;graph.resourceCount=1;}
+            contextCheck_=110;
             if(graph.resources[0]!=portable.resource)return Result::UnsupportedDomain;
             auto& node=graph.nodes[graph.nodeCount++];node.type=kind;node.ordinal=portable.ordinal;node.markers=markers;
             for(std::size_t j=0;j<9;++j)if(!Read(object+0xC+j*4,node.vectors[j]))return Result::NativeFault;
@@ -480,6 +561,7 @@ Result NativeRouteResult::CaptureInstalled(const Key& key,const LocalContext& lo
     }
     std::uintptr_t last{};
     if(!graph.nodeCount||link!=sentinel||!Read(sentinel+4,last)||last!=previous)return Result::InvalidNativeState;
+    contextCheck_=111;
     if(graph.failure!=Failure::None)return Result::UnsupportedDomain;
     const auto valid=Validate(graph);if(valid!=Result::Ok)return valid;
     std::uintptr_t endCursor{};std::uint32_t endState{};
@@ -511,6 +593,81 @@ Result NativeRouteResult::Preflight(const Graph& graph,const LocalContext& local
     importStage_=45;
     return Protected(graph.key,local,protection,std::span(mappings).first(graph.nodeCount),GuardPhase::Preflight)?Result::Ok:Result::LifetimeLost;
 }
+Result NativeRouteResult::CertifyAdmission(const Graph& graph,const LocalContext& local,const Protection& supplied,
+    AdmissionPlan& output,ImportPoint point) noexcept {
+    if(busy_)return Result::Reentrant;
+    const auto valid=Preflight(graph,local,supplied);if(valid!=Result::Ok)return valid;
+    const Busy lock(busy_);const Protection protection=supplied;
+    AdmissionPlan plan{};const auto result=PlanAdmission(graph,local,protection,plan,point,0);
+    if(result==Result::Ok)output=plan;
+    return result;
+}
+Result NativeRouteResult::PlanAdmission(const Graph& graph,const LocalContext& local,const Protection& protection,
+    AdmissionPlan& output,ImportPoint point,std::size_t resultCount) noexcept {
+    if(!Protected(graph.key,local,protection,{},GuardPhase::Read))return Result::LifetimeLost;
+    if(!Context(local,false,resultCount,point,true))return Result::InvalidNativeState;
+    AdmissionPlan plan{};const auto n=local.navigation;
+    std::uint8_t reset{},flags{},previousFlags{};
+    if(!Read(n,plan.sentinel)||!Read(n+4,plan.existingNodeCount)||!Read(plan.sentinel,plan.first)||
+        !Read(plan.sentinel+4,plan.tail)||!Read(n+0xC,plan.cursor)||!Read(n+0x44,plan.previousBlock)||
+        !Read(n+0x48,reset)||!Read(local.block+0x90,flags)||
+        (plan.previousBlock&&!Read(plan.previousBlock+0x90,previousFlags)))return Result::NativeFault;
+    plan.incomingCount=graph.nodeCount;
+    if(reset||(flags&1U)||(previousFlags&0x80U)) {output=plan;return Result::Ok;}
+    plan.mode=plan.existingNodeCount?AdmissionMode::Append:AdmissionMode::AppendEmpty;
+    if(!plan.existingNodeCount) {
+        if(plan.cursor!=plan.sentinel)return Result::InvalidNativeState;
+        output=plan;return Result::Ok;
+    }
+    // 004659D0 shares precisely the OLD TAIL, not an arbitrary overlapping
+    // prefix. Earlier nodes/ranges, history and cursor remain native-owned.
+    std::array<std::uintptr_t,kMaxNodes*2> links{};
+    auto link=plan.first;
+    for(std::uint32_t i=0;i<plan.existingNodeCount;++i) {
+        links[i]=link;if(link==plan.cursor)plan.cursorIndex=i;
+        if(!Read(link,link))return Result::NativeFault;
+    }
+    if(plan.cursor!=plan.sentinel&&plan.cursorIndex==UINT32_MAX)return Result::InvalidNativeState;
+    // Validate every live B range before allowing a shared-list append. A
+    // retired previous B can still be registered; its ranges are not reused.
+    std::uintptr_t head{},at{};std::uint32_t count{};
+    if(!Read(n+0x28,head)||!Read(head,at)||!Read(n+0x2C,count))return Result::NativeFault;
+    std::array<std::uintptr_t,128> blocks{};
+    for(std::uint32_t i=0;i<count;++i) {
+        std::uintptr_t b{},begin{},end{};std::uint32_t reason{},state{},mode{};
+        if(!Read(at+8,b)||!b||std::find(blocks.begin(),blocks.begin()+i,b)!=blocks.begin()+i||
+            !Read(b+0x44,reason)||!Read(b+0x40,state)||!Read(b+0x48,mode)||mode)return Result::InvalidNativeState;
+        blocks[i]=b;
+        if(b!=local.block&&reason!=3&&state==3) {
+            if(!Read(b+0x38,begin)||!Read(b+0x3C,end))return Result::NativeFault;
+            const auto first=std::find(links.begin(),links.begin()+plan.existingNodeCount,begin);
+            const auto last=std::find(links.begin(),links.begin()+plan.existingNodeCount,end);
+            if(first==links.begin()+plan.existingNodeCount||last==links.begin()+plan.existingNodeCount||first>last)return Result::InvalidNativeState;
+        }
+        if(!Read(at,at))return Result::NativeFault;
+    }
+    std::uintptr_t object{},control{},type{},borrowed{};std::uint32_t kind{},reference{};
+    if(!Read(plan.tail+8,object)||!Read(plan.tail+12,control)||!Pair(object,control)||
+        !Read(object,type)||type!=base_+kNodeType||!Read(object+4,kind)||!Read(object+8,reference)||
+        !Read(object+0x30,borrowed)||!ReadMarkers(object,plan.tailMarkers))return Result::UnsupportedDomain;
+    const auto& node=graph.nodes[0];route_identity::ElementMapping mapping{};
+    if(registry_->MapElement({graph.resources[node.resourceIndex],node.ordinal},mapping)!=route_identity::Result::Ok)return Result::MissingResource;
+    if(kind!=node.type||reference!=mapping.localReference||!MatchesNode(protection,node,mapping,borrowed))return Result::LocalInvalidity;
+    for(std::size_t i=0;i<9;++i) {
+        std::uint32_t bits{};
+        if(!Read(object+0xC+i*4,bits)||bits!=std::bit_cast<std::uint32_t>(node.vectors[i]))return Result::LocalInvalidity;
+    }
+    plan.prefixCount=plan.incomingOffset=1;plan.incomingCount=graph.nodeCount-1;
+    auto expected=plan.tailMarkers;
+    if(!plan.incomingCount) {
+        unsigned shift{};for(auto markers=expected;markers;markers>>=8)shift+=8;
+        if(shift>=32)return Result::UnsupportedDomain;
+        expected|=11U<<shift;plan.tailMarkerDelta=11;
+    }
+    if(expected!=node.markers)return Result::LocalInvalidity;
+    if(!Protected(graph.key,local,protection,std::span(&mapping,1),GuardPhase::Read))return Result::LifetimeLost;
+    output=plan;return Result::Ok;
+}
 Result NativeRouteResult::Rearm(const Key& previous,const Graph& graph,const LocalContext& local,const Protection& protection) noexcept {
     if(busy_)return Result::Reentrant;
     if(!entered_||!published_||retired_||previous!=key_||pending_.object||pending_.control||pendingMarker_.object||pendingMarker_.control)return Result::InvalidNativeState;
@@ -522,9 +679,53 @@ Result NativeRouteResult::Rearm(const Key& previous,const Graph& graph,const Loc
     if(local.navigation!=local_.navigation||local.block!=local_.block||local.result==local_.result||
         protection.mesh!=protection_.mesh||
         protection.storage!=protection_.storage||protection.storage.owner_before(protection_.storage)||protection_.storage.owner_before(protection.storage)||
-        !Protected(key_,local_,protection_,{},GuardPhase::Rebind)||!Context(local,false,0,ImportPoint::ReplacementNoWorker))return Result::LifetimeLost;
+        !Protected(key_,local_,protection_,{},GuardPhase::Rebind))return Result::LifetimeLost;
+    AdmissionPlan plan{};
+    if(PlanAdmission(graph,local,protection,plan,ImportPoint::ReplacementNoWorker,0)!=Result::Ok)return Result::LifetimeLost;
     // Never drop the backing-storage owner between old history and new nodes.
     protection_=protection;key_=next;local_=local;entered_=published_=false;
+    return Result::Ok;
+}
+Result NativeRouteResult::RetainContinuation(const Graph& authoritative,const LocalContext& installed,
+    const Protection& protection,Graph& output) noexcept {
+    if(busy_)return Result::Reentrant;
+    continuation_.reset();
+    if(!entered_||!published_||retired_||authoritative.key!=key_||Validate(authoritative)!=Result::Ok||
+        authoritative.failure!=Failure::None||installed.navigation!=local_.navigation||installed.block!=local_.block||
+        installed.result||installed.resultControl||protection.storage!=protection_.storage||
+        protection.storage.owner_before(protection_.storage)||protection_.storage.owner_before(protection.storage)||
+        protection.mesh!=protection_.mesh)return Result::InvalidNativeState;
+    route_identity::ElementMapping mapping{};
+    const auto& first=authoritative.nodes[0];
+    if(registry_->MapElement({authoritative.resources[first.resourceIndex],first.ordinal},mapping)!=route_identity::Result::Ok)return Result::MissingResource;
+    Graph captured{};
+    const auto read=CaptureInstalled(key_,installed,protection,mapping.binding,authoritative.auxiliary,captured);
+    if(read!=Result::Ok)return read;
+    if(captured.nodeCount>authoritative.nodeCount||!SameFloatBits(captured.goal,authoritative.goal))return Result::LocalInvalidity;
+    const auto offset=authoritative.nodeCount-captured.nodeCount;
+    for(std::size_t i=0;i<captured.nodeCount;++i) {
+        auto expected=authoritative.nodes[offset+i];const auto actual=captured.nodes[i];
+        if(authoritative.resources[expected.resourceIndex]!=captured.resources[actual.resourceIndex])return Result::LocalInvalidity;
+        expected.resourceIndex=actual.resourceIndex;
+        if(expected!=actual||!SameFloatBits(expected.vectors,actual.vectors))return Result::LocalInvalidity;
+    }
+    Graph remaining=authoritative;remaining.nodeCount=captured.nodeCount;remaining.nodes={};
+    std::copy_n(authoritative.nodes.begin()+offset,remaining.nodeCount,remaining.nodes.begin());
+    try {continuation_=std::make_unique<Graph>(remaining);}catch(...) {return Result::NativeFault;}
+    output=remaining;return Result::Ok;
+}
+Result NativeRouteResult::RearmContinuation(const Graph& graph,const LocalContext& local,const Protection& protection) noexcept {
+    if(busy_)return Result::Reentrant;
+    if(!continuation_||!SameGraphBits(graph,*continuation_)||!entered_||!published_||retired_||graph.key!=key_||
+        pending_.object||pending_.control||pendingMarker_.object||pendingMarker_.control)return Result::InvalidNativeState;
+    const Busy lock(busy_);
+    if(local.navigation!=local_.navigation||local.block!=local_.block||local.result==local_.result||
+        protection.mesh!=protection_.mesh||protection.storage!=protection_.storage||
+        protection.storage.owner_before(protection_.storage)||protection_.storage.owner_before(protection.storage)||
+        !Protected(key_,local_,protection_,{},GuardPhase::Rebind))return Result::LifetimeLost;
+    AdmissionPlan plan{};
+    if(PlanAdmission(graph,local,protection,plan,ImportPoint::ReplacementNoWorker,0)!=Result::Ok)return Result::LifetimeLost;
+    protection_=protection;local_=local;entered_=published_=false;continuation_.reset();
     return Result::Ok;
 }
 Result NativeRouteResult::Populate(const Graph& graph, const LocalContext& local, const Protection& supplied, ImportPoint point) noexcept {
@@ -544,7 +745,9 @@ Result NativeRouteResult::Populate(const Graph& graph, const LocalContext& local
     importStage_=6;
     if (!Protected(graph.key,local,protection,{},GuardPhase::Read)) return Result::LifetimeLost;
     importStage_=7;
-    if (!Context(local,false,0,point)) return Result::InvalidNativeState;
+    AdmissionPlan admission{};
+    const auto admitted=PlanAdmission(graph,local,protection,admission,point,0);
+    if(admitted!=Result::Ok)return admitted;
     std::array<route_identity::ElementMapping,kMaxNodes> mappings{};
     std::array<std::uintptr_t,kMaxNodes> borrowedLinks{};
     for (std::size_t i = 0; i < graph.nodeCount; ++i) {
@@ -565,10 +768,14 @@ Result NativeRouteResult::Populate(const Graph& graph, const LocalContext& local
     if (!Protected(graph.key,local,protection,mapped,GuardPhase::Create)) return Result::LifetimeLost;
     // Fence before the FIRST native allocation. Partial faults cannot retry.
     protection_ = protection; key_ = graph.key; local_ = local; importPoint_ = point; entered_ = true;
-    for (std::size_t i = 0; i < graph.nodeCount; ++i) {
+    const auto stable=[&](std::size_t count) noexcept {
+        AdmissionPlan current{};
+        return PlanAdmission(graph,local_,protection_,current,importPoint_,count)==Result::Ok&&current==admission;
+    };
+    for (std::size_t i = admission.incomingOffset; i < graph.nodeCount; ++i) {
         importNode_=static_cast<std::uint32_t>(i);
         importStage_=13;
-        if (!Protected(key_,local_,protection_,mapped,GuardPhase::Create) || !Context(local_,false,i,importPoint_)) return Result::LifetimeLost;
+        if (!Protected(key_,local_,protection_,mapped,GuardPhase::Create) || !stable(i-admission.incomingOffset)) return Result::LifetimeLost;
         importStage_=14;
         if (!Create(pending_)) return Result::NativeFault;
         importStage_=15;
@@ -598,13 +805,13 @@ Result NativeRouteResult::Populate(const Graph& graph, const LocalContext& local
         importStage_=25;
         if (!Append(local_.result,pending_)) return Result::NativeFault;
         importStage_=26;
-        if (!Protected(key_,local_,protection_,mapped,GuardPhase::Create) || !Context(local_,false,i+1,importPoint_)) return Result::LifetimeLost;
+        if (!Protected(key_,local_,protection_,mapped,GuardPhase::Create) || !stable(i+1-admission.incomingOffset)) return Result::LifetimeLost;
         importStage_=27;
         if (!Release(pending_)) return Result::NativeFault;
         pending_ = {};
     }
     importStage_=28;
-    if (!Protected(key_,local_,protection_,mapped,GuardPhase::Publish) || !Context(local_,false,graph.nodeCount,importPoint_)) return Result::LifetimeLost;
+    if (!Protected(key_,local_,protection_,mapped,GuardPhase::Publish) || !stable(admission.incomingCount)) return Result::LifetimeLost;
     for(std::size_t i=0;i<graph.nodeCount;++i) {
         importNode_=static_cast<std::uint32_t>(i);
         importStage_=29;
