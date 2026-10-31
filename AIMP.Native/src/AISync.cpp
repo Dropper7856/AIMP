@@ -5989,7 +5989,8 @@ bool HostNativeRetirementQualified(const transactions::Scope& scope, const trans
 }
 bool HostBindingQualified(const transactions::Scope& scope, std::uint32_t generation) noexcept {
     return HostExecutionScopeQualified(scope,generation) &&
-        (host_producer::EngineProducer().Current(scope,generation) || host_producer::NativeIdle());
+        (host_producer::EngineProducer().Current(scope,generation) ||
+         host_producer::NativeIdle() || host_producer::NativeReadyForNewWorld(scope));
 }
 bool HostRouteQualified(const transactions::Scope& scope) noexcept {
     return HostExecutionScopeQualified(scope,gCurrent.nativeGeneration);
@@ -10461,6 +10462,8 @@ void LogDiagnostics(Diagnostics& diagnostics) {
     diagnostics.Log("info", "aisync_typed_execution", "Typed Host commands and authoritative routes execute with native CATHODE locomotion.",
         {{"enabled", Diagnostics::Boolean(Installed()), true},
          {"hostSourceBound", Diagnostics::Boolean(host_producer::EngineProducer().Bound()), true},
+         {"hostNativeRetainedLeases", Diagnostics::Unsigned(host_producer::RetainedNativeLeases()), true},
+         {"hostNativeFencedLeases", Diagnostics::Unsigned(host_producer::FencedOldNativeLeases()), true},
          {"hostCoverageLosses", Diagnostics::Unsigned(host_producer::Coverage().losses), true},
          {"hostFirstLossSite", Diagnostics::Unsigned(host_producer::Coverage().firstSite), true},
          {"hostLastLossSite", Diagnostics::Unsigned(host_producer::Coverage().lastSite), true},
