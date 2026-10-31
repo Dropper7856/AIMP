@@ -154,6 +154,20 @@ bool Guard(void* context,const Key& key,const LocalContext& local,
     return local==slot.local||(phase==GuardPhase::Read&&slot.installed&&
         local.navigation==slot.local.navigation&&local.block==slot.local.block&&!local.result&&!local.resultControl);
 }
+// A delayed failure from an old request must not seize movement back from a
+// newer Host route which CATHODE has actually installed and still owns.
+bool NativeRouteResumed(const execution::NavigationBinding& rejected) noexcept {
+    if(!gState)return false;
+    for(const auto& candidate:gState->slots)if(candidate&&candidate->installed&&
+        !candidate->failed&&!candidate->retiring&&!candidate->retirementFault&&
+        candidate->binding.command.scope==rejected.command.scope&&
+        candidate->binding.command.owner==rejected.command.owner&&
+        candidate->binding.command.actor==rejected.command.actor&&
+        HybridResumeCurrent(rejected.command.command,rejected.command.revision,
+            candidate->binding.command.command,candidate->binding.command.revision)&&
+        Current(*candidate))return true;
+    return false;
+}
 bool Reject(const execution::NavigationBinding& binding) noexcept {
     // A route may fail after native cancellation already invalidated its
     // executable binding. Remember the Host-authorized failure independently
@@ -162,7 +176,7 @@ bool Reject(const execution::NavigationBinding& binding) noexcept {
     // BeginScope/actor destruction revoke the remembered identity.
     if(gState&&binding.policy==movement::Navigation::HostRoute&&
         binding.command.command!=0U&&binding.command.actor.character!=0U&&
-        binding.command.actor.creationSerial!=0U) {
+        binding.command.actor.creationSerial!=0U&&!NativeRouteResumed(binding)) {
         Hybrid* available{};bool found{};
         for(auto& entry:gState->hybrid) {
             // Qualification may disappear while an earlier native request is
@@ -795,6 +809,7 @@ bool Retired(const transactions::Scope& scope) noexcept {
 bool HybridBinding(std::uintptr_t character,execution::NavigationBinding& output) noexcept {
     if(!gState||!gEngine||!gEngine())return false;
     for(auto& entry:gState->hybrid)if(entry.used) {
+        if(NativeRouteResumed(entry.binding)){entry={};continue;}
         // A temporarily unqualified native request is precisely the situation
         // for which recovery is needed. Do not destroy its copied identity
         // here; the real scope/actor lifetime boundaries revoke it.
