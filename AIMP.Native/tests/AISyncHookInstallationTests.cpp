@@ -113,6 +113,62 @@ bool PairRetirementScope(const aimp::ai_sync::interactions::Key&,
 
 bool RouteEngine() noexcept {return true;}
 bool RouteScope(const aimp::ai_sync::transactions::Scope&) noexcept {return false;}
+void TestThePlayerNativeAbi(const std::uintptr_t base) {
+    // Reproduce the exact crash caller on an isolated mapped image with private
+    // fake objects. Only the getter and the small 0078EAF0 store helper execute;
+    // no game process, managers, resources or scripts are started.
+    std::array<std::uintptr_t,64> root{},players{};
+    std::array<std::uintptr_t,0x1200U/4U> player{};
+    std::array<std::uintptr_t,0x1520U/4U> controller{};
+    alignas(16) std::array<std::byte,0x3C00U> receiver{};
+    auto localPlayer=reinterpret_cast<std::uintptr_t>(player.data());
+    root[2]=reinterpret_cast<std::uintptr_t>(players.data());
+    players[0x80U/4U]=reinterpret_cast<std::uintptr_t>(&localPlayer);
+    players[0x84U/4U]=1U;
+    player[0x1100U/4U]=reinterpret_cast<std::uintptr_t>(controller.data());
+    controller[0x1514U/4U]=4U;
+    auto* rootSlot=reinterpret_cast<std::uintptr_t*>(base+0x012F0C88U);
+    const auto oldRoot=*rootSlot;
+    *rootSlot=reinterpret_cast<std::uintptr_t>(root.data());
+    DWORD oldGetter{},oldCaller{};
+    Require(VirtualProtect(reinterpret_cast<void*>(base+0x38BAF0U),0x30U,PAGE_EXECUTE_READWRITE,&oldGetter)!=0,
+        "Private getter executable permission");
+    Require(VirtualProtect(reinterpret_cast<void*>(base+0x38EAF0U),0x60U,PAGE_EXECUTE_READ,&oldCaller)!=0,
+        "Private crash caller executable permission");
+    using Store=void(__thiscall*)(void*,std::uint32_t);
+    const auto store=reinterpret_cast<Store>(base+0x38EAF0U);
+    store(receiver.data(),6U); // fallback getter must preserve EDX=receiver
+    Require(*reinterpret_cast<const std::uint32_t*>(receiver.data()+0x3BC4U)==4U,
+        "THE_PLAYER hook corrupted the live native attack receiver");
+    players[0x84U/4U]=0U;
+    store(receiver.data(),6U);
+    Require(*reinterpret_cast<const std::uint32_t*>(receiver.data()+0x3BC4U)==4U,
+        "Empty player getter must not write the receiver");
+    players[0x84U/4U]=1U;
+    const auto getter=base+0x38BAF0U;
+    std::uintptr_t returned{},preserved{};
+    alignas(16) const std::array<std::uint32_t,4> simd{0x12345678U,0x87654321U,0x11223344U,0x55667788U};
+    alignas(16) std::array<std::uint32_t,4> result{};
+    const auto* simdInput=simd.data();auto* simdOutput=result.data();
+    __asm {
+        mov eax,simdInput
+        movups xmm2,[eax]
+        mov edx,13572468h
+        mov eax,getter
+        call eax
+        mov returned,eax
+        mov preserved,edx
+        mov eax,simdOutput
+        movups [eax],xmm2
+    }
+    Require(returned==localPlayer&&preserved==0x13572468U&&result==simd,
+        "THE_PLAYER hook changed native return, EDX or untouched SIMD state");
+    DWORD ignored{};
+    Require(VirtualProtect(reinterpret_cast<void*>(base+0x38BAF0U),0x30U,oldGetter,&ignored)!=0&&
+        VirtualProtect(reinterpret_cast<void*>(base+0x38EAF0U),0x60U,oldCaller,&ignored)!=0,
+        "Private ABI page restoration");
+    *rootSlot=oldRoot;
+}
 void TestProductionInstallation(DataImage& image) {
     aimp::HookManager hooks(true, true);
     aimp::LevelGenerationTracker generations;
@@ -135,11 +191,27 @@ void TestProductionInstallation(DataImage& image) {
     for (const auto site : sites)
         Require(*reinterpret_cast<const std::uint8_t*>(base + site) == 0xE9U,
             "Production intention, animation or brain hook missing");
+    TestThePlayerNativeAbi(base);
+    // Cover the Host path too: the Retail fast-return can happen to preserve
+    // EDX in one optimized build and would conceal the reported defect.
+    Require(dispatcher.BindEngineThread(GetCurrentThreadId(),aimp::EngineThreadSource::CharacterManagerUpdate,1U)==
+        aimp::EngineThreadBindResult::Bound,"Private Host engine thread binding");
+    aimp::ai_sync::Configuration host{};
+    host.role=aimp::ai_sync::Role::Host;host.nativeGeneration=host.worldGeneration=1U;
+    host.sessionCookie=host.localPeer=1U;
+    Require(aimp::ai_sync::Configure(std::as_bytes(std::span{&host,1U})),"Private Host configuration");
+    aimp::ai_sync::PumpOnEngineThread(); // no stable world, no actors/native work
+    Require(aimp::ai_sync::DiagnosticsSnapshot().role==1U,"Private Host role not applied");
+    const aimp::EngineRootObservation privateRoots{1U,2U,3U,4U,5U};
+    for(unsigned i=0;i<aimp::LevelGenerationTracker::kStablePollsRequired;++i)
+        static_cast<void>(generations.Observe(privateRoots));
+    Require(generations.IsStableGeneration(1U),"Private Host generation not ready");
+    TestThePlayerNativeAbi(base); // no manager runs against these synthetic roots
     Require(hooks.UninstallAll(error), "Production rollback: " + error);
     for (std::size_t i = 0; i < sites.size(); ++i)
         Require(std::memcmp(original[i].data(), reinterpret_cast<const void*>(base + sites[i]), original[i].size()) == 0,
             "Production rollback did not restore retail instructions");
-    // This fresh test process never invokes any detour or retail instruction.
+    // The isolated ABI probe returned; no game thread can retain a trampoline.
     Require(hooks.ReleaseRetiredTrampolines(true, error), "Production trampoline release: " + error);
 }
 void TestInstallation(DataImage& image) {
@@ -276,7 +348,7 @@ int main(int argc, char** argv) {
         DataImage image(argv[1]);
         if (argc == 3 && std::string_view(argv[2]) == "production") {
             TestProductionInstallation(image);
-            std::cout << "PASS: complete production Character/AISync installation and rollback on rebased PE data; no game code executed.\n";
+            std::cout << "PASS: production installation/rollback plus exact THE_PLAYER crash-caller ABI on private synthetic objects; no game process.\n";
             return 0;
         }
         // End_Action sets native flags|6, then skips its lethal helper when

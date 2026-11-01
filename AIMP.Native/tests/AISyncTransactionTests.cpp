@@ -355,7 +355,7 @@ void NativeIntentEvidenceAndOrdering() {
 
 void SchedulerControlOrdering() {
     const auto next=[](Record r,Op op) {++r.globalSeq;++r.ownerSeq;r.opcode=op;return r;};
-    for(auto kind:{6U,11U}) for(auto terminal:{Op::Complete,Op::Cancel,Op::Stop}) {
+    for(auto kind:{6U,8U,11U}) for(auto terminal:{Op::Complete,Op::Cancel,Op::Stop}) {
         auto begin=Base();begin.nativeKind=kind;begin.flags=0;
         begin.goalX=begin.goalY=begin.goalZ=begin.distance=begin.stopDistance=begin.aux=0;
         Ledger ledger({},true);
@@ -368,7 +368,7 @@ void SchedulerControlOrdering() {
         auto later=next(release,Op::Begin);++later.commandId;later.parameterRevision=1;later.nativeKind=0x200;
         later.intent.words[0]=1;later.admission=1;CHECK(ledger.Apply(later)==Result::Ok);
         later=next(later,Op::Submit);CHECK(ledger.Apply(later)==Result::Ok);
-        // A short queue control is not a stale goal. Neither its terminal
+        // A short queue control/placement is not a stale goal. Neither its terminal
         // record nor a later direct action can discard or overtake admission.
         CHECK(!ledger.Superseded(submit.globalSeq)&&!ledger.Superseded(update.globalSeq));
         CHECK(ledger.NativeReadiness(later)==Result::OwnerBusy);

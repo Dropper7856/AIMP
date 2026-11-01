@@ -187,6 +187,12 @@ void OwnershipCoordinator::ConfirmDestroyed(const ActorLifetime& actor) noexcept
         entries_[i].destroyed=true;entries_[i].phase=OwnershipPhase::Fenced;
     }
 }
+void OwnershipCoordinator::ForgetGeneration(const std::uint32_t generation) noexcept {
+    if(busy_||generation==0)return;
+    if (revocation_ != UINT64_MAX) ++revocation_;
+    for(std::size_t i=0;i<count_;++i)if(entries_[i].phase!=OwnershipPhase::Released&&
+        entries_[i].token.actor.nativeGeneration==generation)entries_[i].phase=OwnershipPhase::Released;
+}
 void OwnershipCoordinator::ReleaseDestroyed() noexcept {
     if(busy_)return;
     for(std::size_t i=0;i<count_;++i)if(entries_[i].destroyed&&entries_[i].phase!=OwnershipPhase::Released)

@@ -269,6 +269,15 @@ void NativeLayoutAndOwnership() {
 }
 }
 int main() {
+    CHECK(DecodePairPayloadHigh(0U)==0U); CHECK(DecodePairPayloadHigh(1U)==1U);
+    CHECK(DecodePairPayloadHigh(0x12345600U)==0U); CHECK(DecodePairPayloadHigh(0x12345601U)==1U);
+    CHECK(DecodePairPayloadHigh(0x12345602U)==2U); CHECK(DecodePairPayloadHigh(0x123456FFU)==255U);
+    for(const auto raw:{0x12345600U,0x12345601U,0x12345602U,0x123456FFU}) {
+        Harness h; Receipt receipt{};h.binding.localPairFlagsHigh=DecodePairPayloadHigh(raw);
+        const auto admitted=h.Admit(receipt);
+        if((raw&0xFFU)<=1U) {CHECK(admitted==Result::Admitted);CHECK(h.registers==1U&&h.transitions==1U);}
+        else {CHECK(admitted==Result::Rejected);CHECK(h.registers==0U&&h.transitions==0U);}
+    }
     AdmissionAndCompletion(); CallbackPublication(); AdmissionWaits(); FencesAndIdentity(); PrerequisitesAndReuse(); PreEntryRevocation(); PreparedDefinitionTransition(); NativeLayoutAndOwnership();
     std::cout << "AISync native pair adapter and 00d6 layout invariants passed; runtime rendering/audio/physics UNPROVEN.\n";
 }

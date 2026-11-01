@@ -167,6 +167,11 @@ NativeRequestStatus ExecutionSession::Inspect(const Record& record) noexcept {
     const BusyScope callbackGuard(busy_);
     return native_.Inspect(record);
 }
+bool ExecutionSession::RejectNavigation(const NavigationBinding& binding) noexcept {
+    if(busy_||!configured_||retired_||binding.command.scope!=scope_)return false;
+    const BusyScope callbackGuard(busy_);
+    return native_.RejectNavigation(binding);
+}
 bool ExecutionSession::IsWaiting(const Record& record) const noexcept {
     ExecutionDisposition disposition{};
     return !busy_ && configured_ && !retired_ && record.scope == scope_ &&

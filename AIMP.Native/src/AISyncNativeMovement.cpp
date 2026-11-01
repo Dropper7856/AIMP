@@ -1,11 +1,14 @@
 #include "aimp/AISyncNativeRequestAdapter.h"
+#include "aimp/AISyncExecutionCodec.h"
 #include "aimp/CharacterResourceAdmission.h"
 #include "aimp/AISyncRouteRuntime.h"
+#include "aimp/AISyncRouteExecution.h"
 #include <Windows.h>
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <bit>
+#include <new>
 
 // 00d6: 0070A940 producer; 00683BF0/00683510 factories;
 // 006777B0 initial goal; 006C7550 pending goal; 0067D0D0 stop.
@@ -16,7 +19,14 @@ namespace aimp::ai_sync::execution {
 namespace {
 using namespace transactions;
 std::atomic<std::uint64_t> gUpdatesAfterLocalEnd{},gHostPathSteers{};
+std::atomic<MarkerResolve> gMarkerResolve{};
 constexpr std::uintptr_t kScheduler=0x2CD0;
+struct MarkerBusyScope {
+    bool& busy;
+    bool previous;
+    explicit MarkerBusyScope(bool& value) noexcept : busy(value),previous(value) {busy=true;}
+    ~MarkerBusyScope() {busy=previous;}
+};
 template<class T> bool Read(std::uintptr_t at,T& value) noexcept {
     __try { value=*reinterpret_cast<const T*>(at);return true; }
     __except(EXCEPTION_EXECUTE_HANDLER){return false;}
@@ -24,6 +34,16 @@ template<class T> bool Read(std::uintptr_t at,T& value) noexcept {
 bool SameFloat(float a,float b) noexcept {return std::bit_cast<std::uint32_t>(a)==std::bit_cast<std::uint32_t>(b);}
 bool SameGoal(const std::array<float,3>& a,const std::array<float,3>& b) noexcept {
     for(std::size_t i=0;i<3;++i)if(!SameFloat(a[i],b[i]))return false;return true;
+}
+bool MarkerGeometry(const movement::Bundle& a,const movement::Bundle& b) noexcept {
+    auto x=a,y=b;
+    x.before.retained=x.after.retained=y.before.retained=y.after.retained=0;
+    return movement::Same(x,y);
+}
+bool MarkerKey(const native_intent::Payload& a,const native_intent::Payload& b) noexcept {
+    for(std::size_t i=0;i<a.words.size();++i)
+        if(i!=12&&i!=13&&a.words[i]!=b.words[i])return false;
+    return true;
 }
 bool Gait(std::uintptr_t character,std::uint32_t requested) noexcept {
     // 00684900/00683E80 author these native inputs. Effective gait, velocity
@@ -37,9 +57,97 @@ bool Gait(std::uintptr_t character,std::uint32_t requested) noexcept {
     } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
 }
 }
+void SetMarkerResolver(MarkerResolve resolver) noexcept {gMarkerResolve.store(resolver,std::memory_order_release);}
+bool NativeRequestAdapter::MarkerRevalidate(const Lease& lease) noexcept {
+    // Binding can be revoked after Submit or from a native callback. Keep the
+    // complete operation, including revision and payload, for exact rechecks.
+    if(!lease.markerRecord)return false;
+    const Record record=*lease.markerRecord;
+    const auto resolver=gMarkerResolve.load(std::memory_order_acquire);
+    std::uint32_t marker{};
+    std::uint32_t requestMarker{};
+    return record.scope==lease.scope&&record.owner==lease.owner&&record.commandId==lease.command&&
+        record.nativeKind==2&&record.parameterRevision==lease.revision&&record.intent==lease.markerPayload&&
+        resolver&&resolver(record,marker)&&marker!=UINT32_MAX&&marker==lease.localMarker&&
+        Read(lease.ref.object+0xB0U,requestMarker)&&requestMarker==lease.localMarker;
+}
+bool NativeRequestAdapter::MarkerFields(Lease& lease,bool after) noexcept {
+    __try {
+        if(!after)*reinterpret_cast<std::uint32_t*>(lease.ref.object+0xB0)=lease.localMarker;
+        *reinterpret_cast<std::uint8_t*>(lease.ref.object+0xB4)=
+            static_cast<std::uint8_t>(lease.markerPayload.words[after?13:12]);
+        *reinterpret_cast<std::uint8_t*>(lease.ref.object+0x18)=
+            static_cast<std::uint8_t>(after?lease.movement.after.retained:lease.movement.before.retained);
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+bool NativeRequestAdapter::MarkerInsert(Lease& lease) noexcept {
+    __try {
+        const auto block=lease.ref.object+0x1CU;
+        const auto& p=lease.movement.before;
+        // Actual00440080 also authors the shadow destination. Never use the
+        // Move request setter006777B0 or the context-reading00681810 here.
+        if(markerGoal_) {
+            if(!markerGoal_(movementCallsContext_,block,p.goal.data()))return false;
+        } else reinterpret_cast<void(__thiscall*)(void*,const float*)>(base_+0x40080U)(
+            reinterpret_cast<void*>(block),p.goal.data());
+        if(!MarkerRevalidate(lease)||!NavigationRevalidate(lease)||lease.routeRejected)return false;
+        *reinterpret_cast<std::uint32_t*>(block+0x50)=p.style;
+        *reinterpret_cast<float*>(block+0x2C)=p.stoppingDistance;
+        *reinterpret_cast<float*>(block+0x30)=p.stopDistance;
+        for(std::size_t i=0;i<9;++i)*reinterpret_cast<float*>(block+0x58+i*4)=p.query[i];
+        auto& f90=*reinterpret_cast<std::uint8_t*>(block+0x90);
+        auto& f91=*reinterpret_cast<std::uint8_t*>(block+0x91);
+        f90=static_cast<std::uint8_t>((f90&~0x3FU)|(p.flags90&0x3FU));
+        f91=static_cast<std::uint8_t>((f91&~0x31U)|(p.flags91&0x31U));
+        const auto navigation=lease.movementResource.object+0xC4U;
+        if(markerInsertion_)return markerInsertion_(movementCallsContext_,navigation,block);
+        reinterpret_cast<void(__thiscall*)(void*,void*)>(base_+0x4D190U)(
+            reinterpret_cast<void*>(navigation),reinterpret_cast<void*>(block));
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+MarkerInitialization NativeRequestAdapter::InitializeMarker(std::uintptr_t request,std::uintptr_t character,
+    bool currentLifetime) noexcept {
+    Lease* selected{};
+    for(auto& lease:leases_)if(lease.used&&lease.ref.object==request) {selected=&lease;break;}
+    if(!selected) {
+        // An unknown request on an actor with retained marker ownership must
+        // not escape into the local context solver.
+        bool owned=false;
+        for(auto& lease:leases_)if(lease.used&&lease.kind==2&&lease.actor.character==character) {
+            lease.routeRejected=true;owned=true;
+        }
+        return owned?MarkerInitialization::Rejected:MarkerInitialization::Unowned;
+    }
+    auto& lease=*selected;
+    const bool admitting=busy_&&invokingRecord_&&invokingRecord_->scope==lease.scope&&
+        invokingRecord_->owner==lease.owner&&invokingRecord_->commandId==lease.command&&
+        invokingRecord_->nativeKind==2&&invokingRecord_->opcode==Op::Submit;
+    std::uint32_t marker{};
+    if(lease.kind!=2||lease.actor.character!=character||!currentLifetime||retiring_||!base_||
+        lease.routeRejected||lease.cancelled||lease.markerInitializing||lease.markerInitialized||
+        (busy_&&!admitting)||(lease.unknown&&!admitting)||(!lease.admitted&&!admitting)||
+        lease.movement.navigation!=movement::Navigation::HostRoute||!NavigationRevalidate(lease)||
+        !Read(request+0xB0U,marker)||marker!=lease.localMarker) {
+        lease.routeRejected=true;return MarkerInitialization::Rejected;
+    }
+    const MarkerBusyScope callbackGuard(busy_);
+    if(!MarkerRevalidate(lease)||!NavigationRevalidate(lease)||lease.routeRejected) {
+        lease.routeRejected=true;return MarkerInitialization::Rejected;
+    }
+    const character_direct_step_runtime::MovementResourceLease resources(character);
+    if(!resources||!NavigationRevalidate(lease)) {lease.routeRejected=true;return MarkerInitialization::Rejected;}
+    lease.markerInitializing=true;
+    const bool applied=MarkerInsert(lease)&&MarkerRevalidate(lease)&&NavigationRevalidate(lease)&&!lease.routeRejected;
+    lease.markerInitializing=false;
+    if(!applied) {lease.routeRejected=true;lease.unknown=true;return MarkerInitialization::Rejected;}
+    lease.markerInitialized=true;
+    return MarkerInitialization::Applied;
+}
 NavigationOwnership NativeRequestAdapter::IdentifyNavigation(std::uintptr_t navigation,std::uintptr_t block,
     NavigationBinding& output,bool currentLifetime) noexcept {
-    for (auto& lease : leases_) if (lease.used && (lease.kind == 1 || lease.kind == 3) && lease.ref.object &&
+    for (auto& lease : leases_) if (lease.used && (lease.kind == 1 || lease.kind == 2 || lease.kind == 3) && lease.ref.object &&
         block == lease.ref.object + (lease.kind == 1 ? 0x28U : 0x1CU)) {
         NavigationBinding value{{lease.scope,lease.owner,lease.command,lease.actor,lease.kind,lease.revision},
             lease.movement.navigation,lease.secondary ? 1U : 0U};
@@ -51,14 +159,16 @@ NavigationOwnership NativeRequestAdapter::IdentifyNavigation(std::uintptr_t navi
         // values and refuse before reading Character/M; never reclassify it as
         // unowned work that could dispatch a competing local solver.
         if (!currentLifetime || retiring_ || !base_) return NavigationOwnership::Rejected;
-        const bool admitting=busy_&&invokingRecord_&&invokingRecord_->scope==lease.scope&&
+        const bool invoking=busy_&&invokingRecord_&&invokingRecord_->scope==lease.scope&&
             invokingRecord_->owner==lease.owner&&invokingRecord_->commandId==lease.command&&
             (invokingRecord_->opcode==Op::Submit||invokingRecord_->opcode==Op::Update);
-        if(admitting){value.command.revision=invokingRecord_->parameterRevision;output=value;}
-        if (lease.cancelled || (lease.unknown&&!admitting)) return NavigationOwnership::Rejected;
+        const bool admitting=invoking||lease.markerInitializing;
+        if(invoking){value.command.revision=invokingRecord_->parameterRevision;output=value;}
+        if (lease.routeRejected || lease.cancelled || (lease.unknown&&!admitting)) return NavigationOwnership::Rejected;
         if(busy_&&!admitting)return NavigationOwnership::Waiting;
         LocalActorBinding actor{};
-        if (!resolve_ || !resolve_(context_,lease.owner,actor) || !actor.exclusiveExecution ||
+        const auto resolver=invoking?resolve_:(lifecycleResolver_?lifecycleResolver_:resolve_);
+        if (!resolver || !resolver(context_,lease.owner,actor) || !actor.exclusiveExecution ||
             !Live(lease,actor) || !lease.movementResource.object ||
             navigation != lease.movementResource.object + 0xC4U) return NavigationOwnership::Rejected;
         if(admitting)return NavigationOwnership::Admitting;
@@ -69,12 +179,47 @@ NavigationOwnership NativeRequestAdapter::IdentifyNavigation(std::uintptr_t navi
     // permission to run a local solver. Correlate retained values only; this
     // is a refusal identity, never authority to admit an unknown native block.
     for(const auto& lease:leases_)if(lease.used&&!lease.secondary&&lease.ref.object&&
-        (lease.kind==1||lease.kind==3)&&lease.movement.navigation==movement::Navigation::HostRoute&&
+        (lease.kind==1||lease.kind==2||lease.kind==3)&&lease.movement.navigation==movement::Navigation::HostRoute&&
         lease.movementResource.object&&navigation==lease.movementResource.object+0xC4U) {
         output={{lease.scope,lease.owner,lease.command,lease.actor,lease.kind,lease.revision},lease.movement.navigation,0};
         return NavigationOwnership::Rejected;
     }
     return NavigationOwnership::Unowned;
+}
+bool NativeRequestAdapter::NavigationRevalidate(const Lease& lease) noexcept {
+    const auto resolver=lifecycleResolver_?lifecycleResolver_:resolve_;
+    LocalActorBinding current{};std::uint32_t runtime{};std::uintptr_t scheduler{};
+    return resolver&&resolver(context_,lease.owner,current)&&current==lease.actor&&current.exclusiveExecution&&
+        Read(current.character+0x50U,runtime)&&runtime==current.runtimeId&&
+        Read(current.character+kScheduler,scheduler)&&scheduler==current.character&&Live(lease,current);
+}
+bool NativeRequestAdapter::RejectNavigation(const NavigationBinding& binding) noexcept {
+    if(busy_||retiring_||!base_||binding.policy!=movement::Navigation::HostRoute)return false;
+    Lease* selected{};Lease* primary{};
+    for(auto& lease:leases_)if(lease.used&&lease.scope==binding.command.scope&&lease.owner==binding.command.owner&&
+        lease.command==binding.command.command&&lease.actor==binding.command.actor) {
+        if(!lease.secondary)primary=&lease;
+        const RetirementIdentity identity{lease.scope,lease.owner,lease.command,lease.actor,lease.kind,lease.revision};
+        if(identity==binding.command&&binding.part==(lease.secondary?1U:0U))selected=&lease;
+    }
+    if(!selected||!primary||primary->movement.navigation!=binding.policy)return false;
+    // Fence every retained part before Cancel can reenter the route hooks.
+    for(auto& lease:leases_)if(lease.used&&lease.scope==binding.command.scope&&lease.owner==binding.command.owner&&
+        lease.command==binding.command.command&&lease.actor==binding.command.actor)lease.routeRejected=true;
+    busy_=true;
+    bool complete=true;
+    for(int pass=0;pass<2;++pass)for(auto& lease:leases_) {
+        if(!lease.used||lease.scope!=binding.command.scope||lease.owner!=binding.command.owner||
+            lease.command!=binding.command.command||lease.actor!=binding.command.actor||lease.secondary!=(pass==0))continue;
+        if(lease.unknown||!NavigationRevalidate(lease)){complete=false;continue;}
+        if(lease.cancelled)continue;
+        const character_direct_step_runtime::MovementResourceLease resources(lease.actor.character);
+        if(!resources||!NavigationRevalidate(lease)){complete=false;continue;}
+        lease.unknown=true;
+        if(!CancelRetiring(lease.ref.object)||!NavigationRevalidate(lease)){complete=false;continue;}
+        lease.cancelled=true;lease.unknown=false;
+    }
+    busy_=false;return complete;
 }
 bool NativeRequestAdapter::MovementFactory(Lease& lease,std::uint32_t kind) noexcept {
     lease.refCertified=false;lease.releaseEntered=false;
@@ -85,8 +230,8 @@ bool NativeRequestAdapter::MovementFactory(Lease& lease,std::uint32_t kind) noex
         } else {
             const auto* control=scheduler_control::Find(kind);
             const auto factory=control?control->factoryRva:
-                kind==1?0x283BF0U:kind==3?0x283510U:kind==4?0x282450U:
-                kind==5?0x282410U:kind==9?0x2823B0U:kind==7?0x2823F0U:0U;
+                kind==1?0x283BF0U:kind==2?0x283530U:kind==3?0x283510U:kind==4?0x282450U:
+                kind==5?0x282410U:kind==9?0x2823B0U:kind==7?0x2823F0U:kind==kPlacementKind?0x282430U:0U;
             if(!factory)return false;
             reinterpret_cast<Ref*(__thiscall*)(void*,Ref*)>(base_+factory)(
                 reinterpret_cast<void*>(lease.actor.character+kScheduler),&lease.ref);
@@ -144,26 +289,34 @@ bool NativeRequestAdapter::MovementRevalidate(const Record& r,Lease& lease) noex
     LocalActorBinding actor{};return Resolve(r,actor)&&Live(lease,actor);
 }
 namespace {
-HostPoseQuery gHostPose{};
 ExecutionOwnedQuery gExecutionOwned{};
-std::atomic<std::uint64_t> gHostStartHolds{},gSteersSuspended{},gHostProgressCatchups{};
 }
-void SetHostPoseQuery(HostPoseQuery query) noexcept { gHostPose = query; }
+void SetHostPoseQuery(HostPoseQuery) noexcept {}
 void SetExecutionOwnedQuery(ExecutionOwnedQuery query) noexcept { gExecutionOwned = query; }
 bool MovementExecutionOwned(std::uintptr_t character) noexcept {return gExecutionOwned&&gExecutionOwned(character);}
-std::uint64_t SteersSuspended() noexcept { return gSteersSuspended.load(std::memory_order_relaxed); }
-std::uint64_t HostProgressCatchups() noexcept { return gHostProgressCatchups.load(std::memory_order_relaxed); }
-std::uint64_t HostStartHolds() noexcept { return gHostStartHolds.load(std::memory_order_relaxed); }
+std::uint64_t SteersSuspended() noexcept { return 0; }
+std::uint64_t HostProgressCatchups() noexcept { return 0; }
+std::uint64_t HostStartHolds() noexcept { return 0; }
 void NativeRequestAdapter::MovementUnknown(const Record& r) noexcept {
     for(auto& lease:leases_)if(lease.used&&lease.scope==r.scope&&lease.owner==r.owner&&lease.command==r.commandId)
         lease.unknown=true;
 }
 Readiness NativeRequestAdapter::CheckMovement(const Record& r,const LocalActorBinding& actor) noexcept {
     auto* primary=Find(r);
+    if(r.nativeKind==2&&(r.opcode==Op::Submit||r.opcode==Op::Update)) {
+        std::uint32_t marker{};const auto resolver=gMarkerResolve.load(std::memory_order_acquire);
+        auto after=r.movement.after;after.retained=r.movement.before.retained;
+        if(r.movement.parts!=1||r.movement.navigation!=movement::Navigation::HostRoute||
+            !movement::Same(after,r.movement.before)||!resolver||!resolver(r,marker)||marker==UINT32_MAX)
+            return Readiness::Rejected;
+        if(primary&&(!MarkerKey(r.intent,primary->markerPayload)||marker!=primary->localMarker||
+            !MarkerGeometry(r.movement,primary->movement)))return Readiness::Rejected;
+    }
     if(!primary) {
         if(r.opcode!=Op::Submit)return Readiness::Rejected;
         // Host-guided movement requires its path capture/value provider.
-        if(r.movement.navigation==movement::Navigation::HostRoute&&!route_runtime::Available()){waitReason_=5U;return Readiness::Waiting;}
+        if(r.movement.navigation==movement::Navigation::HostRoute&&
+            !(movementRoutesAvailable_?movementRoutesAvailable_():route_runtime::Available())){waitReason_=5U;return Readiness::Waiting;}
         if(!SameGoal(r.movement.before.goal,r.movement.after.goal))return Readiness::Rejected;
         if(r.nativeKind==3) {
             auto after=r.movement.after;after.retained=r.movement.before.retained;
@@ -173,7 +326,16 @@ Readiness NativeRequestAdapter::CheckMovement(const Record& r,const LocalActorBi
         if(kCapacity-ActiveCount()<r.movement.parts)return Readiness::Rejected;
 
     } else {
-        if(primary->kind!=r.nativeKind||primary->admission!=r.admission||primary->unknown||!Live(*primary,actor))return Readiness::Rejected;
+        if(primary->routeRejected&&r.opcode==Op::Update&&r.nativeKind==1&&r.movement.parts==1&&
+            primary->cancelled&&!primary->unknown&&primary->kind==r.nativeKind&&
+            primary->admission==r.admission&&Live(*primary,actor)&&r.parameterRevision>primary->revision&&
+            r.movement.navigation==movement::Navigation::HostRoute) {
+            const auto quiet=movementRouteQuiet_?movementRouteQuiet_(movementCallsContext_,r):route_execution::CommandRetired(r.scope,r.owner,r.commandId);
+            if(!quiet){waitReason_=7U;return Readiness::Waiting;}
+            return Resources(actor.character);
+        }
+        if(primary->kind!=r.nativeKind||primary->admission!=r.admission||primary->unknown||!Live(*primary,actor)||
+            (primary->routeRejected&&(r.opcode==Op::Submit||r.opcode==Op::Update)))return Readiness::Rejected;
         for(const auto& lease:leases_)if(lease.used&&lease.scope==r.scope&&lease.owner==r.owner&&lease.command==r.commandId) {
             if(lease.unknown||!Live(lease,actor))return Readiness::Rejected;
             if(r.opcode==Op::Release&&!lease.cancelled) {
@@ -193,9 +355,12 @@ Readiness NativeRequestAdapter::CheckMovement(const Record& r,const LocalActorBi
                 r.parameterRevision<=primary->revision||r.movement.parts!=primary->movement.parts||
                 r.movement.navigation!=primary->movement.navigation)
                 return Readiness::Rejected;
-            // Completion of a local request is not completion of the Host
-            // intention. Recreating it still needs live native resources.
-            if(status>=3&&status<=6)return Resources(actor.character);
+            if(r.nativeKind==2)return status<=2?Resources(actor.character):Readiness::Rejected;
+            // A strict route belongs to this native admission and its consumed
+            // prefix. An Update cannot resurrect it with a fresh B and rewind
+            // that prefix. Only a new Host command may obtain a new admission.
+            if(status>=3&&status<=6)return r.movement.navigation==movement::Navigation::HostRoute?
+                Readiness::Rejected:Resources(actor.character);
             if(status!=1&&status!=2)return Readiness::Rejected;
             // Companion mutations require their own native setter contract.
             if(!movement::Same(r.movement.companion,primary->movement.companion)||
@@ -232,14 +397,20 @@ bool NativeRequestAdapter::RestartMovement(Lease& lease,const Record& r,const Lo
     std::uint32_t status{};
     if(Read(lease.ref.object+0xC,status)&&status<=2&&(!CancelRetiring(lease.ref.object)||!MovementRevalidate(r,lease)))return false;
     if(!ReleaseLeaseRef(lease))return false;
-    lease.ref={};lease.admitted=lease.cancelled=false;lease.steerStopApplied=false;lease.steeredGoal={};
+    lease.ref={};lease.admitted=lease.cancelled=false;
+    lease.routeRejected=false;
+    lease.revision=r.parameterRevision;lease.movement=r.movement;
+    LocalActorBinding current{};Ref resource{};
+    if(!Resolve(r,current)||current!=actor||!Read(actor.character+0x42A8U,resource)||
+        resource.object!=lease.movementResource.object||resource.control!=lease.movementResource.control)return false;
     bool accepted{};
-    if(!MovementFactory(lease,1)||!MovementRevalidate(r,lease)||
+    if(!Gait(actor.character,r.movement.gait)||
+        !MovementFactory(lease,1)||!MovementRevalidate(r,lease)||
         !MovementGoal(lease,r.movement.after.goal,false)||!MovementRevalidate(r,lease)||
         !MovementParameters(lease,r.movement.after,true)||
         !MovementAdmit(lease,r.admission,accepted)||!MovementRevalidate(r,lease)||!accepted)return false;
     lease.admitted=true;
-    return Gait(actor.character,r.movement.gait)&&MovementParameters(lease,r.movement.after,false)&&
+    return MovementParameters(lease,r.movement.after,false)&&
         MovementStop(lease,r.movement.after.stopDistance,static_cast<std::uint8_t>((r.movement.after.flags91>>5)&1))&&
         MovementRevalidate(r,lease);
 }
@@ -247,16 +418,40 @@ NativeOutcome NativeRequestAdapter::InvokeMovement(const Record& r,const LocalAc
     auto* primary=Find(r);
     if(r.opcode==Op::Submit) {
         if(primary)return NativeOutcome::Rejected;
+        std::uint32_t marker{};
+        if(r.nativeKind==2) {
+            const auto resolver=gMarkerResolve.load(std::memory_order_acquire);
+            if(!resolver||!resolver(r,marker)||marker==UINT32_MAX)return NativeOutcome::Rejected;
+        }
         for(auto& lease:leases_)if(!lease.used){primary=&lease;break;}
         if(!primary)return NativeOutcome::Rejected;
         *primary={};primary->used=primary->unknown=true;primary->scope=r.scope;primary->owner=r.owner;
         primary->command=r.commandId;primary->actor=actor;primary->kind=r.nativeKind;primary->revision=r.parameterRevision;
         primary->admission=r.admission;
         primary->movement=r.movement;
+        if(r.nativeKind==2) {
+            primary->markerPayload=r.intent;primary->localMarker=marker;
+            auto& retained=markerRecords_[static_cast<std::size_t>(primary-leases_.data())];
+            retained.reset(new(std::nothrow) Record(r));primary->markerRecord=retained.get();
+            if(!primary->markerRecord) {*primary={};return NativeOutcome::Rejected;}
+        }
         if(!Read(actor.character+0x42A8,primary->movementResource)||!primary->movementResource.object||!primary->movementResource.control)
             return NativeOutcome::Unknown;
         bool accepted{};
-        if(!MovementFactory(*primary,r.nativeKind)||!MovementRevalidate(r,*primary)||
+        if(r.nativeKind==2) {
+            if(!MovementFactory(*primary,2)||!MovementRevalidate(r,*primary)||!MarkerFields(*primary,false)||
+                !MovementAdmit(*primary,r.admission,accepted)||!MovementRevalidate(r,*primary)||
+                primary->routeRejected)return NativeOutcome::Unknown;
+            // Admission may initialize now or leave status0 queued. Geometry
+            // stays immutable in the lease until the native callback runs.
+            if(!MarkerFields(*primary,true))return NativeOutcome::Unknown;
+            primary->admitted=accepted;primary->unknown=false;
+            return accepted?NativeOutcome::Admitted:NativeOutcome::Rejected;
+        }
+        // 0070A940 sets M+194 before constructing/admitting the Move. Native
+        // synchronous callbacks must see the captured gait, not an old input.
+        if(!Gait(actor.character,r.movement.gait)||
+            !MovementFactory(*primary,r.nativeKind)||!MovementRevalidate(r,*primary)||
             (r.nativeKind==1&&(!MovementGoal(*primary,r.movement.before.goal,false)||!MovementRevalidate(r,*primary)))||
             !MovementParameters(*primary,r.movement.before,true))return NativeOutcome::Unknown;
         if(r.nativeKind==3) {
@@ -269,7 +464,7 @@ NativeOutcome NativeRequestAdapter::InvokeMovement(const Record& r,const LocalAc
             !MovementRevalidate(r,*primary))return NativeOutcome::Unknown;
         primary->admitted=accepted;
         if(!accepted){primary->unknown=false;return NativeOutcome::Rejected;}
-        if(!Gait(actor.character,r.movement.gait)||!MovementParameters(*primary,r.movement.after,false)||
+        if(!MovementParameters(*primary,r.movement.after,false)||
             (r.nativeKind==1&&!MovementStop(*primary,r.movement.after.stopDistance,static_cast<std::uint8_t>((r.movement.after.flags91>>5)&1)))||
             !MovementRevalidate(r,*primary))return NativeOutcome::Unknown;
         if(r.movement.parts==2) {
@@ -292,11 +487,28 @@ NativeOutcome NativeRequestAdapter::InvokeMovement(const Record& r,const LocalAc
             __try{*reinterpret_cast<std::uint8_t*>(companion->ref.object+0x18)=static_cast<std::uint8_t>(r.movement.companionRetainedAfter);}
             __except(EXCEPTION_EXECUTE_HANDLER){MovementUnknown(r);return NativeOutcome::Unknown;}
         }
-        primary->steeredGoal=r.movement.before.goal;primary->steerRoute=0;primary->steerSegment=0;
         primary->unknown=false;return NativeOutcome::Admitted;
     }
     if(!primary||primary->unknown)return NativeOutcome::Rejected;
     if(r.opcode==Op::Update) {
+        if(primary->routeRejected) {
+            const auto quiet=movementRouteQuiet_?movementRouteQuiet_(movementCallsContext_,r):route_execution::CommandRetired(r.scope,r.owner,r.commandId);
+            if(r.nativeKind!=1||r.movement.parts!=1||!primary->cancelled||
+                !quiet)return NativeOutcome::Rejected;
+            if(!RestartMovement(*primary,r,actor)){MovementUnknown(r);return NativeOutcome::Unknown;}
+            primary->movement=r.movement;primary->revision=r.parameterRevision;primary->unknown=false;
+            ++gUpdatesAfterLocalEnd;return NativeOutcome::Admitted;
+        }
+        if(r.nativeKind==2) {
+            // CheckMovement proved the exact same marker/HostRoute geometry.
+            // Never rewrite B or reinsert a route for a retention/B4 revision.
+            primary->unknown=true;
+            primary->markerPayload=r.intent;*primary->markerRecord=r;
+            primary->movement=r.movement;
+            if(!MarkerFields(*primary,true)||!MovementRevalidate(r,*primary))return NativeOutcome::Unknown;
+            primary->revision=r.parameterRevision;primary->unknown=false;
+            return NativeOutcome::Admitted;
+        }
         std::uint32_t status{},phase{};std::uint8_t flags{},stop{};
         const bool goalChanged=!SameGoal(r.movement.after.goal,primary->movement.after.goal);
         const bool ended=Read(primary->ref.object+0xC,status)&&status>=3&&status<=6;
@@ -308,7 +520,6 @@ NativeOutcome NativeRequestAdapter::InvokeMovement(const Record& r,const LocalAc
             // Recreate that same native request with the current parameters.
             if(!RestartMovement(*primary,r,actor)){MovementUnknown(r);return NativeOutcome::Unknown;}
             primary->movement=r.movement;primary->revision=r.parameterRevision;
-            primary->steeredGoal=r.movement.after.goal;primary->steerRoute=0;primary->steerSegment=0;
             ++gUpdatesAfterLocalEnd;primary->unknown=false;return NativeOutcome::Admitted;
         }
         if(ended) {
@@ -331,10 +542,11 @@ NativeOutcome NativeRequestAdapter::InvokeMovement(const Record& r,const LocalAc
                 (!MovementGoal(*primary,r.movement.after.goal,true)||!MovementRevalidate(r,*primary)))) {
             MovementUnknown(r);return NativeOutcome::Unknown;
         }
-        if(!SameGoal(r.movement.after.goal,primary->movement.after.goal)) {
-            primary->steeredGoal=r.movement.after.goal;primary->steerRoute=0;primary->steerSegment=0;
-        }
-        primary->movement=r.movement;primary->revision=r.parameterRevision;primary->unknown=false;
+        // Both native requests represent one producer revision. A companion
+        // queried later must not claim the previous parameter revision.
+        for(auto& lease:leases_)if(lease.used&&lease.scope==r.scope&&lease.owner==r.owner&&lease.command==r.commandId)
+            lease.revision=r.parameterRevision;
+        primary->movement=r.movement;primary->unknown=false;
         return NativeOutcome::Admitted;
     }
     if(r.opcode!=Op::Cancel&&r.opcode!=Op::Stop&&r.opcode!=Op::Release)return NativeOutcome::Rejected;

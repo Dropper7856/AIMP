@@ -13,7 +13,7 @@ struct MailboxEngine {
     bool (*execute)(void*, std::span<const std::uint8_t>, const transactions::Scope&, std::span<Receipt>, std::size_t&) noexcept{};
     bool (*retry)(void*, const transactions::Record&, std::uint64_t, const transactions::Scope&, Receipt&) noexcept{};
     transactions::Result (*checkpoint)(void*, const transactions::Scope&, std::uint64_t) noexcept{};
-    bool (*carrier)(void*,std::span<const std::uint8_t>,const transactions::Scope&) noexcept{};
+    bool (*carrier)(void*,std::span<const std::uint8_t>,const transactions::Scope&,std::uint64_t arrivalTick) noexcept{};
     bool (*route)(void*,std::span<const std::uint8_t>,const transactions::Scope&) noexcept{};
 };
 struct MailboxPacket {
@@ -38,6 +38,8 @@ public:
     [[nodiscard]] bool QueueCarrier(std::span<const std::uint8_t>) noexcept;
     [[nodiscard]] bool QueueRoute(std::span<const std::uint8_t>) noexcept;
     void Retire() noexcept;
+    // Revoke only the old world. A newer Offer queued by IPC must survive.
+    void RetireGeneration(std::uint32_t nativeGeneration) noexcept;
     [[nodiscard]] bool Fence(Recovery) noexcept; // Preserve produced receipts, append terminal recovery.
     [[nodiscard]] bool Fence(const transactions::Scope&, Recovery) noexcept;
     [[nodiscard]] bool Matches(const transactions::Scope&) noexcept;

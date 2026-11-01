@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 
 #include <cstddef>
 #include <cstdint>
@@ -66,6 +67,10 @@ struct RuntimeSnapshot {
     bool nativeStateActive{};
     bool moveActive{};
     bool armed{};
+    // Hybrid AI follower probe (last locomotion hook), see HybridProbe indices.
+    std::array<float, 28> hybridProbe{};
+    // Demand branch frames: 0 other, 1 moving, 2 settle, 3 turn-only, 4 no drive, 5 AI legacy.
+    std::array<std::uint64_t, 6> hybridBranches{};
 };
 
 // Remote-player replication owns the locomotion state machine for bound
@@ -110,10 +115,35 @@ bool HoldAIIntentIdle(
     std::uint32_t moveType,
     std::string& error) noexcept;
 
-// Drops only AIMP's persistent intent slot. Unlike Stop(), this deliberately
+// Engine thread only, for an AISync-qualified ordinary locomotion owner. Host
+// velocity and pose drive the existing native cycle with bounded speed/heading
+// correction; zero velocity settles to the target through native locomotion.
+// Selects the AI-only no-snap policy inside ArmCore before publishing the target:
+// no initial placement, hard resync, physical delta or direct position writes.
+// A 600ms lease stops both travel and target chasing when Host updates cease.
+// Release ownership before replaying a captured native action; rearm afterwards
+// with a fresh Host sample, converging from the Character's current transform.
+// PlayerSync's ArmWorldReplication/HoldWorldReplicationIdle policy is unchanged.
+bool ArmAIHybridReplication(
+    std::uintptr_t characterAddress,
+    float velocityX,
+    float velocityZ,
+    float intensity,
+    float targetX,
+    float targetY,
+    float targetZ,
+    float yaw,
+    std::uint32_t moveType,
+    std::string& error,
+    std::uint64_t authorityDeadlineMs = 0U) noexcept;
+
+// Drops only AIMP's persistent intent/hybrid slot. Unlike Stop(), this deliberately
 // does not force Idle or submit a zero movement request, so a just-replayed
 // retail transition remains fully owned by CATHODE.
 bool ReleaseAIIntentOwnership(std::uintptr_t characterAddress) noexcept;
+// AISync recovery only. Refresh physical registry + Character transform;
+// never selects/reinitializes a locomotion or paired animation cycle.
+bool ApplyAIRecoveryTransform(std::uintptr_t characterAddress,const float* position,float yaw) noexcept;
 
 // Called from CharacterManagerUpdate on the engine thread. PRE owns normal
 // follower preparation and native transitions. POST is a reconciliation pass

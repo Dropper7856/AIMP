@@ -26,6 +26,7 @@ internal static class AISyncExecutionCodecTests
 
     internal static Task RoundTripsAsync()
     {
+        SchedulerPlacement();
         foreach(var kind in new[]{AISyncExecutionCodec.ForcedRelocateKind,AISyncExecutionCodec.DirectRelocateKind,AISyncExecutionCodec.DirectForcedRelocateKind})
         foreach(var opcode in new[]{AISyncTransactionOpcode.Begin,AISyncTransactionOpcode.Submit})
             RoundTrip(Turn() with { Opcode=opcode,NativeKind=kind,
@@ -61,13 +62,17 @@ internal static class AISyncExecutionCodecTests
     {
         const uint profile = (uint)AISyncExecutionProfiles.SchedulerControl;
         AssertEx.Equal(256U, profile);
-        AssertEx.Equal(503U, (uint)AISyncExecutionProfiles.All);
-        AssertEx.Equal(511U, (uint)AISyncExecutionProfiles.Known);
+        AssertEx.Equal(2039U, (uint)AISyncExecutionProfiles.All);
+        AssertEx.Equal(2047U, (uint)AISyncExecutionProfiles.Known);
+        var markerOnly = new AISyncExecutionControl(Scope(), AISyncExecutionControlKind.Offer,
+            (uint)(AISyncExecutionProfiles.Marker | AISyncExecutionProfiles.AuthoritativeRoutes));
+        AssertEx.Equal(markerOnly, AISyncExecutionControlCodec.Decode(AISyncExecutionControlCodec.Encode(markerOnly)));
+
         foreach (var controlKind in new[] { AISyncExecutionControlKind.Offer, AISyncExecutionControlKind.Ready })
         {
             var control = new AISyncExecutionControl(Scope(), controlKind, profile);
             AssertEx.Equal(control, AISyncExecutionControlCodec.Decode(AISyncExecutionControlCodec.Encode(control)));
-            AssertEx.Throws<ProtocolException>(() => AISyncExecutionControlCodec.Encode(control with { Value = 512 }));
+            AssertEx.Throws<ProtocolException>(() => AISyncExecutionControlCodec.Encode(control with { Value = 2048 }));
         }
         var movement = new AISyncMovementBundle(1, 1, 0, AISyncMovementNavigation.LocalNative, default, default, default);
         var intentWords = new uint[AISyncNativeIntentCodec.WordCount];
@@ -163,13 +168,64 @@ internal static class AISyncExecutionCodecTests
             AISyncNativeIntentCodec.Encode(intent).CopyTo(packet, 72 + AISyncExecutionCodec.ExtendedRecordBytes);
             RejectBatch(packet);
         }
-        // The shared vtable does not authorize the pose-bearing kind8 or callback-bearing kind10.
-        foreach (var kind in new[] { 8U, 10U })
+        // Shared vtable alone cannot authorize the specialized kind10 capability.
+        foreach (var kind in new[] { 10U })
         {
             AssertEx.Equal(0U, AISyncExecutionControlCodec.ProfileForKind(kind));
             RejectModel(Stance() with { NativeKind = kind, Mode = 0 });
         }
         return Task.CompletedTask;
+    }
+
+    private static void SchedulerPlacement()
+    {
+        const uint profile = (uint)AISyncExecutionProfiles.Placement;
+        AssertEx.Equal(512U, profile);
+        AssertEx.Equal(profile, AISyncExecutionControlCodec.ProfileForKind(AISyncExecutionCodec.PlacementKind));
+        // Negotiation carries the capability; native entry still requires local dedup proof.
+        AssertEx.Equal(profile, (uint)AISyncExecutionProfiles.All & profile);
+        var record = Turn() with { NativeKind = AISyncExecutionCodec.PlacementKind,
+            Mode = 0, Aux = -1.25F, Distance = 0 };
+        AssertEx.True(AISyncExecutionControlCodec.Allows(profile, record));
+        AssertEx.True(AISyncExecutionControlCodec.Allows((uint)AISyncExecutionProfiles.All, record));
+        foreach (var opcode in new[] { AISyncTransactionOpcode.Begin, AISyncTransactionOpcode.Submit, AISyncTransactionOpcode.Update })
+        for (uint branch = 0; branch <= 1; branch++)
+        for (uint admission = 0; admission <= 2; admission++)
+        for (uint retention = 0; retention <= 3; retention++)
+        {
+            var operation = record with { Opcode = opcode, Mode = branch, NativeAdmission = admission, ScalarRetention = retention };
+            RoundTrip(operation);
+            var bytes = AISyncExecutionCodec.EncodeBatch(Batch(operation));
+            // Payload is scalar: no new wire version or padding/pointer bytes.
+            var version = admission == 0 && retention == 3 ? AISyncExecutionCodec.Version : AISyncExecutionCodec.MovementVersion;
+            AssertEx.Equal(version, BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(4)));
+            foreach (var stage in Enum.GetValues<AISyncExecutionStage>())
+            {
+                var receipt = Receipt() with { Operation = operation, Stage = stage };
+                AssertEx.Equal(receipt, AISyncExecutionCodec.DecodeReceipt(AISyncExecutionCodec.EncodeReceipt(receipt), Scope()));
+            }
+        }
+        foreach (var opcode in new[] { AISyncTransactionOpcode.Cancel, AISyncTransactionOpcode.Stop,
+            AISyncTransactionOpcode.Complete, AISyncTransactionOpcode.Release })
+            RoundTrip(Stance() with { NativeKind = AISyncExecutionCodec.PlacementKind, Opcode = opcode, Mode = 0 });
+        foreach (var invalid in new[] { record with { Flags = 0 }, record with { Mode = 2 }, record with { Mode = 255 },
+            record with { Gait = 1 }, record with { Distance = -0F }, record with { Stop = -0F },
+            record with { Distance = 1 }, record with { Stop = 1 }, record with { NativeAdmission = 3 },
+            record with { ScalarRetention = 4 }, record with { GoalX = 100001 }, record with { GoalY = -100001 },
+            record with { GoalZ = float.NaN }, record with { Aux = float.PositiveInfinity }, record with { Aux = 6.5F } })
+            RejectModel(invalid);
+        // Native scheduler placement is distinct from lifecycle placement's mode0..15 and append-only contract.
+        RejectModel(record with { Mode = 15 });
+        var movement = new AISyncMovementBundle(1, 1, 0, AISyncMovementNavigation.LocalNative, default, default, default);
+        var words = new uint[AISyncNativeIntentCodec.WordCount]; words[0] = 1;
+        foreach(var invalid in new[] { record with { Movement = movement }, record with { NativeIntent = new AISyncNativeIntent(words) } })
+        {
+            // The historical v1 carrier omits extensions, so exercise the
+            // complete executable model rather than stripping them via AITX.
+            AssertEx.Throws<ProtocolException>(()=>AISyncExecutionCodec.ValidateExecutable(invalid));
+            AssertEx.Throws<ProtocolException>(()=>AISyncExecutionCodec.EncodeBatch(Batch(invalid)));
+            AssertEx.Throws<ProtocolException>(()=>AISyncExecutionCodec.EncodeReceipt(Receipt() with { Operation=invalid }));
+        }
     }
 
     internal static Task MalformedPacketsAsync()

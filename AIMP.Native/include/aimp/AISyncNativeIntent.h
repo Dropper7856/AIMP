@@ -10,6 +10,12 @@
 namespace aimp::ai_sync::native_intent {
 inline constexpr std::uint32_t kKind = 0x200U, kProfile = 128U;
 inline constexpr std::size_t kBytes = 144;
+// Typed extension only: contract24 belongs to native kind2, never constructor0x200.
+// words: 0=contract,1=schema,2..9=SHA256 resource digest (LE words),
+// 10=one-based serialized cover,11=zero-based marker within cover,
+// 12/13=opaque R+B4 before/after admission;14..35 reserved zero.
+inline constexpr std::uint32_t kMarkerContract = 24U, kMarkerSchema = 1U,
+    kMarkerMaxOrdinal = 1000000U;
 // 0043FC90 copies all three low flag bytes and only bits0/1 of byte+57.
 // The remaining six bits are structure padding, not animation options.
 inline constexpr std::uint32_t kScriptedFlags = 0x03FFFFFFU;
@@ -18,6 +24,13 @@ struct Payload {
     bool operator==(const Payload&) const = default;
 };
 using CanonicalPayload = std::array<std::uint8_t, kBytes>;
+// 00401520 duration<=0 sets deadline -1; its virtual+60 (004015A0)
+// deliberately ORs flags6 before hiding the native Character. This is a
+// completed command, not a rejected initialization.
+[[nodiscard]] inline bool CompletesAtConstruction(const Payload& p) noexcept {
+    return p.words[0]==22U||(p.words[0]==23U&&
+        std::isfinite(std::bit_cast<float>(p.words[2]))&&std::bit_cast<float>(p.words[2])<=0.0F);
+}
 
 [[nodiscard]] inline bool Empty(const Payload& value) noexcept {
     for (const auto word : value.words) if (word != 0) return false;
@@ -39,8 +52,26 @@ using CanonicalPayload = std::array<std::uint8_t, kBytes>;
         return n >= -1 && n <= high;
     };
     const auto id = w[0];
-    if (id < 1 || id > 20 || id == 11 || id == 14 || id == 18 || w[35] != 0)
+    if (id == kMarkerContract) {
+        bool digest = false;
+        for (std::size_t i = 2; i < 10; ++i) digest |= w[i] != 0;
+        return w[1] == kMarkerSchema && digest && w[10] > 0 && w[10] <= kMarkerMaxOrdinal &&
+            w[11] <= kMarkerMaxOrdinal && w[12] <= 1 && w[13] <= 1 && zero(14, 36);
+    }
+    if (id < 1 || id > 23 || id == 11 || id == 14 || id == 18 || w[35] != 0)
         return false;
+    // 0064A8A0 (RET4) forwards a pointer to00401770, which copies only
+    // XYZ through004013F0. The fourth vector lane is padding, never data.
+    if (id == 21)
+        return w[1] == 4 && zero(2, 8) && w[11] == 0 && zero(12, 35) &&
+            std::isfinite(std::bit_cast<float>(w[8])) &&
+            std::isfinite(std::bit_cast<float>(w[9])) &&
+            std::isfinite(std::bit_cast<float>(w[10]));
+    // 0064A9C0 takes no arguments; it supplies zero to the4D constructor.
+    if (id == 22) return zero(1, 35);
+    // 0064AA50 (RET4) supplies the caller's float duration to00401520.
+    if (id == 23)
+        return w[1] == 1 && std::isfinite(std::bit_cast<float>(w[2])) && zero(3, 35);
     if (id == 20) {
         // Four CATHODE RuntimeKeys {entityShortGuid,hierarchyHash}, resolved
         // locally through009236A0. Neither component is a native pointer.
