@@ -18,6 +18,19 @@
 
 int main(int argc,char** argv) {
     using namespace aimp::ai_sync;
+    for(const auto id:{1U,2U,7U}) {
+        // Observed reaction53 -> exact Host37 exit cannot be metadata only.
+        assert(!HybridMayConsumeConstructor(id,0xEACE68U,0x53U));
+        assert(!HybridMayConsumeConstructor(id,0xEAE5D0U,0x4EU));
+        assert(!HybridMayConsumeConstructor(id,0xEADB58U,0x12U));
+        assert(HybridMayConsumeConstructor(id,0xEABF80U,0x38U));
+        assert(HybridMayConsumeConstructor(id,0xEABE00U,0x37U));
+        assert(HybridMayConsumeConstructor(id,0xEABA40U,3U));
+    }
+    assert(!HybridMayConsumeConstructor(10U,0xEABF80U,0x38U));
+    assert(!HybridMayConsumeConstructor(1U,0xEACE68U,0x38U));
+    assert(!MovementDrainCycleAllowed(0xEABE00U,0x37U));
+    assert(!MovementDrainCycleAllowed(0xEABA40U,3U));
     // Deferred End_Action cannot finish early, from stale evidence, or via a
     // lethal native branch. All five independent obligations are mandatory.
     for(unsigned mask=0;mask<32U;++mask)
@@ -343,7 +356,7 @@ int main(int argc,char** argv) {
     aim.flags = combat::Present | combat::Aiming; assert(!combat::Valid(aim));
     static_assert(navigation::kNavigationCapacity >= 256U);
     static_assert(sizeof(NavigationGoalState) == 60U && offsetof(State, navigation) == 256U);
-    static_assert(sizeof(State) == 816U && State{}.version == 15U);
+    static_assert(sizeof(State) == 840U && State{}.version == 16U);
     static_assert(offsetof(State, outcome) == 192U && offsetof(State, executionRevision) == 240U);
     static_assert(sizeof(ImpactEvent) == 64U && ImpactEvent{}.version == 2U);
     static_assert(offsetof(State, health) == 316U && offsetof(State, damage) == 356U);

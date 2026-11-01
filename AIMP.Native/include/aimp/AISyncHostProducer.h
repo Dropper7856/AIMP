@@ -130,6 +130,12 @@ using QualifyHost = bool(*)(const transactions::Scope&, std::uint32_t generation
 [[nodiscard]] bool QueueBindingHost(std::span<const std::uint8_t>, std::uint32_t nativeGeneration) noexcept;
 void PumpHost() noexcept;
 void RetireHost() noexcept;
+// Engine-side handshake counters, independent of timeout/network logs.
+// A queued Offer is not a Ready and cannot grant native ownership.
+struct BindingPumpDiagnostics {
+    std::uint64_t queued{},cancelled{},qualificationRejected{},configurationRejected{},readyProduced{};
+};
+[[nodiscard]] BindingPumpDiagnostics BindingPumpStatus() noexcept;
 [[nodiscard]] bool PeekHost(HostPacket&) noexcept;
 [[nodiscard]] bool CommitHost(std::uint64_t token) noexcept;
 [[nodiscard]] bool HostScope(transactions::Scope&) noexcept;
@@ -140,10 +146,25 @@ using CommandTrace = void(*)(const transactions::Record&) noexcept;
 void SetCommandTrace(CommandTrace) noexcept;
 using NativeContext = bool(*)(std::uintptr_t character, transactions::OwnerKey&) noexcept;
 using NativeGuard = bool(*)() noexcept;
+// Engine-qualified exact loaded marker identity, never a raw marker index on wire.
+using NativeMarkerCapture = bool(*)(std::uint32_t localMarker,native_intent::Payload&) noexcept;
+void SetNativeMarkerCapture(NativeMarkerCapture) noexcept;
+// Only the certified0068192F pre-insertion seam may supply authored geometry.
+void BeforeNativeMarkerInsertion(std::uintptr_t navigation,std::uintptr_t block) noexcept;
 using NativeSchedulerObserver = void(*)(std::uintptr_t scheduler,bool entering) noexcept;
 void SetNativeSchedulerObserver(NativeSchedulerObserver) noexcept;
 // Exact status before00683470 can overwrite a terminal disposition with6.
 void BeforeNativeRetention(std::uintptr_t scheduler,std::uintptr_t request) noexcept;
+struct NativePlacementIdentity {
+    CommandIdentity command{};
+    std::uintptr_t scheduler{},request{},character{};
+    std::uint32_t runtime{},branch{};
+    bool operator==(const NativePlacementIdentity&) const noexcept = default;
+};
+// Exact current head, held by our live native observer lease. Read-only:
+// returns false for provisional/unpublished/mutated/foreign requests. The
+// caller must refresh pending source parameters before entering mode8.
+[[nodiscard]] bool IdentifyNativePlacement(std::uintptr_t scheduler,NativePlacementIdentity&) noexcept;
 using NativeRetirementGuard = bool(*)(const transactions::Scope&, const transactions::OwnerKey&,
     std::uintptr_t character, std::uint32_t runtime) noexcept;
 // Exact-build native capture. The existing Submit detour forwards successful
@@ -179,6 +200,17 @@ void RetireNative(bool liveWorld) noexcept;
     std::uint8_t state,std::uint8_t serial,std::uint32_t executionRevision,action_correlation::Reference&) noexcept;
 void InvalidateNativeActor(std::uintptr_t character, std::uint32_t runtime) noexcept;
 [[nodiscard]] bool NativeIdle() noexcept;
+// Only live, not-yet-fenced request observations may trigger a live-world
+// native retirement. Previously fenced old-world refs remain pinned, but must
+// never replace a pending new-world Offer with an unsolicited Close.
+[[nodiscard]] bool NativeNeedsLiveWorldRetirement() noexcept;
+// New-world startup may ignore ONLY old-world, terminally fenced native
+// observations. Their strong Refs remain pinned and cannot be reused as new
+// requests. Same-world restart and active/unknown current-world work still
+// require the ordinary NativeIdle proof.
+[[nodiscard]] bool NativeReadyForNewWorld(const transactions::Scope&) noexcept;
+[[nodiscard]] std::uint32_t RetainedNativeLeases() noexcept;
+[[nodiscard]] std::uint32_t FencedOldNativeLeases() noexcept;
 // Resolve a real native N/B pair to its already accepted logical command.
 // part=0 primary, part=1 companion. Local pointers never leave this boundary.
 [[nodiscard]] bool IdentifyNativeNavigation(std::uintptr_t navigation, std::uintptr_t block,

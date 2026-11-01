@@ -20,6 +20,8 @@ native_intent::Payload Intent(std::uint32_t id) {
         w[29]=0xFFFFFFFF;w[30]=std::bit_cast<std::uint32_t>(-1.F);
         w[31]=std::bit_cast<std::uint32_t>(60.F);w[32]=std::bit_cast<std::uint32_t>(-100000.F);w[33]=0x0302BE7F;
     }
+    if (id==21) {w[1]=4;w[8]=std::bit_cast<std::uint32_t>(-1.5F);w[9]=0x80000000U;w[10]=std::bit_cast<std::uint32_t>(3.25F);}
+    if (id==23) {w[1]=1;w[2]=0x80000000U;}
     return p;
 }
 transactions::Record Record() {
@@ -31,8 +33,8 @@ transactions::Record Record() {
 void PayloadDomain() {
     native_intent::CanonicalPayload bytes{};native_intent::Payload decoded{};
     Check(native_intent::Encode({},bytes) && native_intent::Decode(bytes,decoded) && native_intent::Empty(decoded),"empty payload");
-    for (std::uint32_t id=1;id<=20;++id) {
-        const auto p=Intent(id);const bool supported=id!=11&&id!=14&&id!=18;
+    for (std::uint32_t id=1;id<=24;++id) {
+        const auto p=Intent(id);const bool supported=id<=23&&id!=11&&id!=14&&id!=18;
         Check(native_intent::Validate(p)==supported,"contract domain");
         if (!supported) continue;
         Check(native_intent::Encode(p,bytes) && native_intent::Decode(bytes,decoded) && decoded==p,"payload exact round trip");
@@ -85,6 +87,53 @@ void PayloadDomain() {
     auto invalid=Intent(20);invalid.words[33]|=0x80000000;Check(!native_intent::Validate(invalid),"unsupported native flag");
     invalid=Intent(8);invalid.words[1]=15;Check(!native_intent::Validate(invalid),"Refused kind admitted");
 }
+void NewContracts() {
+    native_intent::CanonicalPayload bytes{};native_intent::Payload decoded{};
+    Check(native_intent::CompletesAtConstruction(Intent(22)),"native immediate 4D completion treated as rejection");
+    for(const float duration : {-1.0F,-0.0F,0.0F,0.5F}) {
+        auto timed=Intent(23);timed.words[2]=std::bit_cast<std::uint32_t>(duration);
+        Check(native_intent::CompletesAtConstruction(timed)==(duration<=0.0F),"native duration completion contract");
+    }
+    Check(!native_intent::CompletesAtConstruction(Intent(21)),"passage initialization failure hidden");
+    for (auto id : {21U,22U,23U}) {
+        const auto p=Intent(id);
+        Check(native_intent::Encode(p,bytes)&&native_intent::Decode(bytes,decoded)&&decoded==p,"new contract round trip");
+        if(id==21) Check(bytes[34]==0xC0&&bytes[35]==0xBF&&bytes[39]==0x80&&
+            bytes[42]==0x50&&bytes[43]==0x40,"XYZ order or signed zero lost");
+        if(id==23) Check(bytes[11]==0x80,"duration signed zero lost");
+        // Every unused word, including the fourth vector lane, is canonical
+        // integer zero. Negative float zero is also forbidden in padding.
+        for(std::size_t i=1;i<36;++i) {
+            if((id==21&&(i==1||(i>=8&&i<=10)))||(id==23&&(i==1||i==2)))continue;
+            for(auto bits : {1U,0x80000000U}) {
+                auto invalid=p;invalid.words[i]=bits;
+                Check(!native_intent::Validate(invalid)&&!native_intent::Encode(invalid,bytes),"new reserved word admitted");
+                Check(native_intent::Encode(p,bytes),"new contract reencode");bytes[i*4+(bits==1U?0:3)]=bits==1U?1:0x80;
+                Check(!native_intent::Decode(bytes,decoded),"new reserved wire word admitted");
+            }
+        }
+    }
+    for(auto id : {21U,23U}) {
+        for(auto kind : {0U,1U,2U,4U,5U,0x11U}) {
+            if(kind==(id==21?4U:1U))continue;
+            auto invalid=Intent(id);invalid.words[1]=kind;Check(!native_intent::Validate(invalid),"new wrong argument carrier");
+        }
+        const std::size_t begin=id==21?8:2,end=id==21?11:3;
+        for(auto i=begin;i<end;++i) {
+            for(auto bits : {0U,0x80000000U,0x7F7FFFFFU,0xFF7FFFFFU,1U,0x80000001U}) {
+                auto finite=Intent(id);finite.words[i]=bits;
+                Check(native_intent::Encode(finite,bytes)&&native_intent::Decode(bytes,decoded)&&decoded==finite,"finite float bits changed");
+            }
+            for(auto bits : {0x7F800000U,0xFF800000U,0x7FC00000U,0x7F800001U}) {
+                auto invalid=Intent(id);invalid.words[i]=bits;Check(!native_intent::Validate(invalid),"new nonfinite argument");
+                Check(native_intent::Encode(Intent(id),bytes),"finite wire setup");
+                for(std::size_t b=0;b<4;++b)bytes[i*4+b]=static_cast<std::uint8_t>(bits>>(b*8));
+                Check(!native_intent::Decode(bytes,decoded),"new nonfinite wire argument");
+            }
+        }
+    }
+    for(auto id : {24U,25U,0xFFFFFFFFU}) Check(!native_intent::Validate(Intent(id)),"future contract admitted");
+}
 void WireAndReceipts() {
     auto r=Record();execution::Batch batch{};batch.scope=r.scope;batch.batchId=5;batch.count=2;batch.records[0]=r;
     auto scalar=r;scalar.nativeKind=7;scalar.admission=0;scalar.intent={};batch.records[1]=scalar;
@@ -119,6 +168,14 @@ void WireAndReceipts() {
     receipt.operation=batch.records[0];Check(execution::EncodeReceipt(receipt,bytes)&&bytes[4]==2&&execution::DecodeReceipt(bytes,r.scope,echoed),"v2 receipt regression");
     execution::Control control{r.scope,execution::ControlKind::Offer,execution::kProfileNativeIntent};std::array<std::uint8_t,execution::kHeaderSize> offer{};
     Check(execution::EncodeControl(control,offer)&&execution::ProfileForKind(native_intent::kKind)==128,"intent capability");
+    for(auto id : {21U,22U,23U}) {
+        auto operation=Record();operation.intent=Intent(id);batch.count=1;batch.records[0]=operation;
+        Check(execution::EncodeBatch(batch,bytes)&&bytes[4]==3&&bytes.size()==execution::kBatchHeaderSize+execution::kNativeIntentRecordSize&&
+            execution::DecodeBatch(bytes,r.scope,copy)&&copy.records[0].intent==operation.intent,"new contract batch envelope");
+        receipt.operation=operation;
+        Check(execution::EncodeReceipt(receipt,bytes)&&bytes[4]==3&&bytes.size()==execution::kMaximumReceiptBytes&&
+            execution::DecodeReceipt(bytes,r.scope,echoed)&&echoed.operation.intent==operation.intent,"new contract receipt envelope");
+    }
 }
 }
-int main() { PayloadDomain();WireAndReceipts();std::cout<<"AISync native intent codec PASS (offline)\n"; }
+int main() { PayloadDomain();NewContracts();WireAndReceipts();std::cout<<"AISync native intent codec PASS (offline)\n"; }

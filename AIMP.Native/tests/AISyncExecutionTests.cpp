@@ -102,6 +102,41 @@ void CodecGuards() {
         Require(!DecodeReceipt(ack, r.scope, copy), "high result bits truncated before validation");
     }
 }
+void PlacementCodec() {
+    Require(!PlacementDedupReady(),"placement integration gate enabled by default");
+    Require(ProfileForKind(kPlacementKind)==kProfilePlacement&&kProfilePlacement==512U,"placement profile missing");
+    for(const auto op:{Op::Begin,Op::Submit,Op::Update})for(const auto branch:{0U,1U})
+        for(const auto admission:{0U,1U,2U})for(const auto retention:{0U,1U,2U,3U}) {
+        auto r=Command(op);r.nativeKind=kPlacementKind;r.mode=branch;r.admission=admission;
+        r.scalarRetention=retention;r.distance=0;r.aux=-1.25F;
+        Batch batch{};batch.scope=r.scope;batch.batchId=1;batch.count=1;batch.records[0]=r;
+        std::vector<std::uint8_t> bytes;Batch decoded{};
+        Require(ValidateExecutable(r)&&EncodeBatch(batch,bytes)&&DecodeBatch(bytes,r.scope,decoded),"placement scalar roundtrip failed");
+        const auto& copy=decoded.records[0];
+        Require(copy.nativeKind==8&&copy.mode==branch&&copy.admission==admission&&copy.scalarRetention==retention&&
+            copy.goalX==r.goalX&&copy.goalY==r.goalY&&copy.goalZ==r.goalZ&&copy.aux==r.aux,"placement payload changed");
+        const auto stride=admission==0&&retention==3?transactions::kRecordSize:kExtendedRecordSize;
+        Require(bytes.size()==kBatchHeaderSize+stride,"placement invented a new wire extension");
+        Receipt receipt{r.scope,1,r,Stage::Waiting,Result::Ok},echo{};
+        Require(EncodeReceipt(receipt,bytes)&&DecodeReceipt(bytes,r.scope,echo)&&echo.operation.mode==branch&&
+            echo.operation.admission==admission&&echo.operation.scalarRetention==retention,"placement receipt lost exact operation");
+        for(auto invalid:{0U,1U,2U,3U,4U,5U,6U,7U,8U,9U,10U}) {
+            auto bad=r;
+            switch(invalid) {
+            case 0:bad.flags=0;break;case 1:bad.mode=2;break;case 2:bad.mode=255;break;
+            case 3:bad.distance=-0.0F;break;case 4:bad.stopDistance=-0.0F;break;case 5:bad.gait=1;break;
+            case 6:bad.goalX=100001.0F;break;case 7:bad.aux=6.5F;break;case 8:bad.distance=1;break;
+            case 9:bad.goalY=std::bit_cast<float>(0x7F800000U);break;case 10:bad.aux=std::bit_cast<float>(0x7FC00001U);break;
+            }
+            Require(!ValidateExecutable(bad),"invalid placement payload accepted");
+        }
+    }
+    for(const auto op:{Op::Cancel,Op::Stop,Op::Complete,Op::Release}) {
+        auto r=Command(op);r.nativeKind=kPlacementKind;r.mode=r.flags=0;r.goalX=r.goalY=r.goalZ=r.distance=0;
+        Require(ValidateExecutable(r),"placement terminal lifecycle rejected");
+        r.scalarRetention=0;Require(!ValidateExecutable(r),"placement terminal accepted noncanonical retention");
+    }
+}
 std::vector<std::uint8_t> HexFile(const char* path) {
     std::ifstream input(path);
     Require(static_cast<bool>(input), "shared execution fixture missing");
@@ -140,7 +175,7 @@ public:
         Require(memory_ != nullptr, "synthetic image allocation failed");
         const std::array<unsigned char,7> prefix{0x51,0x56,0x8B,0x74,0x24,0x0C,0x56};
         const std::array<unsigned char,3> ret{0xC2,4,0};
-        for (auto rva : {0x00282450U,0x002823F0U,0x00282410U,0x002823B0U,0x002823D0U,0x00282390U}) {
+        for (auto rva : {0x00282450U,0x002823F0U,0x00282410U,0x002823B0U,0x002823D0U,0x00282390U,0x00282430U,0x00283530U}) {
             std::memcpy(memory_ + rva, prefix.data(), prefix.size());
             std::memcpy(memory_ + rva + 0x18, ret.data(), ret.size());
         }
@@ -148,6 +183,13 @@ public:
             const auto callback = Base() + 0x002777E0;
             std::memcpy(memory_ + rva + 8, &callback, sizeof(callback));
         }
+        const auto markerEligibility=Base()+0x277800U,markerStatus=Base()+0x282560U;
+        std::memcpy(memory_+0xEB1A64,&markerEligibility,sizeof(markerEligibility));
+        std::memcpy(memory_+0xEB1A68,&markerStatus,sizeof(markerStatus));
+        const unsigned char markerEligible[]{0x33,0xC0,0x83,0xB9,0xB0,0,0,0,0xFF,0x0F,0x95,0xC0,0xC3};
+        std::memcpy(memory_+0x277800,markerEligible,sizeof(markerEligible));
+        const unsigned char markerInitialize[]{0xE8,0x62,0xF2,0xFF,0xFF};
+        std::memcpy(memory_+0x2825A9,markerInitialize,sizeof(markerInitialize));
         // Kind5 (action) overrides the status method with 006799F0.
         const auto actionStatus = Base() + 0x002799F0;
         std::memcpy(memory_ + 0x00EB198C + 8, &actionStatus, sizeof(actionStatus));
@@ -159,6 +201,11 @@ public:
         std::memcpy(memory_+scheduler_control::kTypeRva+8,&controlStatus,sizeof(controlStatus));
         const unsigned char statusRet[]{0xC2,0x0C,0};
         std::memcpy(memory_+scheduler_control::kStatusRva,statusRet,sizeof(statusRet));
+        const auto tick=Base()+0x74D3F0U;
+        std::memcpy(memory_+scheduler_control::kTypeRva+12,&tick,sizeof(tick));
+        const unsigned char eligibleRet[]{0xB0,0x01,0xC3};
+        std::memcpy(memory_+0xAA70F0U,eligibleRet,sizeof(eligibleRet));
+        std::memcpy(memory_+0x74D3F0U,ret.data(),ret.size());
         const std::array<unsigned char,4> release{0x56,0x8B,0x71,4};
         std::memcpy(memory_ + 0xD770, release.data(), release.size());
     }
@@ -308,6 +355,69 @@ void SchedulerControlAdapter() {
         Require(adapter.Invoke(r)==NativeOutcome::Admitted&&adapter.ActiveCount()==0,"control Release failed");
         Require(calls.creates==1&&calls.admits==1&&calls.cancels==1&&calls.releases==1&&calls.cleanTail&&
             calls.refControl[1]==0&&resourceControl[1]==1,"control wrote beyond base header or leaked references");
+    }
+}
+void PlacementAdapter() {
+    struct Calls {
+        std::array<std::uint8_t,0x34> request{};std::array<LONG,3> control{0,1,1};
+        std::uintptr_t base{};std::uint32_t admission{},retention{};unsigned creates{},admits{},cancels{},releases{};
+        static bool Factory(void* context,std::uint32_t kind,std::uintptr_t scheduler,std::uintptr_t* out)noexcept {
+            auto& h=*static_cast<Calls*>(context);++h.creates;if(kind!=kPlacementKind)return false;h.request.fill(0xCD);
+            const std::uint32_t header[]{static_cast<std::uint32_t>(h.base+0xEB199CU),0,0,0,kind,static_cast<std::uint32_t>(scheduler),0};
+            std::memcpy(h.request.data(),header,sizeof(header));out[0]=reinterpret_cast<std::uintptr_t>(h.request.data());
+            out[1]=reinterpret_cast<std::uintptr_t>(h.control.data());return true;
+        }
+        static bool Admit(void* context,std::uintptr_t request,std::uint32_t admission,bool& accepted)noexcept {
+            auto& h=*static_cast<Calls*>(context);++h.admits;h.admission=admission;h.retention=h.request[0x18];
+            *reinterpret_cast<std::uint32_t*>(request+0xC)=2;accepted=true;return true;
+        }
+        static bool Cancel(void* context,std::uintptr_t request)noexcept {
+            ++static_cast<Calls*>(context)->cancels;*reinterpret_cast<std::uint32_t*>(request+0xC)=5;return true;
+        }
+        static bool Release(void* context,std::uintptr_t)noexcept {
+            auto& h=*static_cast<Calls*>(context);++h.releases;--h.control[1];return true;
+        }
+    };
+    FakeImage image;
+    for(const auto branch:{0U,1U})for(const auto admission:{0U,1U,2U})for(const auto retention:{0U,1U,2U,3U}) {
+        Calls calls{};calls.base=image.Base();SyntheticActor actor;NativeRequestAdapter adapter;
+        Require(adapter.Initialize(image.Base(),true,&SyntheticActor::Permit,&SyntheticActor::Resolve,&actor),"placement adapter init");
+        std::array<LONG,3> resourceControl{0,1,1};std::array<std::uint8_t,0x2C> resource{};
+        const std::uintptr_t pair[]{reinterpret_cast<std::uintptr_t>(resource.data()),reinterpret_cast<std::uintptr_t>(resourceControl.data())};
+        std::memcpy(actor.storage.data()+0x42A8,pair,sizeof(pair));
+        NativeRequestAdapterTestAccess::Calls(adapter,&calls,&Calls::Factory,&Calls::Admit,&Calls::Cancel,&Calls::Release);
+        auto r=Command(Op::Submit);r.nativeKind=kPlacementKind;r.mode=branch;r.admission=admission;r.scalarRetention=retention;r.distance=0;r.aux=-1.25F;
+        Require(!PlacementDedupReady()&&adapter.Invoke(r)==NativeOutcome::Rejected&&calls.creates==0,"placement bypassed dedup integration gate");
+        SetPlacementDedupReady(true);
+        Require(adapter.Invoke(r)==NativeOutcome::Admitted&&calls.creates==1&&calls.admits==1,"placement Submit failed");
+        std::array<std::uintptr_t,4> head{},node{};
+        head[0]=reinterpret_cast<std::uintptr_t>(node.data());node[0]=reinterpret_cast<std::uintptr_t>(head.data());
+        node[2]=reinterpret_cast<std::uintptr_t>(calls.request.data());node[3]=reinterpret_cast<std::uintptr_t>(calls.control.data());
+        const auto list=reinterpret_cast<std::uintptr_t>(head.data()),scheduler=actor.binding.character+0x2CD0U;
+        const std::uint32_t count=1;
+        std::memcpy(actor.storage.data()+0x2CD4,&list,sizeof(list));std::memcpy(actor.storage.data()+0x2CD8,&count,sizeof(count));
+        RetirementIdentity identity{};
+        Require(adapter.IsOwnedPlacement(scheduler,&identity)&&identity.command==r.commandId&&identity.revision==r.parameterRevision&&
+            identity.scope==r.scope&&identity.owner==r.owner,"placement typed current-head identity missing");
+        ++actor.binding.creationSerial;Require(!adapter.IsOwnedPlacement(scheduler),"foreign actor incarnation acquired placement ownership");--actor.binding.creationSerial;
+        ++node[2];Require(!adapter.IsOwnedPlacement(scheduler),"foreign scheduler head acquired placement ownership");--node[2];
+        const auto payload=[&] {
+            float values[4]{};std::memcpy(values,calls.request.data()+0x1C,sizeof(values));
+            Require(values[0]==r.goalX&&values[1]==r.goalY&&values[2]==r.goalZ&&values[3]==r.aux&&calls.request[0x2C]==r.mode,"placement fields changed");
+            for(std::size_t i=0x2D;i<calls.request.size();++i)Require(calls.request[i]==0xCD,"placement wrote padding or unused tail");
+        };
+        payload();Require(calls.admission==admission&&calls.retention==(retention&1)&&calls.request[0x18]==(retention>>1),"placement admission/retention lost");
+        r.opcode=Op::Update;++r.parameterRevision;r.goalX=-4.5F;r.aux=2;r.mode=1-branch;
+        // Same-vtable kind6 cannot impersonate our live kind8 request.
+        calls.request[0x10]=6;Require(adapter.Check(r)==Readiness::Rejected,"same-vtable foreign kind accepted");calls.request[0x10]=8;
+        Require(adapter.Invoke(r)==NativeOutcome::Admitted&&calls.creates==1&&calls.admits==1,"placement mutation recreated native request");payload();
+        const auto oldIdentity=identity;
+        Require(adapter.IsOwnedPlacement(scheduler,&identity)&&identity.revision==r.parameterRevision&&identity!=oldIdentity,"placement typed revision was not immutable");
+        SetPlacementDedupReady(false);
+        ++r.parameterRevision;Require(adapter.Invoke(r)==NativeOutcome::Rejected,"withdrawn dedup proof allowed placement update");
+        r.opcode=Op::Release;r.flags=r.mode=0;r.goalX=r.goalY=r.goalZ=r.aux=0;r.scalarRetention=3;
+        Require(adapter.Invoke(r)==NativeOutcome::Admitted&&adapter.ActiveCount()==0&&calls.cancels==1&&calls.releases==1&&
+            calls.control[1]==0&&resourceControl[1]==1,"placement retirement leaked native references");
     }
 }
 bool PermissionCheck(void* opaque, const Record& record) noexcept {
@@ -711,7 +821,7 @@ void RuntimeOwnership(bool commandAdmission) {
 int main(int argc, char** argv) {
     try {
         Require(argc == 2 || (argc == 3 && std::string(argv[2]) == "--command-admission"), "expected shared execution fixture path");
-        CodecGuards(); Fixture(argv[1]); SessionGuards(); ActionCoordinationGuards(); DelayedInteractionReservation(); ActionSequenceScenarios(); NativeReadiness(); NativeIntentAdapter(); SchedulerControlAdapter(); RuntimeOwnership(argc == 3);
+        CodecGuards(); PlacementCodec(); Fixture(argv[1]); SessionGuards(); ActionCoordinationGuards(); DelayedInteractionReservation(); ActionSequenceScenarios(); NativeReadiness(); NativeIntentAdapter(); SchedulerControlAdapter(); PlacementAdapter(); RuntimeOwnership(argc == 3);
         std::cout << "PASS AIEX codec, canonical C++/C# fixture and qualified session guards (no game execution)\n";
         return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

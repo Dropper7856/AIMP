@@ -20,6 +20,11 @@ void ExecutionMailbox::InvalidateLocked() noexcept {
 void ExecutionMailbox::Retire() noexcept {
     std::lock_guard lock(gate_); InvalidateLocked(); requested_ = {}; nativeGeneration_ = 0;
 }
+void ExecutionMailbox::RetireGeneration(const std::uint32_t generation) noexcept {
+    std::lock_guard lock(gate_);
+    if (generation == 0U || nativeGeneration_ != generation) return;
+    InvalidateLocked(); requested_ = {}; nativeGeneration_ = 0;
+}
 bool ExecutionMailbox::Fence(Recovery reason) noexcept {
     std::lock_guard lock(gate_);
     const auto value = static_cast<std::uint32_t>(reason);
@@ -190,7 +195,7 @@ void ExecutionMailbox::Pump(const MailboxEngine& engine) noexcept {
             } else if(processing_.route) {
                 success=engine.route&&engine.route(engine.context,std::span(processing_.bytes).first(processing_.size),processing_.binding.scope);
             } else if(processing_.carrier) {
-                success=engine.carrier&&engine.carrier(engine.context,std::span(processing_.bytes).first(processing_.size),processing_.binding.scope);
+                success=engine.carrier&&engine.carrier(engine.context,std::span(processing_.bytes).first(processing_.size),processing_.binding.scope,processing_.queuedTick);
             } else if (processing_.retry) {
                 Batch batch{};
                 success = engine.retry != nullptr && DecodeBatch(std::span(processing_.bytes).first(processing_.size),

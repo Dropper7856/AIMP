@@ -207,6 +207,21 @@ constexpr bool MovementDrainCycleAllowed(const std::uint32_t typeRva,const std::
         (typeRva == 0xEABEC0U && state == 0x3BU);
 }
 
+// The pose motor uses the certified native 00657900 Move transition, without
+// acquiring a path/scheduler drain. Host constructors006577F0/00657980 can
+// legitimately leave it in locomotion-start37 or neutral3 after an action.
+// These extra entries do NOT relax the separate movement-drain proof above.
+constexpr bool HybridLocomotionCycleAllowed(const std::uint32_t typeRva,const std::uint8_t state) noexcept {
+    return MovementDrainCycleAllowed(typeRva,state)||
+        (typeRva==0xEABE00U&&state==0x37U)||(typeRva==0xEABA40U&&state==3U);
+}
+constexpr bool HybridMayConsumeConstructor(const std::uint32_t contract,const std::uint32_t typeRva,
+    const std::uint8_t state) noexcept {
+    // A movement constructor is also the Host's actual exit from reactions,
+    // scripts and interactions. Only an already ordinary cycle can omit it.
+    return (contract==1U||contract==2U||contract==7U)&&HybridLocomotionCycleAllowed(typeRva,state);
+}
+
 constexpr bool NavigationAuthorityAdvanced(const std::uint32_t flags,
     const std::uint32_t revision, const std::uint32_t requestRevision,
     const std::uint32_t releasedRevision, const std::uint32_t releasedRequestRevision) noexcept {

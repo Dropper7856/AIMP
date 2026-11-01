@@ -1,10 +1,12 @@
 #include "aimp/AISyncExecutionCodec.h"
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
 
 namespace aimp::ai_sync::execution {
 namespace {
+std::atomic<bool> gPlacementDedupReady{};
 using namespace transactions;
 template<class T> void Put(std::span<std::uint8_t> bytes, std::size_t at, T value) noexcept {
     for (std::size_t i = 0; i < sizeof(T); ++i) bytes[at + i] = static_cast<std::uint8_t>(value >> (i * 8U));
@@ -52,8 +54,8 @@ std::size_t Stride(std::span<const std::uint8_t> bytes) noexcept {
     return Get<std::uint16_t>(bytes,4)==kNativeIntentVersion ? kNativeIntentRecordSize :
         Get<std::uint16_t>(bytes,4)==kMovementVersion ? kExtendedRecordSize : transactions::kRecordSize;
 }
-bool Intent(const Record& r) noexcept { return r.nativeKind == native_intent::kKind || !native_intent::Empty(r.intent); }
-bool Extended(const Record& r) noexcept {return r.nativeKind==1||r.nativeKind==3||r.admission!=0||r.scalarRetention!=3;}
+bool Intent(const Record& r) noexcept { return r.nativeKind == kMarkerKind || r.nativeKind == native_intent::kKind || !native_intent::Empty(r.intent); }
+bool Extended(const Record& r) noexcept {return r.nativeKind==kMarkerKind||r.nativeKind==1||r.nativeKind==3||r.admission!=0||r.scalarRetention!=3;}
 bool WriteOperation(std::span<std::uint8_t> bytes, const Record& record) noexcept {
     CanonicalRecord base{};
     if (transactions::Encode(record,base)!=Result::Ok) return false;
@@ -76,19 +78,36 @@ bool ReadOperation(std::span<const std::uint8_t> bytes, Record& record) noexcept
     if(bytes.size()==kExtendedRecordSize || bytes.size()==kNativeIntentRecordSize) {
         record.admission=Get<std::uint32_t>(bytes,160);record.scalarRetention=Get<std::uint32_t>(bytes,164);
         if(!movement::Decode(bytes.subspan(transactions::kRecordSize+8,movement::kBundleBytes),record.movement))return false;
-    } else if((record.nativeKind==1 || record.nativeKind==3))return false;
+    } else if((record.nativeKind==kMarkerKind || record.nativeKind==1 || record.nativeKind==3))return false;
     if (bytes.size()==kNativeIntentRecordSize) {
         if (!native_intent::Decode(bytes.subspan(kExtendedRecordSize,native_intent::kBytes),record.intent)) return false;
-    } else if (record.nativeKind==native_intent::kKind) return false;
+    } else if (record.nativeKind==kMarkerKind || record.nativeKind==native_intent::kKind) return false;
     return ValidateExecutable(record);
 }
 }
+void SetPlacementDedupReady(bool ready) noexcept { gPlacementDedupReady.store(ready,std::memory_order_release); }
+bool PlacementDedupReady() noexcept { return gPlacementDedupReady.load(std::memory_order_acquire); }
 bool ValidateExecutable(const transactions::Record& r) noexcept {
     using namespace transactions;
     if (Validate(r) != Result::Ok || (r.flags & (Incomplete | ObservationOnly | Accepted)) != 0 ||
         r.opcode == Op::Oracle || r.opcode == Op::CoverageLost || r.nativeStatus != 0 ||
         ProfileForKind(r.nativeKind) == 0 || (r.gait != 0 && r.nativeKind != kActionKind)) return false;
+    if (r.nativeKind == kMarkerKind) {
+        if (r.flags != 0 || r.mode != 0 || r.gait != 0 || !ZeroFloats(r) || r.scalarRetention != 3)
+            return false;
+        const bool payload = r.opcode == Op::Begin || r.opcode == Op::Submit || r.opcode == Op::Update;
+        if (!payload) return native_intent::Empty(r.intent) && movement::Empty(r.movement);
+        if (r.intent.words[0] != native_intent::kMarkerContract || !native_intent::Validate(r.intent) ||
+            movement::Empty(r.movement) || !movement::Validate(r.movement) || r.movement.version != 1 ||
+            r.movement.parts != 1 || r.movement.navigation != movement::Navigation::HostRoute ||
+            r.movement.primaryFlags != 0) return false;
+        // BEFORE is authored before0044D190; AFTER may change retained only.
+        auto after = r.movement.after;
+        after.retained = r.movement.before.retained;
+        return movement::Same(r.movement.before, after);
+    }
     if (r.nativeKind == native_intent::kKind) {
+        if (r.intent.words[0] == native_intent::kMarkerContract) return false;
         if (r.admission != 1 || r.scalarRetention != 3 || r.flags != 0 || r.mode != 0 || r.gait != 0 ||
             !ZeroFloats(r) || !movement::Empty(r.movement)) return false;
         if (r.opcode == Op::Begin || r.opcode == Op::Submit)
@@ -105,6 +124,10 @@ bool ValidateExecutable(const transactions::Record& r) noexcept {
     if (scheduler_control::Supported(r.nativeKind))
         return r.flags == 0 && r.mode == 0 && r.gait == 0 && ZeroFloats(r);
     if (r.nativeKind == 7) return r.flags == 0 && r.mode <= 2 && ZeroFloats(r);
+    if (r.nativeKind == kPlacementKind)
+        return r.flags == HasGoal && r.mode <= 1U && std::abs(r.goalX) <= 100000.0F &&
+            std::abs(r.goalY) <= 100000.0F && std::abs(r.goalZ) <= 100000.0F &&
+            std::abs(r.aux) <= 6.4F && Zero(r.distance) && Zero(r.stopDistance);
     // Action: +1C cycle state, +20/+21/+22 booleans packed into gait bits0..2.
     if (r.nativeKind == kActionKind)
         return r.flags == 0 && r.mode <= 0xFFU && r.mode != kActionNoState && r.gait <= 7U && ZeroFloats(r);
@@ -212,7 +235,7 @@ bool EncodeControl(const Control& control, std::array<std::uint8_t, kHeaderSize>
     if(checkpoint ? (!control.through||control.value!=0) : control.through!=0)return false;
     if (control.kind == ControlKind::Offer || control.kind == ControlKind::Ready) {
         if (control.value == 0 || (control.value & ~kKnownProfiles) != 0 ||
-            ((control.value&kProfileRoutes)!=0&&(control.value&kProfileMove)==0)) return false;
+            ((control.value&kProfileRoutes)!=0&&(control.value&(kProfileMove|kProfileMarker))==0)) return false;
     } else if (control.kind == ControlKind::Recovery) {
         if (control.value < 1 || control.value > 5) return false;
     } else if (!checkpoint && (control.kind != ControlKind::Close || control.value != 0)) return false;

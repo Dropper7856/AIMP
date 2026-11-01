@@ -50,6 +50,7 @@ std::uintptr_t gBase{};
 Qualifier gQualifier{};
 transactions::Scope gScope{};
 bool gScoped{};
+std::uint32_t gNativeWorld{};
 std::atomic<void*> gSourceOriginal{}, gVictimOriginal{}, gActionOriginal{};
 void* gSourceTrampoline{};
 void* gVictimTrampoline{};
@@ -250,6 +251,8 @@ Check Track(const Key& key, std::uint64_t serial, const Binding& binding, const 
     if (!gInstalled || !serial || !binding.source.creationSerial || !binding.victim.creationSerial ||
         !gQualifier || !gQualifier(key, binding)) return Check::Unknown;
     const std::lock_guard lock(gMutex);
+    if (gNativeWorld != 0U && binding.nativeGeneration != gNativeWorld)
+        return Check::Unknown;
     if (!gScoped || key.scope != gScope) {
         // Scope retirement may discard only obligations whose exact two native
         // return pairs were delivered. Generation never resets, so an old
@@ -300,6 +303,20 @@ Check Track(const Key& key, std::uint64_t serial, const Binding& binding, const 
             }
     for (const auto& side : entry->sides) if (side.unknown) return Check::Unknown;
     return Complete(*entry) ? Check::Ready : Check::Waiting;
+}
+bool ResetForWorld(const std::uint32_t current) noexcept {
+    const std::lock_guard lock(gMutex);
+    if (current == 0U || current < gNativeWorld) return false;
+    if (current == gNativeWorld) return true;
+    for (const auto& entry : gEntries)
+        if (entry.used && (entry.binding.nativeGeneration == 0U || entry.binding.nativeGeneration >= current))
+            return false;
+    // Token.generation never resets: a destructor returning after this point
+    // cannot complete an entry created in the new world at the same address.
+    gEntries = {}; gMissed = {}; gRevoked = {};
+    gMissedCount = gRevokedCount = 0U; gCoverageLost = false;
+    gScope = {}; gScoped = false; gNativeWorld = current;
+    return true;
 }
 Check CheckCycleRetired(const Key& key, std::uint64_t serial, bool victim) noexcept {
     const std::lock_guard lock(gMutex);

@@ -8,9 +8,9 @@ namespace AIMP.Protocol;
 // regenerate presentation locally; resolved paired health/outcomes come from Host.
 public static class AISyncCodec
 {
-    public const uint StateVersion = 15;
+    public const uint StateVersion = 16;
     public const uint ImpactVersion = 2;
-    public const int NativeStateBytes = 816;
+    public const int NativeStateBytes = 840;
     public const int NativeImpactBytes = 64;
     public const int ConfigurationBytes = 1096;
     public const int NetworkStateBytes = 16 + NativeStateBytes;
@@ -36,6 +36,10 @@ public static class AISyncCodec
     private const uint KnownLifecycleFlags = 63U; // includes Character backstage (bit 5)
     private const uint InteractionPairValid = 1U << 2;
     private const uint KnownInteractionFlags = 63U; // includes retained source cycle (bit 5)
+    public const uint MotionValidSample = 1U << 0;
+    public const uint MotionNativeActionOwnsMotion = 1U << 1;
+    public const uint MotionDiscontinuity = 1U << 2;
+    private const uint KnownMotionFlags = MotionValidSample | MotionNativeActionOwnsMotion | MotionDiscontinuity;
 
     public static ulong SessionCookie(Guid session)
     {
@@ -52,8 +56,29 @@ public static class AISyncCodec
             || (U32(bytes, 20) == 0 && U32(bytes, 24) == 0) || U32(bytes, 32) == 0
             || U32(bytes, 36) == 0
             || !AllowedCharacterClass(U32(bytes, 28)))
-            throw new ProtocolException("Invalid AISync authority snapshot v14.");
+            throw new ProtocolException("Invalid AISync authority snapshot v16.");
         ValidateAuthorityState(bytes);
+        ValidateMotion(bytes);
+    }
+
+    // v16 appends the Host's GetTickCount64 sample at 816, actual physical
+    // velocity XYZ at 824/828/832 and flags at 836. The tick is Host-local;
+    // it does not establish a wall-clock delay or carry a native address.
+    private static void ValidateMotion(ReadOnlySpan<byte> bytes)
+    {
+        var flags = U32(bytes, 836);
+        if ((flags & ~KnownMotionFlags) != 0)
+            throw new ProtocolException("Invalid AISync motion flags.");
+        for (var offset = 824; offset <= 832; offset += 4)
+            if (!BoundedFloat(bytes, offset, -128F, 128F))
+                throw new ProtocolException("Invalid AISync sampled physical velocity.");
+        if ((flags & MotionValidSample) == 0)
+        {
+            foreach (var value in bytes.Slice(816, 24))
+                if (value != 0) throw new ProtocolException("Inactive AISync motion sample has a payload.");
+        }
+        else if (BinaryPrimitives.ReadUInt64LittleEndian(bytes[816..]) == 0 || (U32(bytes, 40) & PoseValid) == 0)
+            throw new ProtocolException("AISync motion sample requires a Host tick and valid pose.");
     }
 
     // v15 block at 764: the Host's native cycle constructor call. The native

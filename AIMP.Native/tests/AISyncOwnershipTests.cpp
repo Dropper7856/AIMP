@@ -315,10 +315,30 @@ void ConstructionReuse() {
     CHECK(d.Request(owner)==OwnershipResult::Busy);
     CHECK(!d.ResolveOwned(ScopeValue(),owner,current));
 }
+void RevokedWorldDoesNotWaitForDeadActor() {
+    Harness h; OwnershipCoordinator c(h.Api()); h.coordinator = &c;
+    const auto owner = Owner(); auto scope = ScopeValue();
+    CHECK(c.Configure(scope,7)==OwnershipResult::Ready && c.Request(owner)==OwnershipResult::Ready);
+    c.RetireAll(); h.resolve=OwnershipCheck::Waiting;
+    CHECK(c.Release(owner)==OwnershipResult::Waiting);
+    auto next=scope; ++next.worldEpoch; ++next.consumerEpoch;
+    CHECK(c.CanConfigure(next,9)==OwnershipResult::Busy);
+    const auto checks=h.checks, restores=h.restores;
+    c.ForgetGeneration(6); // A different generation cannot release this lease.
+    CHECK(c.CanConfigure(next,9)==OwnershipResult::Busy);
+    c.ForgetGeneration(7);
+    CHECK(h.checks==checks && h.restores==restores); // No stale native callback.
+    CHECK(c.Configure(next,9)==OwnershipResult::Ready);
+    ActorLifetime old{}; CHECK(!c.ResolveOwned(scope,owner,old));
+    h.generation=9; ++h.creationSerial; h.resolve=OwnershipCheck::Ready;
+    CHECK(c.Request(owner)==OwnershipResult::Ready);
+    c.ForgetGeneration(7); // Delayed old-world revocation cannot retire the new one.
+    CHECK(c.ResolveOwned(next,owner,old) && old.nativeGeneration==9);
+}
 }
 int main() {
     static_assert(!std::is_copy_constructible_v<OwnershipCoordinator>);
     Lifecycle(); WaitingAndIndependentActors(); FaultsAndLifetimes(); ValidationAndCapacity(); DestructionCallbacks(); BorrowedInput(); Generated();
-    PreflightPreservesExistingExecutor();ConstructionReuse();DestructionReturnAndRoundRestart();
+    PreflightPreservesExistingExecutor();ConstructionReuse();DestructionReturnAndRoundRestart();RevokedWorldDoesNotWaitForDeadActor();
     std::cout << "AISyncOwnership: 9 groups and 2000 generated handoff traces PASS (offline only)\n";
 }

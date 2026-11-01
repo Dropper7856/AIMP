@@ -6,7 +6,9 @@ public enum AISyncExecutionControlKind : ushort { Offer = 1, Ready, Recovery, Cl
 [Flags]
 public enum AISyncExecutionProfiles : uint {
     Turn = 1, Stance = 2, Move = 4, AuthoritativeRoutes = 8, Action = 16, Directed = 32, Lifecycle = 64, NativeIntent = 128, SchedulerControl = 256,
-    All = Turn | Stance | Move | Action | Directed | Lifecycle | NativeIntent | SchedulerControl, Known = All | AuthoritativeRoutes
+    // Native placement entry remains gated by the local dedup integration proof.
+    Placement = 512, Marker = 1024,
+    All = Turn | Stance | Move | Action | Directed | Lifecycle | NativeIntent | SchedulerControl | Placement | Marker, Known = All | AuthoritativeRoutes
 }
 public enum AISyncExecutionRecovery : uint { RestartRequired = 1, Capacity, InvalidStream, NativeUnavailable, TransportLost }
 public sealed record AISyncExecutionControl(AISyncExecutionScope Scope, AISyncExecutionControlKind Kind, uint Value, ulong Through = 0);
@@ -64,7 +66,7 @@ public static class AISyncExecutionControlCodec
         {
             AISyncExecutionControlKind.Offer or AISyncExecutionControlKind.Ready =>
                 control.Value != 0 && (control.Value & ~(uint)AISyncExecutionProfiles.Known) == 0
-                    && ((control.Value & 8U) == 0 || (control.Value & 4U) != 0),
+                    && ((control.Value & 8U) == 0 || (control.Value & (4U | 1024U)) != 0),
             AISyncExecutionControlKind.Recovery => control.Value is >= 1 and <= 5,
             AISyncExecutionControlKind.Close => control.Value == 0,
             AISyncExecutionControlKind.Checkpoint or AISyncExecutionControlKind.CheckpointAck => control.Value == 0,
@@ -78,6 +80,8 @@ public static class AISyncExecutionControlCodec
         4 => (uint)AISyncExecutionProfiles.Turn,
         6 or 11 => (uint)AISyncExecutionProfiles.SchedulerControl,
         7 => (uint)AISyncExecutionProfiles.Stance,
+        AISyncExecutionCodec.MarkerKind => (uint)AISyncExecutionProfiles.Marker,
+        AISyncExecutionCodec.PlacementKind => (uint)AISyncExecutionProfiles.Placement,
         AISyncExecutionCodec.ActionKind => (uint)AISyncExecutionProfiles.Action,
         AISyncExecutionCodec.DirectedKind => (uint)AISyncExecutionProfiles.Directed,
         AISyncNativeIntentCodec.Kind => (uint)AISyncExecutionProfiles.NativeIntent,

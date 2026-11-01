@@ -81,6 +81,32 @@ void ForcedPlacement() {
     transactions::Ledger ledger;CHECK(ledger.SetScope(binding.scope)==transactions::Result::Ok);
     std::uint64_t sequence{};Drain(*p,ledger,binding.scope,sequence);CHECK(sequence==4U);
 }
+void SchedulerPlacement() {
+    auto p=std::make_unique<Producer>();auto binding=Binding();binding.value=execution::kProfilePlacement;
+    Ready(*p,binding);
+    Command placement{};placement.kind=execution::kPlacementKind;placement.point=true;
+    placement.x=1.25F;placement.y=-2.5F;placement.z=3.75F;placement.heading=-1.25F;
+    placement.mode=1;placement.admission=2;placement.scalarRetention=2;
+    CHECK(p->Admit(Owner(),100,placement)==SourceResult::Ok);
+    CommandIdentity original{},current{};CHECK(p->Identify(100,original)&&original.nativeKind==execution::kPlacementKind);
+    placement.x=4.5F;CHECK(p->Update(100,placement)==SourceResult::Ok&&p->Identify(100,current)&&
+        original.command==current.command&&original.parameterRevision+1==current.parameterRevision);
+    CHECK(p->Complete(100)==SourceResult::Ok&&p->Release(100)==SourceResult::Ok);
+    HostPacket packet{};std::uint64_t sequence{};std::vector<transactions::Op> observed;
+    while(p->Peek(packet)) {
+        execution::Batch batch{};CHECK(!packet.control&&execution::DecodeBatch(std::span(packet.bytes).first(packet.size),binding.scope,batch));
+        for(std::size_t i=0;i<batch.count;++i) {
+            const auto& r=batch.records[i];CHECK(r.globalSeq==++sequence&&r.ownerSeq==sequence&&r.nativeKind==8&&r.admission==2);
+            observed.push_back(r.opcode);
+            if(r.opcode==transactions::Op::Begin||r.opcode==transactions::Op::Submit||r.opcode==transactions::Op::Update)
+                CHECK(r.flags==transactions::HasGoal&&r.mode==1&&r.aux==-1.25F&&r.scalarRetention==2&&
+                    r.goalX==(r.opcode==transactions::Op::Update?4.5F:1.25F));
+        }
+        CHECK(p->Commit(packet.token));
+    }
+    CHECK(observed==std::vector<transactions::Op>({transactions::Op::Begin,transactions::Op::Submit,
+        transactions::Op::Update,transactions::Op::Complete,transactions::Op::Release}));
+}
 void NativeIntentOrdering() {
     auto p=std::make_unique<Producer>();auto binding=Binding();binding.value=execution::kProfileNativeIntent|execution::kProfileAction;
     Ready(*p,binding);
@@ -357,4 +383,4 @@ void CheckpointHistory() {
     CHECK(sequence==40000&&lastCommand==10000);
 }
 }
-int main(int argc,char** argv) { CHECK(argc==2);ActionReferences(argv[1]); Lifecycle(); ForcedPlacement(); NativeIntentOrdering(); MovementBundle(); RouteOrdering(); RecalculatedRoutes(); RouteFailureIsolation(); Refusals(); Backpressure(); BindingRevocation(); CheckpointHistory(); std::cout << "Host producer: lifecycle, movement bundle, route ordering/recalculations, full scope, allocator reuse, refusal, backpressure, binding revocation and 10000 checkpointed commands passed\n"; }
+int main(int argc,char** argv) { CHECK(argc==2);ActionReferences(argv[1]); Lifecycle(); ForcedPlacement(); SchedulerPlacement(); NativeIntentOrdering(); MovementBundle(); RouteOrdering(); RecalculatedRoutes(); RouteFailureIsolation(); Refusals(); Backpressure(); BindingRevocation(); CheckpointHistory(); std::cout << "Host producer: lifecycle, movement bundle, route ordering/recalculations, full scope, allocator reuse, refusal, backpressure, binding revocation and 10000 checkpointed commands passed\n"; }

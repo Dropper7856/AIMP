@@ -15,6 +15,7 @@
 
 namespace aimp::ai_sync::execution {
 struct NativeRequestAdapterTestAccess {
+    static void RouteQuiet(NativeRequestAdapter& a,bool(*query)(void*,const transactions::Record&) noexcept) {a.movementRouteQuiet_=query;}
     static void Policy(NativeRequestAdapter& a,movement::Navigation policy) {
         for(auto& lease:a.leases_)if(lease.used&&(lease.kind==1||lease.kind==3))lease.movement.navigation=policy;
     }
@@ -93,7 +94,8 @@ struct NativeHarness {
     std::array<std::array<LONG,3>,4> controls{{{0,1,1},{0,1,1},{0,1,1},{0,1,1}}};
     alignas(4)std::array<std::uint8_t,0x198> resource{};std::array<LONG,3> resourceControl{0,1,1};
     LocalActorBinding binding{reinterpret_cast<std::uintptr_t>(actor.data()),19,true};
-    Record current{};std::vector<unsigned> calls;bool accepted{true},faultCompanion{},recycleOnAdmission{},reenter{};
+    Record current{};std::vector<unsigned> calls;bool accepted{true},faultCompanion{},recycleOnAdmission{},reenter{},failCancel{};
+    std::vector<std::uintptr_t> cancellations;
     bool wirePermit{true},localOwned{true};
     unsigned navigationDuringAdmission{};
     template<class T>static void Write(std::uintptr_t at,T v){*reinterpret_cast<T*>(at)=v;}
@@ -135,10 +137,68 @@ struct NativeHarness {
     static bool Stop(void* p,std::uintptr_t request,float distance,std::uint8_t variant)noexcept{
         static_cast<NativeHarness*>(p)->calls.push_back(25);Write(request+0x58,distance);
         auto& flags=*reinterpret_cast<std::uint8_t*>(request+0xB9);flags=static_cast<std::uint8_t>((flags&~0x20)|(variant<<5)|0x40);return true;}
-    static bool Cancel(void* p,std::uintptr_t request)noexcept{static_cast<NativeHarness*>(p)->calls.push_back(30);Write(request+0xC,4U);return true;}
+    static bool Cancel(void* p,std::uintptr_t request)noexcept{auto& h=*static_cast<NativeHarness*>(p);h.calls.push_back(30);h.cancellations.push_back(request);if(h.failCancel)return false;Write(request+0xC,4U);return true;}
     static bool Release(void* p,std::uintptr_t ref)noexcept{static_cast<NativeHarness*>(p)->calls.push_back(31);auto* pair=reinterpret_cast<std::uintptr_t*>(ref);pair[0]=pair[1]=0;return true;}
     NativeOutcome Submit(){current=Move();current.opcode=Op::Submit;CHECK(adapter.Check(current)==Readiness::Ready);return adapter.Invoke(current);}
 };
+void RejectedRouteRetainsNativeLifetime() {
+    NativeHarness h;CHECK(h.Submit()==NativeOutcome::Admitted);
+    NativeRequestAdapterTestAccess::Policy(h.adapter,movement::Navigation::HostRoute);
+    const auto n=reinterpret_cast<std::uintptr_t>(h.resource.data())+0xC4U;
+    const auto main=reinterpret_cast<std::uintptr_t>(h.requests[0].data());
+    const auto companion=reinterpret_cast<std::uintptr_t>(h.requests[1].data());
+    NavigationBinding binding{};
+    CHECK(h.adapter.IdentifyNavigation(n,main+0x28U,binding)==NavigationOwnership::Ready);
+    auto stale=binding;++stale.command.actor.creationSerial;
+    CHECK(!h.adapter.RejectNavigation(stale)&&h.cancellations.empty());
+    CHECK(h.adapter.RejectNavigation(binding)&&h.adapter.ActiveCount()==2);
+    CHECK((h.cancellations==std::vector<std::uintptr_t>{companion,main}));
+    CHECK(std::count(h.calls.begin(),h.calls.end(),31U)==0); // Cancellation is not Ref release.
+    CHECK(h.adapter.RejectNavigation(binding)&&h.cancellations.size()==2); // No duplicate native Cancel.
+    auto update=h.current;update.opcode=Op::Update;++update.parameterRevision;
+    update.movement.navigation=movement::Navigation::HostRoute;
+    CHECK(h.adapter.Check(update)==Readiness::Rejected);
+    auto release=h.current;release.opcode=Op::Release;release.movement={};
+    CHECK(h.adapter.Invoke(release)==NativeOutcome::Admitted&&h.adapter.ActiveCount()==0);
+    CHECK(h.cancellations.size()==2&&std::count(h.calls.begin(),h.calls.end(),31U)==2);
+
+    NativeHarness ended;CHECK(ended.Submit()==NativeOutcome::Admitted);
+    NativeRequestAdapterTestAccess::Policy(ended.adapter,movement::Navigation::HostRoute);
+    auto next=ended.current;next.opcode=Op::Update;++next.parameterRevision;
+    next.movement.navigation=movement::Navigation::HostRoute;
+    NativeHarness::Write(reinterpret_cast<std::uintptr_t>(ended.requests[0].data())+0xCU,3U);
+    const auto before=ended.calls.size();
+    CHECK(ended.adapter.Check(next)==Readiness::Rejected&&ended.calls.size()==before);
+
+    NativeHarness unknown;CHECK(unknown.Submit()==NativeOutcome::Admitted);
+    NativeRequestAdapterTestAccess::Policy(unknown.adapter,movement::Navigation::HostRoute);
+    CHECK(unknown.adapter.IdentifyNavigation(reinterpret_cast<std::uintptr_t>(unknown.resource.data())+0xC4U,
+        reinterpret_cast<std::uintptr_t>(unknown.requests[0].data())+0x28U,binding)==NavigationOwnership::Ready);
+    unknown.failCancel=true;CHECK(!unknown.adapter.RejectNavigation(binding));
+    auto replacement=unknown.current;++replacement.commandId;
+    CHECK(unknown.adapter.Check(replacement)==Readiness::Rejected&&unknown.adapter.ActiveCount()==2);
+
+    NativeHarness single;single.current=Move();single.current.opcode=Op::Submit;
+    single.current.movement.parts=1;single.current.movement.companion={};
+    single.current.movement.companionFlags=single.current.movement.companionRetainedAfter=0;
+    CHECK(single.adapter.Check(single.current)==Readiness::Ready&&single.adapter.Invoke(single.current)==NativeOutcome::Admitted);
+    NativeRequestAdapterTestAccess::Policy(single.adapter,movement::Navigation::HostRoute);
+    const auto singleN=reinterpret_cast<std::uintptr_t>(single.resource.data())+0xC4U;
+    const auto singleB=reinterpret_cast<std::uintptr_t>(single.requests[0].data())+0x28U;
+    CHECK(single.adapter.IdentifyNavigation(singleN,singleB,binding)==NavigationOwnership::Ready);
+    CHECK(single.adapter.RejectNavigation(binding));
+    single.current.opcode=Op::Update;++single.current.parameterRevision;
+    single.current.movement.navigation=movement::Navigation::HostRoute;
+    NativeRequestAdapterTestAccess::RouteQuiet(single.adapter,[](void*,const Record&) noexcept{return false;});
+    const auto heldCalls=single.calls.size();
+    CHECK(single.adapter.Check(single.current)==Readiness::Waiting&&single.calls.size()==heldCalls);
+    CHECK(single.adapter.Invoke(single.current)==NativeOutcome::Rejected&&single.calls.size()==heldCalls);
+    NativeRequestAdapterTestAccess::RouteQuiet(single.adapter,[](void*,const Record&) noexcept{return true;});
+    CHECK(single.adapter.Check(single.current)==Readiness::Ready);
+    CHECK(single.adapter.Invoke(single.current)==NativeOutcome::Admitted);
+    CHECK(single.adapter.IdentifyNavigation(singleN,singleB,binding)==NavigationOwnership::Ready&&binding.command.revision==2);
+    CHECK(std::count(single.calls.begin(),single.calls.end(),31U)==1);
+}
 void GoalDependencies() {
     NativeHarness h;auto move=Move();move.opcode=Op::Submit;move.movement.parts=1;
     move.movement.companion={};move.movement.companionFlags=move.movement.companionRetainedAfter=0;
@@ -239,4 +299,4 @@ void Native() {
     stance.opcode=Op::Release;stance.mode=0;stance.scalarRetention=3;CHECK(queued.adapter.Invoke(stance)==NativeOutcome::Admitted&&queued.adapter.ActiveCount()==0);
 }
 }
-int main(int argc,char** argv){CHECK(argc==2);Wire(argv[1]);Evidence();GoalDependencies();NativeRouteInitializationOwnership();Native();std::cout<<"AISync Move wire, full evidence, compound native ownership PASS (offline)\n";}
+int main(int argc,char** argv){CHECK(argc==2);Wire(argv[1]);Evidence();RejectedRouteRetainsNativeLifetime();GoalDependencies();NativeRouteInitializationOwnership();Native();std::cout<<"AISync Move wire, full evidence, compound native ownership PASS (offline)\n";}

@@ -37,7 +37,8 @@ internal sealed partial class AISyncHostBridge : IDisposable
     private uint _profiles;
     private ulong _routePackets, _lastStateSerial, _statePackets;
     private bool _offered, _ready;
-    private long _opened, _lossEpoch = long.MinValue;
+    private long _opened, _lossEpoch = long.MinValue, _lastReadinessLog;
+    private const long SourceReadyTimeoutMilliseconds = 22000;
     // A lost scope is never resumed: a NEW authority epoch is offered after a
     // bounded backoff, once natives retired the old one (empty baseline).
     private const long MinimumReopenDelay = 2000, MaximumReopenDelay = 15000;
@@ -156,16 +157,33 @@ internal sealed partial class AISyncHostBridge : IDisposable
         if (roster.State != "Starting" || roster.LevelGeneration != _binding.WorldGeneration ||
             !peers.SetEquals(_peers.Keys))
             throw new ProtocolException("Host execution roster changed; a new empty baseline is required.");
-        if (!_ready && Environment.TickCount64 - _opened > 10000)
-            throw new ProtocolException("Native command readiness did not complete.");
+        if (!_ready && Environment.TickCount64 - _opened > SourceReadyTimeoutMilliseconds)
+        {
+            var missing = _peers.Where(p => !_binding.Host.AISyncExecutionReady(p.Key, p.Value))
+                .Select(p => p.Key.ToString()).ToArray();
+            throw new ProtocolException(!_offered
+                ? $"Client execution readiness missing for world {_binding.WorldGeneration}: peers={string.Join(",", missing)}."
+                : $"Host native source Ready not acknowledged for world {_binding.WorldGeneration}.");
+        }
     }
     private async Task OfferSourceAsync()
     {
-        if (!_offered && _peers.All(p => _binding!.Host!.AISyncExecutionReady(p.Key, p.Value)))
+        if (_offered) return;
+        if (!_peers.All(p => _binding!.Host!.AISyncExecutionReady(p.Key, p.Value)))
         {
-            _offered = true;
-            await SendAsync(_binding!, new(_scope!.Value, AISyncExecutionControlKind.Offer, _profiles)).ConfigureAwait(false);
+            var now = Environment.TickCount64;
+            if (now - _lastReadinessLog >= 3000)
+            {
+                _lastReadinessLog = now;
+                var missing = _peers.Where(p => !_binding!.Host!.AISyncExecutionReady(p.Key, p.Value))
+                    .Select(p => p.Key.ToString());
+                _log($"Waiting for Client native execution Ready: round={_binding!.WorldGeneration}, peers={string.Join(",", missing)}.");
+            }
+            return;
         }
+        _offered = true;
+        _log($"Client execution roster Ready, offering Host source: round={_binding!.WorldGeneration}, authority={_scope!.Value.AuthorityEpoch}.");
+        await SendAsync(_binding!, new(_scope!.Value, AISyncExecutionControlKind.Offer, _profiles)).ConfigureAwait(false);
     }
     private void RetryWaiting()
     {
@@ -203,7 +221,7 @@ internal sealed partial class AISyncHostBridge : IDisposable
         _journal = new(_scope.Value); _lastStateSerial = 0;
         _routes = new(_scope.Value);
         _profiles = (uint)AISyncExecutionProfiles.All | (_authoritativeRoutes ? (uint)AISyncExecutionProfiles.AuthoritativeRoutes : 0);
-        _opened = Environment.TickCount64;
+        _opened = Environment.TickCount64; _lastReadinessLog = 0;
     }
     private void OfferConsumers(AISyncHostBinding binding)
     {
@@ -288,11 +306,21 @@ internal sealed partial class AISyncHostBridge : IDisposable
         if (work.Control is { } control && control.Scope == scope && control.Kind != AISyncExecutionControlKind.Ready)
             throw new ProtocolException($"Client command scope entered recovery: {work.Control?.Kind}, reason={work.Control?.Value}.");
         if (work.Receipt is not { } receipt || receipt.Scope != scope) return;
+        // LobbyHost raises receipts only after its per-peer journal validates
+        // the exact batch/operation echo and legal disposition transition.
+        // A refusal settles retry eligibility, not native ownership or cleanup.
+        var key = (work.Peer, receipt.Operation.GlobalSequence);
         if (receipt.Stage is AISyncExecutionStage.Rejected or AISyncExecutionStage.Unknown)
-            throw new ProtocolException($"Client native command refused: stage={receipt.Stage}, result={receipt.Result}, "
+        {
+            _waiting.Remove(key);
+            _log($"Client native command refused: peer={work.Peer}, stage={receipt.Stage}, result={receipt.Result}, "
                 + $"sequence={receipt.Operation.GlobalSequence}, command={receipt.Operation.CommandId}, "
                 + $"kind={receipt.Operation.NativeKind}, opcode={receipt.Operation.Opcode}.");
-        var key = (work.Peer, receipt.Operation.GlobalSequence);
+            // Leave the final receipt in the consumer journal. In particular,
+            // Unknown cannot authorize a retry, replacement, or checkpoint of
+            // resources whose release has not been proved by native execution.
+            return;
+        }
         if (receipt.Stage == AISyncExecutionStage.Waiting)
             _waiting[key] = new(receipt.Operation, Environment.TickCount64);
         else if (receipt.Stage is AISyncExecutionStage.Entered or AISyncExecutionStage.Admitted

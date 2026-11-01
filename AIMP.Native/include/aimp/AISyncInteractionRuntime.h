@@ -39,6 +39,9 @@ public:
     // Rebinding a consumer requires a new Host authority to reject old pairs.
     [[nodiscard]] Result Configure(const transactions::Scope&, std::uint64_t sessionCookie,
         std::uint32_t worldGeneration) noexcept;
+    // Qualified engine world change only. Revokes reservations, NOT native
+    // resources. Old callbacks remain stale by scope and monotonic receipt ID.
+    [[nodiscard]] bool ResetForWorld(std::uint32_t currentNativeGeneration) noexcept;
     // Source is an NPC; player victims require State v13's registration-time
     // seal, a matching portable incarnation and exact local construction.
     // Permission must prove the association and both exclusive reservations.

@@ -1,5 +1,6 @@
 #include "aimp/AISyncExecutionMailbox.h"
 #include "aimp/AISyncExecutionRuntime.h"
+#include "aimp/AISyncCausalState.h"
 #include <algorithm>
 #include <fstream>
 #include <iostream>
@@ -9,6 +10,7 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <Windows.h>
 
 namespace {
 using namespace aimp::ai_sync;
@@ -205,7 +207,7 @@ void MovementEcho() {
             Control control{};Check(!packet.receipt&&DecodeControl(std::span(packet.bytes).first(packet.size),control)&&
                 control.kind==ControlKind::Recovery&&!box->Bound(ScopeValue(),7),"modified Move echo escaped mailbox");
         } else {
-            Receipt receipt{};Check(packet.receipt&&packet.size==kMaximumReceiptBytes&&
+            Receipt receipt{};Check(packet.receipt&&packet.size==kHeaderSize+kExtendedRecordSize+8U&&
                 DecodeReceipt(std::span(packet.bytes).first(packet.size),ScopeValue(),receipt)&&
                 movement::Same(r.movement,receipt.operation.movement),"Move receipt was truncated");
         }
@@ -268,9 +270,41 @@ void ConcurrentBindingReads() {
     Check(allBound,"IPC read contention revoked a live engine binding");
     box->Retire();Check(!box->Bound(ScopeValue(),7),"retirement retained the binding");
 }
+void CarrierArrivalLease() {
+    auto box=std::make_unique<ExecutionMailbox>();Engine engine{box.get()};Bind(*box,engine);
+    struct Arrival {std::uint64_t tick{};unsigned calls{};} arrival;
+    auto api=engine.Api();api.context=&arrival;
+    api.carrier=[](void* context,std::span<const std::uint8_t>,const Scope&,std::uint64_t tick) noexcept {
+        auto& observed=*static_cast<Arrival*>(context);observed.tick=tick;++observed.calls;return true;
+    };
+    State state{};state.sessionCookie=0x6677445500112233ULL;state.worldGeneration=2;
+    std::array<std::uint8_t,causal_state::kBytes> bytes{};
+    Check(causal_state::Encode(bytes,ScopeValue(),1,0,state),"carrier fixture encode");
+    const auto before=GetTickCount64();Check(box->QueueCarrier(bytes),"carrier queue");
+    const auto after=GetTickCount64();Sleep(20);box->Pump(api);
+    Check(arrival.calls==1&&arrival.tick>=before&&arrival.tick<=after&&arrival.tick<GetTickCount64(),
+        "carrier rebased immutable intake time at engine apply");
+}
+void OldWorldRetirementPreservesNewOffer() {
+    auto box=std::make_unique<ExecutionMailbox>(); Engine engine{box.get()}; Bind(*box,engine);
+    box->RetireGeneration(6); Check(box->Bound(ScopeValue(),7),"unrelated world retired current binding");
+    box->RetireGeneration(7); Check(!box->Bound(ScopeValue(),7),"old-world binding remained active");
+    auto next=ScopeValue(); ++next.worldEpoch; ++next.consumerEpoch;
+    Check(box->QueueBinding({next,ControlKind::Offer,3},9),"new-world offer refused");
+    box->RetireGeneration(7); // IPC's next offer may arrive before the engine reset.
+    auto api=engine.Api();
+    api.bind=[](void*,const Scope&,std::uint32_t generation) noexcept {return generation==9?Result::Ok:Result::WrongScope;};
+    box->Pump(api);
+    Check(box->Bound(next,9),"old-world reset discarded a new-world offer");
+    MailboxPacket packet{}; Control ready{};
+    Check(box->Peek(packet)&&DecodeControl(std::span(packet.bytes).first(packet.size),ready)&&
+        ready.kind==ControlKind::Ready&&ready.scope==next,"new-world ready acknowledgement lost");
+    auto old=BatchValue();std::vector<std::uint8_t> bytes;
+    Check(EncodeBatch(old,bytes)&&!box->QueueBatch(bytes),"old-world batch entered the new round");
+}
 }
 int main(int argc, char** argv) {
-    try { Check(argc == 2,"expected control fixture"); ControlFixture(argv[1]); Guards(); WorldRollbackAndDelayedWork(); PendingRetirementBinding(); FailureAndRetry(); Bounds(); MovementEcho(); Checkpoint(); RouteNegotiation(); ConcurrentBindingReads();
+    try { Check(argc == 2,"expected control fixture"); ControlFixture(argv[1]); Guards(); WorldRollbackAndDelayedWork(); PendingRetirementBinding(); FailureAndRetry(); Bounds(); MovementEcho(); Checkpoint(); RouteNegotiation(); ConcurrentBindingReads(); CarrierArrivalLease(); OldWorldRetirementPreservesNewOffer();
         std::cout << "PASS execution mailbox binding, retirement, receipts, retry and bounds (offline only)\n"; return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

@@ -57,7 +57,7 @@ internal static class AISyncParticipantBindingTests
         var session=Guid.NewGuid();var state=AISyncCodecTests.ValidState(session);
         BinaryPrimitives.WriteUInt32LittleEndian(state.AsSpan(640),12);
         AISyncCodec.ValidateNative(state);
-        AssertEx.Equal(15U,AISyncCodec.StateVersion);AssertEx.Equal(816,state.Length);
+        AssertEx.Equal(16U,AISyncCodec.StateVersion);AssertEx.Equal(840,state.Length);
         AssertEx.SequenceEqual(state,AISyncCodec.DecodeNetwork(AISyncCodec.EncodeNetwork(session,state),session).ToArray());
         var legacy=state.ToArray();legacy.AsSpan(640).Clear();AISyncCodec.ValidateNative(legacy);
         AssertEx.Throws<ProtocolException>(()=>AISyncCodec.ValidateNative(state.AsSpan(0,640)));
