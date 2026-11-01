@@ -3526,6 +3526,16 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         uint characterBase,
         int equipmentIndex)
     {
+        // Flare 32/33 are wire-only inventory identities, not NPC equipment
+        // slots. Giving Flare_Held to a replicated Character can execute retail
+        // first-person-only code and crash the observing game instance.
+        if (equipmentIndex is 32 or 33)
+        {
+            _diagnostics.Log("PlayerSync",
+                $"Remote PeerId {peerId}: held flare {equipmentIndex} kept as observation only; " +
+                "no native equipment Give, activation or hand selection.");
+            return false;
+        }
         int provisionedIndex;
         lock (_stateGate)
         {
@@ -4555,6 +4565,16 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         RemoteEquipmentCatalog catalog,
         bool activateHeld = false, bool releaseHeld = false)
     {
+        // Also protects manual/catalog calls, not only the automatic 32/33
+        // PlayerSync path. Keep the legacy release operation available solely
+        // to detach an already-attached flare; it never creates held equipment.
+        if (!releaseHeld && RemoteEquipmentDefinitions.IsUnsafeRemoteHeldThrowable(catalog.Definition.Id))
+        {
+            _diagnostics.Log("PlayerSync",
+                $"Remote PeerId {player.PeerId}: blocked unsafe held throwable '{catalog.Definition.Id}' " +
+                "on proxy Character; ThrowableSync handles the released object.");
+            return false;
+        }
         var arguments = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["characterAddress"] = $"0x{characterBase:X8}",
