@@ -162,10 +162,15 @@ internal static class MissionSyncFrontierCompiler
     private static bool IsMissionGraph(string? name)
     {
         if (string.IsNullOrWhiteSpace(name)) return false;
-        // Semantic mission scripts: SCRIPT_StoryMission, MISSION_Foo,
-        // DLC/anything/Mission_Foo, etc. No level-specific identifier.
-        var normalized = name.Replace('/', '\\');
-        return normalized.Contains("Mission", StringComparison.OrdinalIgnoreCase);
+        // Match a reusable semantic token rather than an arbitrary substring:
+        // "Permission" is not a mission. Recognizes StoryMission, MISSION_X,
+        // MissionControl and lowercase "mission" across arbitrary paths.
+        var tokens = name.Replace('/', '\\').Split(['\\', '_', '-', '.'],
+            StringSplitOptions.RemoveEmptyEntries);
+        return tokens.Any(token =>
+            token.Equals("mission", StringComparison.OrdinalIgnoreCase)
+            || token.StartsWith("mission", StringComparison.OrdinalIgnoreCase)
+            || token.EndsWith("Mission", StringComparison.Ordinal));
     }
 
     internal static byte[] Encode(WorldManifest manifest, IReadOnlyList<MissionSyncFrontier> roots)
