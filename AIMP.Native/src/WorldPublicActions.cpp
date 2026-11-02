@@ -2761,8 +2761,12 @@ void OutputCapture(void* self, void** instance, const std::uint32_t* input,
     // MissionSync owns only graph-compiled mission ingress ports. Its commits
     // replay the complete native fan-out under RemoteRoot, so WorldSync does
     // not also publish every consequence of the same mission decision.
-    if (CurrentOrigin() == Origin::None && !replication_core::RemoteApplyActive()) {
-        mission_sync::ObserveOutputAttempt();
+    // Observe the existing lineage but never change its gameplay meaning:
+    // a mission completion may currently be born inside WorldSync LocalRoot.
+    const auto missionOrigin = CurrentOrigin();
+    mission_sync::ObserveOutputAttempt(
+        missionOrigin == Origin::LocalRoot, missionOrigin == Origin::RemoteRoot);
+    if (missionOrigin == Origin::None && !replication_core::RemoteApplyActive()) {
         void* missionExecution{}; void* missionCallback{};
         std::uint32_t missionPort{}; bool payloadless{};
         if (ReadPublicArguments(instance, input, callback, missionExecution, missionPort,
