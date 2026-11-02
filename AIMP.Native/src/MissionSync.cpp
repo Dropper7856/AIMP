@@ -4,6 +4,7 @@
 #include "aimp/WorldPublicActions.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <deque>
 #include <fstream>
@@ -13,7 +14,10 @@
 
 namespace aimp::mission_sync {
 namespace {
-struct Frontier final { WorldEntityId entity{}; std::uint32_t port{}; };
+// flags bit0: compiler-proven interface pin with control-only targets, so a
+// runtime data reference attached to the emission is not mission data.
+constexpr std::uint32_t kFlagPayloadTolerant = 1U;
+struct Frontier final { WorldEntityId entity{}; std::uint32_t port{}; std::uint32_t flags{}; };
 std::mutex gMutex;
 std::unordered_map<std::uint64_t, std::vector<Frontier>> gFrontiers;
 std::deque<Signal> gObserved;
@@ -22,6 +26,26 @@ WorldEntityId gMap{};
 std::uint32_t gGeneration{};
 std::uint64_t gSequence{}, gCommitted{}, gCaptured{}, gApplied{}, gUnsupported{}, gFailures{};
 std::uint64_t gWithPayload{}, gWithDelay{}, gWithTail{};
+std::uint64_t gUnsafePayload{}, gUnsafeDelay{}, gUnsafeTail{};
+// Engine-side observation coverage: distinguish authored-port mismatch from
+// runtime identity mismatch and a rejected local OutputDefinition selector.
+std::atomic<std::uint64_t> gRawOutputAttempts{}, gRawOutputLocalRoot{}, gRawOutputRemoteRoot{};
+std::uint64_t gOutputCandidates{}, gOutputIdentityResolved{}, gOutputIdentityRejected{},
+    gOutputKnownSource{}, gOutputKnownPort{}, gOutputPortOnOtherSource{},
+    gOutputMatched{};
+std::uint64_t gScopedLocalExact{}, gScopedRemoteExact{},
+    gScopedLocalForeign{}, gScopedRemoteForeign{};
+std::uint32_t gLastKnownSourcePort{}, gLastUnmatchedPort{};
+std::uint64_t gLastUnmatchedRuntimeKey{};
+struct ForeignPortEvidence final {
+    std::uint32_t port{};
+    std::uint64_t firstKey{}, lastKey{}, occurrences{}, observedKeys{};
+    WorldEntityId lastMapped{};
+};
+std::array<ForeignPortEvidence, 16U> gForeignPorts{};
+// Engine-thread-only scope: distinguishes an authoritative MissionSync APPLY
+// from a WorldSync RemoteRoot replay of a potentially overlapping frontier.
+thread_local bool gMissionReplayActive{};
 bool gEnabled{}, gFault{};
 
 template<typename T> bool Read(std::ifstream& stream, T& value) {
@@ -58,7 +82,7 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
     std::ifstream file(path, std::ios::binary);
     std::uint32_t magic{}, count{};
     WorldEntityId map{};
-    if (!Read(file, magic) || magic != 0x31534D41U || !Read(file, map.high) ||
+    if (!Read(file, magic) || magic != 0x32534D41U || !Read(file, map.high) ||
         !Read(file, map.low) || !Read(file, count) || count > 4096U) {
         error = "Invalid MissionSync frontier catalogue."; return false;
     }
@@ -72,6 +96,7 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
         CathodeRuntimeKey key{};
         if (!Read(file, entry.entity.high) || !Read(file, entry.entity.low) ||
             !Read(file, key.entityA) || !Read(file, key.entityB) || !Read(file, entry.port) ||
+            !Read(file, entry.flags) || (entry.flags & ~kFlagPayloadTolerant) != 0U ||
             !entry.entity.Valid() || key.entityA == 0U || entry.port == 0U) {
             error = "Truncated or invalid mission frontier."; return false;
         }
@@ -92,16 +117,112 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
     gMap = map; gGeneration = context.levelGeneration;
     gSequence = 0U; gCommitted = 0U;
     gCaptured = 0U; gApplied = 0U; gUnsupported = 0U; gFailures = 0U;
+    gUnsafePayload = gUnsafeDelay = gUnsafeTail = 0U;
+    gRawOutputAttempts.store(0U, std::memory_order_relaxed);
+    gRawOutputLocalRoot.store(0U, std::memory_order_relaxed);
+    gRawOutputRemoteRoot.store(0U, std::memory_order_relaxed);
+    gOutputCandidates = gOutputIdentityResolved = gOutputIdentityRejected = 0U;
+    gOutputKnownSource = gOutputKnownPort = gOutputPortOnOtherSource = gOutputMatched = 0U;
+    gLastKnownSourcePort = gLastUnmatchedPort = 0U;
+    gLastUnmatchedRuntimeKey = 0U;
+    gForeignPorts = {};
+    gScopedLocalExact = gScopedRemoteExact = gScopedLocalForeign = gScopedRemoteForeign = 0U;
     gFault = false; gEnabled = true;
     gRegistry.store(&registry, std::memory_order_release);
     return true;
 }
 
-bool Candidate(void* execution, const std::uint32_t port) noexcept {
+bool ReplayActive() noexcept { return gMissionReplayActive; }
+void ObserveOutputAttempt(bool localRoot, bool remoteRoot) noexcept {
+    if (gRegistry.load(std::memory_order_relaxed) == nullptr) return;
+    gRawOutputAttempts.fetch_add(1U, std::memory_order_relaxed);
+    if (localRoot) gRawOutputLocalRoot.fetch_add(1U, std::memory_order_relaxed);
+    if (remoteRoot) gRawOutputRemoteRoot.fetch_add(1U, std::memory_order_relaxed);
+}
+void ProbeScopedOutput(void* execution, std::uint32_t port, bool localRoot) noexcept {
+    auto* registry = gRegistry.load(std::memory_order_acquire);
+    if (registry == nullptr) return;
+    std::scoped_lock lock(gMutex);
+    if (!gEnabled || !Current(*registry)) return;
+    CathodeRuntimeKey key{};
+    if (!registry->TryExtractRuntimeKey(execution, key)) return;
+    bool exact = false, foreign = false;
+    for (const auto& [source, entries] : gFrontiers) {
+        for (const auto& entry : entries) {
+            if (entry.port != port) continue;
+            if (source == Key(key)) exact = true;
+            else foreign = true;
+        }
+    }
+    if (localRoot) {
+        if (exact) ++gScopedLocalExact;
+        else if (foreign) ++gScopedLocalForeign;
+    } else {
+        if (exact) ++gScopedRemoteExact;
+        else if (foreign) ++gScopedRemoteForeign;
+    }
+}
+bool Candidate(void* execution, const std::uint32_t port, bool& payloadTolerant) noexcept {
+    payloadTolerant = false;
     auto* registry = gRegistry.load(std::memory_order_acquire);
     if (registry == nullptr) return false;
     std::scoped_lock lock(gMutex);
-    return gEnabled && Current(*registry) && Find(execution, port, *registry) != nullptr;
+    if (!gEnabled || !Current(*registry)) return false;
+    ++gOutputCandidates;
+    CathodeRuntimeKey key{};
+    if (!registry->TryExtractRuntimeKey(execution, key)) {
+        ++gOutputIdentityRejected;
+        return false;
+    }
+    ++gOutputIdentityResolved;
+    const auto found = gFrontiers.find(Key(key));
+    if (found != gFrontiers.end()) {
+        ++gOutputKnownSource;
+        gLastKnownSourcePort = port;
+        for (const auto& entry : found->second) {
+            if (entry.port == port) {
+                ++gOutputMatched;
+                payloadTolerant = (entry.flags & kFlagPayloadTolerant) != 0U;
+                return true;
+            }
+        }
+    }
+    bool portInCatalog = false;
+    for (const auto& [source, entries] : gFrontiers) {
+        static_cast<void>(source);
+        for (const auto& entry : entries)
+            if (entry.port == port) { portInCatalog = true; break; }
+        if (portInCatalog) break;
+    }
+    if (portInCatalog) {
+        ++gOutputPortOnOtherSource;
+        // Store bounded *observed* source identities for each compiled port.
+        // These are diagnostics only: matching a port alone is NOT sufficient
+        // proof to replay a CATHODE mission output on a different Character.
+        auto* sample = static_cast<ForeignPortEvidence*>(nullptr);
+        for (auto& slot : gForeignPorts) {
+            if (slot.port == port) { sample = &slot; break; }
+            if (slot.port == 0U && sample == nullptr) sample = &slot;
+        }
+        if (sample != nullptr) {
+            const auto observedKey = Key(key);
+            if (sample->port == 0U) {
+                sample->port = port;
+                sample->firstKey = observedKey;
+            }
+            ++sample->occurrences;
+            if (sample->lastKey != observedKey) {
+                ++sample->observedKeys;
+                sample->lastKey = observedKey;
+                sample->lastMapped = registry->FindWorldEntityId(key).value_or(WorldEntityId{});
+            }
+        }
+        ++gOutputKnownPort;
+    } else {
+        gLastUnmatchedPort = port;
+        gLastUnmatchedRuntimeKey = Key(key);
+    }
+    return false;
 }
 bool Capture(void* execution, const std::uint32_t port, const std::uint8_t selector) noexcept {
     auto* registry = gRegistry.load(std::memory_order_acquire);
@@ -118,6 +239,13 @@ bool Capture(void* execution, const std::uint32_t port, const std::uint8_t selec
     return true;
 }
 void Unsupported() noexcept { std::scoped_lock lock(gMutex); ++gUnsupported; }
+void NoteUnsafeShape(const bool payload, const bool delayed, const bool tail) noexcept {
+    std::scoped_lock lock(gMutex);
+    gUnsafePayload += payload ? 1U : 0U;
+    gUnsafeDelay += delayed ? 1U : 0U;
+    gUnsafeTail += tail ? 1U : 0U;
+}
+
 void NoteCapturedShape(const bool payload, const bool delayed, const bool tail) noexcept {
     std::scoped_lock lock(gMutex);
     gWithPayload += payload ? 1U : 0U; gWithDelay += delayed ? 1U : 0U; gWithTail += tail ? 1U : 0U;
@@ -147,8 +275,15 @@ bool Apply(const Signal& signal, std::string& status, std::string& error) noexce
     if (!resolved.lease) { status = "MISSION_SYNC_NOT_READY"; return false; }
     const auto live = registry->IdentifyRuntimeEntity(resolved.lease.Get());
     if (!live || !(*live == signal.entity)) { status = "MISSION_SYNC_REJECTED"; return false; }
-    // The registry's lease pins the original native entity through all fan-out.
-    const auto result = world_actions::InvokeMissionOutputNoCapture(resolved.lease, signal.port, signal.selector);
+    // WorldSync also uses Origin::RemoteRoot. Give MissionSync its own
+    // engine-thread scope so that the OutputCapture hook cannot mistake this
+    // authoritative commit for another WorldSync-replayed interaction.
+    // The native invocation returns with its own fault boundary (no throw).
+    const auto previousReplay = gMissionReplayActive;
+    gMissionReplayActive = true;
+    const auto result = world_actions::InvokeMissionOutputNoCapture(
+        resolved.lease, signal.port, signal.selector);
+    gMissionReplayActive = previousReplay;
     std::scoped_lock lock(gMutex);
     if (result != world_actions::LocalCompositeInputInvokeStatus::Invoked) {
         ++gFailures;
@@ -177,12 +312,44 @@ void LogDiagnostics(Diagnostics& diagnostics) {
         {{"generation", Diagnostics::Unsigned(gGeneration), true},
          {"sources", Diagnostics::Unsigned(gFrontiers.size()), true},
          {"captured", Diagnostics::Unsigned(gCaptured), true},
+         {"rawOutputHookCalls", Diagnostics::Unsigned(gRawOutputAttempts.load(std::memory_order_relaxed)), true},
+         {"rawOutputLocalRoot", Diagnostics::Unsigned(gRawOutputLocalRoot.load(std::memory_order_relaxed)), true},
+         {"rawOutputRemoteRoot", Diagnostics::Unsigned(gRawOutputRemoteRoot.load(std::memory_order_relaxed)), true},
+         {"observedOutputs", Diagnostics::Unsigned(gOutputCandidates), true},
+         {"outputRuntimeIdentities", Diagnostics::Unsigned(gOutputIdentityResolved), true},
+         {"outputIdentityRejected", Diagnostics::Unsigned(gOutputIdentityRejected), true},
+         {"outputOnCatalogSources", Diagnostics::Unsigned(gOutputKnownSource), true},
+         {"outputCatalogPortOnOtherSource", Diagnostics::Unsigned(gOutputPortOnOtherSource), true},
+         {"outputMatched", Diagnostics::Unsigned(gOutputMatched), true},
+         {"scopedLocalExact", Diagnostics::Unsigned(gScopedLocalExact), true},
+         {"scopedRemoteExact", Diagnostics::Unsigned(gScopedRemoteExact), true},
+         {"scopedLocalForeign", Diagnostics::Unsigned(gScopedLocalForeign), true},
+         {"scopedRemoteForeign", Diagnostics::Unsigned(gScopedRemoteForeign), true},
+         {"lastCatalogSourcePort", Diagnostics::Unsigned(gLastKnownSourcePort), true},
+         {"lastUnmatchedPort", Diagnostics::Unsigned(gLastUnmatchedPort), true},
+         {"lastUnmatchedRuntimeKey", Diagnostics::Unsigned(gLastUnmatchedRuntimeKey), true},
          {"applied", Diagnostics::Unsigned(gApplied), true},
          {"unsupportedContext", Diagnostics::Unsigned(gUnsupported), true},
+         {"unsafePayloadPreservedLocal", Diagnostics::Unsigned(gUnsafePayload), true},
+         {"unsafeDelayPreservedLocal", Diagnostics::Unsigned(gUnsafeDelay), true},
+         {"unsafeTailPreservedLocal", Diagnostics::Unsigned(gUnsafeTail), true},
          {"capturedWithPayload", Diagnostics::Unsigned(gWithPayload), true},
          {"capturedWithDelay", Diagnostics::Unsigned(gWithDelay), true},
          {"capturedWithTail", Diagnostics::Unsigned(gWithTail), true},
          {"failures", Diagnostics::Unsigned(gFailures), true},
          {"fault", gFault ? "true" : "false", true}});
+    for (const auto& sample : gForeignPorts) {
+        if (sample.port == 0U) continue;
+        diagnostics.Log("info", "native_missionsync_foreign_output",
+            "Observed an authored mission-output port on a different native source. "
+            "Port equality alone is never replay authority.",
+            {{"port", Diagnostics::Unsigned(sample.port), true},
+             {"firstRuntimeKey", Diagnostics::Unsigned(sample.firstKey), true},
+             {"lastRuntimeKey", Diagnostics::Unsigned(sample.lastKey), true},
+             {"lastMappedEntityHigh", Diagnostics::Unsigned(sample.lastMapped.high), true},
+             {"lastMappedEntityLow", Diagnostics::Unsigned(sample.lastMapped.low), true},
+             {"occurrences", Diagnostics::Unsigned(sample.occurrences), true},
+             {"runtimeKeyChanges", Diagnostics::Unsigned(sample.observedKeys), true}});
+    }
 }
 }

@@ -4,14 +4,64 @@ using CATHODE.Scripting.Internal;
 
 namespace AIMP.Launcher;
 
-internal readonly record struct MissionSyncFrontier(WorldEntityDescriptor Source, uint Signal);
+// PayloadTolerant: the source is a Composite/Proxy interface pin and every
+// target is a compiler-proven control input. The native runtime may attach the
+// pin's data reference to that emission, but no receiver consumes it.
+internal readonly record struct MissionSyncFrontier(
+    WorldEntityDescriptor Source, uint Signal, bool PayloadTolerant = false);
 
 internal static class MissionSyncFrontierCompiler
 {
+    // "AMS2": v1 entries plus a uint flags word. Must match AIMP.Native MissionSync.
+    internal const uint CatalogMagic = 0x32534D41U;
+    internal const uint FlagPayloadTolerant = 1U;
+
     private static readonly HashSet<uint> CompletionPorts = new[]
     {
         "used", "key_accepted", "completed", "finished", "animation_finished", "on_entered", "on_exited"
     }.Select(name => ShortGuidUtils.Generate(name).AsUInt32).ToHashSet();
+    // Survival progression is compiled from the manifest's authored graph.
+    // These are reusable CATHODE signal *families*, not level names or a list
+    // of hardcoded map objectives. Unknown output names can also qualify when
+    // their verified targets include a semantic objective/mission-complete sink.
+    private static readonly HashSet<uint> SurvivalCompletionPorts = new[]
+    {
+        "complete", "completed", "finished", "success",
+        "objectiveComplete", "objectiveCompleted", "objective_complete",
+        "missionComplete", "missionCompleted", "mission_complete",
+        "levelComplete", "levelCompleted", "level_complete"
+    }.Concat(Enumerable.Range(1, 64).SelectMany(index => new[]
+    {
+        $"obj{index}Completed", $"obj{index}Complete",
+        $"objective{index}Completed", $"objective{index}Complete",
+        $"objective_{index}_complete", $"objective_{index}_completed"
+    })).Select(name => ShortGuidUtils.Generate(name).AsUInt32).ToHashSet();
+
+    // These events can represent the interacting Character or an animation
+    // rather than a portable milestone. Never suppress/replay them in Survival.
+    private static readonly HashSet<uint> SurvivalLocalInteractionPorts = new[]
+    {
+        "used", "interact", "interaction", "on_entered", "on_exited",
+        "animation_finished", "pressed", "activated", "deactivated",
+        "entered", "exited", "start", "started"
+    }.Select(name => ShortGuidUtils.Generate(name).AsUInt32).ToHashSet();
+
+    // Only stateless control inputs are replayable without the sender-local
+    // callback/Character. Indexed objective inputs are a *generic* convention.
+    private static readonly HashSet<uint> SurvivalControlInputs = new[]
+    {
+        "complete", "completed", "finished", "success",
+        "objectiveComplete", "objectiveCompleted", "objective_complete",
+        "missionComplete", "missionCompleted", "mission_complete",
+        "levelComplete", "levelCompleted", "level_complete",
+        "gotoEndScreen", "showSplash", "setObjIcons"
+    }.Concat(Enumerable.Range(1, 64).SelectMany(index => new[]
+    {
+        $"Objective {index} Complete", $"obj{index}Completed",
+        $"obj{index}Complete", $"objective{index}Completed",
+        $"objective{index}Complete"
+    })).Select(name => ShortGuidUtils.Generate(name).AsUInt32).ToHashSet();
+
     // Port names are authored control contracts, not the World-domain causal hint.
     // In particular objective triggers belong to UI and carry PotentialCausalEdge=false.
     private static readonly HashSet<uint> ControlInputs = new[]
@@ -19,17 +69,22 @@ internal static class MissionSyncFrontierCompiler
         "trigger", "start", "force_open", "force_close", "enable", "disable", "activate", "deactivate"
     }.Select(name => ShortGuidUtils.Generate(name).AsUInt32).ToHashSet();
 
-    internal static IReadOnlyList<MissionSyncFrontier> Compile(WorldManifest manifest)
+    // Arming a proximity volume is a shared World consequence of an objective
+    // (e.g. the next objective's trigger box). Its on_entered output stays
+    // per-player and is never a frontier source.
+    private static readonly HashSet<uint> ArmingInputs = new[]
+    {
+        "enable", "disable", "activate", "deactivate"
+    }.Select(name => ShortGuidUtils.Generate(name).AsUInt32).ToHashSet();
+
+    internal static IReadOnlyList<MissionSyncFrontier> Compile(
+        WorldManifest manifest, bool survival = false)
     {
         var entities = manifest.Entities.ToDictionary(value => value.EntityId);
-        var sources = MissionSources(manifest);
-        var roots = manifest.Connections.GroupBy(edge => (edge.SourceEntity, edge.SourceParameter))
-            .Where(group => CompletionPorts.Contains(group.Key.SourceParameter)
-                && sources.ContainsKey(group.Key.SourceEntity)
-                && group.All(edge => ControlInputs.Contains(edge.TargetParameter)
-                    && edge.TargetEntity.IsValid && entities.TryGetValue(edge.TargetEntity, out var target)
-                    && target.Domain != WorldDomain.AIMP))
-            .Select(group => new MissionSyncFrontier(sources[group.Key.SourceEntity], group.Key.SourceParameter))
+        var admitted = DirectFrontiers(manifest, entities, survival);
+        if (survival) admitted.AddRange(ProxiedFrontiers(manifest, entities, admitted));
+        var roots = admitted
+            .GroupBy(value => (value.Source.EntityId, value.Signal)).Select(group => group.First())
             .OrderBy(value => value.Source.EntityId.High).ThenBy(value => value.Source.EntityId.Low)
             .ThenBy(value => value.Signal).ToArray();
         if (roots.Length > MissionSignalValidation.MaximumSignalsPerGeneration)
@@ -37,25 +92,168 @@ internal static class MissionSyncFrontierCompiler
         return roots;
     }
 
-    // Runtime-addressable story-mission composites, trigger volumes and cinematics.
-    private static Dictionary<WorldEntityId, WorldEntityDescriptor> MissionSources(WorldManifest manifest)
+    private static List<MissionSyncFrontier> DirectFrontiers(WorldManifest manifest,
+        IReadOnlyDictionary<WorldEntityId, WorldEntityDescriptor> entities, bool survival)
+    {
+        var composites = manifest.Composites.ToDictionary(value => value.CompositeShortGuid);
+        var sources = MissionSources(manifest, survival);
+        return manifest.Connections.GroupBy(edge => (edge.SourceEntity, edge.SourceParameter))
+            .Where(group => sources.TryGetValue(group.Key.SourceEntity, out var source)
+                && group.All(edge => SafeTarget(edge, entities, survival))
+                && (!survival
+                    ? CompletionPorts.Contains(group.Key.SourceParameter)
+                    : SurvivalBoundary(group.Key.SourceParameter, source, group, entities, composites)))
+            .Select(group => new MissionSyncFrontier(sources[group.Key.SourceEntity], group.Key.SourceParameter,
+                survival && sources[group.Key.SourceEntity].Kind is WorldEntityKind.Proxy
+                    or WorldEntityKind.CompositeInstance))
+            .ToList();
+    }
+
+    // A mission graph observes another composite's milestone through a Proxy
+    // (e.g. Proxy<Power_Generator_Control>.complete). The engine may emit that
+    // output from the proxied instance rather than from the Proxy, so admit the
+    // proxied entity's same port as well. Its replay reaches both its own
+    // section graph and the mission proxy.
+    private static IEnumerable<MissionSyncFrontier> ProxiedFrontiers(WorldManifest manifest,
+        IReadOnlyDictionary<WorldEntityId, WorldEntityDescriptor> entities, IReadOnlyList<MissionSyncFrontier> admitted)
+    {
+        var targets = ProxyTargets(manifest);
+        var edges = manifest.Connections.ToLookup(edge => (edge.SourceEntity, edge.SourceParameter));
+        return admitted.Where(root => root.Source.Kind == WorldEntityKind.Proxy)
+            .Select(root => (root.Signal, Found: targets.TryGetValue(root.Source.EntityId, out var target), target))
+            .Where(value => value.Found && ReplayableProxyTarget(value.target!)
+                && edges[(value.target!.EntityId, value.Signal)].All(edge => SafeTarget(edge, entities, true)))
+            .Select(value => new MissionSyncFrontier(value.target!, value.Signal,
+                value.target!.Kind == WorldEntityKind.CompositeInstance))
+            .ToArray();
+    }
+
+    private static bool ReplayableProxyTarget(WorldEntityDescriptor target) =>
+        target.EntityId.IsValid && target.Domain == WorldDomain.World
+        && (target.Flags & WorldEntityFlags.RuntimeAddressable) != 0
+        && target.Kind is WorldEntityKind.CompositeInstance or WorldEntityKind.Function
+        && target.PrimitiveName is not ("Interaction" or "PlayerTriggerBox" or "PlayerTriggerSphere");
+
+    // CATHODE proxy paths are [root?, instance steps..., entity, 0]. Entity
+    // descriptors store the instance steps separately from their own ShortGuid.
+    // An ambiguous or unresolved path is never replay authority.
+    private static Dictionary<WorldEntityId, WorldEntityDescriptor> ProxyTargets(WorldManifest manifest)
+    {
+        var paths = manifest.InstancePaths.ToDictionary(value => value.PathId, value => value.Steps);
+        var byLeaf = manifest.Entities.Where(value => value.EntityId.IsValid).ToLookup(value => value.SourceShortGuid);
+        return manifest.References.Where(value => value.Kind == WorldReferenceKind.Proxy)
+            .Select(reference => (reference.OwnerEntity,
+                Steps: reference.TargetPathSteps.Reverse().SkipWhile(value => value == 0U).Reverse().ToArray()))
+            .Where(value => value.Steps.Length != 0)
+            .Select(value => (value.OwnerEntity, Matches: byLeaf[value.Steps[^1]]
+                .Where(entity => paths.TryGetValue(entity.InstancePathId, out var path)
+                    && PathMatches(path, value.Steps[..^1])).Take(2).ToArray()))
+            .Where(value => value.Matches.Length == 1)
+            .ToDictionary(value => value.OwnerEntity, value => value.Matches[0]);
+    }
+
+    private static bool PathMatches(IReadOnlyList<uint> path, uint[] prefix) =>
+        path.SequenceEqual(prefix) || prefix.Length != 0 && path.SequenceEqual(prefix[1..]);
+
+    private static bool SurvivalBoundary(
+        uint output, WorldEntityDescriptor source,
+        IGrouping<(WorldEntityId SourceEntity, uint SourceParameter), WorldConnectionDescriptor> edges,
+        IReadOnlyDictionary<WorldEntityId, WorldEntityDescriptor> entities,
+        IReadOnlyDictionary<uint, WorldCompositeDescriptor> composites)
+    {
+        if (SurvivalLocalInteractionPorts.Contains(output)) return false;
+
+        var sourceInMission = composites.TryGetValue(source.SourceCompositeShortGuid, out var composite)
+            && IsMissionGraph(composite.Name);
+        // Known completion outputs need to originate from an authored mission
+        // graph, never a generator, player interaction or arbitrary World script.
+        if (sourceInMission && SurvivalCompletionPorts.Contains(output)) return true;
+
+        // Custom/unnamed output conventions can be admitted when the actual
+        // fan-out proves a progression sink. This uses entity semantics, not
+        // a DLC path, map ID or hardcoded output name.
+        return edges.Any(edge => entities.TryGetValue(edge.TargetEntity, out var target)
+            && IsObjectiveSink(target));
+    }
+
+    private static bool IsObjectiveSink(WorldEntityDescriptor target)
+    {
+        if (target.Domain is not (WorldDomain.World or WorldDomain.UI)) return false;
+        // A mission's entire graph is not an objective sink. Require a
+        // specific target primitive/entity that describes the outcome.
+        return IsObjectiveName(target.PrimitiveName) || IsObjectiveName(target.EntityName);
+    }
+
+    private static bool IsObjectiveName(string? name) =>
+        !string.IsNullOrWhiteSpace(name) && (
+            name.Contains("Objective", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("MissionComplete", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("LevelComplete", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("MissionEnd", StringComparison.OrdinalIgnoreCase));
+
+    private static bool SafeTarget(
+        WorldConnectionDescriptor edge,
+        IReadOnlyDictionary<WorldEntityId, WorldEntityDescriptor> entities,
+        bool survival)
+    {
+        if (!edge.TargetEntity.IsValid || !entities.TryGetValue(edge.TargetEntity, out var target)
+            || target.Domain == WorldDomain.AIMP) return false;
+        if (!ControlInputs.Contains(edge.TargetParameter)
+            && !(survival && SurvivalControlInputs.Contains(edge.TargetParameter))) return false;
+        // Surviving mission fan-out must never replay the Character's local
+        // movement, a proximity trigger, an AI action or unknown data binding.
+        if (!survival) return true;
+        if (target.Domain is not (WorldDomain.World or WorldDomain.UI)) return false;
+        if (target.PrimitiveName is "PlayerTriggerBox" or "PlayerTriggerSphere")
+            return ArmingInputs.Contains(edge.TargetParameter);
+        return target.PrimitiveName is not "Interaction";
+    }
+
+    // Campaign keeps its existing SCRIPT_StoryMission frontier contract.
+    // Survival identifies the enclosing *mission semantics* across any DLC,
+    // custom challenge or future map. It also accepts any graph with a
+    // proved objective sink (see SurvivalBoundary), regardless of its name.
+    private static Dictionary<WorldEntityId, WorldEntityDescriptor> MissionSources(
+        WorldManifest manifest, bool survival)
     {
         var scripts = manifest.Composites.Where(value => !value.AimpNamespace
-            && value.Name.Replace('/', '\\').StartsWith("SCRIPT_StoryMission\\", StringComparison.OrdinalIgnoreCase))
+            && (!survival
+                ? value.Name.Replace('/', '\\').StartsWith("SCRIPT_StoryMission\\",
+                    StringComparison.OrdinalIgnoreCase)
+                : IsMissionGraph(value.Name)))
             .Select(value => value.CompositeShortGuid).ToHashSet();
         return manifest.Entities.Where(value => value.EntityId.IsValid
-            && value.Domain != WorldDomain.AIMP && scripts.Contains(value.SourceCompositeShortGuid)
+            && value.Domain != WorldDomain.AIMP
+            && (survival || scripts.Contains(value.SourceCompositeShortGuid))
             && (value.Flags & WorldEntityFlags.RuntimeAddressable) != 0
-            && (value.Kind == WorldEntityKind.CompositeInstance
-                || value.PrimitiveName is "PlayerTriggerBox" or "PlayerTriggerSphere" or "CAGEAnimation"))
+            && (survival
+                ? value.Domain == WorldDomain.World
+                  && value.Kind is WorldEntityKind.CompositeInstance or WorldEntityKind.Function or WorldEntityKind.Proxy
+                  && value.PrimitiveName is not ("Interaction" or "PlayerTriggerBox" or "PlayerTriggerSphere")
+                : value.Kind == WorldEntityKind.CompositeInstance
+                  || value.PrimitiveName is "PlayerTriggerBox" or "PlayerTriggerSphere" or "CAGEAnimation"))
             .ToDictionary(value => value.EntityId);
+    }
+
+    private static bool IsMissionGraph(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return false;
+        // Match a reusable semantic token rather than an arbitrary substring:
+        // "Permission" is not a mission. Recognizes StoryMission, MISSION_X,
+        // MissionControl and lowercase "mission" across arbitrary paths.
+        var tokens = name.Replace('/', '\\').Split(['\\', '_', '-', '.'],
+            StringSplitOptions.RemoveEmptyEntries);
+        return tokens.Any(token =>
+            token.Equals("mission", StringComparison.OrdinalIgnoreCase)
+            || token.StartsWith("mission", StringComparison.OrdinalIgnoreCase)
+            || token.EndsWith("Mission", StringComparison.Ordinal));
     }
 
     internal static byte[] Encode(WorldManifest manifest, IReadOnlyList<MissionSyncFrontier> roots)
     {
         using var stream = new MemoryStream();
         using var writer = new BinaryWriter(stream);
-        writer.Write(0x31534D41U);
+        writer.Write(CatalogMagic);
         writer.Write(manifest.MapContentIdHigh);
         writer.Write(manifest.MapContentIdLow);
         writer.Write((uint)roots.Count);
@@ -65,7 +263,7 @@ internal static class MissionSyncFrontierCompiler
             writer.Write(root.Source.EntityId.Low);
             writer.Write(root.Source.CathodeEntityA);
             writer.Write(root.Source.CathodeEntityB);
-            writer.Write(root.Signal);
+            writer.Write(root.Signal); writer.Write(root.PayloadTolerant ? FlagPayloadTolerant : 0U);
         }
         return stream.ToArray();
     }

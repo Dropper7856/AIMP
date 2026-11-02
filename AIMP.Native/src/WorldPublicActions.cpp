@@ -135,7 +135,7 @@ struct Counters final {
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ActionClass::Count)> classified{};
     std::atomic<std::uint64_t> targetOwnerDistinct{}, externalRoots{}, delayedRoots{};
     std::atomic<std::uint64_t> seen{}, publicCandidates{}, rootsSent{}, compositeInputRootsSent{}, emittedOutputRootsSent{}, scheduledInputRootsSent{}, schedulerEdgeRootsSent{},
-        typedMessageRootsSent{}, typedMessageRootsApplied{},
+        typedMessageRootsSent{}, typedMessageRootsApplied{}, typedPlayerPayloadLocalOnly{},
         canonicalCompositeRootsSent{}, canonicalCompositeRootsApplied{},
         doorLockStateRootsSent{}, doorLockStateRootsApplied{},
         schedulerEdgeSidecarObserved{}, schedulerEdgeSidecarSubmitted{},
@@ -2761,27 +2761,61 @@ void OutputCapture(void* self, void** instance, const std::uint32_t* input,
     // MissionSync owns only graph-compiled mission ingress ports. Its commits
     // replay the complete native fan-out under RemoteRoot, so WorldSync does
     // not also publish every consequence of the same mission decision.
-    if (CurrentOrigin() == Origin::None && !replication_core::RemoteApplyActive()) {
+    // Observe the existing lineage but never change its gameplay meaning:
+    // a mission completion may currently be born inside WorldSync LocalRoot.
+    const auto missionOrigin = CurrentOrigin();
+    mission_sync::ObserveOutputAttempt(
+        missionOrigin == Origin::LocalRoot, missionOrigin == Origin::RemoteRoot);
+    if (missionOrigin == Origin::LocalRoot || missionOrigin == Origin::RemoteRoot) {
+        void* scopedExecution{}; void* scopedCallback{};
+        std::uint32_t scopedPort{}; bool scopedPayloadless{};
+        if (ReadPublicArguments(instance, input, callback, scopedExecution,
+                scopedPort, scopedCallback, scopedPayloadless))
+            mission_sync::ProbeScopedOutput(
+                scopedExecution, scopedPort, missionOrigin == Origin::LocalRoot);
+    }
+    // A mission completion often fires *inside* a WorldSync LocalRoot. The
+    // previous Origin::None-only gate missed those proven frontiers entirely.
+    // Capture a local mission decision once, then replay its full CATHODE
+    // fan-out from the Host-ordered mission commit. A WorldSync RemoteRoot can
+    // naturally reach the same frontier first; suppress only that exact
+    // re-emission so it cannot double-execute the mission before its commit.
+    // MissionSync::Apply has its own explicit scope to exempt the authoritative
+    // replay from this interception.
+    const bool worldRemoteMission = missionOrigin == Origin::RemoteRoot;
+    const bool localMission = (missionOrigin == Origin::None ||
+        missionOrigin == Origin::LocalRoot) && !replication_core::RemoteApplyActive();
+    if (!mission_sync::ReplayActive() && (localMission || worldRemoteMission)) {
         void* missionExecution{}; void* missionCallback{};
-        std::uint32_t missionPort{}; bool payloadless{};
+        std::uint32_t missionPort{}; bool payloadless{}; bool payloadTolerant{};
         if (ReadPublicArguments(instance, input, callback, missionExecution, missionPort,
-                missionCallback, payloadless) && mission_sync::Candidate(missionExecution, missionPort)) {
-            // The compiler admits a frontier only when every authored target is a
-            // control input, so the commit replays the decision without the
-            // sender-local data reference or delay (interaction outputs such as
-            // "used" carry the interacting Character). Only an output whose
-            // base interface cannot be named portably stays local.
-            bool captured = false;
-            for (std::uint8_t selector = 1U; selector <= 2U; ++selector) {
-                void* definition{};
-                if (OutputDefinition(missionExecution, selector, definition) && definition == self) {
-                    captured = mission_sync::Capture(missionExecution, missionPort, selector);
-                    if (captured) mission_sync::NoteCapturedShape(!payloadless, delay != 0.0, tail != 0U);
-                    break;
+                missionCallback, payloadless) &&
+            mission_sync::Candidate(missionExecution, missionPort, payloadTolerant)) {
+            // Previous builds captured a VariableBool output with native typed
+            // data and replayed it with an EMPTY callback. Both peers returned
+            // MISSION_SYNC_APPLIED, but no objective state was transferred.
+            // A CATHODE data reference is not a portable bool/value. Do not
+            // suppress the original fan-out or issue a false mission commit
+            // unless the *observed* native output is actually data-free.
+            // Exception: a Composite/Proxy interface pin (e.g. a generator's
+            // `complete`) whose compiled targets are all control inputs. Its
+            // data reference is a pass-through no receiver reads.
+            if ((!payloadless && !payloadTolerant) || delay != 0.0 || tail != 0U) {
+                mission_sync::NoteUnsafeShape(!payloadless, delay != 0.0, tail != 0U);
+            } else {
+                bool captured = false;
+                for (std::uint8_t selector = 1U; selector <= 2U; ++selector) {
+                    void* definition{};
+                    if (OutputDefinition(missionExecution, selector, definition) && definition == self) {
+                        if (worldRemoteMission) return; // Mission commit owns fan-out.
+                        captured = mission_sync::Capture(missionExecution, missionPort, selector);
+                        if (captured) mission_sync::NoteCapturedShape(!payloadless, false, false);
+                        break;
+                    }
                 }
+                if (captured) return;
+                mission_sync::Unsupported();
             }
-            if (captured) return;
-            mission_sync::Unsupported();
         }
     }
     if (!runtime_features::Enabled(runtime_features::Feature::WorldSyncHooks)) {
@@ -3811,6 +3845,21 @@ TypedMessageSubmission SubmitTypedMessageRoot(
     const auto observedSourceKind = causalStamp.Valid() ? causalStamp.source : CausalSource::World;
     const bool nonHostClient = !SessionAuthorityHost();
 
+    // A non-empty TypedMessage attributed by the causal tracker to the local
+    // Player may contain the sender's interaction/pose/Character context.
+    // The receiving single-player engine can reinterpret that context as an
+    // instruction to perform the same interaction, including repositioning
+    // the observer's Player. Such messages are personal controls, not proven
+    // shared-world state transitions. Keep retail on the originator only.
+    // Do not guess that all Client World messages are player-owned: require a
+    // positive Player causal stamp, so autonomous World->World messages retain
+    // the existing replication contract.
+    if (observedSourceKind == CausalSource::Player && !payload.empty()) {
+        gStats.typedPlayerPayloadLocalOnly.fetch_add(1U, std::memory_order_relaxed);
+        gStats.authorityRetailPreserved.fetch_add(1U, std::memory_order_relaxed);
+        return TypedMessageSubmission::RetailOnly;
+    }
+
     // Patch 5.10 restores the proven WS2 TypedMessage ordering under WS3
     // authority. A compatible Client is allowed to originate the same bounded
     // World->World TypedMessage class that WS2 published after retail local
@@ -4261,16 +4310,10 @@ bool MissionOutputReady() noexcept {
     return gOutputTrampoline.load(std::memory_order_acquire) != nullptr && gModule != 0U;
 }
 
-LocalCompositeInputInvokeStatus InvokeMissionOutputNoCapture(
-    const WorldEntityLease& lease, const std::uint32_t port, const std::uint8_t selector) noexcept {
-    auto* sharedRef = WorldPublicActionLeaseAccess::SharedRef(lease);
-    void* definition{};
-    if (!lease || sharedRef == nullptr || port == 0U ||
-        !OutputDefinition(lease.Get(), selector, definition))
-        return LocalCompositeInputInvokeStatus::InvalidBoundary;
-    const auto original = reinterpret_cast<PublicFn>(gOutputTrampoline.load(std::memory_order_acquire));
-    if (original == nullptr) return LocalCompositeInputInvokeStatus::RuntimeUnavailable;
-    void* callback{};
+namespace {
+// SEH boundary kept free of C++ unwinding (the callback lease lives in the caller).
+LocalCompositeInputInvokeStatus InvokeMissionOutputGuarded(PublicFn original, void* definition,
+    void* sharedRef, std::uint32_t port, void* callback) noexcept {
 #if defined(_MSC_VER) && defined(_M_IX86)
     __try {
 #endif
@@ -4280,6 +4323,29 @@ LocalCompositeInputInvokeStatus InvokeMissionOutputNoCapture(
 #if defined(_MSC_VER) && defined(_M_IX86)
     } __except (EXCEPTION_EXECUTE_HANDLER) { return LocalCompositeInputInvokeStatus::NativeFault; }
 #endif
+}
+}
+
+LocalCompositeInputInvokeStatus InvokeMissionOutputNoCapture(
+    const WorldEntityLease& lease, const std::uint32_t port, const std::uint8_t selector) noexcept {
+    auto* sharedRef = WorldPublicActionLeaseAccess::SharedRef(lease);
+    void* definition{};
+    if (!lease || sharedRef == nullptr || port == 0U ||
+        !OutputDefinition(lease.Get(), selector, definition))
+        return LocalCompositeInputInvokeStatus::InvalidBoundary;
+    const auto original = reinterpret_cast<PublicFn>(gOutputTrampoline.load(std::memory_order_acquire));
+    if (original == nullptr) return LocalCompositeInputInvokeStatus::RuntimeUnavailable;
+    // v355 replayed with a null callback. Retail receivers dereference the
+    // causal WorkItem (e.g. the activation handler FUN_00937670 -> 004DFE90
+    // reads *context+0x20) and both peers crashed on the generator objective.
+    // Root the fan-out in a real receiver-local callback on the frontier
+    // entity, exactly like ItemSync's placed-completion replay. Retail
+    // descendants retain their own references before the lease is released.
+    cathode_primitives::NativeCallbackLease context;
+    if (cathode_primitives::CreateNativeCallback(lease, 0x10000000U, {}, context) !=
+            cathode_primitives::ExecuteStatus::Queued || context.Get() == nullptr)
+        return LocalCompositeInputInvokeStatus::RuntimeUnavailable;
+    return InvokeMissionOutputGuarded(original, definition, sharedRef, port, context.Get());
 }
 
 LocalCompositeInputInvokeStatus InvokeLocalCompositeInputNoCapture(
@@ -4493,7 +4559,7 @@ Diagnostics Snapshot() noexcept {
     WS3_READ(contextChainDepthPeak); WS3_READ(contextChainOverflow);
     WS3_READ(contextFramesReconstructed);
     WS3_READ(actorUnresolved); WS3_READ(causeTableOverflow);
-    WS3_READ(seen); WS3_READ(publicCandidates); WS3_READ(rootsSent); WS3_READ(compositeInputRootsSent); WS3_READ(emittedOutputRootsSent); WS3_READ(scheduledInputRootsSent); WS3_READ(schedulerEdgeRootsSent); WS3_READ(typedMessageRootsSent); WS3_READ(typedMessageRootsApplied); WS3_READ(canonicalCompositeRootsSent); WS3_READ(canonicalCompositeRootsApplied); WS3_READ(doorLockStateRootsSent); WS3_READ(doorLockStateRootsApplied);
+    WS3_READ(seen); WS3_READ(publicCandidates); WS3_READ(rootsSent); WS3_READ(compositeInputRootsSent); WS3_READ(emittedOutputRootsSent); WS3_READ(scheduledInputRootsSent); WS3_READ(schedulerEdgeRootsSent); WS3_READ(typedMessageRootsSent); WS3_READ(typedMessageRootsApplied); WS3_READ(typedPlayerPayloadLocalOnly); WS3_READ(canonicalCompositeRootsSent); WS3_READ(canonicalCompositeRootsApplied); WS3_READ(doorLockStateRootsSent); WS3_READ(doorLockStateRootsApplied);
     WS3_READ(schedulerEdgeSidecarObserved); WS3_READ(schedulerEdgeSidecarSubmitted);
     WS3_READ(schedulerEdgeRemoteNaturalRemembered); WS3_READ(schedulerEdgeRemoteDedupConsumed);
     WS3_READ(scheduledEventRootsSuppressed);
