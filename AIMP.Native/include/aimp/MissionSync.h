@@ -34,6 +34,9 @@ void Unsupported() noexcept;
 // the frontier's targets are control inputs only (compiler-proven), so its data
 // reference, delay and tail are not part of the mission decision.
 void NoteCapturedShape(bool payload, bool delayed, bool tail) noexcept;
+// A raw CATHODE data reference cannot be discarded and then declared applied.
+// Record rejected shapes; leave the retail invocation untouched.
+void NoteUnsafeShape(bool payload, bool delayed, bool tail) noexcept;
 bool Apply(const Signal& signal, std::string& status, std::string& error) noexcept;
 bool TryPeek(Signal& signal) noexcept;
 void Pop() noexcept;
