@@ -116,6 +116,18 @@ internal static class MissionFrontierTests
             ]
         };
         AssertEx.Equal(0, MissionSyncFrontierCompiler.Compile(interaction, survival: true).Count);
+        var objectiveInteraction = semanticObjective with
+        {
+            Connections = [
+                new WorldConnectionDescriptor(Source, Port("used"), Objective, Port("trigger"), false)
+            ]
+        };
+        AssertEx.Equal(0, MissionSyncFrontierCompiler.Compile(objectiveInteraction, survival: true).Count);
+        var misleadingName = survival with
+        {
+            Composites = [script with { Name = @"Mods\MyPermissionController" }]
+        };
+        AssertEx.Equal(0, MissionSyncFrontierCompiler.Compile(misleadingName, survival: true).Count);
 
         // Reject the ENTIRE output fan-out if any branch can affect a local
         // player, an AI actor or an unproved/unknown semantic target.
