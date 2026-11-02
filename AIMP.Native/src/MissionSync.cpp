@@ -23,6 +23,7 @@ WorldEntityId gMap{};
 std::uint32_t gGeneration{};
 std::uint64_t gSequence{}, gCommitted{}, gCaptured{}, gApplied{}, gUnsupported{}, gFailures{};
 std::uint64_t gWithPayload{}, gWithDelay{}, gWithTail{};
+std::uint64_t gUnsafePayload{}, gUnsafeDelay{}, gUnsafeTail{};
 // Engine-side observation coverage: distinguish authored-port mismatch from
 // runtime identity mismatch and a rejected local OutputDefinition selector.
 std::atomic<std::uint64_t> gRawOutputAttempts{}, gRawOutputLocalRoot{}, gRawOutputRemoteRoot{};
@@ -112,6 +113,7 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
     gMap = map; gGeneration = context.levelGeneration;
     gSequence = 0U; gCommitted = 0U;
     gCaptured = 0U; gApplied = 0U; gUnsupported = 0U; gFailures = 0U;
+    gUnsafePayload = gUnsafeDelay = gUnsafeTail = 0U;
     gRawOutputAttempts.store(0U, std::memory_order_relaxed);
     gRawOutputLocalRoot.store(0U, std::memory_order_relaxed);
     gRawOutputRemoteRoot.store(0U, std::memory_order_relaxed);
@@ -231,6 +233,13 @@ bool Capture(void* execution, const std::uint32_t port, const std::uint8_t selec
     return true;
 }
 void Unsupported() noexcept { std::scoped_lock lock(gMutex); ++gUnsupported; }
+void NoteUnsafeShape(const bool payload, const bool delayed, const bool tail) noexcept {
+    std::scoped_lock lock(gMutex);
+    gUnsafePayload += payload ? 1U : 0U;
+    gUnsafeDelay += delayed ? 1U : 0U;
+    gUnsafeTail += tail ? 1U : 0U;
+}
+
 void NoteCapturedShape(const bool payload, const bool delayed, const bool tail) noexcept {
     std::scoped_lock lock(gMutex);
     gWithPayload += payload ? 1U : 0U; gWithDelay += delayed ? 1U : 0U; gWithTail += tail ? 1U : 0U;
@@ -315,6 +324,9 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"lastUnmatchedRuntimeKey", Diagnostics::Unsigned(gLastUnmatchedRuntimeKey), true},
          {"applied", Diagnostics::Unsigned(gApplied), true},
          {"unsupportedContext", Diagnostics::Unsigned(gUnsupported), true},
+         {"unsafePayloadPreservedLocal", Diagnostics::Unsigned(gUnsafePayload), true},
+         {"unsafeDelayPreservedLocal", Diagnostics::Unsigned(gUnsafeDelay), true},
+         {"unsafeTailPreservedLocal", Diagnostics::Unsigned(gUnsafeTail), true},
          {"capturedWithPayload", Diagnostics::Unsigned(gWithPayload), true},
          {"capturedWithDelay", Diagnostics::Unsigned(gWithDelay), true},
          {"capturedWithTail", Diagnostics::Unsigned(gWithTail), true},
