@@ -13,12 +13,14 @@
 
 #include <Windows.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <iterator>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace aimp {
@@ -68,6 +70,32 @@ void* __fastcall CharacterCreateDetour(
             reinterpret_cast<std::uintptr_t>(request));
     }
     return character;
+}
+
+// The proxy Character is an NPC, not a second retail first-person player.
+// Its EquipmentController cannot be assumed to support player inventory-held
+// throwable composites. Reject them *before* creating CATHODE roots, issuing
+// WEAPON_GiveToCharacter or selecting the equipment slot. A native release
+// of an already-provisioned legacy flare remains a separate cleanup action.
+bool UnsafeRemoteHeldThrowable(std::string_view composite) noexcept {
+    const auto separator=composite.find_last_of("\\/"); 
+    if(separator!=std::string_view::npos)composite.remove_prefix(separator+1U);
+    constexpr std::array<std::string_view,10> kUnsafe{
+        "flare_held","flare_held_infinite","emp_mine_held",
+        "explosive_mine_held","flashbang_held","incendiary_mine_held",
+        "molotov_cocktail_held","noisemaker_held","pipe_bomb_held",
+        "smoke_bomb_held"};
+    const auto lowercase=[](char value) noexcept {
+        return value>='A'&&value<='Z'?static_cast<char>(value-'A'+'a'):value;
+    };
+    for(const auto name:kUnsafe) {
+        if(name.size()!=composite.size())continue;
+        bool match=true;
+        for(std::size_t index=0U;index<name.size();++index)
+            if(lowercase(composite[index])!=name[index]){match=false;break;}
+        if(match)return true;
+    }
+    return false;
 }
 
 bool ValidAddress(const std::uintptr_t value) noexcept {
@@ -474,6 +502,9 @@ SpawnCharacterTracker::ProvisionRemoteEquipmentOnGameThread(
         return {false, false, "REMOTE_EQUIPMENT_INVALID_CHARACTER", "Invalid CharacterBase."};
     if (compositeName.empty() || compositeName.size() > 255U)
         return {false, false, "REMOTE_EQUIPMENT_INVALID_CATALOG", "Invalid equipment composite name."};
+    if(!releaseHeld && UnsafeRemoteHeldThrowable(compositeName))
+        return {false, false, "REMOTE_EQUIPMENT_UNSAFE_HELD_THROWABLE",
+            "A replicated Character cannot safely take player inventory throwables into its hands."};
 
     const auto runtimeId = crash_guard::SafeRead<std::uint32_t>(
         reinterpret_cast<const void*>(characterAddress + 0x50U));

@@ -17,10 +17,28 @@ internal static class RemoteEquipmentSelectionTests
         foreach (var flare in new[] { 32, 33 })
         {
             AssertEx.Equal(flare, RemoteEquipmentSelection.VisibleIndex(flare, 4, true));
-            AssertEx.True(RemoteEquipmentDefinitions.TryGetPlayerSyncEquipmentId(flare, out var id));
-            AssertEx.Equal("flare-held", id);
+            AssertEx.False(RemoteEquipmentDefinitions.TryGetPlayerSyncEquipmentId(flare, out var id));
+            AssertEx.Equal(string.Empty, id);
             AssertEx.False(RemoteEquipmentSelection.SupportsActions(flare, true));
         }
+        // The public COMMANDS catalog must not offer any inventory-held
+        // throwable for a replicated Character, even through manual Give.
+        foreach (var id in new[]
+        {
+            "flare-held", "flare-held-infinite", "emp-mine-held",
+            "explosive-mine-held", "flashbang-held", "incendiary-mine-held",
+            "molotov-held", "noisemaker-held", "pipe-bomb-held", "smoke-bomb-held"
+        })
+        {
+            AssertEx.True(RemoteEquipmentDefinitions.IsUnsafeRemoteHeldThrowable(id));
+            AssertEx.True(RemoteEquipmentDefinitions.TryGet(id, out var definition));
+            AssertEx.False(definition.SelectorEnabled);
+        }
+        // Ordinary NPC equipment stays available for replication.
+        AssertEx.False(RemoteEquipmentDefinitions.IsUnsafeRemoteHeldThrowable("npc-pistol"));
+        AssertEx.True(RemoteEquipmentDefinitions.TryGetPlayerSyncEquipmentId(1, out var pistol));
+        AssertEx.Equal("npc-pistol", pistol);
+
         // Guns lose their inputs when the flare takes over. A lit durable
         // identity remains distinguishable after the short activation edge.
         AssertEx.True(RemoteEquipmentSelection.ActionEligibilityChanged(4, true, 32, true));
@@ -60,7 +78,7 @@ internal static class RemoteEquipmentSelectionTests
         };
         var command = new GameCommandExecutePayload(1, Guid.NewGuid(), 1, Guid.NewGuid(),
             GameCommandNames.RemoteEquipmentProvision, arguments);
-        ModelValidation.Validate(command); // legacy unlit provision stays valid
+        ModelValidation.Validate(command); // Legacy wire schema remains valid; native execution now refuses unsafe held items.
         arguments["activateHeld"] = "true";
         ModelValidation.Validate(command);
         foreach (var value in new[] { "false", "1", "TRUE", "" })
@@ -93,9 +111,10 @@ internal static class RemoteEquipmentSelectionTests
             return Task.CompletedTask;
         }
         var catalog = RemoteEquipmentCatalogCompiler.CompileAll(path, out var diagnostic);
-        AssertEx.True(catalog.TryGet("flare-held", out var flare), diagnostic);
-        AssertEx.Equal(9U, flare.EquipmentSlot);
-        Console.WriteLine($"Retail flare: {flare.CompositeName}, slot={flare.EquipmentSlot}, type={flare.EquipmentFunctionType}.");
+        AssertEx.False(catalog.TryGet("flare-held", out _), diagnostic);
+        AssertEx.True(catalog.Unavailable.TryGetValue("flare-held", out var reason), diagnostic);
+        AssertEx.True(reason!.Contains("unsafe", StringComparison.OrdinalIgnoreCase), diagnostic);
+        Console.WriteLine("Retail flare is intentionally excluded from remote Character equipment catalogs.");
         return Task.CompletedTask;
     }
 }

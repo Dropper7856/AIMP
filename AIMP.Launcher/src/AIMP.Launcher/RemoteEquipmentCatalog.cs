@@ -22,7 +22,8 @@ internal static class RemoteEquipmentDefinitions
                 "cutting-tool", "Cutting Tool", @"Required_Assets\Archetypes\Equipment\Cutting_Tool", false,
                 "The root archetype does not expose a public equipment reference suitable for the external WEAPON_GiveToCharacter bridge."),
             new RemoteEquipmentDefinition("detonator", "Detonator", @"Required_Assets\Archetypes\Equipment\Detonator"),
-            new RemoteEquipmentDefinition("flare-held", "Flare", @"Required_Assets\Archetypes\Equipment\Flare_Held"),
+            new RemoteEquipmentDefinition("flare-held", "Flare", @"Required_Assets\Archetypes\Equipment\Flare_Held", false,
+                "Remote Character held throwables are unsafe; released world events use ThrowableSync."),
             new RemoteEquipmentDefinition(
                 "flare-held-infinite", "Flare (Infinite)", @"Required_Assets\Archetypes\Equipment\Flare_Held_Infinite", false,
                 "The wrapper does not expose a unique public equipment output in the current COMMANDS graph."),
@@ -30,16 +31,24 @@ internal static class RemoteEquipmentDefinitions
                 "medipen", "Medipen", @"Required_Assets\Archetypes\Equipment\Medipen", false,
                 "Medipen is an EQUIPPABLE_ITEM with its own internal give flow; external WEAPON_GiveToCharacter provisioning is not certified."),
             new RemoteEquipmentDefinition("radio-scanner", "Radio Scanner", @"Required_Assets\Archetypes\Equipment\Radio_Scanner"),
-            new RemoteEquipmentDefinition("emp-mine-held", "EMP Mine", @"Required_Assets\Archetypes\Equipment\emp_mine_held"),
-            new RemoteEquipmentDefinition("explosive-mine-held", "Explosive Mine", @"Required_Assets\Archetypes\Equipment\explosive_mine_held"),
-            new RemoteEquipmentDefinition("flashbang-held", "Flashbang", @"Required_Assets\Archetypes\Equipment\flashbang_held"),
-            new RemoteEquipmentDefinition("incendiary-mine-held", "Incendiary Mine", @"Required_Assets\Archetypes\Equipment\incendiary_mine_held"),
+            new RemoteEquipmentDefinition("emp-mine-held", "EMP Mine", @"Required_Assets\Archetypes\Equipment\emp_mine_held", false,
+                "Remote Character held throwables are unsafe; released world events use ThrowableSync."),
+            new RemoteEquipmentDefinition("explosive-mine-held", "Explosive Mine", @"Required_Assets\Archetypes\Equipment\explosive_mine_held", false,
+                "Remote Character held throwables are unsafe; released world events use ThrowableSync."),
+            new RemoteEquipmentDefinition("flashbang-held", "Flashbang", @"Required_Assets\Archetypes\Equipment\flashbang_held", false,
+                "Remote Character held throwables are unsafe; released world events use ThrowableSync."),
+            new RemoteEquipmentDefinition("incendiary-mine-held", "Incendiary Mine", @"Required_Assets\Archetypes\Equipment\incendiary_mine_held", false,
+                "Remote Character held throwables are unsafe; released world events use ThrowableSync."),
             new RemoteEquipmentDefinition("large-medikit-held", "Large Medikit", @"Required_Assets\Archetypes\Equipment\large_medikit_held"),
             new RemoteEquipmentDefinition("small-medikit-held", "Small Medikit", @"Required_Assets\Archetypes\Equipment\small_medikit_held"),
-            new RemoteEquipmentDefinition("molotov-held", "Molotov Cocktail", @"Required_Assets\Archetypes\Equipment\molotov_cocktail_held"),
-            new RemoteEquipmentDefinition("noisemaker-held", "Noisemaker", @"Required_Assets\Archetypes\Equipment\noisemaker_held"),
-            new RemoteEquipmentDefinition("pipe-bomb-held", "Pipe Bomb", @"Required_Assets\Archetypes\Equipment\pipe_bomb_held"),
-            new RemoteEquipmentDefinition("smoke-bomb-held", "Smoke Bomb", @"Required_Assets\Archetypes\Equipment\smoke_bomb_held"),
+            new RemoteEquipmentDefinition("molotov-held", "Molotov Cocktail", @"Required_Assets\Archetypes\Equipment\molotov_cocktail_held", false,
+                "Remote Character held throwables are unsafe; released world events use ThrowableSync."),
+            new RemoteEquipmentDefinition("noisemaker-held", "Noisemaker", @"Required_Assets\Archetypes\Equipment\noisemaker_held", false,
+                "Remote Character held throwables are unsafe; released world events use ThrowableSync."),
+            new RemoteEquipmentDefinition("pipe-bomb-held", "Pipe Bomb", @"Required_Assets\Archetypes\Equipment\pipe_bomb_held", false,
+                "Remote Character held throwables are unsafe; released world events use ThrowableSync."),
+            new RemoteEquipmentDefinition("smoke-bomb-held", "Smoke Bomb", @"Required_Assets\Archetypes\Equipment\smoke_bomb_held", false,
+                "Remote Character held throwables are unsafe; released world events use ThrowableSync."),
             new RemoteEquipmentDefinition("tracker-1979", "Tracker 1979", @"Required_Assets\Archetypes\Equipment\Tracker_1979"),
             new RemoteEquipmentDefinition("motion-tracker", "Motion Tracker", @"Required_Assets\Archetypes\Equipment\Motion_Tracker"),
             new RemoteEquipmentDefinition("npc-pistol", "Pistol (NPC)", @"Required_Assets\Archetypes\Weapons\NPC_Pistol_Standard"),
@@ -74,6 +83,15 @@ internal static class RemoteEquipmentDefinitions
         return true;
     }
 
+    // This classification governs both automatic PlayerSync replication and
+    // explicit equipment provisioning. Inventory launch/release uses a separate
+    // ThrowableSync carrier and must not attach a held composite to a proxy NPC.
+    internal static bool IsUnsafeRemoteHeldThrowable(string id) => id is
+        "flare-held" or "flare-held-infinite" or
+        "emp-mine-held" or "explosive-mine-held" or "flashbang-held" or
+        "incendiary-mine-held" or "molotov-held" or "noisemaker-held" or
+        "pipe-bomb-held" or "smoke-bomb-held";
+
     internal static bool TryGetPlayerSyncEquipmentId(
         int equipmentIndex,
         out string equipmentId)
@@ -87,9 +105,8 @@ internal static class RemoteEquipmentDefinitions
             4 => "npc-flamethrower",
             5 => "boltgun",
             6 => "npc-motion-tracker",
-            // Semantic inventory identities supplied by the native observer.
-            // Lit/unlit use the same composite; activation is a public input.
-            32 or 33 => "flare-held",
+            // Inventory items/throwables (including 32/33 flare) must never
+            // be provisioned onto a replicated NPC Character.
             _ => string.Empty
         };
         return equipmentId.Length != 0;
