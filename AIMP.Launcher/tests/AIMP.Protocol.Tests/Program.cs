@@ -6,6 +6,7 @@ internal static class Program
     {
         new("MissionSync authored completion frontier", MissionFrontierTests.SelectionAsync),
         new("MissionSync survival objective frontiers", MissionFrontierTests.SurvivalAsync),
+        new("MissionSync proxied composite milestone frontiers", MissionFrontierTests.ProxyAsync),
         new("MissionSync generic retail graph coverage", MissionFrontierTests.RetailMissionGraphAsync),
         new("MissionSync canonical native configuration", MissionFrontierTests.BinaryAsync),
         new("MissionSync catalog loading barrier", PreparationTests.MissionCatalogBarrierAsync),

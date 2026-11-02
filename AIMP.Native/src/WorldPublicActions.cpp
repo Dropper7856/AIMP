@@ -2787,16 +2787,20 @@ void OutputCapture(void* self, void** instance, const std::uint32_t* input,
         missionOrigin == Origin::LocalRoot) && !replication_core::RemoteApplyActive();
     if (!mission_sync::ReplayActive() && (localMission || worldRemoteMission)) {
         void* missionExecution{}; void* missionCallback{};
-        std::uint32_t missionPort{}; bool payloadless{};
+        std::uint32_t missionPort{}; bool payloadless{}; bool payloadTolerant{};
         if (ReadPublicArguments(instance, input, callback, missionExecution, missionPort,
-                missionCallback, payloadless) && mission_sync::Candidate(missionExecution, missionPort)) {
+                missionCallback, payloadless) &&
+            mission_sync::Candidate(missionExecution, missionPort, payloadTolerant)) {
             // Previous builds captured a VariableBool output with native typed
             // data and replayed it with an EMPTY callback. Both peers returned
             // MISSION_SYNC_APPLIED, but no objective state was transferred.
             // A CATHODE data reference is not a portable bool/value. Do not
             // suppress the original fan-out or issue a false mission commit
             // unless the *observed* native output is actually data-free.
-            if (!payloadless || delay != 0.0 || tail != 0U) {
+            // Exception: a Composite/Proxy interface pin (e.g. a generator's
+            // `complete`) whose compiled targets are all control inputs. Its
+            // data reference is a pass-through no receiver reads.
+            if ((!payloadless && !payloadTolerant) || delay != 0.0 || tail != 0U) {
                 mission_sync::NoteUnsafeShape(!payloadless, delay != 0.0, tail != 0U);
             } else {
                 bool captured = false;
@@ -2805,7 +2809,7 @@ void OutputCapture(void* self, void** instance, const std::uint32_t* input,
                     if (OutputDefinition(missionExecution, selector, definition) && definition == self) {
                         if (worldRemoteMission) return; // Mission commit owns fan-out.
                         captured = mission_sync::Capture(missionExecution, missionPort, selector);
-                        if (captured) mission_sync::NoteCapturedShape(false, false, false);
+                        if (captured) mission_sync::NoteCapturedShape(!payloadless, false, false);
                         break;
                     }
                 }
@@ -4306,16 +4310,10 @@ bool MissionOutputReady() noexcept {
     return gOutputTrampoline.load(std::memory_order_acquire) != nullptr && gModule != 0U;
 }
 
-LocalCompositeInputInvokeStatus InvokeMissionOutputNoCapture(
-    const WorldEntityLease& lease, const std::uint32_t port, const std::uint8_t selector) noexcept {
-    auto* sharedRef = WorldPublicActionLeaseAccess::SharedRef(lease);
-    void* definition{};
-    if (!lease || sharedRef == nullptr || port == 0U ||
-        !OutputDefinition(lease.Get(), selector, definition))
-        return LocalCompositeInputInvokeStatus::InvalidBoundary;
-    const auto original = reinterpret_cast<PublicFn>(gOutputTrampoline.load(std::memory_order_acquire));
-    if (original == nullptr) return LocalCompositeInputInvokeStatus::RuntimeUnavailable;
-    void* callback{};
+namespace {
+// SEH boundary kept free of C++ unwinding (the callback lease lives in the caller).
+LocalCompositeInputInvokeStatus InvokeMissionOutputGuarded(PublicFn original, void* definition,
+    void* sharedRef, std::uint32_t port, void* callback) noexcept {
 #if defined(_MSC_VER) && defined(_M_IX86)
     __try {
 #endif
@@ -4325,6 +4323,29 @@ LocalCompositeInputInvokeStatus InvokeMissionOutputNoCapture(
 #if defined(_MSC_VER) && defined(_M_IX86)
     } __except (EXCEPTION_EXECUTE_HANDLER) { return LocalCompositeInputInvokeStatus::NativeFault; }
 #endif
+}
+}
+
+LocalCompositeInputInvokeStatus InvokeMissionOutputNoCapture(
+    const WorldEntityLease& lease, const std::uint32_t port, const std::uint8_t selector) noexcept {
+    auto* sharedRef = WorldPublicActionLeaseAccess::SharedRef(lease);
+    void* definition{};
+    if (!lease || sharedRef == nullptr || port == 0U ||
+        !OutputDefinition(lease.Get(), selector, definition))
+        return LocalCompositeInputInvokeStatus::InvalidBoundary;
+    const auto original = reinterpret_cast<PublicFn>(gOutputTrampoline.load(std::memory_order_acquire));
+    if (original == nullptr) return LocalCompositeInputInvokeStatus::RuntimeUnavailable;
+    // v355 replayed with a null callback. Retail receivers dereference the
+    // causal WorkItem (e.g. the activation handler FUN_00937670 -> 004DFE90
+    // reads *context+0x20) and both peers crashed on the generator objective.
+    // Root the fan-out in a real receiver-local callback on the frontier
+    // entity, exactly like ItemSync's placed-completion replay. Retail
+    // descendants retain their own references before the lease is released.
+    cathode_primitives::NativeCallbackLease context;
+    if (cathode_primitives::CreateNativeCallback(lease, 0x10000000U, {}, context) !=
+            cathode_primitives::ExecuteStatus::Queued || context.Get() == nullptr)
+        return LocalCompositeInputInvokeStatus::RuntimeUnavailable;
+    return InvokeMissionOutputGuarded(original, definition, sharedRef, port, context.Get());
 }
 
 LocalCompositeInputInvokeStatus InvokeLocalCompositeInputNoCapture(

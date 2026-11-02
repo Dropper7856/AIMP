@@ -108,12 +108,13 @@ internal sealed partial class MultiplayerSessionCoordinator
         // Bounded per-round evidence lets us correlate the compiler's admitted
         // static signals with the actual native output identities. The prior
         // diagnostics reported roots=5 but zero captured events on both PCs.
-        foreach (var root in roots.Take(16))
+        foreach (var root in roots.Take(32))
             _diagnostics.Log("MissionSync",
                 $"Frontier entity={root.Source.EntityId} output=0x{root.Signal:X8} " +
                 $"runtimeKey={root.Source.CathodeEntityA:X8}:{root.Source.CathodeEntityB:X8} " +
                 $"sourceComposite=0x{root.Source.SourceCompositeShortGuid:X8} " +
-                $"primitive={root.Source.PrimitiveName} domain={root.Source.Domain}.");
+                $"primitive={root.Source.PrimitiveName} kind={root.Source.Kind} domain={root.Source.Domain} " +
+                $"payloadTolerant={root.PayloadTolerant}.");
         if (enabled && roots.Count == 0)
             _diagnostics.Log("MissionSync", $"No safe {mode} objective frontier was proven by the " +
                 "manifest. Raw player interactions are NOT replayed as mission commits.");

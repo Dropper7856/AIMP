@@ -27,7 +27,9 @@ void ProbeScopedOutput(void* execution, std::uint32_t port, bool localRoot) noex
 // True only while a validated MissionSync commit runs native CATHODE fan-out.
 // WorldSync RemoteRoot must not suppress this authoritative mission replay.
 bool ReplayActive() noexcept;
-bool Candidate(void* execution, std::uint32_t port) noexcept;
+// payloadTolerant: the matched frontier is a Composite/Proxy interface pin whose
+// targets are control inputs only; its runtime data reference is not replayed.
+bool Candidate(void* execution, std::uint32_t port, bool& payloadTolerant) noexcept;
 bool Capture(void* execution, std::uint32_t port, std::uint8_t selector) noexcept;
 void Unsupported() noexcept;
 // Shape of a captured frontier call that the commit replay normalizes away:

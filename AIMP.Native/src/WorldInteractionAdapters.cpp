@@ -5772,6 +5772,27 @@ void ObserveTypedInteractionPairCandidate(
     }
 }
 
+// Player-input primitives are per-process HUD/pad state, independent of the
+// message id. The Survival generator's ButtonMashPrompt sends itself
+// 0x200021/0x20002D/0x200001 per mash cycle; replaying those made the Client's
+// own Player enter the Host's generator interaction (snap/teleport). Each peer
+// keeps its prompt local; MissionSync replicates the resulting milestone.
+[[nodiscard]] constexpr bool ReceiverLocalPlayerInputPrimitive(
+    const std::uint32_t primitiveType) noexcept {
+    switch (primitiveType) {
+    case 0x1728F297U: // ButtonMashPrompt
+    case 0x324DBAB5U: // MonitorPadInput
+    case 0x73E92EC1U: // MonitorActionMap
+    case 0x71E671A8U: // Interaction
+        return true;
+    default:
+        return false;
+    }
+}
+
+static_assert(ReceiverLocalPlayerInputPrimitive(0x1728F297U));
+static_assert(!ReceiverLocalPlayerInputPrimitive(0xB9B4A894U)); // ModelReference
+
 // Guard the generic CATHODE interaction-control wire contract in native
 // builds. Mission/environment messages remain eligible for WorldSync.
 static_assert(ReceiverLocalInteractionControlMessage(0x00000043U));
@@ -5916,7 +5937,11 @@ void __fastcall QueueTypedMessageDetour(
         ObserveTypedInteractionPairCandidate(
             *registry, *sourceId, *targetId, messageType, retailCallerRva);
 
-        if (ReceiverLocalInteractionControlMessage(messageType)) {
+        if (ReceiverLocalInteractionControlMessage(messageType) ||
+            ReceiverLocalPlayerInputPrimitive(
+                registry->FindWorldEntityPrimitiveType(*sourceId).value_or(0U)) ||
+            ReceiverLocalPlayerInputPrimitive(
+                registry->FindWorldEntityPrimitiveType(*targetId).value_or(0U))) {
             gWs3TypedReceiverLocalSuppressed.fetch_add(1U, std::memory_order_relaxed);
             gWs3TypedLastReceiverLocalSuppressedType.store(
                 messageType, std::memory_order_relaxed);

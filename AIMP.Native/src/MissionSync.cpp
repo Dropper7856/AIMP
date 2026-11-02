@@ -14,7 +14,10 @@
 
 namespace aimp::mission_sync {
 namespace {
-struct Frontier final { WorldEntityId entity{}; std::uint32_t port{}; };
+// flags bit0: compiler-proven interface pin with control-only targets, so a
+// runtime data reference attached to the emission is not mission data.
+constexpr std::uint32_t kFlagPayloadTolerant = 1U;
+struct Frontier final { WorldEntityId entity{}; std::uint32_t port{}; std::uint32_t flags{}; };
 std::mutex gMutex;
 std::unordered_map<std::uint64_t, std::vector<Frontier>> gFrontiers;
 std::deque<Signal> gObserved;
@@ -79,7 +82,7 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
     std::ifstream file(path, std::ios::binary);
     std::uint32_t magic{}, count{};
     WorldEntityId map{};
-    if (!Read(file, magic) || magic != 0x31534D41U || !Read(file, map.high) ||
+    if (!Read(file, magic) || magic != 0x32534D41U || !Read(file, map.high) ||
         !Read(file, map.low) || !Read(file, count) || count > 4096U) {
         error = "Invalid MissionSync frontier catalogue."; return false;
     }
@@ -93,6 +96,7 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
         CathodeRuntimeKey key{};
         if (!Read(file, entry.entity.high) || !Read(file, entry.entity.low) ||
             !Read(file, key.entityA) || !Read(file, key.entityB) || !Read(file, entry.port) ||
+            !Read(file, entry.flags) || (entry.flags & ~kFlagPayloadTolerant) != 0U ||
             !entry.entity.Valid() || key.entityA == 0U || entry.port == 0U) {
             error = "Truncated or invalid mission frontier."; return false;
         }
@@ -158,7 +162,8 @@ void ProbeScopedOutput(void* execution, std::uint32_t port, bool localRoot) noex
         else if (foreign) ++gScopedRemoteForeign;
     }
 }
-bool Candidate(void* execution, const std::uint32_t port) noexcept {
+bool Candidate(void* execution, const std::uint32_t port, bool& payloadTolerant) noexcept {
+    payloadTolerant = false;
     auto* registry = gRegistry.load(std::memory_order_acquire);
     if (registry == nullptr) return false;
     std::scoped_lock lock(gMutex);
@@ -177,6 +182,7 @@ bool Candidate(void* execution, const std::uint32_t port) noexcept {
         for (const auto& entry : found->second) {
             if (entry.port == port) {
                 ++gOutputMatched;
+                payloadTolerant = (entry.flags & kFlagPayloadTolerant) != 0U;
                 return true;
             }
         }

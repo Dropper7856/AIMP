@@ -155,11 +155,95 @@ internal static class MissionFrontierTests
         return Task.CompletedTask;
     }
 
+    // ChallengeMap16 shape: MISSION_ChallengeMap16 observes the generator through
+    // Proxy<Power_Generator_Control>.complete, which arms the next PlayerTriggerBox
+    // and sets the next SetSubObjective. Both the Proxy and the proxied instance
+    // are frontiers so either native emission identity is captured once.
+    internal static Task ProxyAsync()
+    {
+        WorldEntityId proxy = new(7, 1), objective = new(7, 2), box = new(7, 3),
+            generator = new(7, 4), delay = new(7, 5);
+        WorldEntityDescriptor At(WorldEntityId id, WorldEntityKind kind, WorldDomain domain,
+            uint composite, uint guid, uint path, string primitive) =>
+            new(id, domain, kind, WorldEntityFlags.RuntimeAddressable, composite, guid, path, 0,
+                guid, 300, 0, 0, primitive, "");
+        var complete = Port("complete");
+        var baseline = Manifest() with
+        {
+            Composites =
+            [
+                new WorldCompositeDescriptor(100, @"DLC\ChallengeMap16\MISSION_ChallengeMap16", WorldDomain.World, false, true),
+                new WorldCompositeDescriptor(101, @"AYZ\Levels\DLC_ChallengeMaps\ChallengMap_16_Tech_Section", WorldDomain.World, false, true)
+            ],
+            InstancePaths = [new WorldInstancePathDescriptor(7, [0x8823D1E4U, 0x100EFE12U], 0, 0)],
+            Entities =
+            [
+                At(proxy, WorldEntityKind.Proxy, WorldDomain.World, 100, 0xFF104B68U, 1, "Proxy_0x1A410713"),
+                At(objective, WorldEntityKind.Function, WorldDomain.UI, 100, 0xC91C5E00U, 1, "SetSubObjective"),
+                At(box, WorldEntityKind.Function, WorldDomain.World, 100, 0x985002F8U, 1, "PlayerTriggerBox"),
+                At(generator, WorldEntityKind.CompositeInstance, WorldDomain.World, 101, 0x338558FCU, 7,
+                    @"AYZ\_Props_\Interactive\Generic\Power_Generator_Control"),
+                At(delay, WorldEntityKind.Function, WorldDomain.World, 101, 0x40232208U, 7, "LogicDelay")
+            ],
+            References = [new WorldReferenceDescriptor(proxy, WorldReferenceKind.Proxy, 0x1A410713U,
+                [0xB5D0AE3EU, 0x8823D1E4U, 0x100EFE12U, 0x338558FCU, 0U])],
+            Connections =
+            [
+                new WorldConnectionDescriptor(proxy, complete, objective, Port("trigger"), false),
+                new WorldConnectionDescriptor(proxy, complete, box, Port("enable"), true),
+                new WorldConnectionDescriptor(generator, complete, delay, Port("trigger"), true)
+            ]
+        };
+        var roots = MissionSyncFrontierCompiler.Compile(baseline, survival: true);
+        AssertEx.Equal(2, roots.Count);
+        AssertEx.True(roots.All(value => value.Signal == complete && value.PayloadTolerant));
+        AssertEx.True(roots.Select(value => value.Source.EntityId).OrderBy(value => value.Low)
+            .SequenceEqual([proxy, generator]));
+        // Campaign contract is unchanged.
+        AssertEx.Equal(0, MissionSyncFrontierCompiler.Compile(baseline).Count);
+
+        // A proximity volume may be armed, never pulsed/replayed.
+        var pulsed = baseline with { Connections = baseline.Connections.Append(
+            new WorldConnectionDescriptor(proxy, complete, box, Port("trigger"), true)).ToArray() };
+        AssertEx.Equal(0, MissionSyncFrontierCompiler.Compile(pulsed, survival: true).Count);
+
+        // An unsafe fan-out on the proxied instance keeps only the Proxy frontier.
+        var unsafeTarget = baseline with { Connections = baseline.Connections.Append(
+            new WorldConnectionDescriptor(generator, complete, delay, Port("position"), true)).ToArray() };
+        var proxyOnly = MissionSyncFrontierCompiler.Compile(unsafeTarget, survival: true);
+        AssertEx.Equal(1, proxyOnly.Count);
+        AssertEx.Equal(proxy, proxyOnly[0].Source.EntityId);
+
+        // Ambiguous or unresolved proxy paths are never replay authority.
+        var unresolved = baseline with { References = [baseline.References[0] with
+            { TargetPathSteps = [0xB5D0AE3EU, 0x12345678U, 0U] }] };
+        AssertEx.Equal(1, MissionSyncFrontierCompiler.Compile(unresolved, survival: true).Count);
+
+        // A data-carrying Function source keeps the strict payloadless contract.
+        var function = baseline with { Entities = baseline.Entities.Select(value => value.EntityId == proxy
+            ? value with { Kind = WorldEntityKind.Function, PrimitiveName = "VariableBool" } : value).ToArray() };
+        var functionRoots = MissionSyncFrontierCompiler.Compile(function, survival: true);
+        AssertEx.Equal(1, functionRoots.Count);
+        AssertEx.True(!functionRoots[0].PayloadTolerant);
+        return Task.CompletedTask;
+    }
+
     // Opt-in validation with any extracted level's COMMANDS source. Synthetic
     // manifests test the generic boundary contract; retail coverage is checked
     // separately before claiming that a particular objective is replicable.
     internal static Task RetailMissionGraphAsync()
     {
+        var cached = Environment.GetEnvironmentVariable("AIMP_TEST_MISSION_MANIFEST");
+        if (!string.IsNullOrWhiteSpace(cached))
+        {
+            // An existing WorldManifestCache .aimpwm avoids recompiling COMMANDS.
+            var roots = MissionSyncFrontierCompiler.Compile(WorldManifestBinaryCodec.Read(cached), survival: true);
+            foreach (var root in roots)
+                Console.WriteLine($"  frontier {root.Source.EntityId} {root.Source.Kind} " +
+                    $"{root.Source.PrimitiveName} port=0x{root.Signal:X8} payloadTolerant={root.PayloadTolerant}");
+            AssertEx.True(roots.Count != 0, "The cached manifest has zero proven objective frontiers.");
+            return Task.CompletedTask;
+        }
         var level = Environment.GetEnvironmentVariable("AIMP_TEST_MISSION_LEVEL");
         if (string.IsNullOrWhiteSpace(level))
         {
@@ -185,11 +269,15 @@ internal static class MissionFrontierTests
         var manifest = Manifest();
         var roots = MissionSyncFrontierCompiler.Compile(manifest);
         var bytes = MissionSyncFrontierCompiler.Encode(manifest, roots);
-        AssertEx.Equal(52, bytes.Length);
-        AssertEx.Equal(0x31534D41U, BinaryPrimitives.ReadUInt32LittleEndian(bytes));
+        AssertEx.Equal(56, bytes.Length);
+        AssertEx.Equal(0x32534D41U, BinaryPrimitives.ReadUInt32LittleEndian(bytes));
         AssertEx.Equal(1U, BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(20)));
         AssertEx.Equal(Source.High, BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(24)));
         AssertEx.Equal(Port("key_accepted"), BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(48)));
+        AssertEx.Equal(0U, BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(52)));
+        var tolerant = MissionSyncFrontierCompiler.Encode(manifest, [roots[0] with { PayloadTolerant = true }]);
+        AssertEx.Equal(MissionSyncFrontierCompiler.FlagPayloadTolerant,
+            BinaryPrimitives.ReadUInt32LittleEndian(tolerant.AsSpan(52)));
         var reordered = manifest with { Connections = manifest.Connections.Reverse().ToArray(),
             Entities = manifest.Entities.Reverse().ToArray() };
         AssertEx.True(bytes.SequenceEqual(MissionSyncFrontierCompiler.Encode(reordered,
