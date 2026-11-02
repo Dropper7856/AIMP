@@ -48,24 +48,28 @@ internal sealed partial class MultiplayerSessionCoordinator
     private async Task ConfigureMissionSyncAsync(PreparedWorldManifest prepared, LobbyStartPayload start, int generation)
     {
         EnsureManifestLoadContext(start, generation);
-        bool campaign = LevelGameMode(start.Level) == "Campaign";
-        var (role, epoch) = MissionRole(campaign);
-        IReadOnlyList<MissionSyncFrontier> roots = campaign ? MissionSyncFrontierCompiler.Compile(prepared.Manifest) : [];
-        var catalog = campaign ? MissionSyncFrontierCompiler.Encode(prepared.Manifest, roots) : [];
-        var path = campaign ? Path.Combine(Path.GetTempPath(), $"aimp-mission-{Guid.NewGuid():N}.bin") : "";
+        var mode = LevelGameMode(start.Level);
+        var campaign = mode == "Campaign";
+        var survival = mode == "Survival";
+        var enabled = campaign || survival;
+        var (role, epoch) = MissionRole(enabled);
+        IReadOnlyList<MissionSyncFrontier> roots = enabled
+            ? MissionSyncFrontierCompiler.Compile(prepared.Manifest, survival) : [];
+        var catalog = enabled ? MissionSyncFrontierCompiler.Encode(prepared.Manifest, roots) : [];
+        var path = enabled ? Path.Combine(Path.GetTempPath(), $"aimp-mission-{Guid.NewGuid():N}.bin") : "";
         try
         {
-            if (campaign) await File.WriteAllBytesAsync(path, catalog, _lifetime.Token).ConfigureAwait(false);
+            if (enabled) await File.WriteAllBytesAsync(path, catalog, _lifetime.Token).ConfigureAwait(false);
             await SendMissionConfigurationAsync(start, generation, epoch, path, role).ConfigureAwait(false);
-            CompleteMissionConfiguration(epoch, campaign, catalog);
-            LogMissionConfiguration(role, generation, prepared, roots.Count, campaign);
+            CompleteMissionConfiguration(epoch, enabled, catalog);
+            LogMissionConfiguration(role, generation, prepared, roots.Count, enabled, mode);
         }
         finally { if (path.Length != 0) File.Delete(path); }
     }
 
-    private (string Role, long Epoch) MissionRole(bool campaign)
+    private (string Role, long Epoch) MissionRole(bool enabled)
     {
-        lock (_stateGate) return (campaign ? (_host is not null ? "host" : "client") : "off", _missionEpoch);
+        lock (_stateGate) return (enabled ? (_host is not null ? "host" : "client") : "off", _missionEpoch);
     }
 
     private async Task SendMissionConfigurationAsync(LobbyStartPayload start, int generation, long epoch,
@@ -86,22 +90,24 @@ internal sealed partial class MultiplayerSessionCoordinator
             throw new InvalidOperationException($"MissionSync configuration failed: {result.StatusCode} - {result.Message}");
     }
 
-    private void CompleteMissionConfiguration(long epoch, bool campaign, byte[] catalog)
+    private void CompleteMissionConfiguration(long epoch, bool enabled, byte[] catalog)
     {
         lock (_stateGate)
         {
             if (epoch != _missionEpoch) throw new OperationCanceledException("MissionSync generation changed.");
-            _missionCatalogSha256 = campaign ? Convert.ToHexString(SHA256.HashData(catalog)) : "";
-            _missionConfigured.TrySetResult(campaign);
+            _missionCatalogSha256 = enabled ? Convert.ToHexString(SHA256.HashData(catalog)) : "";
+            _missionConfigured.TrySetResult(enabled);
         }
     }
 
-    private void LogMissionConfiguration(string role, int generation, PreparedWorldManifest prepared, int roots, bool campaign)
+    private void LogMissionConfiguration(string role, int generation, PreparedWorldManifest prepared,
+        int roots, bool enabled, string mode)
     {
-        _diagnostics.Log("MissionSync", $"Configured role={role} nativeGeneration={generation} " +
+        _diagnostics.Log("MissionSync", $"Configured role={role} mode={mode} nativeGeneration={generation} " +
             $"map={prepared.Manifest.MapContentId} roots={roots} sha256={_missionCatalogSha256}.");
-        if (campaign && roots == 0)
-            _diagnostics.Log("MissionSync", "This map contains no supported mission completion frontier; mission progression coverage is unavailable.");
+        if (enabled && roots == 0)
+            _diagnostics.Log("MissionSync", $"No safe {mode} objective frontier was proven by the " +
+                "manifest. Raw player interactions are NOT replayed as mission commits.");
     }
 
     private void OnNativeMissionSignalProduced(object? sender, NativeMissionSignalPayload value)
@@ -109,7 +115,8 @@ internal sealed partial class MultiplayerSessionCoordinator
         lock (_stateGate)
         {
             if (_missionFaulted || _start is null || _missionNativeGeneration != value.LevelGeneration
-                || LevelGameMode(_start.Level) != "Campaign" || (_host is null && _client is null)) return;
+                || LevelGameMode(_start.Level) is not ("Campaign" or "Survival")
+                || (_host is null && _client is null)) return;
             var signal = new MissionSignalPayload(_start.SessionId, _host?.HostPeerId ?? _client!.PeerId,
                 _start.LevelGeneration, value.Sequence, value.EntityId, value.Signal, value.InterfaceSelector);
             if (!_missionReports.Writer.TryWrite((_missionEpoch, _host, _client, signal)))
