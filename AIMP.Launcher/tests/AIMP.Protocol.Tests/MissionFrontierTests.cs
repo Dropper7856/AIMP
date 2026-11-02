@@ -70,6 +70,43 @@ internal static class MissionFrontierTests
         AssertEx.Equal(0, MissionSyncFrontierCompiler.Compile(survival).Count);
         AssertEx.Equal(0, MissionSyncFrontierCompiler.Compile(story, survival: true).Count);
 
+        // A different Survival map and objective number must use exactly
+        // the same compiler path: no per-level ID, no fixed objective slots.
+        var differentLevel = survival with
+        {
+            Composites = [script with { Name = @"Mods\SurvivalScenario\MainMissionLogic" }],
+            Connections = [
+                new WorldConnectionDescriptor(Source, Port("obj17Completed"), Objective, Port("trigger"), false)
+            ]
+        };
+        var otherRoots = MissionSyncFrontierCompiler.Compile(differentLevel, survival: true);
+        AssertEx.Equal(1, otherRoots.Count);
+        AssertEx.Equal(Port("obj17Completed"), otherRoots[0].Signal);
+
+        // Arbitrary authored output vocabulary is supported if its complete
+        // fan-out includes a proven objective sink and no player-local input.
+        var semanticObjective = survival with
+        {
+            Composites = [script with { Name = @"Mods\SurvivalScenario\GenericLogic" }],
+            Entities = survival.Entities.Select(value => value.EntityId == Objective
+                ? value with { PrimitiveName = "ObjectiveState" } : value).ToArray(),
+            Connections = [
+                new WorldConnectionDescriptor(Source, Port("myCustomObjectiveEvent"), Objective, Port("trigger"), false)
+            ]
+        };
+        var semanticRoots = MissionSyncFrontierCompiler.Compile(semanticObjective, survival: true);
+        AssertEx.Equal(1, semanticRoots.Count);
+        AssertEx.Equal(Port("myCustomObjectiveEvent"), semanticRoots[0].Signal);
+        // An arbitrary output routed to a generic World entity has no proof
+        // of progression and is intentionally kept local.
+        var noObjective = semanticObjective with
+        {
+            Connections = [
+                new WorldConnectionDescriptor(Source, Port("myCustomObjectiveEvent"), Door, Port("trigger"), true)
+            ]
+        };
+        AssertEx.Equal(0, MissionSyncFrontierCompiler.Compile(noObjective, survival: true).Count);
+
         // Raw interaction "used" must never replay its sender Character.
         var interaction = survival with
         {
@@ -106,15 +143,15 @@ internal static class MissionFrontierTests
         return Task.CompletedTask;
     }
 
-    // Opt-in validation against the actual extracted DLC folder. Synthetic
-    // manifests validate the contract; this check proves the retail graph
-    // contains an admitted objective frontier before any local output is gated.
-    internal static Task ChallengeMap16GraphAsync()
+    // Opt-in validation with any extracted level's COMMANDS source. Synthetic
+    // manifests test the generic boundary contract; retail coverage is checked
+    // separately before claiming that a particular objective is replicable.
+    internal static Task RetailMissionGraphAsync()
     {
-        var level = Environment.GetEnvironmentVariable("AIMP_TEST_CHALLENGEMAP16");
+        var level = Environment.GetEnvironmentVariable("AIMP_TEST_MISSION_LEVEL");
         if (string.IsNullOrWhiteSpace(level))
         {
-            Console.WriteLine("SKIP MissionSync ChallengeMap16 graph: AIMP_TEST_CHALLENGEMAP16 is not set.");
+            Console.WriteLine("SKIP MissionSync retail graph: AIMP_TEST_MISSION_LEVEL is not set.");
             return Task.CompletedTask;
         }
         var temporary = Path.Combine(Path.GetTempPath(), $"aimp-mission-test-{Guid.NewGuid():N}.aimpwm");
@@ -123,9 +160,9 @@ internal static class MissionFrontierTests
             var manifest = new WorldManifestCompiler().Compile(level, outputPath: temporary, useCache: false).Manifest;
             var roots = MissionSyncFrontierCompiler.Compile(manifest, survival: true);
             AssertEx.True(roots.Count != 0,
-                "ChallengeMap16 has zero proven objective completion frontiers. " +
-                "Do not enable capture or claim that the generator is synchronized without inspecting COMMANDS.");
-            Console.WriteLine($"ChallengeMap16 MissionSync: {roots.Count} safe objective frontiers.");
+                "The selected level has zero proven objective frontiers. " +
+                "Do not claim objective coverage before inspecting its COMMANDS graph.");
+            Console.WriteLine($"Survival MissionSync: {roots.Count} graph-proven objective frontiers.");
         }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
         return Task.CompletedTask;
