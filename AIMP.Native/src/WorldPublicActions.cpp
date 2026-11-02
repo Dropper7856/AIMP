@@ -2762,6 +2762,7 @@ void OutputCapture(void* self, void** instance, const std::uint32_t* input,
     // replay the complete native fan-out under RemoteRoot, so WorldSync does
     // not also publish every consequence of the same mission decision.
     if (CurrentOrigin() == Origin::None && !replication_core::RemoteApplyActive()) {
+        mission_sync::ObserveOutputAttempt();
         void* missionExecution{}; void* missionCallback{};
         std::uint32_t missionPort{}; bool payloadless{};
         if (ReadPublicArguments(instance, input, callback, missionExecution, missionPort,
