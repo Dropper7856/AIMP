@@ -24,7 +24,7 @@ std::uint64_t gSequence{}, gCommitted{}, gCaptured{}, gApplied{}, gUnsupported{}
 std::uint64_t gWithPayload{}, gWithDelay{}, gWithTail{};
 // Engine-side observation coverage: distinguish authored-port mismatch from
 // runtime identity mismatch and a rejected local OutputDefinition selector.
-std::atomic<std::uint64_t> gRawOutputAttempts{};
+std::atomic<std::uint64_t> gRawOutputAttempts{}, gRawOutputLocalRoot{}, gRawOutputRemoteRoot{};
 std::uint64_t gOutputCandidates{}, gOutputIdentityResolved{}, gOutputIdentityRejected{},
     gOutputKnownSource{}, gOutputKnownPort{}, gOutputPortOnOtherSource{},
     gOutputMatched{};
@@ -101,6 +101,8 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
     gSequence = 0U; gCommitted = 0U;
     gCaptured = 0U; gApplied = 0U; gUnsupported = 0U; gFailures = 0U;
     gRawOutputAttempts.store(0U, std::memory_order_relaxed);
+    gRawOutputLocalRoot.store(0U, std::memory_order_relaxed);
+    gRawOutputRemoteRoot.store(0U, std::memory_order_relaxed);
     gOutputCandidates = gOutputIdentityResolved = gOutputIdentityRejected = 0U;
     gOutputKnownSource = gOutputKnownPort = gOutputPortOnOtherSource = gOutputMatched = 0U;
     gLastKnownSourcePort = gLastUnmatchedPort = 0U;
@@ -110,9 +112,11 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
     return true;
 }
 
-void ObserveOutputAttempt() noexcept {
-    if (gRegistry.load(std::memory_order_relaxed) != nullptr)
-        gRawOutputAttempts.fetch_add(1U, std::memory_order_relaxed);
+void ObserveOutputAttempt(bool localRoot, bool remoteRoot) noexcept {
+    if (gRegistry.load(std::memory_order_relaxed) == nullptr) return;
+    gRawOutputAttempts.fetch_add(1U, std::memory_order_relaxed);
+    if (localRoot) gRawOutputLocalRoot.fetch_add(1U, std::memory_order_relaxed);
+    if (remoteRoot) gRawOutputRemoteRoot.fetch_add(1U, std::memory_order_relaxed);
 }
 bool Candidate(void* execution, const std::uint32_t port) noexcept {
     auto* registry = gRegistry.load(std::memory_order_acquire);
@@ -227,6 +231,8 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"sources", Diagnostics::Unsigned(gFrontiers.size()), true},
          {"captured", Diagnostics::Unsigned(gCaptured), true},
          {"rawOutputHookCalls", Diagnostics::Unsigned(gRawOutputAttempts.load(std::memory_order_relaxed)), true},
+         {"rawOutputLocalRoot", Diagnostics::Unsigned(gRawOutputLocalRoot.load(std::memory_order_relaxed)), true},
+         {"rawOutputRemoteRoot", Diagnostics::Unsigned(gRawOutputRemoteRoot.load(std::memory_order_relaxed)), true},
          {"observedOutputs", Diagnostics::Unsigned(gOutputCandidates), true},
          {"outputRuntimeIdentities", Diagnostics::Unsigned(gOutputIdentityResolved), true},
          {"outputIdentityRejected", Diagnostics::Unsigned(gOutputIdentityRejected), true},
