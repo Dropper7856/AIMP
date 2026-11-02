@@ -5,6 +5,7 @@ internal static class Program
     private static readonly TestCase[] Tests =
     {
         new("MissionSync authored completion frontier", MissionFrontierTests.SelectionAsync),
+        new("MissionSync survival objective frontiers", MissionFrontierTests.SurvivalAsync),
         new("MissionSync canonical native configuration", MissionFrontierTests.BinaryAsync),
         new("MissionSync catalog loading barrier", PreparationTests.MissionCatalogBarrierAsync),
         new("MissionSync signal model", MissionSyncTests.ModelAsync),
