@@ -5746,6 +5746,15 @@ void ObserveTypedInteractionPairCandidate(
     case 0x00100003U:
     case 0x00100004U:
     case 0x00100049U:
+    // Paired local Character interaction handshake. The actual Survival
+    // generator trace (both directions of a World->World pair) emitted these
+    // as 0x43 / 0x44. They are not authored mission-completion decisions:
+    // replaying them asks the receiver's local Player to perform the sender's
+    // interaction, including snap-to-interaction/teleport behavior.
+    // Keep the CATHODE controls retail-local on each process. MissionSync
+    // owns the downstream authored progression decision.
+    case 0x00000043U:
+    case 0x00000044U:
     // ItemSync owns world pickups. The pickup manager's owner messages
     // (0x1E spawned, 0x1F collected) and the pickup use/range messages
     // (0x34 use, 0x36/0x37 in/out of range) describe one peer's local
