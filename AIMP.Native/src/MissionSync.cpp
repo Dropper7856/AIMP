@@ -4,6 +4,7 @@
 #include "aimp/WorldPublicActions.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <deque>
 #include <fstream>
@@ -30,6 +31,12 @@ std::uint64_t gOutputCandidates{}, gOutputIdentityResolved{}, gOutputIdentityRej
     gOutputMatched{};
 std::uint32_t gLastKnownSourcePort{}, gLastUnmatchedPort{};
 std::uint64_t gLastUnmatchedRuntimeKey{};
+struct ForeignPortEvidence final {
+    std::uint32_t port{};
+    std::uint64_t firstKey{}, lastKey{}, occurrences{}, observedKeys{};
+    WorldEntityId lastMapped{};
+};
+std::array<ForeignPortEvidence, 16U> gForeignPorts{};
 bool gEnabled{}, gFault{};
 
 template<typename T> bool Read(std::ifstream& stream, T& value) {
@@ -107,6 +114,7 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
     gOutputKnownSource = gOutputKnownPort = gOutputPortOnOtherSource = gOutputMatched = 0U;
     gLastKnownSourcePort = gLastUnmatchedPort = 0U;
     gLastUnmatchedRuntimeKey = 0U;
+    gForeignPorts = {};
     gFault = false; gEnabled = true;
     gRegistry.store(&registry, std::memory_order_release);
     return true;
@@ -148,12 +156,34 @@ bool Candidate(void* execution, const std::uint32_t port) noexcept {
             if (entry.port == port) { portInCatalog = true; break; }
         if (portInCatalog) break;
     }
-    if (portInCatalog) ++gOutputPortOnOtherSource;
-    else {
+    if (portInCatalog) {
+        ++gOutputPortOnOtherSource;
+        // Store bounded *observed* source identities for each compiled port.
+        // These are diagnostics only: matching a port alone is NOT sufficient
+        // proof to replay a CATHODE mission output on a different Character.
+        auto* sample = static_cast<ForeignPortEvidence*>(nullptr);
+        for (auto& slot : gForeignPorts) {
+            if (slot.port == port) { sample = &slot; break; }
+            if (slot.port == 0U && sample == nullptr) sample = &slot;
+        }
+        if (sample != nullptr) {
+            const auto observedKey = Key(key);
+            if (sample->port == 0U) {
+                sample->port = port;
+                sample->firstKey = observedKey;
+            }
+            ++sample->occurrences;
+            if (sample->lastKey != observedKey) {
+                ++sample->observedKeys;
+                sample->lastKey = observedKey;
+                sample->lastMapped = registry->FindWorldEntityId(key).value_or(WorldEntityId{});
+            }
+        }
+        ++gOutputKnownPort;
+    } else {
         gLastUnmatchedPort = port;
         gLastUnmatchedRuntimeKey = Key(key);
     }
-    ++gOutputKnownPort;
     return false;
 }
 bool Capture(void* execution, const std::uint32_t port, const std::uint8_t selector) noexcept {
@@ -249,5 +279,18 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"capturedWithTail", Diagnostics::Unsigned(gWithTail), true},
          {"failures", Diagnostics::Unsigned(gFailures), true},
          {"fault", gFault ? "true" : "false", true}});
+    for (const auto& sample : gForeignPorts) {
+        if (sample.port == 0U) continue;
+        diagnostics.Log("info", "native_missionsync_foreign_output",
+            "Observed an authored mission-output port on a different native source. "
+            "Port equality alone is never replay authority.",
+            {{"port", Diagnostics::Unsigned(sample.port), true},
+             {"firstRuntimeKey", Diagnostics::Unsigned(sample.firstKey), true},
+             {"lastRuntimeKey", Diagnostics::Unsigned(sample.lastKey), true},
+             {"lastMappedEntityHigh", Diagnostics::Unsigned(sample.lastMapped.high), true},
+             {"lastMappedEntityLow", Diagnostics::Unsigned(sample.lastMapped.low), true},
+             {"occurrences", Diagnostics::Unsigned(sample.occurrences), true},
+             {"runtimeKeyChanges", Diagnostics::Unsigned(sample.observedKeys), true}});
+    }
 }
 }
