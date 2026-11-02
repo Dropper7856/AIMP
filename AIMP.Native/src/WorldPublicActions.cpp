@@ -2766,6 +2766,14 @@ void OutputCapture(void* self, void** instance, const std::uint32_t* input,
     const auto missionOrigin = CurrentOrigin();
     mission_sync::ObserveOutputAttempt(
         missionOrigin == Origin::LocalRoot, missionOrigin == Origin::RemoteRoot);
+    if (missionOrigin == Origin::LocalRoot || missionOrigin == Origin::RemoteRoot) {
+        void* scopedExecution{}; void* scopedCallback{};
+        std::uint32_t scopedPort{}; bool scopedPayloadless{};
+        if (ReadPublicArguments(instance, input, callback, scopedExecution,
+                scopedPort, scopedCallback, scopedPayloadless))
+            mission_sync::ProbeScopedOutput(
+                scopedExecution, scopedPort, missionOrigin == Origin::LocalRoot);
+    }
     if (missionOrigin == Origin::None && !replication_core::RemoteApplyActive()) {
         void* missionExecution{}; void* missionCallback{};
         std::uint32_t missionPort{}; bool payloadless{};
