@@ -2782,8 +2782,7 @@ void OutputCapture(void* self, void** instance, const std::uint32_t* input,
     // re-emission so it cannot double-execute the mission before its commit.
     // MissionSync::Apply has its own explicit scope to exempt the authoritative
     // replay from this interception.
-    const bool worldRemoteMission = missionOrigin == Origin::RemoteRoot
-        && replication_core::RemoteApplyActive();
+    const bool worldRemoteMission = missionOrigin == Origin::RemoteRoot;
     const bool localMission = (missionOrigin == Origin::None ||
         missionOrigin == Origin::LocalRoot) && !replication_core::RemoteApplyActive();
     if (!mission_sync::ReplayActive() && (localMission || worldRemoteMission)) {
@@ -2791,21 +2790,28 @@ void OutputCapture(void* self, void** instance, const std::uint32_t* input,
         std::uint32_t missionPort{}; bool payloadless{};
         if (ReadPublicArguments(instance, input, callback, missionExecution, missionPort,
                 missionCallback, payloadless) && mission_sync::Candidate(missionExecution, missionPort)) {
-            // Only a compiler-certified, runtime-addressable, data-free
-            // mission frontier may cross this boundary. Never replay a raw
-            // Interaction/used/Character callback on a different player.
-            bool captured = false;
-            for (std::uint8_t selector = 1U; selector <= 2U; ++selector) {
-                void* definition{};
-                if (OutputDefinition(missionExecution, selector, definition) && definition == self) {
-                    if (worldRemoteMission) return; // Mission commit owns fan-out.
-                    captured = mission_sync::Capture(missionExecution, missionPort, selector);
-                    if (captured) mission_sync::NoteCapturedShape(!payloadless, delay != 0.0, tail != 0U);
-                    break;
+            // Previous builds captured a VariableBool output with native typed
+            // data and replayed it with an EMPTY callback. Both peers returned
+            // MISSION_SYNC_APPLIED, but no objective state was transferred.
+            // A CATHODE data reference is not a portable bool/value. Do not
+            // suppress the original fan-out or issue a false mission commit
+            // unless the *observed* native output is actually data-free.
+            if (!payloadless || delay != 0.0 || tail != 0U) {
+                mission_sync::NoteUnsafeShape(!payloadless, delay != 0.0, tail != 0U);
+            } else {
+                bool captured = false;
+                for (std::uint8_t selector = 1U; selector <= 2U; ++selector) {
+                    void* definition{};
+                    if (OutputDefinition(missionExecution, selector, definition) && definition == self) {
+                        if (worldRemoteMission) return; // Mission commit owns fan-out.
+                        captured = mission_sync::Capture(missionExecution, missionPort, selector);
+                        if (captured) mission_sync::NoteCapturedShape(false, false, false);
+                        break;
+                    }
                 }
+                if (captured) return;
+                mission_sync::Unsupported();
             }
-            if (captured) return;
-            mission_sync::Unsupported();
         }
     }
     if (!runtime_features::Enabled(runtime_features::Feature::WorldSyncHooks)) {
