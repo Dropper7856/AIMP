@@ -24,6 +24,9 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
 // from unmapped runtime keys or an authored signal that never fires.
 void ObserveOutputAttempt(bool localRoot, bool remoteRoot) noexcept;
 void ProbeScopedOutput(void* execution, std::uint32_t port, bool localRoot) noexcept;
+// True only while a validated MissionSync commit runs native CATHODE fan-out.
+// WorldSync RemoteRoot must not suppress this authoritative mission replay.
+bool ReplayActive() noexcept;
 bool Candidate(void* execution, std::uint32_t port) noexcept;
 bool Capture(void* execution, std::uint32_t port, std::uint8_t selector) noexcept;
 void Unsupported() noexcept;
