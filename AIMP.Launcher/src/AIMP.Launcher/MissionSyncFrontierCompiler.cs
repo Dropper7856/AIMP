@@ -12,25 +12,47 @@ internal static class MissionSyncFrontierCompiler
     {
         "used", "key_accepted", "completed", "finished", "animation_finished", "on_entered", "on_exited"
     }.Select(name => ShortGuidUtils.Generate(name).AsUInt32).ToHashSet();
-    // Challenge-map mission progress uses explicit authored completion outputs.
-    // These labels occur in CHALLENGEMAP16/COMMANDS.PAK, unlike the story-only
-    // SCRIPT_StoryMission namespace. Never capture a raw generator "used",
-    // "on_entered", animation-start or player Interaction event in Survival:
-    // its callback may carry a local Character and cause remote repositioning.
+    // Survival progression is compiled from the manifest's authored graph.
+    // These are reusable CATHODE signal *families*, not level names or a list
+    // of ChallengeMap objectives. Unknown output names can also qualify when
+    // their verified targets include a semantic objective/mission-complete sink.
     private static readonly HashSet<uint> SurvivalCompletionPorts = new[]
     {
-        "obj1Completed", "obj2Completed", "obj3Completed",
-        "level_complete", "MissionComplete", "LevelComplete"
+        "complete", "completed", "finished", "success",
+        "objectiveComplete", "objectiveCompleted", "objective_complete",
+        "missionComplete", "missionCompleted", "mission_complete",
+        "levelComplete", "levelCompleted", "level_complete"
+    }.Concat(Enumerable.Range(1, 64).SelectMany(index => new[]
+    {
+        $"obj{index}Completed", $"obj{index}Complete",
+        $"objective{index}Completed", $"objective{index}Complete",
+        $"objective_{index}_complete", $"objective_{index}_completed"
+    })).Select(name => ShortGuidUtils.Generate(name).AsUInt32).ToHashSet();
+
+    // These events can represent the interacting Character or an animation
+    // rather than a portable milestone. Never suppress/replay them in Survival.
+    private static readonly HashSet<uint> SurvivalLocalInteractionPorts = new[]
+    {
+        "used", "interact", "interaction", "on_entered", "on_exited",
+        "animation_finished", "pressed", "activated", "deactivated",
+        "entered", "exited", "start", "started"
     }.Select(name => ShortGuidUtils.Generate(name).AsUInt32).ToHashSet();
-    // Terminal objective/UI controls are scalar-free decisions. Ordinary
-    // interface inputs still require the existing replay-safe control contract.
+
+    // Only stateless control inputs are replayable without the sender-local
+    // callback/Character. Indexed objective inputs are a *generic* convention.
     private static readonly HashSet<uint> SurvivalControlInputs = new[]
     {
-        "Objective 1 Complete", "Objective 2 Complete", "Objective 3 Complete",
-        "obj1Completed", "obj2Completed", "obj3Completed",
-        "MissionComplete", "LevelComplete", "level_complete",
+        "complete", "completed", "finished", "success",
+        "objectiveComplete", "objectiveCompleted", "objective_complete",
+        "missionComplete", "missionCompleted", "mission_complete",
+        "levelComplete", "levelCompleted", "level_complete",
         "gotoEndScreen", "showSplash", "setObjIcons"
-    }.Select(name => ShortGuidUtils.Generate(name).AsUInt32).ToHashSet();
+    }.Concat(Enumerable.Range(1, 64).SelectMany(index => new[]
+    {
+        $"Objective {index} Complete", $"obj{index}Completed",
+        $"obj{index}Complete", $"objective{index}Completed",
+        $"objective{index}Complete"
+    })).Select(name => ShortGuidUtils.Generate(name).AsUInt32).ToHashSet();
 
     // Port names are authored control contracts, not the World-domain causal hint.
     // In particular objective triggers belong to UI and carry PotentialCausalEdge=false.
@@ -43,12 +65,14 @@ internal static class MissionSyncFrontierCompiler
         WorldManifest manifest, bool survival = false)
     {
         var entities = manifest.Entities.ToDictionary(value => value.EntityId);
+        var composites = manifest.Composites.ToDictionary(value => value.CompositeShortGuid);
         var sources = MissionSources(manifest, survival);
-        var completion = survival ? SurvivalCompletionPorts : CompletionPorts;
         var roots = manifest.Connections.GroupBy(edge => (edge.SourceEntity, edge.SourceParameter))
-            .Where(group => completion.Contains(group.Key.SourceParameter)
-                && sources.ContainsKey(group.Key.SourceEntity)
-                && group.All(edge => SafeTarget(edge, entities, survival)))
+            .Where(group => sources.TryGetValue(group.Key.SourceEntity, out var source)
+                && group.All(edge => SafeTarget(edge, entities, survival))
+                && (!survival
+                    ? CompletionPorts.Contains(group.Key.SourceParameter)
+                    : SurvivalBoundary(group.Key.SourceParameter, source, group, entities, composites)))
             .Select(group => new MissionSyncFrontier(sources[group.Key.SourceEntity], group.Key.SourceParameter))
             .OrderBy(value => value.Source.EntityId.High).ThenBy(value => value.Source.EntityId.Low)
             .ThenBy(value => value.Signal).ToArray();
@@ -56,6 +80,42 @@ internal static class MissionSyncFrontierCompiler
             throw new InvalidOperationException("MissionSync has too many authored mission frontiers.");
         return roots;
     }
+
+    private static bool SurvivalBoundary(
+        uint output, WorldEntityDescriptor source,
+        IGrouping<(WorldEntityId SourceEntity, uint SourceParameter), WorldConnectionDescriptor> edges,
+        IReadOnlyDictionary<WorldEntityId, WorldEntityDescriptor> entities,
+        IReadOnlyDictionary<uint, WorldCompositeDescriptor> composites)
+    {
+        if (SurvivalLocalInteractionPorts.Contains(output)) return false;
+
+        var sourceInMission = composites.TryGetValue(source.SourceCompositeShortGuid, out var composite)
+            && IsMissionGraph(composite.Name);
+        // Known completion outputs need to originate from an authored mission
+        // graph, never a generator, player interaction or arbitrary World script.
+        if (sourceInMission && SurvivalCompletionPorts.Contains(output)) return true;
+
+        // Custom/unnamed output conventions can be admitted when the actual
+        // fan-out proves a progression sink. This uses entity semantics, not
+        // a DLC path, map ID or hardcoded output name.
+        return edges.Any(edge => entities.TryGetValue(edge.TargetEntity, out var target)
+            && IsObjectiveSink(target));
+    }
+
+    private static bool IsObjectiveSink(WorldEntityDescriptor target)
+    {
+        if (target.Domain is not (WorldDomain.World or WorldDomain.UI)) return false;
+        // A mission's entire graph is not an objective sink. Require a
+        // specific target primitive/entity that describes the outcome.
+        return IsObjectiveName(target.PrimitiveName) || IsObjectiveName(target.EntityName);
+    }
+
+    private static bool IsObjectiveName(string? name) =>
+        !string.IsNullOrWhiteSpace(name) && (
+            name.Contains("Objective", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("MissionComplete", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("LevelComplete", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("MissionEnd", StringComparison.OrdinalIgnoreCase));
 
     private static bool SafeTarget(
         WorldConnectionDescriptor edge,
@@ -66,44 +126,45 @@ internal static class MissionSyncFrontierCompiler
             || target.Domain == WorldDomain.AIMP) return false;
         if (!ControlInputs.Contains(edge.TargetParameter)
             && !(survival && SurvivalControlInputs.Contains(edge.TargetParameter))) return false;
-        // A Survival commit must never drive a local Player, an AI actor, or an
-        // unknown CATHODE endpoint. Replaying any of those can trigger a
-        // player interaction/teleport instead of merely completing an objective.
-        return !survival || target.Domain is WorldDomain.World or WorldDomain.UI;
+        // Surviving mission fan-out must never replay the Character's local
+        // movement, a proximity trigger, an AI action or unknown data binding.
+        return !survival || target.Domain is WorldDomain.World or WorldDomain.UI
+            && target.PrimitiveName is not ("Interaction" or "PlayerTriggerBox" or "PlayerTriggerSphere");
     }
 
-    // Runtime-addressable story frontiers retain their existing contract.
-    // Survival must be compiled separately: the shipped DLC uses
-    // DLC\\ChallengeMap16\\MISSION_ChallengeMap16, not SCRIPT_StoryMission.
+    // Campaign keeps its existing SCRIPT_StoryMission frontier contract.
+    // Survival identifies the enclosing *mission semantics* across any DLC,
+    // custom challenge or future map. It also accepts any graph with a
+    // proved objective sink (see SurvivalBoundary), regardless of its name.
     private static Dictionary<WorldEntityId, WorldEntityDescriptor> MissionSources(
         WorldManifest manifest, bool survival)
     {
         var scripts = manifest.Composites.Where(value => !value.AimpNamespace
-            && (survival ? IsSurvivalMissionScript(value.Name)
-                : value.Name.Replace('/', '\\').StartsWith("SCRIPT_StoryMission\\",
-                    StringComparison.OrdinalIgnoreCase)))
+            && (!survival
+                ? value.Name.Replace('/', '\\').StartsWith("SCRIPT_StoryMission\\",
+                    StringComparison.OrdinalIgnoreCase)
+                : IsMissionGraph(value.Name)))
             .Select(value => value.CompositeShortGuid).ToHashSet();
         return manifest.Entities.Where(value => value.EntityId.IsValid
-            && value.Domain != WorldDomain.AIMP && scripts.Contains(value.SourceCompositeShortGuid)
+            && value.Domain != WorldDomain.AIMP
+            && (survival || scripts.Contains(value.SourceCompositeShortGuid))
             && (value.Flags & WorldEntityFlags.RuntimeAddressable) != 0
             && (survival
                 ? value.Domain == WorldDomain.World
                   && (value.Kind is WorldEntityKind.CompositeInstance or WorldEntityKind.Function)
-                  && (value.PrimitiveName is not "Interaction" and not "PlayerTriggerBox"
-                      and not "PlayerTriggerSphere")
+                  && value.PrimitiveName is not ("Interaction" or "PlayerTriggerBox" or "PlayerTriggerSphere")
                 : value.Kind == WorldEntityKind.CompositeInstance
                   || value.PrimitiveName is "PlayerTriggerBox" or "PlayerTriggerSphere" or "CAGEAnimation"))
             .ToDictionary(value => value.EntityId);
     }
 
-    private static bool IsSurvivalMissionScript(string name)
+    private static bool IsMissionGraph(string? name)
     {
-        var normalized = name.Replace('/', '\\').TrimStart('\\');
-        if (!normalized.StartsWith("DLC\\ChallengeMap", StringComparison.OrdinalIgnoreCase))
-            return false;
-        var separator = normalized.LastIndexOf('\\');
-        return separator >= 0 && normalized[(separator + 1)..].StartsWith(
-            "MISSION_", StringComparison.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(name)) return false;
+        // Semantic mission scripts: SCRIPT_StoryMission, MISSION_Foo,
+        // DLC/anything/Mission_Foo, etc. No level-specific identifier.
+        var normalized = name.Replace('/', '\\');
+        return normalized.Contains("Mission", StringComparison.OrdinalIgnoreCase);
     }
 
     internal static byte[] Encode(WorldManifest manifest, IReadOnlyList<MissionSyncFrontier> roots)
