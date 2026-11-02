@@ -62,7 +62,7 @@ internal sealed partial class MultiplayerSessionCoordinator
             if (enabled) await File.WriteAllBytesAsync(path, catalog, _lifetime.Token).ConfigureAwait(false);
             await SendMissionConfigurationAsync(start, generation, epoch, path, role).ConfigureAwait(false);
             CompleteMissionConfiguration(epoch, enabled, catalog);
-            LogMissionConfiguration(role, generation, prepared, roots.Count, enabled, mode);
+            LogMissionConfiguration(role, generation, prepared, roots, enabled, mode);
         }
         finally { if (path.Length != 0) File.Delete(path); }
     }
@@ -101,11 +101,19 @@ internal sealed partial class MultiplayerSessionCoordinator
     }
 
     private void LogMissionConfiguration(string role, int generation, PreparedWorldManifest prepared,
-        int roots, bool enabled, string mode)
+        IReadOnlyList<MissionSyncFrontier> roots, bool enabled, string mode)
     {
         _diagnostics.Log("MissionSync", $"Configured role={role} mode={mode} nativeGeneration={generation} " +
-            $"map={prepared.Manifest.MapContentId} roots={roots} sha256={_missionCatalogSha256}.");
-        if (enabled && roots == 0)
+            $"map={prepared.Manifest.MapContentId} roots={roots.Count} sha256={_missionCatalogSha256}.");
+        // Bounded per-round evidence lets us correlate the compiler's admitted
+        // static signals with the actual native output identities. The prior
+        // diagnostics reported roots=5 but zero captured events on both PCs.
+        foreach (var root in roots.Take(16))
+            _diagnostics.Log("MissionSync",
+                $"Frontier entity={root.Source.EntityId} output=0x{root.Signal:X8} " +
+                $"sourceComposite=0x{root.Source.SourceCompositeShortGuid:X8} " +
+                $"primitive={root.Source.PrimitiveName} domain={root.Source.Domain}.");
+        if (enabled && roots.Count == 0)
             _diagnostics.Log("MissionSync", $"No safe {mode} objective frontier was proven by the " +
                 "manifest. Raw player interactions are NOT replayed as mission commits.");
     }
