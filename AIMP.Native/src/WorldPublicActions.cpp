@@ -2774,20 +2774,31 @@ void OutputCapture(void* self, void** instance, const std::uint32_t* input,
             mission_sync::ProbeScopedOutput(
                 scopedExecution, scopedPort, missionOrigin == Origin::LocalRoot);
     }
-    if (missionOrigin == Origin::None && !replication_core::RemoteApplyActive()) {
+    // A mission completion often fires *inside* a WorldSync LocalRoot. The
+    // previous Origin::None-only gate missed those proven frontiers entirely.
+    // Capture a local mission decision once, then replay its full CATHODE
+    // fan-out from the Host-ordered mission commit. A WorldSync RemoteRoot can
+    // naturally reach the same frontier first; suppress only that exact
+    // re-emission so it cannot double-execute the mission before its commit.
+    // MissionSync::Apply has its own explicit scope to exempt the authoritative
+    // replay from this interception.
+    const bool worldRemoteMission = missionOrigin == Origin::RemoteRoot
+        && replication_core::RemoteApplyActive();
+    const bool localMission = (missionOrigin == Origin::None ||
+        missionOrigin == Origin::LocalRoot) && !replication_core::RemoteApplyActive();
+    if (!mission_sync::ReplayActive() && (localMission || worldRemoteMission)) {
         void* missionExecution{}; void* missionCallback{};
         std::uint32_t missionPort{}; bool payloadless{};
         if (ReadPublicArguments(instance, input, callback, missionExecution, missionPort,
                 missionCallback, payloadless) && mission_sync::Candidate(missionExecution, missionPort)) {
-            // The compiler admits a frontier only when every authored target is a
-            // control input, so the commit replays the decision without the
-            // sender-local data reference or delay (interaction outputs such as
-            // "used" carry the interacting Character). Only an output whose
-            // base interface cannot be named portably stays local.
+            // Only a compiler-certified, runtime-addressable, data-free
+            // mission frontier may cross this boundary. Never replay a raw
+            // Interaction/used/Character callback on a different player.
             bool captured = false;
             for (std::uint8_t selector = 1U; selector <= 2U; ++selector) {
                 void* definition{};
                 if (OutputDefinition(missionExecution, selector, definition) && definition == self) {
+                    if (worldRemoteMission) return; // Mission commit owns fan-out.
                     captured = mission_sync::Capture(missionExecution, missionPort, selector);
                     if (captured) mission_sync::NoteCapturedShape(!payloadless, delay != 0.0, tail != 0U);
                     break;
