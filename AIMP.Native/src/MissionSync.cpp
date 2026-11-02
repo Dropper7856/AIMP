@@ -22,6 +22,13 @@ WorldEntityId gMap{};
 std::uint32_t gGeneration{};
 std::uint64_t gSequence{}, gCommitted{}, gCaptured{}, gApplied{}, gUnsupported{}, gFailures{};
 std::uint64_t gWithPayload{}, gWithDelay{}, gWithTail{};
+// Engine-side observation coverage: distinguish authored-port mismatch from
+// runtime identity mismatch and a rejected local OutputDefinition selector.
+std::uint64_t gOutputCandidates{}, gOutputIdentityResolved{}, gOutputIdentityRejected{},
+    gOutputKnownSource{}, gOutputKnownPort{}, gOutputPortOnOtherSource{},
+    gOutputMatched{};
+std::uint32_t gLastKnownSourcePort{}, gLastUnmatchedPort{};
+std::uint64_t gLastUnmatchedRuntimeKey{};
 bool gEnabled{}, gFault{};
 
 template<typename T> bool Read(std::ifstream& stream, T& value) {
@@ -92,6 +99,10 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
     gMap = map; gGeneration = context.levelGeneration;
     gSequence = 0U; gCommitted = 0U;
     gCaptured = 0U; gApplied = 0U; gUnsupported = 0U; gFailures = 0U;
+    gOutputCandidates = gOutputIdentityResolved = gOutputIdentityRejected = 0U;
+    gOutputKnownSource = gOutputKnownPort = gOutputPortOnOtherSource = gOutputMatched = 0U;
+    gLastKnownSourcePort = gLastUnmatchedPort = 0U;
+    gLastUnmatchedRuntimeKey = 0U;
     gFault = false; gEnabled = true;
     gRegistry.store(&registry, std::memory_order_release);
     return true;
@@ -101,7 +112,39 @@ bool Candidate(void* execution, const std::uint32_t port) noexcept {
     auto* registry = gRegistry.load(std::memory_order_acquire);
     if (registry == nullptr) return false;
     std::scoped_lock lock(gMutex);
-    return gEnabled && Current(*registry) && Find(execution, port, *registry) != nullptr;
+    if (!gEnabled || !Current(*registry)) return false;
+    ++gOutputCandidates;
+    CathodeRuntimeKey key{};
+    if (!registry->TryExtractRuntimeKey(execution, key)) {
+        ++gOutputIdentityRejected;
+        return false;
+    }
+    ++gOutputIdentityResolved;
+    const auto found = gFrontiers.find(Key(key));
+    if (found != gFrontiers.end()) {
+        ++gOutputKnownSource;
+        gLastKnownSourcePort = port;
+        for (const auto& entry : found->second) {
+            if (entry.port == port) {
+                ++gOutputMatched;
+                return true;
+            }
+        }
+    }
+    bool portInCatalog = false;
+    for (const auto& [source, entries] : gFrontiers) {
+        static_cast<void>(source);
+        for (const auto& entry : entries)
+            if (entry.port == port) { portInCatalog = true; break; }
+        if (portInCatalog) break;
+    }
+    if (portInCatalog) ++gOutputPortOnOtherSource;
+    else {
+        gLastUnmatchedPort = port;
+        gLastUnmatchedRuntimeKey = Key(key);
+    }
+    ++gOutputKnownPort;
+    return false;
 }
 bool Capture(void* execution, const std::uint32_t port, const std::uint8_t selector) noexcept {
     auto* registry = gRegistry.load(std::memory_order_acquire);
@@ -177,6 +220,15 @@ void LogDiagnostics(Diagnostics& diagnostics) {
         {{"generation", Diagnostics::Unsigned(gGeneration), true},
          {"sources", Diagnostics::Unsigned(gFrontiers.size()), true},
          {"captured", Diagnostics::Unsigned(gCaptured), true},
+         {"observedOutputs", Diagnostics::Unsigned(gOutputCandidates), true},
+         {"outputRuntimeIdentities", Diagnostics::Unsigned(gOutputIdentityResolved), true},
+         {"outputIdentityRejected", Diagnostics::Unsigned(gOutputIdentityRejected), true},
+         {"outputOnCatalogSources", Diagnostics::Unsigned(gOutputKnownSource), true},
+         {"outputCatalogPortOnOtherSource", Diagnostics::Unsigned(gOutputPortOnOtherSource), true},
+         {"outputMatched", Diagnostics::Unsigned(gOutputMatched), true},
+         {"lastCatalogSourcePort", Diagnostics::Unsigned(gLastKnownSourcePort), true},
+         {"lastUnmatchedPort", Diagnostics::Unsigned(gLastUnmatchedPort), true},
+         {"lastUnmatchedRuntimeKey", Diagnostics::Unsigned(gLastUnmatchedRuntimeKey), true},
          {"applied", Diagnostics::Unsigned(gApplied), true},
          {"unsupportedContext", Diagnostics::Unsigned(gUnsupported), true},
          {"capturedWithPayload", Diagnostics::Unsigned(gWithPayload), true},
