@@ -22,7 +22,7 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
     const std::string& role, std::string& error);
 // Cheap raw output-hook counter to distinguish missing engine output observations
 // from unmapped runtime keys or an authored signal that never fires.
-void ObserveOutputAttempt() noexcept;
+void ObserveOutputAttempt(bool localRoot, bool remoteRoot) noexcept;
 bool Candidate(void* execution, std::uint32_t port) noexcept;
 bool Capture(void* execution, std::uint32_t port, std::uint8_t selector) noexcept;
 void Unsupported() noexcept;
