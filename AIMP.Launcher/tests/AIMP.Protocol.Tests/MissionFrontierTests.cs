@@ -43,6 +43,69 @@ internal static class MissionFrontierTests
         return Task.CompletedTask;
     }
 
+    internal static Task SurvivalAsync()
+    {
+        // ChallengeMap16 ships DLC\\ChallengeMap16\\MISSION_ChallengeMap16,
+        // not SCRIPT_StoryMission. Progression is an objective output, not a
+        // local generator "used" interaction or a player-trigger edge.
+        var story = Manifest();
+        var objective = Port("obj1Completed");
+        var script = story.Composites[0] with
+        {
+            Name = @"DLC\\ChallengeMap16\\MISSION_ChallengeMap16"
+        };
+        var survival = story with
+        {
+            Composites = [script],
+            Connections =
+            [
+                new WorldConnectionDescriptor(Source, objective, Objective, Port("trigger"), false),
+                new WorldConnectionDescriptor(Source, objective, Door, Port("force_open"), true)
+            ]
+        };
+        var roots = MissionSyncFrontierCompiler.Compile(survival, survival: true);
+        AssertEx.Equal(1, roots.Count);
+        AssertEx.Equal(Source, roots[0].Source.EntityId);
+        AssertEx.Equal(objective, roots[0].Signal);
+        AssertEx.Equal(0, MissionSyncFrontierCompiler.Compile(survival).Count);
+        AssertEx.Equal(0, MissionSyncFrontierCompiler.Compile(story, survival: true).Count);
+
+        // Raw interaction "used" must never replay its sender Character.
+        var interaction = survival with
+        {
+            Connections =
+            [
+                new WorldConnectionDescriptor(Source, Port("used"), Door, Port("trigger"), true)
+            ]
+        };
+        AssertEx.Equal(0, MissionSyncFrontierCompiler.Compile(interaction, survival: true).Count);
+
+        // Reject the ENTIRE output fan-out if any branch can affect a local
+        // player, an AI actor or an unproved/unknown semantic target.
+        foreach (var domain in new[] { WorldDomain.Player, WorldDomain.AI, WorldDomain.Unknown })
+        {
+            var unsafeManifest = survival with
+            {
+                Entities = survival.Entities.Select(value => value.EntityId == Door
+                    ? value with { Domain = domain } : value).ToArray()
+            };
+            AssertEx.Equal(0, MissionSyncFrontierCompiler.Compile(unsafeManifest, survival: true).Count);
+        }
+        var dataDependent = survival with
+        {
+            Connections = survival.Connections.Append(new WorldConnectionDescriptor(
+                Source, objective, Door, Port("position"), true)).ToArray()
+        };
+        AssertEx.Equal(0, MissionSyncFrontierCompiler.Compile(dataDependent, survival: true).Count);
+        var noRuntime = survival with
+        {
+            Entities = survival.Entities.Select(value => value.EntityId == Source
+                ? value with { Flags = WorldEntityFlags.None } : value).ToArray()
+        };
+        AssertEx.Equal(0, MissionSyncFrontierCompiler.Compile(noRuntime, survival: true).Count);
+        return Task.CompletedTask;
+    }
+
     internal static Task BinaryAsync()
     {
         var manifest = Manifest();
