@@ -29,6 +29,8 @@ std::atomic<std::uint64_t> gRawOutputAttempts{}, gRawOutputLocalRoot{}, gRawOutp
 std::uint64_t gOutputCandidates{}, gOutputIdentityResolved{}, gOutputIdentityRejected{},
     gOutputKnownSource{}, gOutputKnownPort{}, gOutputPortOnOtherSource{},
     gOutputMatched{};
+std::uint64_t gScopedLocalExact{}, gScopedRemoteExact{},
+    gScopedLocalForeign{}, gScopedRemoteForeign{};
 std::uint32_t gLastKnownSourcePort{}, gLastUnmatchedPort{};
 std::uint64_t gLastUnmatchedRuntimeKey{};
 struct ForeignPortEvidence final {
@@ -115,6 +117,7 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
     gLastKnownSourcePort = gLastUnmatchedPort = 0U;
     gLastUnmatchedRuntimeKey = 0U;
     gForeignPorts = {};
+    gScopedLocalExact = gScopedRemoteExact = gScopedLocalForeign = gScopedRemoteForeign = 0U;
     gFault = false; gEnabled = true;
     gRegistry.store(&registry, std::memory_order_release);
     return true;
@@ -125,6 +128,29 @@ void ObserveOutputAttempt(bool localRoot, bool remoteRoot) noexcept {
     gRawOutputAttempts.fetch_add(1U, std::memory_order_relaxed);
     if (localRoot) gRawOutputLocalRoot.fetch_add(1U, std::memory_order_relaxed);
     if (remoteRoot) gRawOutputRemoteRoot.fetch_add(1U, std::memory_order_relaxed);
+}
+void ProbeScopedOutput(void* execution, std::uint32_t port, bool localRoot) noexcept {
+    auto* registry = gRegistry.load(std::memory_order_acquire);
+    if (registry == nullptr) return;
+    std::scoped_lock lock(gMutex);
+    if (!gEnabled || !Current(*registry)) return;
+    CathodeRuntimeKey key{};
+    if (!registry->TryExtractRuntimeKey(execution, key)) return;
+    bool exact = false, foreign = false;
+    for (const auto& [source, entries] : gFrontiers) {
+        for (const auto& entry : entries) {
+            if (entry.port != port) continue;
+            if (source == Key(key)) exact = true;
+            else foreign = true;
+        }
+    }
+    if (localRoot) {
+        if (exact) ++gScopedLocalExact;
+        else if (foreign) ++gScopedLocalForeign;
+    } else {
+        if (exact) ++gScopedRemoteExact;
+        else if (foreign) ++gScopedRemoteForeign;
+    }
 }
 bool Candidate(void* execution, const std::uint32_t port) noexcept {
     auto* registry = gRegistry.load(std::memory_order_acquire);
@@ -269,6 +295,10 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"outputOnCatalogSources", Diagnostics::Unsigned(gOutputKnownSource), true},
          {"outputCatalogPortOnOtherSource", Diagnostics::Unsigned(gOutputPortOnOtherSource), true},
          {"outputMatched", Diagnostics::Unsigned(gOutputMatched), true},
+         {"scopedLocalExact", Diagnostics::Unsigned(gScopedLocalExact), true},
+         {"scopedRemoteExact", Diagnostics::Unsigned(gScopedRemoteExact), true},
+         {"scopedLocalForeign", Diagnostics::Unsigned(gScopedLocalForeign), true},
+         {"scopedRemoteForeign", Diagnostics::Unsigned(gScopedRemoteForeign), true},
          {"lastCatalogSourcePort", Diagnostics::Unsigned(gLastKnownSourcePort), true},
          {"lastUnmatchedPort", Diagnostics::Unsigned(gLastUnmatchedPort), true},
          {"lastUnmatchedRuntimeKey", Diagnostics::Unsigned(gLastUnmatchedRuntimeKey), true},
