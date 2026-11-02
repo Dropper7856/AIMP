@@ -52,7 +52,7 @@ internal static class MissionFrontierTests
         var objective = Port("obj1Completed");
         var script = story.Composites[0] with
         {
-            Name = @"DLC\\ChallengeMap16\\MISSION_ChallengeMap16"
+            Name = @"DLC\ChallengeMap16\MISSION_ChallengeMap16"
         };
         var survival = story with
         {
