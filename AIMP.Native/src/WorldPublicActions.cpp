@@ -135,7 +135,7 @@ struct Counters final {
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ActionClass::Count)> classified{};
     std::atomic<std::uint64_t> targetOwnerDistinct{}, externalRoots{}, delayedRoots{};
     std::atomic<std::uint64_t> seen{}, publicCandidates{}, rootsSent{}, compositeInputRootsSent{}, emittedOutputRootsSent{}, scheduledInputRootsSent{}, schedulerEdgeRootsSent{},
-        typedMessageRootsSent{}, typedMessageRootsApplied{},
+        typedMessageRootsSent{}, typedMessageRootsApplied{}, typedPlayerPayloadLocalOnly{},
         canonicalCompositeRootsSent{}, canonicalCompositeRootsApplied{},
         doorLockStateRootsSent{}, doorLockStateRootsApplied{},
         schedulerEdgeSidecarObserved{}, schedulerEdgeSidecarSubmitted{},
@@ -3824,6 +3824,21 @@ TypedMessageSubmission SubmitTypedMessageRoot(
     const auto observedSourceKind = causalStamp.Valid() ? causalStamp.source : CausalSource::World;
     const bool nonHostClient = !SessionAuthorityHost();
 
+    // A non-empty TypedMessage attributed by the causal tracker to the local
+    // Player may contain the sender's interaction/pose/Character context.
+    // The receiving single-player engine can reinterpret that context as an
+    // instruction to perform the same interaction, including repositioning
+    // the observer's Player. Such messages are personal controls, not proven
+    // shared-world state transitions. Keep retail on the originator only.
+    // Do not guess that all Client World messages are player-owned: require a
+    // positive Player causal stamp, so autonomous World->World messages retain
+    // the existing replication contract.
+    if (observedSourceKind == CausalSource::Player && !payload.empty()) {
+        gStats.typedPlayerPayloadLocalOnly.fetch_add(1U, std::memory_order_relaxed);
+        gStats.authorityRetailPreserved.fetch_add(1U, std::memory_order_relaxed);
+        return TypedMessageSubmission::RetailOnly;
+    }
+
     // Patch 5.10 restores the proven WS2 TypedMessage ordering under WS3
     // authority. A compatible Client is allowed to originate the same bounded
     // World->World TypedMessage class that WS2 published after retail local
@@ -4506,7 +4521,7 @@ Diagnostics Snapshot() noexcept {
     WS3_READ(contextChainDepthPeak); WS3_READ(contextChainOverflow);
     WS3_READ(contextFramesReconstructed);
     WS3_READ(actorUnresolved); WS3_READ(causeTableOverflow);
-    WS3_READ(seen); WS3_READ(publicCandidates); WS3_READ(rootsSent); WS3_READ(compositeInputRootsSent); WS3_READ(emittedOutputRootsSent); WS3_READ(scheduledInputRootsSent); WS3_READ(schedulerEdgeRootsSent); WS3_READ(typedMessageRootsSent); WS3_READ(typedMessageRootsApplied); WS3_READ(canonicalCompositeRootsSent); WS3_READ(canonicalCompositeRootsApplied); WS3_READ(doorLockStateRootsSent); WS3_READ(doorLockStateRootsApplied);
+    WS3_READ(seen); WS3_READ(publicCandidates); WS3_READ(rootsSent); WS3_READ(compositeInputRootsSent); WS3_READ(emittedOutputRootsSent); WS3_READ(scheduledInputRootsSent); WS3_READ(schedulerEdgeRootsSent); WS3_READ(typedMessageRootsSent); WS3_READ(typedMessageRootsApplied); WS3_READ(typedPlayerPayloadLocalOnly); WS3_READ(canonicalCompositeRootsSent); WS3_READ(canonicalCompositeRootsApplied); WS3_READ(doorLockStateRootsSent); WS3_READ(doorLockStateRootsApplied);
     WS3_READ(schedulerEdgeSidecarObserved); WS3_READ(schedulerEdgeSidecarSubmitted);
     WS3_READ(schedulerEdgeRemoteNaturalRemembered); WS3_READ(schedulerEdgeRemoteDedupConsumed);
     WS3_READ(scheduledEventRootsSuppressed);
