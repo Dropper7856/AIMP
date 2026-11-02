@@ -14,7 +14,7 @@ internal static class MissionSyncFrontierCompiler
     }.Select(name => ShortGuidUtils.Generate(name).AsUInt32).ToHashSet();
     // Survival progression is compiled from the manifest's authored graph.
     // These are reusable CATHODE signal *families*, not level names or a list
-    // of ChallengeMap objectives. Unknown output names can also qualify when
+    // of hardcoded map objectives. Unknown output names can also qualify when
     // their verified targets include a semantic objective/mission-complete sink.
     private static readonly HashSet<uint> SurvivalCompletionPorts = new[]
     {
