@@ -39,6 +39,9 @@ struct ForeignPortEvidence final {
     WorldEntityId lastMapped{};
 };
 std::array<ForeignPortEvidence, 16U> gForeignPorts{};
+// Engine-thread-only scope: distinguishes an authoritative MissionSync APPLY
+// from a WorldSync RemoteRoot replay of a potentially overlapping frontier.
+thread_local bool gMissionReplayActive{};
 bool gEnabled{}, gFault{};
 
 template<typename T> bool Read(std::ifstream& stream, T& value) {
@@ -123,6 +126,7 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
     return true;
 }
 
+bool ReplayActive() noexcept { return gMissionReplayActive; }
 void ObserveOutputAttempt(bool localRoot, bool remoteRoot) noexcept {
     if (gRegistry.load(std::memory_order_relaxed) == nullptr) return;
     gRawOutputAttempts.fetch_add(1U, std::memory_order_relaxed);
@@ -256,8 +260,15 @@ bool Apply(const Signal& signal, std::string& status, std::string& error) noexce
     if (!resolved.lease) { status = "MISSION_SYNC_NOT_READY"; return false; }
     const auto live = registry->IdentifyRuntimeEntity(resolved.lease.Get());
     if (!live || !(*live == signal.entity)) { status = "MISSION_SYNC_REJECTED"; return false; }
-    // The registry's lease pins the original native entity through all fan-out.
-    const auto result = world_actions::InvokeMissionOutputNoCapture(resolved.lease, signal.port, signal.selector);
+    // WorldSync also uses Origin::RemoteRoot. Give MissionSync its own
+    // engine-thread scope so that the OutputCapture hook cannot mistake this
+    // authoritative commit for another WorldSync-replayed interaction.
+    // The native invocation returns with its own fault boundary (no throw).
+    const auto previousReplay = gMissionReplayActive;
+    gMissionReplayActive = true;
+    const auto result = world_actions::InvokeMissionOutputNoCapture(
+        resolved.lease, signal.port, signal.selector);
+    gMissionReplayActive = previousReplay;
     std::scoped_lock lock(gMutex);
     if (result != world_actions::LocalCompositeInputInvokeStatus::Invoked) {
         ++gFailures;
