@@ -111,6 +111,7 @@ internal sealed partial class MultiplayerSessionCoordinator
         foreach (var root in roots.Take(16))
             _diagnostics.Log("MissionSync",
                 $"Frontier entity={root.Source.EntityId} output=0x{root.Signal:X8} " +
+                $"runtimeKey={root.Source.CathodeEntityA:X8}:{root.Source.CathodeEntityB:X8} " +
                 $"sourceComposite=0x{root.Source.SourceCompositeShortGuid:X8} " +
                 $"primitive={root.Source.PrimitiveName} domain={root.Source.Domain}.");
         if (enabled && roots.Count == 0)
