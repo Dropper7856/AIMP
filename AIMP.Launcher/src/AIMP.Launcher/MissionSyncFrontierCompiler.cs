@@ -20,8 +20,7 @@ internal static class MissionSyncFrontierCompiler
     private static readonly HashSet<uint> SurvivalCompletionPorts = new[]
     {
         "obj1Completed", "obj2Completed", "obj3Completed",
-        "completed", "finished", "complete", "level_complete",
-        "MissionComplete", "LevelComplete"
+        "level_complete", "MissionComplete", "LevelComplete"
     }.Select(name => ShortGuidUtils.Generate(name).AsUInt32).ToHashSet();
     // Terminal objective/UI controls are scalar-free decisions. Ordinary
     // interface inputs still require the existing replay-safe control contract.
@@ -89,9 +88,9 @@ internal static class MissionSyncFrontierCompiler
             && (value.Flags & WorldEntityFlags.RuntimeAddressable) != 0
             && (survival
                 ? value.Domain == WorldDomain.World
-                  && value.Kind is WorldEntityKind.CompositeInstance or WorldEntityKind.Function
-                  && value.PrimitiveName is not "Interaction" and not "PlayerTriggerBox"
-                      and not "PlayerTriggerSphere"
+                  && (value.Kind is WorldEntityKind.CompositeInstance or WorldEntityKind.Function)
+                  && (value.PrimitiveName is not "Interaction" and not "PlayerTriggerBox"
+                      and not "PlayerTriggerSphere")
                 : value.Kind == WorldEntityKind.CompositeInstance
                   || value.PrimitiveName is "PlayerTriggerBox" or "PlayerTriggerSphere" or "CAGEAnimation"))
             .ToDictionary(value => value.EntityId);
