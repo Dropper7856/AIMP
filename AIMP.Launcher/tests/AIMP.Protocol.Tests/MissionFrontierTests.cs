@@ -106,6 +106,31 @@ internal static class MissionFrontierTests
         return Task.CompletedTask;
     }
 
+    // Opt-in validation against the actual extracted DLC folder. Synthetic
+    // manifests validate the contract; this check proves the retail graph
+    // contains an admitted objective frontier before any local output is gated.
+    internal static Task ChallengeMap16GraphAsync()
+    {
+        var level = Environment.GetEnvironmentVariable("AIMP_TEST_CHALLENGEMAP16");
+        if (string.IsNullOrWhiteSpace(level))
+        {
+            Console.WriteLine("SKIP MissionSync ChallengeMap16 graph: AIMP_TEST_CHALLENGEMAP16 is not set.");
+            return Task.CompletedTask;
+        }
+        var temporary = Path.Combine(Path.GetTempPath(), $"aimp-mission-test-{Guid.NewGuid():N}.aimpwm");
+        try
+        {
+            var manifest = new WorldManifestCompiler().Compile(level, outputPath: temporary, useCache: false).Manifest;
+            var roots = MissionSyncFrontierCompiler.Compile(manifest, survival: true);
+            AssertEx.True(roots.Count != 0,
+                "ChallengeMap16 has zero proven objective completion frontiers. " +
+                "Do not enable capture or claim that the generator is synchronized without inspecting COMMANDS.");
+            Console.WriteLine($"ChallengeMap16 MissionSync: {roots.Count} safe objective frontiers.");
+        }
+        finally { if (File.Exists(temporary)) File.Delete(temporary); }
+        return Task.CompletedTask;
+    }
+
     internal static Task BinaryAsync()
     {
         var manifest = Manifest();
