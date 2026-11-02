@@ -115,6 +115,7 @@ struct Diagnostics final {
     std::uint64_t schedulerEdgeRootsSent{};
     std::uint64_t typedMessageRootsSent{};
     std::uint64_t typedMessageRootsApplied{};
+    std::uint64_t typedPlayerPayloadLocalOnly{};
     std::uint64_t canonicalCompositeRootsSent{};
     std::uint64_t canonicalCompositeRootsApplied{};
     std::uint64_t doorLockStateRootsSent{};
