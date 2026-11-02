@@ -5732,7 +5732,7 @@ void ObserveTypedInteractionPairCandidate(
         std::memory_order_relaxed);
 }
 
-[[nodiscard]] bool ReceiverLocalInteractionControlMessage(
+[[nodiscard]] constexpr bool ReceiverLocalInteractionControlMessage(
     const std::uint32_t messageType) noexcept {
     // Patch 5.5 / SALVAGEMODE1. These retail message ids belong to the
     // task/script interaction-control family. Replaying them on another peer
@@ -5771,6 +5771,14 @@ void ObserveTypedInteractionPairCandidate(
         return false;
     }
 }
+
+// Guard the generic CATHODE interaction-control wire contract in native
+// builds. Mission/environment messages remain eligible for WorldSync.
+static_assert(ReceiverLocalInteractionControlMessage(0x00000043U));
+static_assert(ReceiverLocalInteractionControlMessage(0x00000044U));
+static_assert(ReceiverLocalInteractionControlMessage(0x00100001U));
+static_assert(!ReceiverLocalInteractionControlMessage(0x00000041U));
+static_assert(!ReceiverLocalInteractionControlMessage(0x00000053U));
 
 void __fastcall QueueTypedMessageDetour(
     void* manager,
