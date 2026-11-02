@@ -128,7 +128,8 @@ internal static class MissionSyncFrontierCompiler
             && !(survival && SurvivalControlInputs.Contains(edge.TargetParameter))) return false;
         // Surviving mission fan-out must never replay the Character's local
         // movement, a proximity trigger, an AI action or unknown data binding.
-        return !survival || target.Domain is WorldDomain.World or WorldDomain.UI
+        return !survival ||
+            (target.Domain is WorldDomain.World or WorldDomain.UI)
             && target.PrimitiveName is not ("Interaction" or "PlayerTriggerBox" or "PlayerTriggerSphere");
     }
 
