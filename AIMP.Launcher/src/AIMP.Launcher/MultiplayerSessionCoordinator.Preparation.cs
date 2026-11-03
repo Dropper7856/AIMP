@@ -146,6 +146,37 @@ internal sealed partial class MultiplayerSessionCoordinator
         }
     }
 
+    // Retail may load the next level while every engine root keeps its
+    // address, so the native generation would never advance on its own and
+    // per-level state (WS3 ordering, AISync world, captures) would leak into
+    // this round. Open the round explicitly before anything binds to it.
+    private async Task BeginNativeRoundAsync(LobbyStartPayload start)
+    {
+        var before = _controller.Snapshot.LevelGeneration;
+        try
+        {
+            var result = await _controller.ExecuteCommandAsync("SESSION_ROUND_BOUNDARY",
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["sessionId"] = start.SessionId.ToString("D")
+                }, _lifetime.Token).ConfigureAwait(false);
+            if (!result.Executed || result.StatusCode != "SESSION_ROUND_BOUNDARY_APPLIED")
+            {
+                _diagnostics.Log("Multiplayer", $"Round boundary was not applied: {result.StatusCode} - {result.Message}");
+                return;
+            }
+            var deadline = Environment.TickCount64 + 3_000;
+            while (_controller.Snapshot.LevelGeneration == before && Environment.TickCount64 < deadline)
+                await Task.Delay(50, _lifetime.Token).ConfigureAwait(false);
+            _diagnostics.Log("Multiplayer",
+                $"Round boundary opened native generation {_controller.Snapshot.LevelGeneration} (was {before}).");
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            _diagnostics.Log("Multiplayer", $"Round boundary failed: {exception.Message}");
+        }
+    }
+
     private async Task SetSessionLoadingHoldAsync(LobbyStartPayload start, bool active, CancellationToken token)
     {
         if (active)

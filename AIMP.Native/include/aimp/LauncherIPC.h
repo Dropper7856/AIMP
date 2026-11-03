@@ -186,6 +186,8 @@ private:
     std::string nonce_;
     std::uint64_t localPeerId_{};
     std::string worldSyncAuthoritySessionId_;
+    std::string worldSyncLastBoundSessionId_;
+    std::string lastRoundBoundarySessionId_;
     std::uint64_t worldSyncAuthorityGeneration_{};
     bool worldSyncAuthorityBound_{};
     bool worldSyncAuthorityHost_{};

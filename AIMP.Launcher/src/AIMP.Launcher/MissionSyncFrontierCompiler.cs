@@ -7,8 +7,10 @@ namespace AIMP.Launcher;
 // PayloadTolerant: the source is a Composite/Proxy interface pin and every
 // target is a compiler-proven control input. The native runtime may attach the
 // pin's data reference to that emission, but no receiver consumes it.
+// Repeatable: a player-chosen nested mission start (a hub terminal) can be
+// committed again later in the same round; other frontiers commit once.
 internal readonly record struct MissionSyncFrontier(
-    WorldEntityDescriptor Source, uint Signal, bool PayloadTolerant = false);
+    WorldEntityDescriptor Source, uint Signal, bool PayloadTolerant = false, bool Repeatable = false);
 
 internal static class MissionSyncFrontierCompiler
 {
@@ -62,6 +64,15 @@ internal static class MissionSyncFrontierCompiler
         $"objective{index}Complete"
     })).Select(name => ShortGuidUtils.Generate(name).AsUInt32).ToHashSet();
 
+    // A mission graph that starts a nested mission composite (e.g. a Salvage
+    // hub terminal choosing which challenge to run) commits a shared
+    // milestone: every participant must run the same mission. Only the start
+    // input family of a mission-graph CompositeInstance qualifies.
+    private static readonly HashSet<uint> MissionStartInputs = new[]
+    {
+        "MissionStart", "missionStart", "mission_start", "StartMission", "start_mission"
+    }.Select(name => ShortGuidUtils.Generate(name).AsUInt32).ToHashSet();
+
     // Port names are authored control contracts, not the World-domain causal hint.
     // In particular objective triggers belong to UI and carry PotentialCausalEdge=false.
     private static readonly HashSet<uint> ControlInputs = new[]
@@ -105,7 +116,9 @@ internal static class MissionSyncFrontierCompiler
                     : SurvivalBoundary(group.Key.SourceParameter, source, group, entities, composites)))
             .Select(group => new MissionSyncFrontier(sources[group.Key.SourceEntity], group.Key.SourceParameter,
                 survival && sources[group.Key.SourceEntity].Kind is WorldEntityKind.Proxy
-                    or WorldEntityKind.CompositeInstance))
+                    or WorldEntityKind.CompositeInstance,
+                survival && group.All(edge => entities.TryGetValue(edge.TargetEntity, out var target)
+                    && IsMissionStartSink(target, edge.TargetParameter))))
             .ToList();
     }
 
@@ -169,12 +182,21 @@ internal static class MissionSyncFrontierCompiler
         // graph, never a generator, player interaction or arbitrary World script.
         if (sourceInMission && SurvivalCompletionPorts.Contains(output)) return true;
 
+        // An authored mission graph starting a nested mission is a shared
+        // milestone even though its trigger is a generic output name.
+        if (sourceInMission && edges.All(edge => entities.TryGetValue(edge.TargetEntity, out var target)
+                && IsMissionStartSink(target, edge.TargetParameter))) return true;
+
         // Custom/unnamed output conventions can be admitted when the actual
         // fan-out proves a progression sink. This uses entity semantics, not
         // a DLC path, map ID or hardcoded output name.
         return edges.Any(edge => entities.TryGetValue(edge.TargetEntity, out var target)
             && IsObjectiveSink(target));
     }
+
+    private static bool IsMissionStartSink(WorldEntityDescriptor target, uint input) =>
+        MissionStartInputs.Contains(input) && target.Domain == WorldDomain.World
+        && target.Kind == WorldEntityKind.CompositeInstance && IsMissionGraph(target.PrimitiveName);
 
     private static bool IsObjectiveSink(WorldEntityDescriptor target)
     {
@@ -199,7 +221,8 @@ internal static class MissionSyncFrontierCompiler
         if (!edge.TargetEntity.IsValid || !entities.TryGetValue(edge.TargetEntity, out var target)
             || target.Domain == WorldDomain.AIMP) return false;
         if (!ControlInputs.Contains(edge.TargetParameter)
-            && !(survival && SurvivalControlInputs.Contains(edge.TargetParameter))) return false;
+            && !(survival && SurvivalControlInputs.Contains(edge.TargetParameter))
+            && !(survival && IsMissionStartSink(target, edge.TargetParameter))) return false;
         // Surviving mission fan-out must never replay the Character's local
         // movement, a proximity trigger, an AI action or unknown data binding.
         if (!survival) return true;

@@ -15,4 +15,7 @@ public sealed class PreparationController : ControllerBase
 
     [HttpPost]
     public ActionResult<GamePreparationDto> Start() => Ok(_preparation.Start(revalidate: true));
+
+    [HttpPost("skip")]
+    public ActionResult<GamePreparationDto> Skip() => Ok(_preparation.Skip());
 }

@@ -2370,6 +2370,31 @@ void ResetForGeneration(const std::uint64_t generation) noexcept {
     TouchVersion();
 }
 
+void ResetAuthorityOrdering() noexcept {
+    gOutboundIntents.Clear();
+    gResults.Clear();
+    {
+        std::lock_guard lock(gOutboundSubmitMutex);
+        gStagedRoots.clear();
+    }
+    {
+        std::lock_guard lock(gDeferredRemoteApplyMutex);
+        gDeferredRemoteApplies.clear();
+        gReservedRemoteRoots = 0U; gIngressRoot = {}; gIngressPeer = 0U; gIngressNextOrdinal = 0U;
+    }
+    {
+        std::lock_guard lock(gOrderingMutex);
+        gLastCommittedSequence = 0U;
+        gCausalRecoveryRequired = false;
+        gDivergedAuthorityTransaction = 0U;
+        gStateRevisions.clear();
+        gPublicCauses.clear();
+        gPublicCauseOrder.clear();
+    }
+    world_interactions::ResetSessionObservations();
+    TouchVersion();
+}
+
 void BeginLogicalShutdown() noexcept {
     if (!gInitialized.exchange(false, std::memory_order_acq_rel)) return;
     gOutboundIntents.Clear();

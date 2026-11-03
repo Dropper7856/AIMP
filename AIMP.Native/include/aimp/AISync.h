@@ -286,6 +286,9 @@ void BeginLogicalShutdown() noexcept;
 // True while AISync, rather than retail AI, owns the NPC authority boundary.
 bool OwnsAI() noexcept;
 bool Installed() noexcept;
+// True while an AI actor pairs with this participant Character (kill/grab),
+// and briefly after. Any thread; network adapters must not move or re-equip it.
+bool PairedParticipantVictim(std::uintptr_t character) noexcept;
 struct Counters final {
     std::uint64_t observed{}, applied{}, dropped{}, refused{}, suspended{}, faults{};
     std::uint64_t missingIdentity{};

@@ -1954,6 +1954,15 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
             return true;
         }
 
+        // Authority transactions restart at 1 for every lobby session. A
+        // committed checkpoint from an earlier session would otherwise make
+        // every lower sequence look already applied and be acknowledged
+        // without execution. Rebinding the same session (recovery/reconnect)
+        // keeps its checkpoint so retransmissions stay idempotent.
+        if (session != worldSyncLastBoundSessionId_) {
+            replication_core::ResetAuthorityOrdering();
+            worldSyncLastBoundSessionId_ = session;
+        }
         world_actions::SetSessionAuthority(peer, host);
         world_actions::SetWorldBusActive(busActive);
         localPeerId_ = peer;
@@ -2802,7 +2811,8 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
         const bool ws3Setting = request.command == "WORLD_WS3_EMPTY_CALLBACK_SET";
         const bool performanceSetting = request.command == "PERFORMANCE_ISOLATION_SET";
         const bool loadingSetting = request.command == "SESSION_LOADING_HOLD";
-        const bool processSetting = ws3Setting || performanceSetting || loadingSetting;
+        const bool roundBoundary = request.command == "SESSION_ROUND_BOUNDARY";
+        const bool processSetting = ws3Setting || performanceSetting || loadingSetting || roundBoundary;
         if (processSetting && request.portableDummyId != localLauncherPlayerId_) return false;
         const auto currentGeneration = processSetting ? 0ULL : generations_->CurrentGeneration();
         if (!processSetting && request.levelGeneration == 0) {
@@ -2849,6 +2859,37 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
                 request.sessionLoadingSessionId, request.sessionLoadingGeneration);
             result.statusCode = result.executed ? "SESSION_LOADING_APPLIED" : "SESSION_LOADING_REJECTED";
             result.message = result.executed ? "Session loading simulation hold updated." : "Loading token is obsolete or native simulation hold is unavailable.";
+            const auto payload = experimental::EncodeGameCommandResult(request, request.command, result);
+            return CompleteExperimentalRequest(request.requestId, reservation.epoch,
+                protocol::MessageType::GameCommandResult, frame.payload, payload);
+        }
+
+        // Retail can reload a level, or return from it, while every observed
+        // engine root keeps its address. Each lobby start therefore revokes
+        // the previous incarnation explicitly, exactly like the mod-owned
+        // RETURN_TO_FRONTEND does; Bootstrap then invalidates every
+        // generation-bound registry (WS3 ordering, AISync world, captures).
+        // Idempotent per session so a retried request cannot bump twice.
+        if (roundBoundary) {
+            GameCommandExecutionResult result{};
+            const bool fresh = request.sessionLoadingSessionId != lastRoundBoundarySessionId_;
+            if (fresh && generations_ != nullptr) {
+                lastRoundBoundarySessionId_ = request.sessionLoadingSessionId;
+                const auto previous = generations_->CurrentGeneration();
+                const auto next = generations_->BeginTransition();
+                diagnostics_->Log(
+                    "info",
+                    "session_round_boundary",
+                    "A lobby start revoked the previous level incarnation; the next observation opens a new generation.",
+                    {{"session", request.sessionLoadingSessionId, true},
+                     {"previousGeneration", Diagnostics::Unsigned(previous), true},
+                     {"transitionGeneration", Diagnostics::Unsigned(next.generation), true}});
+            }
+            result.executed = generations_ != nullptr;
+            result.statusCode = result.executed ? "SESSION_ROUND_BOUNDARY_APPLIED" : "SESSION_ROUND_BOUNDARY_REJECTED";
+            result.message = result.executed
+                ? (fresh ? "Previous level incarnation revoked." : "Round boundary already applied for this session.")
+                : "Level generation tracking is unavailable.";
             const auto payload = experimental::EncodeGameCommandResult(request, request.command, result);
             return CompleteExperimentalRequest(request.requestId, reservation.epoch,
                 protocol::MessageType::GameCommandResult, frame.payload, payload);

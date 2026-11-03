@@ -824,9 +824,12 @@ bool NativeReadyForNewWorld(const transactions::Scope& scope) noexcept {
         // world's request; at a completed engine-thread generation boundary
         // they cannot grant a new-world native callback. The global native
         // call/Move-frame barriers above still forbid any in-flight call.
-        if(!lease.unknown||
-            lease.scope.session!=scope.session||lease.scope.worldEpoch==0U||
-            lease.scope.worldEpoch>=scope.worldEpoch)return false;
+        // A fenced lease from an earlier lobby session is necessarily older:
+        // sessions never overlap and a new lobby always loads a new world.
+        // Keeping it pinned is enough; it must not veto every later session.
+        if(!lease.unknown)return false;
+        if(lease.scope.session==scope.session&&
+            (lease.scope.worldEpoch==0U||lease.scope.worldEpoch>=scope.worldEpoch))return false;
     }
     // Retained references are *not* released, recycled, or declared quiet:
     // future source leases occupy distinct free slots and retain the new

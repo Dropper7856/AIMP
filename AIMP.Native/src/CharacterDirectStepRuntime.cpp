@@ -1,5 +1,6 @@
 #include "aimp/CharacterDirectStepRuntime.h"
 #include "aimp/CharacterResourceAdmission.h"
+#include "aimp/AISync.h"
 #include "aimp/AISyncExecutionPolicy.h"
 #include "aimp/PlayerPostureRuntime.h"
 #include "aimp/PlayerTorchRuntime.h"
@@ -2616,6 +2617,10 @@ void PumpSlotOnEngineThread(
             slot.stopPending.load(std::memory_order_acquire)) ReleaseSlot(slot);
         return;
     }
+    // An AI kill/grab already targets this participant even though its own
+    // cycle may still be locomotion. Do not move or teleport it under the
+    // aligning attacker; the mailbox keeps the latest target for afterwards.
+    if (!UsesAIHybridReplication(slot) && ai_sync::PairedParticipantVictim(characterAddress)) return;
 
     if (runtime_features::Enabled(
             runtime_features::Feature::NativeDiagnostics)) {

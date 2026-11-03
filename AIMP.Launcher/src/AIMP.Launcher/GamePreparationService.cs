@@ -21,6 +21,8 @@ public sealed class GamePreparationService
     private readonly LauncherDiagnostics _diagnostics;
     private readonly CancellationToken _shutdown;
     private Task _job = Task.CompletedTask;
+    private CancellationTokenSource? _jobCancel;
+    private bool _skipped;
     private int _configurationEpoch;
     private PreparationReceipt? _receipt;
     private GamePreparationDto _status = EmptyStatus(string.Empty);
@@ -49,17 +51,52 @@ public sealed class GamePreparationService
             {
                 if (!SameDirectory(game.GameDirectory, _status.GameDirectory))
                     throw new InvalidOperationException("Another installation is being prepared. Wait for it to finish.");
+                if (_skipped)
+                    throw new InvalidOperationException("Game preparation is stopping. Retry in a few seconds.");
                 return _status;
             }
+            _skipped = false;
             if (!revalidate && SameDirectory(game.GameDirectory, _status.GameDirectory) && _status.State == "Ready")
                 return _status;
             _receipt = null;
             _status = new(Guid.NewGuid().ToString("D"), game.GameDirectory, "Running", "Checking",
                 0, 0, 0, string.Empty, "Checking your installation", string.Empty, DateTimeOffset.UtcNow, null);
             var id = _status.JobId;
-            _job = Task.Run(() => Run(game.GameDirectory, id), CancellationToken.None);
+            _jobCancel?.Dispose();
+            _jobCancel = CancellationTokenSource.CreateLinkedTokenSource(_shutdown);
+            var token = _jobCancel.Token;
+            _job = Task.Run(() => Run(game.GameDirectory, id, token), CancellationToken.None);
             return _status;
         }
+    }
+
+    // The player may skip preparation and use the launcher immediately. A running
+    // job stops at its next level boundary; game assets are replaced atomically.
+    internal GamePreparationDto Skip()
+    {
+        lock (_sync)
+        {
+            _skipped = true;
+            if (!_job.IsCompleted)
+            {
+                _jobCancel?.Cancel();
+                _status = _status with { Message = "Stopping game preparation" };
+            }
+            _diagnostics.Log("Preparation", "Game preparation skipped by the player.");
+            return _status;
+        }
+    }
+
+    // Launch revalidates a prepared installation, but never forces a skipped one.
+    // Multiplayer lobbies still require a prepared manifest (PrepareLevelAsync).
+    internal async Task PrepareForLaunchAsync(CancellationToken cancellationToken)
+    {
+        Task job;
+        lock (_sync) job = _job;
+        await job.WaitAsync(cancellationToken).ConfigureAwait(false);
+        lock (_sync)
+            if (_skipped) return;
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
     }
 
     internal T WithConfigurationLock<T>(Func<T> operation)
@@ -167,13 +204,13 @@ public sealed class GamePreparationService
         return prepared;
     }
 
-    private void Run(string game, string jobId)
+    private void Run(string game, string jobId, CancellationToken token)
     {
         try
         {
             lock (GamePreparationSynchronization.Gate)
             {
-                _shutdown.ThrowIfCancellationRequested();
+                token.ThrowIfCancellationRequested();
                 AssertGameStopped();
                 var levels = WorldManifestLevelDiscovery.Discover(game).Where(l => l.CanCompile).ToArray();
                 if (levels.Length == 0) throw new InvalidDataException("No playable levels were found.");
@@ -192,11 +229,11 @@ public sealed class GamePreparationService
                 Update("Character", 2, 0, levels.Length, string.Empty, "Preparing multiplayer characters");
                 RipleyCharacterInstaller.Install(game, new InlineProgress<RipleyInstallProgress>(p =>
                     Update("Character", 2 + (int)(38L * p.CompletedLevels / Math.Max(1, p.TotalLevels)),
-                        p.CompletedLevels, p.TotalLevels, p.Level, p.Message)), _shutdown);
+                        p.CompletedLevels, p.TotalLevels, p.Level, p.Message)), token);
                 var manifests = new List<PreparedManifestReceipt>();
                 for (var i = 0; i < levels.Length; i++)
                 {
-                    _shutdown.ThrowIfCancellationRequested();
+                    token.ThrowIfCancellationRequested();
                     AssertGameStopped();
                     var index = i;
                     var level = levels[i];

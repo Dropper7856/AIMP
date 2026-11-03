@@ -511,7 +511,7 @@ internal sealed class NativeRuntimeController : IDisposable
         IReadOnlyDictionary<string, string> arguments) => new(
         ProtocolConstants.ExperimentalSchemaVersion,
         Guid.NewGuid(),
-        command == "SESSION_LOADING_HOLD" ? 0 : Snapshot.LevelGeneration,
+        command is "SESSION_LOADING_HOLD" or "SESSION_ROUND_BOUNDARY" ? 0 : Snapshot.LevelGeneration,
         _runtimeIdentity,
         command,
         arguments);

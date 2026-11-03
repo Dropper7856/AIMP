@@ -1,4 +1,5 @@
 #include "aimp/CathodeEquipmentGive.h"
+#include "aimp/AISync.h"
 #include "aimp/BuildProfile.h"
 #include "aimp/CrashGuard.h"
 #include "aimp/SignatureResolver.h"
@@ -192,6 +193,9 @@ Result StepNative(std::uintptr_t base, std::uintptr_t character, Record& r) {
     if (character < 0x10000U || (character & 0x0FU) != 0U ||
         Read<std::uint32_t>(character + 0x50U) != r.runtimeId)
         return Fail(r, Result::InvalidCharacter);
+    // Temporal hold only: never re-equip a player Character while an AI
+    // kill/grab aligns on it. Eligibility itself is unchanged.
+    if (ai_sync::PairedParticipantVictim(character)) return Result::Pending;
 
     auto* manager = Read<void*>(base + 0x0134EF40U);
     if (manager == nullptr) return Result::Pending;

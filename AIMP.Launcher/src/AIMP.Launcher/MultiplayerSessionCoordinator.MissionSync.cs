@@ -56,6 +56,10 @@ internal sealed partial class MultiplayerSessionCoordinator
         IReadOnlyList<MissionSyncFrontier> roots = enabled
             ? MissionSyncFrontierCompiler.Compile(prepared.Manifest, survival) : [];
         var catalog = enabled ? MissionSyncFrontierCompiler.Encode(prepared.Manifest, roots) : [];
+        LobbyHost? missionHost;
+        lock (_stateGate) missionHost = _host;
+        missionHost?.SetMissionRepeatableFrontiers(roots.Where(root => root.Repeatable)
+            .Select(root => (root.Source.EntityId.ToString(), root.Signal)));
         var path = enabled ? Path.Combine(Path.GetTempPath(), $"aimp-mission-{Guid.NewGuid():N}.bin") : "";
         try
         {

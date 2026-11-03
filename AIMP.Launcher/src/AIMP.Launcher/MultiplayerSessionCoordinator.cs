@@ -2701,6 +2701,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             host = _host;
             client = _client;
         }
+        await BeginNativeRoundAsync(value).ConfigureAwait(false);
         if (host is not null)
             await SetNativeWorldSyncLifecycleAsync(
                 host.SessionId, host.HostPeerId, true, value.LevelGeneration,

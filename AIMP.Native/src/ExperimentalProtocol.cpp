@@ -872,6 +872,20 @@ bool DecodeGameCommand(
             return true;
         }
 
+        if (command->stringValue == "SESSION_ROUND_BOUNDARY") {
+            if (output.levelGeneration != 0U || arguments->objectValue.size() != 1U) return false;
+            const auto* session = Field(*arguments, "sessionId", JsonType::String);
+            if (session == nullptr || session->stringValue.size() != 36U) return false;
+            for (std::size_t i = 0U; i < 36U; ++i) {
+                const char c = session->stringValue[i];
+                if (i == 8U || i == 13U || i == 18U || i == 23U) { if (c != '-') return false; }
+                else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return false;
+            }
+            output.command = command->stringValue;
+            output.sessionLoadingSessionId = session->stringValue;
+            return true;
+        }
+
         if (command->stringValue == "PERFORMANCE_ISOLATION_SET") {
             if (output.levelGeneration != 0U || arguments->objectValue.size() != 2U)
                 return false;

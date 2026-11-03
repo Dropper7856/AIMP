@@ -57,6 +57,12 @@ internal static class GameCommandCatalog
         new[]
         {
             new GameCommandDefinition(
+                "SESSION_ROUND_BOUNDARY", "Multiplayer round boundary", "Revokes the previous level incarnation at a lobby start. Internal launcher command.",
+                new[]
+                {
+                    new GameCommandParameterDefinition("sessionId", "Session", GameCommandParameterKind.Text, string.Empty, "Session GUID.", MaximumUtf8Bytes: 36)
+                }),
+            new GameCommandDefinition(
                 "SESSION_LOADING_HOLD", "Multiplayer loading hold", "Session-owned preparation barrier. Internal launcher command.",
                 new[]
                 {
