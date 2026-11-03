@@ -401,7 +401,8 @@ void RecordResult(const ReconciliationResult& result) noexcept {
         gLast = result;
         gHasLast = true;
     }
-    WriteTrace(result);
+    // Persist from the diagnostics worker. A semantic check must not seek,
+    // serialize JSON, write and truncate a file on the gameplay thread.
 }
 
 } // namespace
@@ -539,6 +540,13 @@ ReconciliationResult EvaluateBeforePrepare(
         local);
     if (result.readStatus != StateReadStatus::Resolved) {
         result.candidateDecision = CandidateDecision::Unknown;
+        if (CanReplayCarrierWithoutDescendantState(*profile, result.readStatus)) {
+            // Prepare still resolves and validates the actual root owner,
+            // target and portable context. Retail decides which children exist.
+            result.action = ReconciliationAction::ApplyCarrierTransition;
+            RecordResult(result);
+            return result;
+        }
         switch (result.readStatus) {
         case StateReadStatus::RuntimeUnavailable:
             result.action = ReconciliationAction::RetryRuntimeUnavailable; break;
@@ -638,6 +646,16 @@ RuntimeDiagnostics DiagnosticsSnapshot() noexcept {
         if (gHasLast) result.last = gLast;
     }
     return result;
+}
+
+void DrainDiagnosticFiles() noexcept {
+    ReconciliationResult last{};
+    {
+        std::lock_guard lock(gLastMutex);
+        if (!gHasLast) return;
+        last = gLast;
+    }
+    WriteTrace(last);
 }
 
 void ResetForGeneration() noexcept {

@@ -1,5 +1,9 @@
 #include "aimp/WorldInteractionAdapters.h"
 #include "aimp/WorldPublicActions.h"
+#include "aimp/PlayerLocalControls.h"
+#include "aimp/LocalObservationLedger.h"
+#include "aimp/SelfClockedRootFilter.h"
+#include "aimp/Diagnostics.h"
 #include "aimp/RuntimeFeatureFlags.h"
 
 #include "aimp/BuildProfile.h"
@@ -562,6 +566,27 @@ std::atomic<std::uint64_t> gInvalidEdgesSkipped{0U};
 std::atomic<std::uint64_t> gRemoteApplySuppressed{0U};
 std::atomic<std::uint64_t> gOriginEchoSuppressed{0U};
 std::atomic<std::uint64_t> gDiscardedPublicRootObservations{0U};
+std::mutex gSelfClockedMutex;
+SelfClockedRootFilter gSelfClockedRoots;
+std::atomic<std::uint64_t> gSelfClockedKeys{0U};
+std::atomic<std::uint64_t> gSelfClockedLocalRoots{0U};
+
+// Locally executed by the caller when false: the retail loop keeps running on
+// every peer, only its network copy is withheld.
+bool SelfClockedLocalRoot(const WorldEntityId& owner, const CompositePublicInputEvent& event) noexcept {
+    const auto key = (owner.high * 0x9E3779B97F4A7C15ULL) ^ owner.low ^
+        (event.targetEntity.low * 0xC2B2AE3D27D4EB4FULL) ^ event.publicInputShortGuid;
+    SelfClockedRootFilter::Decision decision{};
+    {
+        std::lock_guard lock(gSelfClockedMutex);
+        decision = gSelfClockedRoots.Observe(key, GetTickCount64());
+    }
+    if (decision == SelfClockedRootFilter::Decision::Replicate) return false;
+    if (decision == SelfClockedRootFilter::Decision::BecameLocal)
+        gSelfClockedKeys.fetch_add(1U, std::memory_order_relaxed);
+    gSelfClockedLocalRoots.fetch_add(1U, std::memory_order_relaxed);
+    return true;
+}
 std::atomic<std::uint64_t> gEchoTableFull{0U};
 std::atomic<std::uint64_t> gIntentQueueRejected{0U};
 std::atomic<std::uint64_t> gSourceClassMismatch{0U};
@@ -956,7 +981,9 @@ std::array<std::atomic<std::uint32_t>, kCallbackRawWordCount> gLogicSwitchCausal
 std::atomic<std::uint64_t> gCallbackClassificationUntilTickMs{0U};
 std::atomic<std::uint64_t> gObservationSequence{1U};
 std::atomic<std::uint64_t> gSchedulerCausalSequence{1U};
-std::array<std::atomic<std::uint64_t>, kEchoSlots> gLocalEchoIds{};
+std::mutex gLocalObservationMutex;
+LocalObservationLedger<4096U> gLocalObservations;
+std::uint64_t gLocalObservationRemembered{}, gLocalObservationEchoed{}, gLocalObservationRetired{}, gLocalObservationMissing{};
 std::array<std::atomic<std::uint64_t>, kEchoSlots> gTypedMatchHashes{};
 std::array<std::atomic<std::uint64_t>, kEchoSlots> gTypedMatchExpiryMs{};
 std::array<std::atomic<std::uint64_t>, kEchoSlots> gCharacterCallbackMatchHashes{};
@@ -2095,22 +2122,22 @@ void CaptureCallbackAbiProbeSample(
 }
 
 [[nodiscard]] std::uint64_t NextObservationId() noexcept {
-    const auto sequence = gObservationSequence.fetch_add(1U, std::memory_order_acq_rel);
-    auto value = gObservationSalt ^ (sequence * 0x9E3779B97F4A7C15ULL);
-    if (value == 0U) value = sequence == 0U ? 1U : sequence;
-    return value;
+    // Skip the single zero encoding; keep every emitted ID invertible.
+    for (;;) {
+        const auto sequence = gObservationSequence.fetch_add(1U, std::memory_order_acq_rel);
+        const auto value = gObservationSalt ^ (sequence * kObservationMultiplier);
+        if (sequence != 0U && value != 0U) return value;
+    }
 }
 
 [[nodiscard]] bool RememberLocalObservation(const std::uint64_t observationId) noexcept {
-    const auto start = static_cast<std::size_t>(observationId) & (kEchoSlots - 1U);
-    for (std::size_t probe = 0U; probe < kEchoProbeCount; ++probe) {
-        auto& slot = gLocalEchoIds[(start + probe) & (kEchoSlots - 1U)];
-        auto expected = std::uint64_t{0U};
-        if (slot.compare_exchange_strong(
-                expected, observationId, std::memory_order_acq_rel,
-                std::memory_order_acquire) || expected == observationId) {
-            return true;
-        }
+    if (observationId == 0U) return false;
+    std::lock_guard lock(gLocalObservationMutex);
+    const auto serial = ObservationSerial(observationId, gObservationSalt);
+    const bool existed = gLocalObservations.Contains(serial);
+    if (gLocalObservations.Remember(serial)) {
+        if (!existed) ++gLocalObservationRemembered;
+        return true;
     }
     gEchoTableFull.fetch_add(1U, std::memory_order_acq_rel);
     TouchVersion();
@@ -2121,20 +2148,16 @@ void CaptureCallbackAbiProbeSample(
     const std::uint64_t observationId,
     const bool countAsEcho) noexcept {
     if (observationId == 0U) return false;
-    const auto start = static_cast<std::size_t>(observationId) & (kEchoSlots - 1U);
-    for (std::size_t probe = 0U; probe < kEchoProbeCount; ++probe) {
-        auto& slot = gLocalEchoIds[(start + probe) & (kEchoSlots - 1U)];
-        auto expected = observationId;
-        if (slot.compare_exchange_strong(
-                expected, 0U, std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
-            if (countAsEcho) {
-                gOriginEchoSuppressed.fetch_add(1U, std::memory_order_acq_rel);
-                TouchVersion();
-            }
-            return true;
-        }
+    std::lock_guard lock(gLocalObservationMutex);
+    if (gLocalObservations.Consume(ObservationSerial(observationId, gObservationSalt))) {
+        if (countAsEcho) {
+            ++gLocalObservationEchoed;
+            gOriginEchoSuppressed.fetch_add(1U, std::memory_order_acq_rel);
+        } else ++gLocalObservationRetired;
+        TouchVersion();
+        return true;
     }
+    ++gLocalObservationMissing;
     return false;
 }
 
@@ -4434,7 +4457,17 @@ std::uint8_t __fastcall LogicSwitchClearDetour(
 }
 
 void ClearEchoIds() noexcept {
-    for (auto& slot : gLocalEchoIds) slot.store(0U, std::memory_order_release);
+    {
+        std::lock_guard lock(gLocalObservationMutex);
+        gLocalObservations.Clear();
+        gLocalObservationRemembered = gLocalObservationEchoed = gLocalObservationRetired = gLocalObservationMissing = 0U;
+    }
+    {
+        std::lock_guard lock(gSelfClockedMutex);
+        gSelfClockedRoots.Clear();
+    }
+    gSelfClockedKeys.store(0U, std::memory_order_relaxed);
+    gSelfClockedLocalRoots.store(0U, std::memory_order_relaxed);
     for (auto& slot : gTypedMatchHashes) slot.store(0U, std::memory_order_release);
     for (auto& slot : gTypedMatchExpiryMs) slot.store(0U, std::memory_order_release);
     for (auto& slot : gCharacterCallbackMatchHashes) slot.store(0U, std::memory_order_release);
@@ -5103,6 +5136,13 @@ void __fastcall QueueInputDetour(
         }
         gWs3QueueLastSchedulerParameter.store(edge.schedulerParameter, std::memory_order_relaxed);
         gWs3QueueLastTargetInput.store(edge.targetInput, std::memory_order_relaxed);
+        // This exact Event already belongs to the immediately preceding
+        // certified output. Preserve retail without publishing a second root.
+        if (world_actions::CurrentRootOwnsEvent(edge.target, edge.targetInput)) {
+            original(manager, sourceSharedRef, inputShortGuid, targetDescriptor, callbackRecord,
+                delaySeconds, retailTailArgument);
+            return;
+        }
 
         // A higher RemoteRoot is allowed to generate the edge naturally on the
         // receiver. Record it, but never publish it back to authority. The later
@@ -5779,15 +5819,7 @@ void ObserveTypedInteractionPairCandidate(
 // keeps its prompt local; MissionSync replicates the resulting milestone.
 [[nodiscard]] constexpr bool ReceiverLocalPlayerInputPrimitive(
     const std::uint32_t primitiveType) noexcept {
-    switch (primitiveType) {
-    case 0x1728F297U: // ButtonMashPrompt
-    case 0x324DBAB5U: // MonitorPadInput
-    case 0x73E92EC1U: // MonitorActionMap
-    case 0x71E671A8U: // Interaction
-        return true;
-    default:
-        return false;
-    }
+    return world_actions::ReceiverLocalPlayerControlPrimitive(primitiveType);
 }
 
 static_assert(ReceiverLocalPlayerInputPrimitive(0x1728F297U));
@@ -7212,6 +7244,18 @@ RuntimeDiagnostics DiagnosticsSnapshot() noexcept {
     result.discardedPublicRootObservations =
         gDiscardedPublicRootObservations.load(std::memory_order_acquire);
     result.echoTableFull = gEchoTableFull.load(std::memory_order_acquire);
+    {
+        std::lock_guard lock(gLocalObservationMutex);
+        result.observationPending = gLocalObservations.Pending();
+        result.observationHighWater = gLocalObservations.HighWater();
+        result.observationRanges = gLocalObservations.Ranges();
+        result.observationOldestSerial = gLocalObservations.OldestSerial();
+        result.observationSplitRefused = gLocalObservations.SplitRefused();
+        result.observationRemembered = gLocalObservationRemembered;
+        result.observationEchoed = gLocalObservationEchoed;
+        result.observationRetired = gLocalObservationRetired;
+        result.observationMissing = gLocalObservationMissing;
+    }
     result.intentQueueRejected = gIntentQueueRejected.load(std::memory_order_acquire);
     result.sourceClassMismatch = gSourceClassMismatch.load(std::memory_order_acquire);
     result.executeAttempts = gExecuteAttempts.load(std::memory_order_acquire);
@@ -7725,9 +7769,13 @@ bool SubmitPublicRoot(
 bool SubmitPublicRoot(const WorldEntityId& owner,
     CompositePublicInputEvent& event) noexcept {
     auto* registry = gRegistry.load(std::memory_order_acquire);
-    if (!Initialized() || registry == nullptr || !event.retailRoot ||
-        !ValidPublicRootContext(event) ||
-        !world_actions::PublicRootManifestAdmissionAllowed(*registry, owner, event)) return false;
+    if (!Initialized() || registry == nullptr || !event.retailRoot || !ValidPublicRootContext(event)) {
+        return false;
+    }
+    if (!world_actions::PublicRootManifestAdmissionAllowed(*registry, owner, event)) {
+        return false;
+    }
+    if (SelfClockedLocalRoot(owner, event)) return false;
     // Allocate once before queueing; descendants and the echo use this same ID.
     if (event.observationId == 0U) event.observationId = NextObservationId();
     if (event.causalSerial == 0U) event.causalSerial = event.observationId;
@@ -7735,11 +7783,15 @@ bool SubmitPublicRoot(const WorldEntityId& owner,
 
     WorldPayload payload{};
     const bool localExecuted = (event.flags & world_actions::kPublicRootFlagAwaitAuthority) == 0U;
-    if (!EncodeCompositePublicInputPayload(event, payload) ||
-        (localExecuted && !RememberLocalObservation(event.observationId))) return false;
+    if (!EncodeCompositePublicInputPayload(event, payload)) return false;
+    if (localExecuted && !RememberLocalObservation(event.observationId)) {
+        return false;
+    }
     if (replication_core::SubmitLocalIntent(owner, WorldMutationKind::Event,
         kOperationCompositePublicInput,
-        std::span<const std::byte>(payload.bytes.data(), payload.size))) return true;
+        std::span<const std::byte>(payload.bytes.data(), payload.size))) {
+        return true;
+    }
     if (localExecuted) static_cast<void>(RemoveLocalObservation(event.observationId, false));
     return false;
 }
@@ -7770,16 +7822,47 @@ bool DiscardPublicRootIntent(const WorldIntent& intent) noexcept {
 
 bool HasLocalObservation(const std::uint64_t observationId) noexcept {
     if (observationId == 0U) return false;
-    const auto start = static_cast<std::size_t>(observationId) & (kEchoSlots - 1U);
-    for (std::size_t probe = 0U; probe < kEchoProbeCount; ++probe) {
-        const auto& slot = gLocalEchoIds[(start + probe) & (kEchoSlots - 1U)];
-        if (slot.load(std::memory_order_acquire) == observationId) return true;
-    }
-    return false;
+    std::lock_guard lock(gLocalObservationMutex);
+    return gLocalObservations.Contains(ObservationSerial(observationId, gObservationSalt));
 }
 
 bool ConsumeLocalObservation(const std::uint64_t observationId) noexcept {
     return RemoveLocalObservation(observationId, true);
+}
+
+void DrainObservationDiagnostics(aimp::Diagnostics& diagnostics) {
+    static std::uint64_t lastSample{};
+    const auto now = GetTickCount64();
+    if (now - lastSample < 30000U || !world_actions::WorldBusActive()) return;
+    lastSample = now;
+    std::uint64_t pending{}, ranges{}, oldest{}, remembered{}, echoed{}, retired{}, missing{};
+    {
+        std::lock_guard lock(gLocalObservationMutex);
+        pending = gLocalObservations.Pending(); ranges = gLocalObservations.Ranges();
+        oldest = gLocalObservations.OldestSerial(); remembered = gLocalObservationRemembered;
+        echoed = gLocalObservationEchoed; retired = gLocalObservationRetired; missing = gLocalObservationMissing;
+    }
+    const auto replication = replication_core::DiagnosticsSnapshot();
+    diagnostics.Log("info", "worldsync_observation_backlog", "Worker sample of observation and transport lifetimes.",
+        {{"tickMs", Diagnostics::Unsigned(now), true},
+         {"pending", Diagnostics::Unsigned(pending), true},
+         {"ranges", Diagnostics::Unsigned(ranges), true},
+         {"oldestSerial", Diagnostics::Unsigned(oldest), true},
+         {"remembered", Diagnostics::Unsigned(remembered), true},
+         {"echoed", Diagnostics::Unsigned(echoed), true},
+         {"retired", Diagnostics::Unsigned(retired), true},
+         {"missing", Diagnostics::Unsigned(missing), true},
+         {"selfClockedKeys", Diagnostics::Unsigned(gSelfClockedKeys.load(std::memory_order_relaxed)), true},
+         {"selfClockedLocalRoots", Diagnostics::Unsigned(gSelfClockedLocalRoots.load(std::memory_order_relaxed)), true},
+         {"outboundPending", Diagnostics::Unsigned(replication.outboundPendingCount), true},
+         {"outboundReserved", Diagnostics::Unsigned(replication.outboundReservedCount), true},
+           {"outboundCapacity", Diagnostics::Unsigned(replication.outboundCapacity), true},
+           {"outboundHighWater", Diagnostics::Unsigned(replication.outboundHighWater), true},
+           {"outboundCapacityRejected", Diagnostics::Unsigned(replication.outboundCapacityRejected), true},
+         {"outboundPopped", Diagnostics::Unsigned(replication.outboundPoppedCount), true},
+         {"received", Diagnostics::Unsigned(replication.receivedMutationCount), true},
+         {"committed", Diagnostics::Unsigned(replication.causalLastCommittedSequence), true},
+         {"deferred", Diagnostics::Unsigned(replication.deferredRemoteApplyCount), true}});
 }
 
 ExecuteResult Execute(

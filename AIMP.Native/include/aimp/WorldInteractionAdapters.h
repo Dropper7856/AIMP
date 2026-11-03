@@ -15,6 +15,7 @@ class HookManager;
 class SignatureResolver;
 class WorldEntityLease;
 class WorldEntityRegistry;
+class Diagnostics;
 
 namespace world_interactions {
 
@@ -470,6 +471,8 @@ struct RuntimeDiagnostics final {
     std::uint64_t originEchoSuppressed{};
     std::uint64_t discardedPublicRootObservations{};
     std::uint64_t echoTableFull{};
+    std::uint64_t observationPending{}, observationHighWater{}, observationRanges{}, observationOldestSerial{};
+    std::uint64_t observationRemembered{}, observationEchoed{}, observationRetired{}, observationMissing{}, observationSplitRefused{};
     std::uint64_t intentQueueRejected{};
     std::uint64_t sourceClassMismatch{};
     std::uint64_t executeAttempts{};
@@ -987,6 +990,8 @@ void ObserveRemoteTypedReplayResult(
     bool queued) noexcept;
 [[nodiscard]] CompositePublicInputDiagnostics CompositePublicInputDiagnosticsSnapshot() noexcept;
 [[nodiscard]] RuntimeDiagnostics DiagnosticsSnapshot() noexcept;
+// Worker-only, five-second backlog samples while the World bus is active.
+void DrainObservationDiagnostics(aimp::Diagnostics& diagnostics);
 
 // Returns true only while this process still owns the observation slot for a
 // locally executed retail edge. The non-destructive form is needed across a

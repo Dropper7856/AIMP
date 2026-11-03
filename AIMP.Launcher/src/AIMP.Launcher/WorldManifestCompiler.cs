@@ -1174,6 +1174,42 @@ internal sealed class WorldManifestCompiler
                 continue;
             }
 
+            // A Door's completion/proximity graph can cycle back to this
+            // output. The exact outgoing cut remains finite: every explicit
+            // edge must be the same certified force command. Inspect that cut
+            // before the general SCC veto, without following later callbacks.
+            if (node.Output && successors[index].Count > 0)
+            {
+                var directEvent = default(CausalSemanticContract);
+                var exactCut = true;
+                foreach (var childIndex in successors[index])
+                {
+                    var child = nodes[childIndex];
+                    if (child.Output || !entities.TryGetValue(child.Entity, out var childEntity) ||
+                        childEntity.PrimitiveType != WorldReplicationSemanticCatalog.DoorPrimitiveType ||
+                        !childEntity.Flags.HasFlag(WorldEntityFlags.RuntimeAddressable) ||
+                        child.Input is not (WorldReplicationSemanticCatalog.DoorForceOpenInput or
+                            WorldReplicationSemanticCatalog.DoorForceCloseInput))
+                    {
+                        exactCut = false;
+                        break;
+                    }
+                    var contract = new CausalSemanticContract(WorldReplicationContractKind.Event,
+                        child.Entity, child.Input);
+                    if (directEvent.IsKnown && directEvent != contract) { exactCut = false; break; }
+                    directEvent = contract;
+                }
+                if (exactCut && directEvent.IsKnown)
+                {
+                    relevance[index] = Pack(WorldReplicationRelevanceDisposition.ReplicateCarrier,
+                        WorldReplicationSemanticClass.RoutingOnly,
+                        evidence | WorldReplicationRelevanceEvidence.ReplicableSinkReachable |
+                            WorldReplicationRelevanceEvidence.EmittedEventCarrier);
+                    semanticContracts[index] = directEvent;
+                    continue;
+                }
+            }
+
             if (cyclic[index])
             {
                 relevance[index] = Pack(
@@ -2061,7 +2097,7 @@ internal sealed class WorldManifestCompiler
     private static bool IsPlayerLocalPrimitive(string name) =>
         name.StartsWith("Camera", StringComparison.Ordinal) ||
         name.EndsWith("Camera", StringComparison.Ordinal) ||
-        name is "Interaction" or "MonitorPadInput" or "Chr_PlayerCrouch" or
+        name is "Interaction" or "MonitorPadInput" or "MonitorActionMap" or "ButtonMashPrompt" or "Chr_PlayerCrouch" or
             "FollowCameraModifier" or "GetCurrentCameraTarget" or "GetCurrentCameraFov";
 
     private static bool IsEnvironmentPrimitive(string name) => ContainsAnyCanonical(name,

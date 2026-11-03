@@ -53,6 +53,16 @@ enum class ReconciliationAction : std::uint8_t {
     ApplyCarrierTransition = 10U,
 };
 
+// A certified CompositeInput replays the original high-level retail operation.
+// Its unique descendant is diagnostic evidence, not the invocation target: a
+// conditional child may not exist before Start/Stop creates/tears down a graph.
+// Do not infer a state or skip the occurrence when that child is unavailable.
+constexpr bool CanReplayCarrierWithoutDescendantState(
+    const WorldCompositePublicInputCausalProfile& profile, StateReadStatus status) noexcept {
+    return status == StateReadStatus::RuntimeUnavailable &&
+        profile.CertifiedCompositeStateTransitionCarrierBoundary();
+}
+
 struct ReconciliationResult final {
     std::uint64_t authoritySequence{};
     std::uint64_t observationId{};
@@ -129,6 +139,7 @@ struct RuntimeDiagnostics final {
 
 [[nodiscard]] RuntimeDiagnostics DiagnosticsSnapshot() noexcept;
 void ResetForGeneration() noexcept;
+void DrainDiagnosticFiles() noexcept;
 void Shutdown() noexcept;
 
 } // namespace semantic_reconciliation

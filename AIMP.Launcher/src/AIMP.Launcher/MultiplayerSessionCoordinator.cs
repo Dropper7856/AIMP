@@ -173,6 +173,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         ulong AuthoritySequence,
         ClientWorldTransaction Transaction);
     private ClientWorldTransaction? _activeWorldTransaction;
+    private readonly WorldMutationDispatchWindow _worldDispatchWindow = new(128);
     // Step 5: correlation is exact and local to Launcher <-> DLL. Authority
     // sequence remains bookkeeping only and is never used to guess which native
     // dispatch completed.
@@ -345,6 +346,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             // exact stale results rather than sequence-order tombstones.
             _activeWorldTransaction?.Completion.TrySetResult(false);
             _activeWorldTransaction = null;
+            _worldDispatchWindow.Clear();
             _lastCommittedWorldSequence = 0;
             _worldRecoveryTargetSequence = 0;
             _worldRecoveryAwaitSnapshot.Clear();
@@ -408,6 +410,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         AwaitAuthorityCause[] PendingAwaitAuthorityCauses);
     private WorldResumeCheckpoint? _worldResumeCheckpoint;
     private ulong _lastCommittedWorldSequence;
+    private long _worldCommitLogTick;
+    private long _worldCommittedTransactionCount;
     private ulong _worldRecoveryTargetSequence;
     private readonly HashSet<AwaitAuthorityCause> _worldRecoveryAwaitSnapshot = new();
     private bool _worldRecoveryRequired;
@@ -1494,7 +1498,24 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                     out var transactionStart, out var transactionRoots, out var rootOrdinal))
                 throw new ProtocolException("Authoritative transaction metadata is invalid.");
 
+            // Leave headroom in the native 256-ROOT FIFO. Wait only when the
+            // window is full, rather than paying one IPC round trip per ROOT.
+            if (rootOrdinal == 0)
+            {
+                while (true)
+                {
+                    Task<bool>? capacityWait;
+                    lock (_stateGate)
+                        capacityWait = _worldDispatchWindow.CapacityWait(transactionRoots);
+                    if (capacityWait is null) break;
+                    await capacityWait.WaitAsync(TimeSpan.FromSeconds(10), _lifetime.Token)
+                        .ConfigureAwait(false);
+                }
+            }
+
             var requestRecovery = false;
+            var windowHighWaterChanged = false;
+            var windowPendingRoots = 0;
             lock (_stateGate)
             {
                 if (networkMutation.Mutation.Sequence <= _lastCommittedWorldSequence)
@@ -1554,7 +1575,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 }
                 if (transaction is null)
                 {
-                    if (transactionStart != _lastCommittedWorldSequence + 1U || rootOrdinal != 0)
+                    if (transactionStart != _worldDispatchWindow.NextSequence(_lastCommittedWorldSequence) || rootOrdinal != 0)
                     {
                         // Never start from a suffix. A retransmitted ordinal-0
                         // from the Host journal is the only safe way to rebuild an
@@ -1587,6 +1608,16 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                     }
                     transaction.ReceivedCount++;
                     lastMember = transaction.ReceivedCount == transaction.RootCount;
+                    if (lastMember)
+                    {
+                        var previousHighWater = _worldDispatchWindow.HighWater;
+                        _worldDispatchWindow.Add(transaction.StartSequence, transaction.RootCount,
+                            transaction.Completion);
+                        windowPendingRoots = _worldDispatchWindow.PendingRoots;
+                        windowHighWaterChanged = previousHighWater < _worldDispatchWindow.HighWater
+                            && _worldDispatchWindow.HighWater % 32 == 0;
+                        _activeWorldTransaction = null;
+                    }
                 }
             }
             if (requestRecovery)
@@ -1602,6 +1633,11 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
 
             if (transaction is null)
                 throw new ProtocolException("Authoritative transaction tracker disappeared before native dispatch.");
+
+            if (windowHighWaterChanged)
+                _diagnostics.Log("WorldSync",
+                    $"WS3 dispatch pipeline: pendingRoots={windowPendingRoots} capacity=128 " +
+                    $"admittedThrough={transaction.EndSequence}; commits remain native-confirmed.");
 
             // Re-check immediately before native enqueue. A context reset can
             // happen while this async task waited on the apply gate.
@@ -1643,23 +1679,10 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             }
 
             if (lastMember)
-            {
-                try
-                {
-                    await transaction.Completion.Task.WaitAsync(TimeSpan.FromSeconds(10), _lifetime.Token)
-                        .ConfigureAwait(false);
-                }
-                catch (TimeoutException)
-                {
-                    MarkWorldRecoveryRequired(
-                        $"Transaction {transaction.StartSequence} did not reach native commit before timeout.",
-                        transaction.StartSequence,
-                        transaction.HostAuthorityContext);
-                }
-            }
+                _ = WatchWorldTransactionCommitAsync(transaction);
         }
         catch (Exception exception) when (exception is ProtocolException or InvalidOperationException
-            or IOException or OperationCanceledException or OverflowException)
+            or IOException or OperationCanceledException or OverflowException or TimeoutException)
         {
             if (!_lifetime.IsCancellationRequested)
             {
@@ -1674,6 +1697,29 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         {
             _worldMutationApplyGate.Release();
         }
+    }
+
+    private async Task WatchWorldTransactionCommitAsync(ClientWorldTransaction transaction)
+    {
+        try
+        {
+            await transaction.Completion.Task.WaitAsync(TimeSpan.FromSeconds(10), _lifetime.Token)
+                .ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            lock (_stateGate)
+            {
+                if (_localWorldContext is not { } current
+                    || !SameWorldContext(current, transaction.WorldContext)
+                    || !_worldDispatchWindow.Contains(transaction.Completion.Task)) return;
+            }
+            MarkWorldRecoveryRequired(
+                $"Transaction {transaction.StartSequence} did not reach native commit before timeout.",
+                transaction.StartSequence, transaction.HostAuthorityContext);
+            transaction.Completion.TrySetResult(false);
+        }
+        catch (OperationCanceledException) { }
     }
 
     private void MarkWorldRecoveryRequired(
@@ -2065,8 +2111,13 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             finishedTransaction.Completion.TrySetResult(transactionSucceeded);
             if (transactionSucceeded)
             {
-                _diagnostics.Log("WorldSync",
-                    $"WS3 transaction committed through sequence {_lastCommittedWorldSequence}.");
+                var committedCount = Interlocked.Increment(ref _worldCommittedTransactionCount);
+                var now = Environment.TickCount64;
+                var lastLog = Interlocked.Read(ref _worldCommitLogTick);
+                if (now - lastLog >= 1_000 &&
+                    Interlocked.CompareExchange(ref _worldCommitLogTick, now, lastLog) == lastLog)
+                    _diagnostics.Log("WorldSync",
+                        $"WS3 transactions committed={committedCount}; committedThrough={_lastCommittedWorldSequence}.");
                 if (client is not null)
                     _ = TryOpenClientWorldBusAfterRecoveryAsync("recovery-suffix-committed");
             }
@@ -2343,6 +2394,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         }
         _activeWorldTransaction?.Completion.TrySetCanceled();
         _activeWorldTransaction = null;
+        _worldDispatchWindow.Clear();
         // Exact NativeDispatchId correlation makes old sequence tombstones
         // unnecessary. Late callbacks from cleared dispatches are unknown/stale
         // and cannot be rebound to any future transaction.

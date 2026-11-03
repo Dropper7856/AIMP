@@ -20,6 +20,8 @@ void BeginCausalTurn() noexcept;
 void EndCausalTurn() noexcept;
 
 struct RuntimeDiagnostics final {
+    std::uint64_t outboundPendingCount{}, outboundReservedCount{}, outboundPoppedCount{};
+    std::uint64_t outboundCapacity{}, outboundHighWater{}, outboundCapacityRejected{};
     bool initialized{};
     std::uint64_t version{};
     std::uint64_t initializationCount{};
@@ -140,7 +142,7 @@ void MarkOutboundIntentTransportFailure(const WorldIntent& intent) noexcept;
     const WorldMutation& mutation) noexcept;
 [[nodiscard]] bool TryPopMutationResult(WorldMutationResult& output) noexcept;
 [[nodiscard]] std::size_t PumpDeferredRemoteApplyOnEngineThread(
-    std::size_t budget = 4U) noexcept;
+    std::size_t budget = 64U) noexcept;
 
 [[nodiscard]] bool RemoteApplyActive() noexcept;
 void ResetForGeneration(std::uint64_t generation) noexcept;

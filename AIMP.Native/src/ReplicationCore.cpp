@@ -1,4 +1,6 @@
 #include "aimp/ReplicationCore.h"
+#include "aimp/CausalPublicationPolicy.h"
+#include "aimp/OrderedTransactionBatch.h"
 
 #include "aimp/CathodePrimitiveExecutor.h"
 #include "aimp/GameThreadDispatcher.h"
@@ -24,7 +26,7 @@
 namespace aimp::replication_core {
 namespace {
 
-constexpr std::size_t kIntentCapacity = 256U;
+constexpr std::size_t kIntentCapacity = kWorldIntentQueueCapacity;
 constexpr std::size_t kResultCapacity = 512U;
 constexpr std::uint64_t kDispatchLifetimeMs = 1000U;
 constexpr std::size_t kDeferredRemoteApplyCapacity = 256U;
@@ -84,9 +86,10 @@ class BoundedRing final {
 public:
     [[nodiscard]] bool Push(const T& value) noexcept {
         std::lock_guard lock(mutex_);
-        if (count_ + reserved_ >= Capacity) return false;
+        if (count_ + reserved_ >= Capacity) { ++rejected_; return false; }
         storage_[(head_ + count_) % Capacity] = value;
         ++count_;
+        highWater_ = (std::max)(highWater_, count_ + reserved_);
         return true;
     }
 
@@ -94,8 +97,9 @@ public:
     // worker cannot observe a fragment until its whole causal turn is sealed.
     [[nodiscard]] std::uint64_t Reserve() noexcept {
         std::lock_guard lock(mutex_);
-        if (count_ + reserved_ >= Capacity) return 0U;
+        if (count_ + reserved_ >= Capacity) { ++rejected_; return 0U; }
         ++reserved_;
+        highWater_ = (std::max)(highWater_, count_ + reserved_);
         return epoch_;
     }
     void Cancel(std::uint64_t ticket) noexcept {
@@ -141,12 +145,25 @@ public:
         std::lock_guard lock(mutex_);
         head_ = 0U;
         count_ = reserved_ = 0U;
+        highWater_ = rejected_ = 0U;
         if (++epoch_ == 0U) ++epoch_;
     }
 
     [[nodiscard]] std::size_t Size() const noexcept {
         std::lock_guard lock(mutex_);
         return count_;
+    }
+    [[nodiscard]] std::size_t Reserved() const noexcept {
+        std::lock_guard lock(mutex_);
+        return reserved_;
+    }
+    [[nodiscard]] std::size_t HighWater() const noexcept {
+        std::lock_guard lock(mutex_);
+        return highWater_;
+    }
+    [[nodiscard]] std::size_t Rejected() const noexcept {
+        std::lock_guard lock(mutex_);
+        return rejected_;
     }
 
 private:
@@ -155,6 +172,7 @@ private:
     std::size_t head_{};
     std::size_t count_{};
     std::size_t reserved_{};
+    std::size_t highWater_{}, rejected_{};
     std::uint64_t epoch_{1U};
 };
 
@@ -168,6 +186,7 @@ std::atomic<std::uint64_t> gLocalIntentSequence{1};
 thread_local std::uint32_t gRemoteApplyDepth = 0U;
 
 std::atomic<std::uint64_t> gOutboundIntentCount{0};
+std::atomic<std::uint64_t> gOutboundPoppedCount{0};
 std::atomic<std::uint64_t> gAppliedMutationCount{0};
 std::atomic<std::uint64_t> gEchoSuppressedCount{0};
 std::atomic<std::uint64_t> gReceivedMutationCount{0};
@@ -1232,17 +1251,18 @@ WorldMutationResult ExecuteMutationOnEngineThread(
     return true;
 }
 
-// Seal and publish the entire currently staged prefix while the caller holds
-// gOutboundSubmitMutex. Returning true means every staged ROOT is visible to
+// Seal and publish the selected prefix (zero selects all staged ROOTs) while
+// the caller holds gOutboundSubmitMutex. True makes that prefix visible to
 // the sole outbound-ring consumer; false means none of the staged ROOTs remain
 // reserved or staged. This is the synchronous publication barrier used by
 // AwaitAuthority so a caller never suppresses retail on a merely reserved ROOT.
-[[nodiscard]] bool SealAndPublishStagedRootsLocked() noexcept {
+[[nodiscard]] bool SealAndPublishStagedRootsLocked(std::size_t prefixCount = 0U) noexcept {
     if (gStagedRoots.empty()) return true;
+    const auto count = prefixCount == 0U ? gStagedRoots.size() : (std::min)(prefixCount, gStagedRoots.size());
     bool publishable = true;
-    for (std::size_t start = 0U; start < gStagedRoots.size();) {
+    for (std::size_t start = 0U; start < count;) {
         std::size_t end = start + 1U;
-        while (end < gStagedRoots.size() && end - start < world_interactions::kMaximumTransactionRoots &&
+        while (end < count && end - start < world_interactions::kMaximumTransactionRoots &&
             gStagedRoots[end].causalSerial == gStagedRoots[start].causalSerial &&
             gStagedRoots[end].intent.levelGeneration == gStagedRoots[start].intent.levelGeneration)
             ++end;
@@ -1269,7 +1289,7 @@ WorldMutationResult ExecuteMutationOnEngineThread(
         start = end;
     }
     const bool published = publishable &&
-        gOutboundIntents.PublishReserved(gStagedRoots.begin(), gStagedRoots.end());
+        gOutboundIntents.PublishReserved(gStagedRoots.begin(), gStagedRoots.begin() + count);
     if (!published) {
         for (auto& staged : gStagedRoots) {
             gOutboundIntents.Cancel(staged.ticket);
@@ -1283,7 +1303,8 @@ WorldMutationResult ExecuteMutationOnEngineThread(
         MarkCausalRecoveryRequired();
         gQueueRejectedCount.fetch_add(gStagedRoots.size(), std::memory_order_relaxed);
     }
-    gStagedRoots.clear();
+    if (published) gStagedRoots.erase(gStagedRoots.begin(), gStagedRoots.begin() + count);
+    else gStagedRoots.clear();
     TouchVersion();
     return published;
 }
@@ -1331,6 +1352,12 @@ RuntimeDiagnostics DiagnosticsSnapshot() noexcept {
     result.observedMutationCount = 0U;
     result.appliedMutationCount = gAppliedMutationCount.load(std::memory_order_acquire);
     result.outboundIntentCount = gOutboundIntentCount.load(std::memory_order_acquire);
+    result.outboundPendingCount = gOutboundIntents.Size();
+    result.outboundReservedCount = gOutboundIntents.Reserved();
+    result.outboundCapacity = kIntentCapacity;
+    result.outboundHighWater = gOutboundIntents.HighWater();
+    result.outboundCapacityRejected = gOutboundIntents.Rejected();
+    result.outboundPoppedCount = gOutboundPoppedCount.load(std::memory_order_acquire);
     result.echoSuppressedCount = gEchoSuppressedCount.load(std::memory_order_acquire);
     result.receivedMutationCount = gReceivedMutationCount.load(std::memory_order_acquire);
     result.acceptedMutationCount = gAcceptedMutationCount.load(std::memory_order_acquire);
@@ -1508,6 +1535,12 @@ bool SubmitLocalIntent(
         try { gStagedRoots.push_back(StagedRoot{intent, ticket, root.causalSerial}); }
         catch (...) { gOutboundIntents.Cancel(ticket); MarkCausalRecoveryRequired(); return false; }
 
+        const auto stablePrefix = StableCausalPublicationPrefix(gStagedRoots,
+            world_interactions::kMaximumTransactionRoots, [](const auto& a, const auto& b) {
+                return a.causalSerial == b.causalSerial && a.intent.levelGeneration == b.intent.levelGeneration;
+            });
+        if (stablePrefix != 0U && !SealAndPublishStagedRootsLocked(stablePrefix)) return false;
+
         // AwaitAuthority is a synchronous takeover promise. Do not report
         // success while this ROOT is merely reserved/staged: seal and publish
         // the complete prefix now, while the native invocation is still on the
@@ -1540,7 +1573,9 @@ bool SubmitLocalIntent(
 }
 
 bool TryPopOutboundIntent(WorldIntent& output) noexcept {
-    return gOutboundIntents.Pop(output);
+    if (!gOutboundIntents.Pop(output)) return false;
+    gOutboundPoppedCount.fetch_add(1U, std::memory_order_relaxed);
+    return true;
 }
 
 void MarkOutboundIntentTransportFailure(const WorldIntent& intent) noexcept {
@@ -1733,7 +1768,7 @@ bool ReceiveAuthoritativeMutation(const WorldMutation& mutation) noexcept {
     return true;
 }
 
-std::size_t PumpDeferredRemoteApplyOnEngineThread(const std::size_t budget) noexcept {
+static std::size_t PumpOneDeferredRemoteTransaction(const std::size_t budget) noexcept {
     if (!Initialized() || gDispatcher == nullptr || gRegistry == nullptr || gGenerations == nullptr ||
         budget == 0U ||
         gDispatcher->EngineThreadId() == 0U ||
@@ -1808,6 +1843,22 @@ std::size_t PumpDeferredRemoteApplyOnEngineThread(const std::size_t budget) noex
             gDeferredRemoteApplies.pop_front();
         }
     }
+    // Several transactions can now be admitted ahead of their native result.
+    // A definitive failure of a complete transaction must fence its suffix in
+    // native immediately, before the launcher receives the failure callback.
+    // Requeued runtime waits release their in-flight ownership and do not fence.
+    struct CommitFence {
+        const std::vector<DeferredRemoteApply>& segment;
+        const InFlightGuard& inFlight;
+        ~CommitFence() {
+            if (inFlight.count == 0U || segment.empty()) return;
+            std::lock_guard lock(gOrderingMutex);
+            if (!gCausalRecoveryRequired && gLastCommittedSequence < segment.back().mutation.sequence) {
+                gCausalRecoveryRequired = true;
+                gDivergedAuthorityTransaction = segment.front().root.authorityTransaction;
+            }
+        }
+    } commitFence{segment, inFlight};
     {
         std::lock_guard lock(gOrderingMutex);
         if (gCausalRecoveryRequired) {
@@ -2259,6 +2310,15 @@ std::size_t PumpDeferredRemoteApplyOnEngineThread(const std::size_t budget) noex
     (failed ? gFailedSegments : gAppliedSegments).fetch_add(1U, std::memory_order_relaxed);
     TouchVersion();
     return segment.size();
+}
+
+std::size_t PumpDeferredRemoteApplyOnEngineThread(const std::size_t budget) noexcept {
+    // Execute complete FIFO transactions. A blocked head stops the batch;
+    // no later transaction may overtake it. Bound gameplay-thread time too.
+    return DrainOrderedTransactionBatch(budget,
+        [](const std::size_t remaining) { return PumpOneDeferredRemoteTransaction(remaining); },
+        [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count(); });
 }
 
 bool TryPopMutationResult(WorldMutationResult& output) noexcept {

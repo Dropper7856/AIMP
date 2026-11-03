@@ -50,6 +50,8 @@
 #include "aimp/WorldEntityRegistry.h"
 #include "aimp/WorldInteractionAdapters.h"
 #include "aimp/WorldAnimatedAdapters.h"
+#include "aimp/WorldPublicActions.h"
+#include "aimp/WorldSemanticReconciliation.h"
 
 #include <array>
 #include <algorithm>
@@ -1043,6 +1045,9 @@ DWORD Bootstrap::RunImpl() {
     RuntimeObservationSnapshot lastRuntime{};
     while (WaitForSingleObject(stopEvent, 250) == WAIT_TIMEOUT) {
         player_lifecycle::DrainDiagnostics(diagnostics);
+        world_interactions::DrainObservationDiagnostics(diagnostics);
+        world_actions::DrainDiagnosticFiles(diagnostics);
+        semantic_reconciliation::DrainDiagnosticFiles();
         if (GetTickCount64() - lastPauseCounterLogTick >= 5000ULL) {
             multiplayer_pause::LogDiagnostics(diagnostics);
             loading_context_guard::LogDiagnostics(diagnostics);
@@ -1575,6 +1580,8 @@ DWORD Bootstrap::RunImpl() {
     throwable_sync::Shutdown();
     player_lifecycle::DrainDiagnostics(diagnostics);
     character_action_runtime::RequestStopAll();
+    world_actions::DrainDiagnosticFiles(diagnostics);
+    semantic_reconciliation::DrainDiagnosticFiles();
     const auto actionReleaseDeadline = GetTickCount64() + 5500U;
     while (!character_action_runtime::InputsReleased() && GetTickCount64() < actionReleaseDeadline) {
         // Only the engine's normal update may apply STOP; this worker just waits.

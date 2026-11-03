@@ -154,6 +154,13 @@ set_target_properties(AIMP.NetZ PROPERTIES
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(AIMP.WorldManifestTests tests/WorldManifestRuntimeTests.cpp)
+    target_link_libraries(AIMP.WorldManifestTests PRIVATE AIMP.Core)
+    target_compile_options(AIMP.WorldManifestTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.WorldManifestTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME WorldManifestNativeRuntimeIndex COMMAND AIMP.WorldManifestTests)
+    set_tests_properties(WorldManifestNativeRuntimeIndex PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(AIMP.AISyncMovementTests tests/AISyncMovementTests.cpp)
     target_link_libraries(AIMP.AISyncMovementTests PRIVATE AIMP.Core)
     target_compile_options(AIMP.AISyncMovementTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
