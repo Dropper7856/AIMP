@@ -9,6 +9,7 @@ public sealed record ResetLauncherResponse(int ManifestsDeleted);
 
 public sealed record LauncherStatusResponse(
     string LauncherVersion,
+    bool DeveloperMode,
     NativeRuntimeStatus Runtime,
     BridgeStatus Bridge,
     MultiplayerStatus Multiplayer,
@@ -82,17 +83,13 @@ public sealed record SettingsResponse(
     string HostAddress,
     int Port,
     Guid PlayerId,
-    bool WorldSyncEnabled,
-    bool WorldSync3EmptyCallbackEnabled,
     string SettingsPath);
 
 public sealed record UpdateSettingsRequest(
     string? GameDirectory,
     string? PlayerName,
     string? HostAddress,
-    int Port,
-    bool WorldSyncEnabled = true,
-    bool WorldSync3EmptyCallbackEnabled = false);
+    int Port);
 
 public sealed record SettingsValidationResponse(
     bool Valid,

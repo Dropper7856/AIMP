@@ -9,8 +9,6 @@ internal sealed record LauncherSettings(
     string HostAddress = "127.0.0.1",
     int Port = ProtocolConstants.DefaultGamePort,
     Guid PlayerId = default,
-    bool WorldSyncEnabled = true,
-    bool WorldSync3EmptyCallbackEnabled = false,
     VoiceSettings? Voice = null,
     bool DeveloperMode = false)
 {
@@ -33,18 +31,16 @@ internal sealed record LauncherSettings(
 }
 
 
+// WorldSync and the WS3 ProbeDirect callback path are permanent in public
+// builds; neither is a user setting.
 internal static class WorldSync3LauncherOptions
 {
     internal const string EmptyCallbackEnvironmentVariable = "AIMP_WS3_EMPTY_CALLBACK";
+    internal const bool EmptyCallbackEnabled = true;
 
-    internal static void ApplyProcessEnvironment(LauncherSettings settings)
-    {
-        ArgumentNullException.ThrowIfNull(settings);
+    internal static void ApplyProcessEnvironment() =>
         Environment.SetEnvironmentVariable(
-            EmptyCallbackEnvironmentVariable,
-            settings.WorldSync3EmptyCallbackEnabled ? "1" : null,
-            EnvironmentVariableTarget.Process);
-    }
+            EmptyCallbackEnvironmentVariable, "1", EnvironmentVariableTarget.Process);
 }
 
 internal sealed class LauncherSettingsStore
@@ -65,12 +61,6 @@ internal sealed class LauncherSettingsStore
         var json = File.ReadAllText(_path);
         var settings = JsonSerializer.Deserialize<LauncherSettings>(json, JsonOptions)
             ?? LauncherSettings.Empty;
-        // System.Text.Json may supply default(bool) for a constructor
-        // parameter missing from a legacy settings file. Preserve the pre-v13.3
-        // behavior by treating an absent WorldSyncEnabled property as enabled.
-        using var document = JsonDocument.Parse(json);
-        if (!document.RootElement.TryGetProperty(nameof(LauncherSettings.WorldSyncEnabled), out _))
-            settings = settings with { WorldSyncEnabled = true };
         return settings.Normalize();
     }
 

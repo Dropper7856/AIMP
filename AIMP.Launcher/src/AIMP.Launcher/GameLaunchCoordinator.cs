@@ -34,7 +34,7 @@ internal sealed class GameLaunchCoordinator
         if (!string.Equals(settings.GameDirectory, latestSettings.GameDirectory, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("The installation changed during preparation. Launch again.");
         settings = latestSettings;
-        WorldSync3LauncherOptions.ApplyProcessEnvironment(settings);
+        WorldSync3LauncherOptions.ApplyProcessEnvironment();
         EnsureGameIsNotRunning();
         _bridge.Start();
         return await Task.Run(() => InstallAndLaunch(game, settings), cancellationToken)
@@ -52,16 +52,15 @@ internal sealed class GameLaunchCoordinator
         _diagnostics.Log("Launch", "Installing the multiplayer UI bridge into UI.PAK.");
         _uiInstaller.Install(game);
         _diagnostics.Log("Launch", "Launching Alien: Isolation.");
-        using var process = Process.Start(CreateStartInfo(game, settings))
+        using var process = Process.Start(CreateStartInfo(game))
             ?? throw new InvalidOperationException("AI.exe could not be started.");
         _diagnostics.Log("Launch", $"AI.exe started with PID={process.Id}; " +
-            $"child {WorldSync3LauncherOptions.EmptyCallbackEnvironmentVariable}=" +
-            $"{(settings.WorldSync3EmptyCallbackEnabled ? "1" : "unset")} " +
-            "(ProbeDirect callback diagnostic only; explicit process environment).");
+            $"child {WorldSync3LauncherOptions.EmptyCallbackEnvironmentVariable}=1 " +
+            "(ProbeDirect callback path; explicit process environment).");
         return process.Id;
     }
 
-    private static ProcessStartInfo CreateStartInfo(GameInstallationPaths game, LauncherSettings settings)
+    private static ProcessStartInfo CreateStartInfo(GameInstallationPaths game)
     {
         var info = new ProcessStartInfo
         {
@@ -69,11 +68,9 @@ internal sealed class GameLaunchCoordinator
             WorkingDirectory = game.GameDirectory,
             UseShellExecute = false
         };
-        // Both lobby roles use this launch path. Freeze the saved setting in
+        // Both lobby roles use this launch path. Pin the permanent WS3 path in
         // the child's environment instead of relying on shell/global inheritance.
-        if (settings.WorldSync3EmptyCallbackEnabled)
-            info.Environment[WorldSync3LauncherOptions.EmptyCallbackEnvironmentVariable] = "1";
-        else info.Environment.Remove(WorldSync3LauncherOptions.EmptyCallbackEnvironmentVariable);
+        info.Environment[WorldSync3LauncherOptions.EmptyCallbackEnvironmentVariable] = "1";
         return info;
     }
 

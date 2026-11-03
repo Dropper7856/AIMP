@@ -69,6 +69,7 @@ public sealed class LauncherRuntimeService : BackgroundService
         var multiplayer = _multiplayer.State;
         return new LauncherStatusResponse(
             ProductInfo.LauncherVersion,
+            LoadSettingsOrDefault().DeveloperMode,
             MapRuntime(_controller.Snapshot),
             new BridgeStatus(bridge.Running, bridge.Connected, bridge.ConnectedClients),
             new MultiplayerStatus(
@@ -120,17 +121,13 @@ public sealed class LauncherRuntimeService : BackgroundService
             validation.NormalizedHostAddress!,
             validation.NormalizedPort!.Value,
             previous.PlayerId == Guid.Empty ? Guid.NewGuid() : previous.PlayerId,
-            request.WorldSyncEnabled,
-            request.WorldSync3EmptyCallbackEnabled,
             previous.Voice, previous.DeveloperMode); // Multiplayer options are edited in game.
         _settings.Save(value);
         _preparation.Start();
-        WorldSync3LauncherOptions.ApplyProcessEnvironment(value);
+        WorldSync3LauncherOptions.ApplyProcessEnvironment();
         _controller.Diagnostics.Log(
             "Settings",
-            $"Settings saved for player {value.PlayerName}; " +
-            $"WorldSync={(value.WorldSyncEnabled ? "enabled" : "disabled")}; " +
-            $"WS3 ProbeDirect callback test={(value.WorldSync3EmptyCallbackEnabled ? "enabled" : "disabled")} for the next game session.");
+            $"Settings saved for player {value.PlayerName}.");
         return MapSettings(value);
     }
 
@@ -148,7 +145,7 @@ public sealed class LauncherRuntimeService : BackgroundService
                 LauncherResetFiles.DeleteGeneratedData(
                     LauncherResetFiles.UserDataDirectory(),
                     _settings.SettingsPath, LoadSettingsOrDefault().GameDirectory))), cancellationToken).ConfigureAwait(false);
-            WorldSync3LauncherOptions.ApplyProcessEnvironment(LauncherSettings.Empty);
+            WorldSync3LauncherOptions.ApplyProcessEnvironment();
             _controller.Diagnostics.Log("Settings", $"Launcher reset completed; {deleted} manifest(s) removed.");
             return new ResetLauncherResponse(deleted);
         }
@@ -572,8 +569,6 @@ public sealed class LauncherRuntimeService : BackgroundService
         value.HostAddress,
         value.Port,
         value.PlayerId,
-        value.WorldSyncEnabled,
-        value.WorldSync3EmptyCallbackEnabled,
         _settings.SettingsPath);
 
     private LauncherSettings LoadSettingsOrDefault()

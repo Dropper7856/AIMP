@@ -130,7 +130,7 @@ internal sealed class NativeRuntimeController : IDisposable
     private async Task SynchronizeWorldSync3OptionsAsync(
         DllIpcSession session, int processId, CancellationToken token)
     {
-        var enabled = _settings.Load().WorldSync3EmptyCallbackEnabled;
+        const bool enabled = WorldSync3LauncherOptions.EmptyCallbackEnabled;
         var request = CreateWorldSync3OptionsRequest(enabled);
         Log($"Applying WS3 ProbeDirect callback test={(enabled ? 1 : 0)} via IPC to AI.exe PID={processId}.");
         var result = await session.ExecuteGameCommandAsync(request,

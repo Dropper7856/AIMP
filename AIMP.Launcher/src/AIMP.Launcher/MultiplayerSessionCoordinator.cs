@@ -539,7 +539,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                     _performanceIsolation.SetEnabled(module, true);
                     lock (_stateGate)
                     {
-                        _worldSyncEnabledForSession = _settingsStore.Load().WorldSyncEnabled;
+                        _worldSyncEnabledForSession = true;
                         _worldActivationAttempted = false;
                     }
                     await TryActivateAutomaticWorldSyncAsync(_controller.Snapshot).ConfigureAwait(false);
@@ -2689,8 +2689,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
 
     private async Task ApplyLobbyStartedAsync(LobbyStartPayload value)
     {
-        var worldSyncEnabled = _settingsStore.Load().WorldSyncEnabled &&
-            _performanceIsolation.IsEnabled(PerformanceIsolationModule.WorldSync);
+        var worldSyncEnabled = _performanceIsolation.IsEnabled(PerformanceIsolationModule.WorldSync);
         uint[] previousCharacters;
         LobbyHost? host;
         LobbyClient? client;
@@ -5103,16 +5102,16 @@ internal static class LobbyCompatibility
 {
     private const string ProfileId = "aimp-ws3-logicswitch-lifecycle-v33-root10-wm08c9";
 
-    private static string EffectiveProfileId(LauncherSettings settings) => ProfileId +
+    private const string EffectiveProfileId = ProfileId +
         ":ws3" +
-        (settings.WorldSync3EmptyCallbackEnabled ? ":probe-callback-test" : ":strict") +
+        ":probe-callback-test" +
         ":aisync-v6-participants" +
         ":round-end-v1" +
         ":itemsync-v2";
 
     internal static CompatibilityInfo Create(LauncherSettings settings)
     {
-        var profileId = EffectiveProfileId(settings);
+        var profileId = EffectiveProfileId;
         return new CompatibilityInfo(
             ProtocolConstants.Version,
             ProductInfo.LauncherVersion,

@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.367-aisync-native";
+    "0.11.4.368-aisync-native";
 
 } // namespace aimp

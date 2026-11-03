@@ -554,21 +554,19 @@ internal static class LauncherTests
     {
         var store = new LauncherSettingsStore(temporary.Combine("settings.json"));
         var playerId = Guid.NewGuid();
-        store.Save(new LauncherSettings(game, "Ripley", "10.0.0.5", 28015, playerId, false));
+        store.Save(new LauncherSettings(game, "Ripley", "10.0.0.5", 28015, playerId));
         var loaded = store.Load();
         AssertEx.Equal(game, loaded.GameDirectory);
         AssertEx.Equal("Ripley", loaded.PlayerName);
         AssertEx.Equal("10.0.0.5", loaded.HostAddress);
         AssertEx.Equal(28015, loaded.Port);
         AssertEx.Equal(playerId, loaded.PlayerId);
-        AssertEx.False(loaded.WorldSyncEnabled);
         AssertEx.Equal(new VoiceSettings(), loaded.Voice!);
         var voice = new VoiceSettings(false, "voiceActivity", "persistent-interface", 0xA3, 0.1f, 1.5f, 0.4f);
-        store.Save(loaded with { Voice = voice, WorldSync3EmptyCallbackEnabled = true });
+        store.Save(loaded with { Voice = voice, DeveloperMode = true });
         loaded = store.Load();
         AssertEx.Equal(voice, loaded.Voice!);
-        AssertEx.False(loaded.WorldSyncEnabled);
-        AssertEx.True(loaded.WorldSync3EmptyCallbackEnabled);
+        AssertEx.True(loaded.DeveloperMode);
         AssertEx.True(voice.TryValidate(out _));
         foreach (var invalid in new[]
         {
@@ -596,8 +594,21 @@ internal static class LauncherTests
             }));
         var legacyStore = new LauncherSettingsStore(temporary.Combine("legacy-settings.json"));
         AssertEx.Equal(new VoiceSettings(), legacyStore.Load().Voice!);
-        AssertEx.True(legacyStore.Load().WorldSyncEnabled,
-            "WorldSync must remain enabled for settings files created before the checkbox existed.");
+
+        // Settings written while WorldSync was a user toggle still load; the
+        // retired properties are ignored because WorldSync is always on.
+        File.WriteAllText(temporary.Combine("toggle-settings.json"),
+            JsonSerializer.Serialize(new
+            {
+                GameDirectory = game,
+                PlayerName = "Toggle",
+                WorldSyncEnabled = false,
+                WorldSync3EmptyCallbackEnabled = false,
+                DeveloperMode = true
+            }));
+        var toggleSettings = new LauncherSettingsStore(temporary.Combine("toggle-settings.json")).Load();
+        AssertEx.Equal("Toggle", toggleSettings.PlayerName);
+        AssertEx.True(toggleSettings.DeveloperMode);
     }
 
     private static void AssertBridgeProtocol()
