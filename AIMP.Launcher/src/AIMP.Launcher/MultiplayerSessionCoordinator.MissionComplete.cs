@@ -3,9 +3,12 @@ using System.Globalization;
 
 namespace AIMP.Launcher;
 
-// Mission completion: native PlayerLifecycle suppresses a retail level exit
-// (GoToFrontend/SwitchLevel, shared by every map) inside a gameplay session and
-// reports it here. The finished player waits on a PICKUPOVERLAY screen while
+// Mission completion has two generic sources: native PlayerLifecycle suppresses
+// a retail level exit (GoToFrontend/SwitchLevel, every map and the campaign),
+// and the challenge HUD reports challengemapOpenedResults, which every DLC
+// SurvivorUILogic invokes on LevelComplete. The latter matters because outside
+// a frontend playlist the retail results branch (indexed by "Playlist Order No")
+// never runs, so no level exit is ever reached. The finished player waits on a PICKUPOVERLAY screen while
 // the Host counts finished and dead participants; RoundEnded(MissionComplete)
 // then reuses the game-over return to the lobby.
 internal sealed partial class MultiplayerSessionCoordinator
@@ -31,11 +34,19 @@ internal sealed partial class MultiplayerSessionCoordinator
         }
     }
 
-    private async Task ReportLocalMissionCompleteAsync(NativePlayerLifecycleStatePayload value)
+    private bool TryAcceptMissionResultsOpened(ScaleformBridgeEvent value)
+    {
+        if (!value.Message.Type.Equals("MISSION_RESULTS_OPENED", StringComparison.OrdinalIgnoreCase)
+            || value.Message.Get("source") != "challenge_map_overlay") return false;
+        _ = ReportLocalMissionCompleteAsync("challenge results opened");
+        return true;
+    }
+
+    private async Task ReportLocalMissionCompleteAsync(string origin)
     {
         if (CaptureMissionCompleteReport() is not { } report) return;
-        _diagnostics.Log("PlayerLifecycle", $"Local level exit #{value.LevelExitSequence} reported as " +
-            $"mission complete for generation {report.Generation}.");
+        _diagnostics.Log("PlayerLifecycle", $"Local mission complete ({origin}) reported for " +
+            $"generation {report.Generation}.");
         await ShowMissionWaitAsync(report.Generation).ConfigureAwait(false);
         try { await SendLocalMissionCompleteAsync(report).ConfigureAwait(false); }
         catch (Exception exception) when (exception is IOException or ObjectDisposedException

@@ -750,6 +750,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         { AcceptSessionLoadingAck(value); return; }
         if (value.Message.Type.Equals("ROUND_RETURN_READY", StringComparison.OrdinalIgnoreCase))
         { AcceptRoundReturnReady(value); return; }
+        if (TryAcceptMissionResultsOpened(value)) return;
         if (TryHandleImmediateMenuMessage(value)) return;
         _ = HandleBridgeMessageAsync(value.Message);
     }
