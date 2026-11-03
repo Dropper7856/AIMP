@@ -164,6 +164,8 @@ public static class GameCommandNames
     public const string WorldStateDiscoveryStatus = "WORLD_STATE_DISCOVERY_STATUS";
     // Internal round lifecycle: retail "quit to main menu" path, absent from the UI catalogue.
     public const string SessionLoadingHold = "SESSION_LOADING_HOLD";
+    // Internal round lifecycle: revokes the previous level incarnation at a lobby start.
+    public const string SessionRoundBoundary = "SESSION_ROUND_BOUNDARY";
     public const string ReturnToFrontend = "RETURN_TO_FRONTEND";
     // Internal ItemSync: remove a pickup another participant collected, absent from the UI catalogue.
     public const string ItemSyncApply = "ITEM_SYNC_APPLY";
@@ -195,6 +197,7 @@ public static class GameCommandNames
             WorldStateDiscoveryStatus,
             ReturnToFrontend,
             SessionLoadingHold,
+            SessionRoundBoundary,
             ItemSyncApply,
             ItemSyncSpawn,
             MissionSyncConfigure,

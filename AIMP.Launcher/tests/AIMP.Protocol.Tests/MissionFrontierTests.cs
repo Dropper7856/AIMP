@@ -155,6 +155,46 @@ internal static class MissionFrontierTests
         return Task.CompletedTask;
     }
 
+    // SalvageMode1 shape: the hub terminal's chosen TriggerSimple in
+    // MISSION_SalvageMode1 starts a nested MISSION_ChallengeMap10 instance.
+    // Starting a mission is a shared, repeatable milestone; a non-mission
+    // target or a Campaign catalogue keeps it local.
+    internal static Task MissionStartAsync()
+    {
+        WorldEntityId trigger = new(9, 1), mission = new(9, 2);
+        WorldEntityDescriptor At(WorldEntityId id, WorldEntityKind kind, string primitive) =>
+            new(id, WorldDomain.World, kind, WorldEntityFlags.RuntimeAddressable, 100, (uint)id.Low, 1, 0,
+                (uint)id.Low, 300, 0, 0, primitive, "");
+        var start = Manifest() with
+        {
+            Composites = [new WorldCompositeDescriptor(100, @"DLC\SalvageMode1\MISSION_SalvageMode1", WorldDomain.World, false, true)],
+            Entities =
+            [
+                At(trigger, WorldEntityKind.Function, "TriggerSimple"),
+                At(mission, WorldEntityKind.CompositeInstance, @"DLC\ChallengeMap10\MISSION_ChallengeMap10")
+            ],
+            Connections = [new WorldConnectionDescriptor(trigger, Port("triggered"), mission, Port("MissionStart"), false)]
+        };
+        var roots = MissionSyncFrontierCompiler.Compile(start, survival: true);
+        AssertEx.Equal(1, roots.Count);
+        AssertEx.Equal(trigger, roots[0].Source.EntityId);
+        AssertEx.Equal(Port("triggered"), roots[0].Signal);
+        AssertEx.True(roots[0].Repeatable);
+        AssertEx.Equal(0, MissionSyncFrontierCompiler.Compile(start).Count);
+        var notMission = start with
+        {
+            Entities = start.Entities.Select(value => value.EntityId == mission
+                ? value with { PrimitiveName = @"AYZ\_Props_\Interactive\Door_Controller" } : value).ToArray()
+        };
+        AssertEx.Equal(0, MissionSyncFrontierCompiler.Compile(notMission, survival: true).Count);
+        var notFromMission = start with
+        {
+            Composites = [start.Composites[0] with { Name = @"DLC\SalvageMode1\HUB_SalvageMode1" }]
+        };
+        AssertEx.Equal(0, MissionSyncFrontierCompiler.Compile(notFromMission, survival: true).Count);
+        return Task.CompletedTask;
+    }
+
     // ChallengeMap16 shape: MISSION_ChallengeMap16 observes the generator through
     // Proxy<Power_Generator_Control>.complete, which arms the next PlayerTriggerBox
     // and sets the next SetSubObjective. Both the Proxy and the proxied instance

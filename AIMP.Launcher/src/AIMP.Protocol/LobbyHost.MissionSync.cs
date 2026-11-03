@@ -9,11 +9,34 @@ public sealed partial class LobbyHost
     // box, or a delayed consequence fires on every machine); the duplicate must
     // not replay the authored branch twice nor consume a commit sequence.
     private readonly HashSet<(string EntityId, uint Signal, byte Selector)> _missionCommittedFrontiers = new();
+    // A repeatable frontier (a hub terminal starting a nested mission) is only
+    // raised by the participant who used it, possibly several times a round.
+    // A short window still collapses near-simultaneous duplicate proposals.
+    private static readonly TimeSpan DefaultRepeatableMissionWindow = TimeSpan.FromSeconds(10);
+    private long _missionRepeatableWindowMilliseconds = (long)DefaultRepeatableMissionWindow.TotalMilliseconds;
+    private readonly HashSet<(string EntityId, uint Signal)> _missionRepeatable = new();
+    private readonly Dictionary<(string EntityId, uint Signal, byte Selector), long> _missionRepeatableCommits = new();
     private int _missionGeneration;
     private ulong _missionCommitSequence;
     private long _missionDrops;
 
     public event EventHandler<MissionSignalPayload>? MissionSignalCommitted;
+
+    public void SetMissionRepeatableFrontiers(IEnumerable<(string EntityId, uint Signal)> frontiers,
+        TimeSpan? duplicateWindow = null)
+    {
+        ArgumentNullException.ThrowIfNull(frontiers);
+        var window = duplicateWindow ?? DefaultRepeatableMissionWindow;
+        if (window < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(duplicateWindow));
+        lock (_stateLock)
+        {
+            _missionRepeatableWindowMilliseconds = (long)window.TotalMilliseconds;
+            _missionRepeatable.Clear();
+            foreach (var (entityId, signal) in frontiers)
+                _missionRepeatable.Add((entityId.ToUpperInvariant(), signal));
+            _missionRepeatableCommits.Clear();
+        }
+    }
 
     public Task ReportHostMissionSignalAsync(MissionSignalPayload signal,
         CancellationToken cancellationToken = default)
@@ -59,6 +82,7 @@ public sealed partial class LobbyHost
                         _missionCommitSequence = 0;
                         _missionProposals.Clear();
                         _missionCommittedFrontiers.Clear();
+                        _missionRepeatableCommits.Clear();
                     }
                     if (_missionProposals.TryGetValue(proposal.PeerId, out var previous)
                         && proposal.Sequence <= previous)
@@ -68,8 +92,19 @@ public sealed partial class LobbyHost
                     else
                     {
                         _missionProposals[proposal.PeerId] = proposal.Sequence;
-                        if (_missionCommittedFrontiers.Add((proposal.EntityId.ToUpperInvariant(),
-                                proposal.Signal, proposal.InterfaceSelector)))
+                        var frontier = (proposal.EntityId.ToUpperInvariant(), proposal.Signal, proposal.InterfaceSelector);
+                        if (_missionRepeatable.Contains((frontier.Item1, frontier.Item2)))
+                        {
+                            var now = Environment.TickCount64;
+                            if (!_missionRepeatableCommits.TryGetValue(frontier, out var last)
+                                || now - last >= _missionRepeatableWindowMilliseconds)
+                            {
+                                _missionRepeatableCommits[frontier] = now;
+                                committed = proposal with { Sequence = ++_missionCommitSequence };
+                            }
+                            else rejection = "repeatable mission frontier already committed moments ago";
+                        }
+                        else if (_missionCommittedFrontiers.Add(frontier))
                             committed = proposal with { Sequence = ++_missionCommitSequence };
                         else rejection = "mission frontier already committed this round";
                     }

@@ -102,6 +102,22 @@ internal static class MissionSyncTests
         AssertEx.Equal(13, Count(atHost));
         AssertEx.Equal(1UL, Copy(atClient)[12].Sequence);
         AssertEx.Equal(next.LevelGeneration, Copy(atClient)[12].LevelGeneration);
+
+        // A hub terminal can start the same nested mission again later in the
+        // round. Repeatable frontiers commit again after the duplicate window,
+        // while a near-simultaneous duplicate proposal still collapses.
+        host.SetMissionRepeatableFrontiers([(Entity.ToLowerInvariant(), 777U)], TimeSpan.FromMilliseconds(300));
+        MissionSignalPayload Start(ulong peer, ulong sequence) =>
+            new(host.SessionId, peer, next.LevelGeneration, sequence, Entity, 777U, 1);
+        await client.SendMissionSignalAsync(Start(client.PeerId, 1), token);
+        await host.ReportHostMissionSignalAsync(Start(host.HostPeerId, 2), token);
+        await WaitAsync(() => Count(atClient) == 14, token);
+        await Task.Delay(400, token);
+        await client.SendMissionSignalAsync(Start(client.PeerId, 2), token);
+        await WaitAsync(() => Count(atClient) == 15, token);
+        await Task.Delay(100, token);
+        AssertEx.Equal(15, Count(atHost));
+        AssertEx.True(Copy(atClient).Skip(13).All(value => value.Signal == 777U));
     }
 
     private static int Count(List<MissionSignalPayload> values) { lock (values) return values.Count; }

@@ -84,6 +84,8 @@ set(AIMP_CORE_SOURCES
     src/MissionSync.cpp
     src/PlayerLifecycle.cpp
     src/LoadingContextGuard.cpp
+    src/PairedTransformGuard.cpp
+    src/TeardownReferenceGuard.cpp
     src/UIHeapGuard.cpp
     src/MultiplayerPause.cpp
     src/ItemSync.cpp

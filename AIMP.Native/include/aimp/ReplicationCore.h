@@ -146,6 +146,9 @@ void MarkOutboundIntentTransportFailure(const WorldIntent& intent) noexcept;
 
 [[nodiscard]] bool RemoteApplyActive() noexcept;
 void ResetForGeneration(std::uint64_t generation) noexcept;
+// Clears authority ordering and local observation echoes for a new lobby
+// session without touching level-bound registries.
+void ResetAuthorityOrdering() noexcept;
 void BeginLogicalShutdown() noexcept;
 
 } // namespace replication_core

@@ -29,7 +29,7 @@ internal sealed class GameLaunchCoordinator
         var settings = _settings.Load();
         var game = ResolveConfiguredGame(settings);
         EnsureGameIsNotRunning();
-        await _preparation.EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+        await _preparation.PrepareForLaunchAsync(cancellationToken).ConfigureAwait(false);
         var latestSettings = _settings.Load();
         if (!string.Equals(settings.GameDirectory, latestSettings.GameDirectory, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("The installation changed during preparation. Launch again.");

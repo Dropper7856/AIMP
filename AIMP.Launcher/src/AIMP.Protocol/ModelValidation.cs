@@ -886,6 +886,16 @@ public static class ModelValidation
             return;
         }
 
+        if (string.Equals(value.Command, GameCommandNames.SessionRoundBoundary,
+                StringComparison.Ordinal))
+        {
+            if (value.LevelGeneration != 0 || value.Arguments.Count != 1
+                || !value.Arguments.TryGetValue("sessionId", out var boundaryText)
+                || !Guid.TryParse(boundaryText, out var boundarySession) || boundarySession == Guid.Empty)
+                throw new ProtocolException("SESSION_ROUND_BOUNDARY parameters are invalid.");
+            return;
+        }
+
         if (string.Equals(value.Command, GameCommandNames.SessionLoadingHold,
                 StringComparison.Ordinal))
         {

@@ -8253,6 +8253,10 @@ ExecuteResult ExecuteTypedMessage(
     }
 }
 
+void ResetSessionObservations() noexcept {
+    ClearEchoIds();
+}
+
 void ResetForGeneration() noexcept {
     world_actions::ResetForGeneration();
     gCompositePublicInputPreQueueBuilderUnknownTraceCount.store(0U, std::memory_order_relaxed);

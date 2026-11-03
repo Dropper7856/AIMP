@@ -39,6 +39,8 @@
 #include "aimp/PlayerLifecycle.h"
 #include "aimp/UIHeapGuard.h"
 #include "aimp/LoadingContextGuard.h"
+#include "aimp/PairedTransformGuard.h"
+#include "aimp/TeardownReferenceGuard.h"
 #include "aimp/MultiplayerPause.h"
 #include "aimp/ItemSync.h"
 #include "aimp/ThrowableSync.h"
@@ -648,6 +650,22 @@ DWORD Bootstrap::RunImpl() {
     }
 
     {
+        std::string pairedError;
+        const bool installed = validation.hashMatch &&
+            paired_transform_guard::Install(moduleBase, *hooks, pairedError);
+        diagnostics.Log(installed ? "info" : "error", "paired_transform_guard_initialized",
+            installed ? "Paired animation partner transform guard installed." : pairedError);
+    }
+
+    {
+        std::string teardownError;
+        const bool installed = validation.hashMatch &&
+            teardown_reference_guard::Install(moduleBase, *hooks, teardownError);
+        diagnostics.Log(installed ? "info" : "error", "teardown_reference_guard_initialized",
+            installed ? "Stale entity transform reference guard installed." : teardownError);
+    }
+
+    {
         std::string lifecycleError;
         const bool installed = signaturesValid && resolver != nullptr &&
             player_lifecycle::Install(profile, *resolver, *hooks,
@@ -1051,6 +1069,8 @@ DWORD Bootstrap::RunImpl() {
         if (GetTickCount64() - lastPauseCounterLogTick >= 5000ULL) {
             multiplayer_pause::LogDiagnostics(diagnostics);
             loading_context_guard::LogDiagnostics(diagnostics);
+            paired_transform_guard::LogDiagnostics(diagnostics);
+            teardown_reference_guard::LogDiagnostics(diagnostics);
             item_sync::LogDiagnostics(diagnostics);
             lastPauseCounterLogTick = GetTickCount64();
         }

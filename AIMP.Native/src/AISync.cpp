@@ -1219,6 +1219,35 @@ bool ParticipantConstructionCurrent(const ParticipantBinding& binding,const bool
         Read(binding.character+0x50U,runtime)&&runtime==binding.runtimeId&&
         character_incarnations::NativeRegistry().Current(ticket);
 }
+// Participants (local player or remote player proxies) an AI actor is
+// currently pairing with. Published from the engine thread for network
+// locomotion/equipment adapters, which must not move, teleport or re-equip a
+// victim while the kill/grab graph aligns on it. Held briefly after the
+// interaction ends so the retail outro also completes undisturbed.
+constexpr ULONGLONG kPairedParticipantVictimHoldMs = 1500ULL;
+constexpr std::size_t kPairedParticipantVictimSlots = 4U;
+std::array<std::atomic<std::uintptr_t>, kPairedParticipantVictimSlots> gPairedParticipantVictims{};
+std::array<std::atomic<ULONGLONG>, kPairedParticipantVictimSlots> gPairedParticipantVictimUntil{};
+
+std::uintptr_t ParticipantForPeer(const std::uint64_t peer) noexcept;
+
+void PublishPairedParticipantVictim(const std::uintptr_t victim, const ULONGLONG until) noexcept {
+    std::size_t free = kPairedParticipantVictimSlots;
+    const auto now = GetTickCount64();
+    for (std::size_t i = 0U; i < kPairedParticipantVictimSlots; ++i) {
+        if (gPairedParticipantVictims[i].load(std::memory_order_acquire) == victim) {
+            gPairedParticipantVictimUntil[i].store(until, std::memory_order_release);
+            return;
+        }
+        if (free == kPairedParticipantVictimSlots &&
+            gPairedParticipantVictimUntil[i].load(std::memory_order_acquire) <= now) free = i;
+    }
+    if (free == kPairedParticipantVictimSlots) return;
+    gPairedParticipantVictimUntil[free].store(0U, std::memory_order_release);
+    gPairedParticipantVictims[free].store(victim, std::memory_order_release);
+    gPairedParticipantVictimUntil[free].store(until, std::memory_order_release);
+}
+
 std::uintptr_t ParticipantForPeer(const std::uint64_t peer) noexcept {
     if (peer == 0U) return 0U;
     if (peer == gCurrent.localPeer) {
@@ -9513,6 +9542,17 @@ void PumpOnEngineThread() noexcept {
     const profiling::Timer timing(profiling::Section::AiPump);
     if (!Installed() || !EngineThread()) return;
     PublishLocalIncarnation();
+    {
+        const auto until = GetTickCount64() + kPairedParticipantVictimHoldMs;
+        for (const auto& actor : gActors) {
+            if (actor.character == 0U || actor.duplicate) continue;
+            const auto flags = actor.desired.interactionFlags;
+            if ((flags & InteractionTargetIsParticipant) == 0U ||
+                (flags & (InteractionCycleActive | InteractionPairValid)) == 0U) continue;
+            const auto victim = ParticipantForPeer(actor.desired.interactionTargetPeer);
+            if (victim != 0U) PublishPairedParticipantVictim(victim, until);
+        }
+    }
     // Revoke old-world value permissions BEFORE retirement and configuration
     // barriers. Waiting for owner retirement before forgetting its invalid
     // world deadlocked every later round at contextBlocker 5.
@@ -9977,6 +10017,15 @@ bool OwnsAI() noexcept {
     return Installed() && role != Role::Retail;
 }
 bool Installed() noexcept { return gInstalled.load(std::memory_order_acquire); }
+
+bool PairedParticipantVictim(const std::uintptr_t character) noexcept {
+    if (character == 0U) return false;
+    const auto now = GetTickCount64();
+    for (std::size_t i = 0U; i < kPairedParticipantVictimSlots; ++i)
+        if (gPairedParticipantVictims[i].load(std::memory_order_acquire) == character &&
+            now < gPairedParticipantVictimUntil[i].load(std::memory_order_acquire)) return true;
+    return false;
+}
 std::uintptr_t ResolveLivingParticipant(const std::uint64_t peer,
     const std::uint32_t nativeGeneration) noexcept {
     if (!EngineThread() || !Stable() || gCurrent.nativeGeneration != nativeGeneration) return 0U;

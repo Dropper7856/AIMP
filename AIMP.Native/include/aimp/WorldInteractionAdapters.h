@@ -1040,6 +1040,8 @@ void DrainObservationDiagnostics(aimp::Diagnostics& diagnostics);
     WorldEntityRegistry& registry) noexcept;
 
 void ResetForGeneration() noexcept;
+// Forgets local observation/echo state at a lobby session boundary.
+void ResetSessionObservations() noexcept;
 void BeginLogicalShutdown() noexcept;
 
 } // namespace world_interactions
