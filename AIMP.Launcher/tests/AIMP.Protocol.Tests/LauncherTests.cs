@@ -7,6 +7,19 @@ namespace AIMP.Protocol.Tests;
 
 internal static class LauncherTests
 {
+    internal static Task NativeBuildVersionAgreementAsync()
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
+        {
+            var header = Path.Combine(directory.FullName, "AIMP.Native", "include", "aimp", "ProductVersion.h");
+            if (!File.Exists(header)) continue;
+            AssertEx.True(File.ReadAllText(header).Contains($"\"{ProductInfo.ExpectedDllVersion}\"", StringComparison.Ordinal),
+                $"Launcher expects {ProductInfo.ExpectedDllVersion}, which differs from the native build version.");
+            return Task.CompletedTask;
+        }
+        throw new InvalidOperationException("Native product-version header was not found.");
+    }
+
     internal static Task ManifestCacheIdentityAsync()
     {
         // TECH_COMMS: the compiler found this cache while lobby preflight searched

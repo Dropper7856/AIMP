@@ -1437,6 +1437,14 @@ std::optional<WorldDomain> WorldEntityRegistry::FindWorldEntityDomain(
     return found->second.domain;
 }
 
+bool WorldEntityRegistry::IsPlayerMissionCompleteEndpoint(const WorldEntityId& id) const noexcept {
+    std::lock_guard lock(mutex_);
+    if (!manifestLoaded_) return false;
+    const auto found = entries_.find(id);
+    return found != entries_.end() &&
+        (found->second.flags & WorldEntityFlagPlayerMissionComplete) != 0U;
+}
+
 std::optional<std::uint32_t> WorldEntityRegistry::FindWorldEntityPrimitiveType(
     const WorldEntityId& id) const noexcept {
     if (!id.Valid()) return std::nullopt;

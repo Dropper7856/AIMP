@@ -33,6 +33,9 @@ inline constexpr std::uint32_t kTriggerInput = 0xD9D0CA29U;
 // true when the retail transition must be suppressed: the local player then
 // counts as having completed the mission (one more LocalLevelExitSequence).
 [[nodiscard]] bool DecideLevelExit(std::uint32_t primitive) noexcept;
+// Observe the executed native terminal HUD trigger, before Flash dispatch.
+// This does not suppress CATHODE or require a working results movie.
+void ObserveMissionComplete() noexcept;
 // Monotonic count of suppressed local level exits (0 = none yet).
 [[nodiscard]] std::uint64_t LocalLevelExitSequence() noexcept;
 // Stop suppressing immediately. HookManager owns restoration/retirement;

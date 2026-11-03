@@ -37,6 +37,7 @@ std::atomic<std::uint64_t> gLocalLevelExitSequence{0};
 std::atomic<std::uint64_t> gLevelExitObserved{0}, gLevelExitAllowed{0}, gLevelExitDrained{0};
 std::atomic<std::uint32_t> gLevelExitLastPrimitive{0};
 std::atomic<std::int32_t> gLevelExitLastMode{-1};
+std::atomic<std::uint64_t> gMissionCompleteObserved{0}, gMissionCompleteDrained{0};
 const void* gGlobalRootAddress{};
 // Published before HookManager resumes patched threads. Neither destination
 // is cleared at logical shutdown: an in-flight naked detour still needs it.
@@ -261,6 +262,14 @@ std::uint64_t LocalLevelExitSequence() noexcept {
     return gLocalLevelExitSequence.load(std::memory_order_acquire);
 }
 
+void ObserveMissionComplete() noexcept {
+    if (!gEnabled.load(std::memory_order_acquire) || !world_actions::SessionAuthorityBound()) return;
+    const auto mode = ReadGameplayMode();
+    if (!mode || *mode == 0 || *mode == 3) return;
+    gMissionCompleteObserved.fetch_add(1U, std::memory_order_relaxed);
+    gLocalLevelExitSequence.fetch_add(1U, std::memory_order_acq_rel);
+}
+
 void Shutdown() noexcept {
     gEnabled.store(false, std::memory_order_release);
 }
@@ -311,6 +320,13 @@ void DrainDiagnostics(Diagnostics& diagnostics) {
              {"retailAllowed", Diagnostics::Unsigned(gLevelExitAllowed.load(std::memory_order_relaxed)), true},
              {"lastPrimitive", Diagnostics::Unsigned(gLevelExitLastPrimitive.load(std::memory_order_relaxed)), true},
              {"lastGameplayMode", std::to_string(gLevelExitLastMode.load(std::memory_order_relaxed)), true}});
+    }
+    const auto completed = gMissionCompleteObserved.load(std::memory_order_relaxed);
+    if (completed != gMissionCompleteDrained.exchange(completed, std::memory_order_relaxed)) {
+        diagnostics.Log("info", "playerlifecycle_mission_complete",
+            "[PlayerLifecycle] local terminal HUD trigger executed; completion reported before Flash dispatch.",
+            {{"observed", Diagnostics::Unsigned(completed), true},
+             {"levelExitSequence", Diagnostics::Unsigned(LocalLevelExitSequence()), true}});
     }
     if (dropped != 0U) {
         diagnostics.Log("warning", "playerlifecycle_diagnostics_overflow",

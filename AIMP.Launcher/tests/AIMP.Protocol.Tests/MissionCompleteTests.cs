@@ -1,9 +1,32 @@
 using AIMP.Launcher;
+using CATHODE.Scripting;
+using CATHODE.Scripting.Internal;
 
 namespace AIMP.Protocol.Tests;
 
 internal static class MissionCompleteTests
 {
+    internal static Task NativeEndpointAsync()
+    {
+        var endpoint = new FunctionEntity { function = ShortGuidUtils.Generate("FlashInvoke") };
+        void Argument(string name, string value) => endpoint.parameters.Add(
+            new Parameter(name, new cString { value = value }, ParameterVariant.PARAMETER));
+        Argument("method", "challengemapOpenedResults");
+        Argument("layer_name", "ChallengeMapOverlay");
+        AssertEx.True(WorldManifestCompiler.IsPlayerMissionCompleteEndpoint(endpoint));
+        endpoint.function = ShortGuidUtils.Generate("DebugText");
+        AssertEx.False(WorldManifestCompiler.IsPlayerMissionCompleteEndpoint(endpoint));
+        endpoint.function = ShortGuidUtils.Generate("FlashInvoke");
+        ((cString)endpoint.parameters[0].content).value = "dead";
+        AssertEx.False(WorldManifestCompiler.IsPlayerMissionCompleteEndpoint(endpoint));
+        ((cString)endpoint.parameters[0].content).value = "challengemapOpenedResults";
+        ((cString)endpoint.parameters[1].content).value = "OtherOverlay";
+        AssertEx.False(WorldManifestCompiler.IsPlayerMissionCompleteEndpoint(endpoint));
+        endpoint.parameters.Clear();
+        AssertEx.False(WorldManifestCompiler.IsPlayerMissionCompleteEndpoint(endpoint));
+        return Task.CompletedTask;
+    }
+
     private sealed record Session(LobbyHost Host, LobbyClient Client, int Generation) : IAsyncDisposable
     {
         public async ValueTask DisposeAsync()

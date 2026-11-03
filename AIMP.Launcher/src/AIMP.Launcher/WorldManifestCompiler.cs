@@ -562,6 +562,7 @@ internal sealed class WorldManifestCompiler
         if (IsNondeterministicBoundary(primitiveName)) flags |= WorldEntityFlags.NondeterministicBoundary;
         if (IsZonePrimitive(primitiveName)) flags |= WorldEntityFlags.ZonePrimitive;
         if (runtimeBaseInstanceId != 0U) flags |= WorldEntityFlags.RuntimeAddressable;
+        if (IsPlayerMissionCompleteEndpoint(entity)) flags |= WorldEntityFlags.PlayerMissionComplete;
 
         var id = ComputeEntityId(composite.shortGUID.AsUInt32, entity.shortGUID.AsUInt32, kind, path);
         var zoneId = flags.HasFlag(WorldEntityFlags.ZonePrimitive)
@@ -586,6 +587,17 @@ internal sealed class WorldManifestCompiler
             primitiveName,
             entityName);
     }
+
+    // Inspect the actual function and its arguments, rather than a map name,
+    // entity name or ShortGuid. This endpoint is used by the shared Survivor UI
+    // before the playlist/results branch, including maps launched outside it.
+    internal static bool IsPlayerMissionCompleteEndpoint(Entity entity) =>
+        entity is FunctionEntity function
+        && function.function == ShortGuidUtils.Generate("FlashInvoke")
+        && function.parameters.Any(parameter => parameter.name == ShortGuidUtils.Generate("method")
+            && parameter.content is cString { value: "challengemapOpenedResults" })
+        && function.parameters.Any(parameter => parameter.name == ShortGuidUtils.Generate("layer_name")
+            && parameter.content is cString { value: "ChallengeMapOverlay" });
 
     private static WorldEntityKind GetKind(Commands commands, Entity entity)
     {

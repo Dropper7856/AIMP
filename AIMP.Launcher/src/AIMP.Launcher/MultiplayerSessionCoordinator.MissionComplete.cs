@@ -5,8 +5,9 @@ namespace AIMP.Launcher;
 
 // Mission completion has two generic sources: native PlayerLifecycle suppresses
 // a retail level exit (GoToFrontend/SwitchLevel, every map and the campaign),
-// and the challenge HUD reports challengemapOpenedResults, which every DLC
-// SurvivorUILogic invokes on LevelComplete. The latter matters because outside
+// and observes the native terminal HUD trigger, which every DLC
+// SurvivorUILogic invokes on LevelComplete, before attempting Flash dispatch.
+// The HUD callback remains a fallback. The earlier native trigger matters because outside
 // a frontend playlist the retail results branch (indexed by "Playlist Order No")
 // never runs, so no level exit is ever reached. The finished player waits on a PICKUPOVERLAY screen while
 // the Host counts finished and dead participants; RoundEnded(MissionComplete)
