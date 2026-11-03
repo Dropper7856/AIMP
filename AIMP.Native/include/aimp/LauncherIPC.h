@@ -177,6 +177,7 @@ private:
     std::uint32_t processId_{};
     std::uint64_t aiSyncRejectedFrames_{}; // IPC-worker only, retained across reconnects.
     std::uint64_t publishedDeathSequence_{}; // IPC-worker only.
+    std::uint64_t publishedLevelExitSequence_{}; // IPC-worker only.
     std::array<std::uint8_t,40> publishedCharacterIncarnation_{}; // IPC-worker only.
     bool characterIncarnationPublished_{};
     bool buildValidated_{};

@@ -138,6 +138,13 @@ package
       private var aimp_loading_released:Object = {};
 
       private var aimp_round_end_layer:Sprite;
+
+      // MISSION_WAIT: this player finished; other participants are still playing.
+      private var aimp_mission_wait_layer:Sprite;
+
+      private var aimp_mission_wait_title:TextField;
+
+      private var aimp_mission_wait_text:TextField;
       
       private var aimp_round_end_count_text:TextField;
       
@@ -572,6 +579,7 @@ package
          removeEventListener(Event.ENTER_FRAME,this.aimp_on_bridge_frame);
          this.aimp_bridge_init_pending = false;
          this.aimp_hide_round_end();
+         this.aimp_hide_mission_wait();
          this.aimp_hide_loading();
          this.aimp_close_bridge();
          this.aimp_returning = false;
@@ -810,6 +818,10 @@ package
          {
             this.aimp_update_remote_state(param1);
          }
+         else if(param1.indexOf("MISSION_WAIT|") == 0)
+         {
+            this.aimp_show_mission_wait(param1);
+         }
          else if(param1.indexOf("ROUND_END|") == 0 || param1 == "ROUND_END")
          {
             this.aimp_show_round_end(param1);
@@ -921,6 +933,7 @@ package
          {
             _loc4_ = 5;
          }
+         this.aimp_hide_mission_wait();
          this.aimp_hide_round_end();
          try
          {
@@ -958,6 +971,56 @@ package
          }
       }
       
+      // Kept until the Host ends the round; ROUND_END replaces it with the shared
+      // lobby-return countdown. Never shown over an active round-end layer.
+      private function aimp_show_mission_wait(param1:String) : void
+      {
+         var title:String = this.aimp_get_bridge_value(param1,"title");
+         var message:String = this.aimp_get_bridge_value(param1,"message");
+         var width:Number = stage != null ? stage.stageWidth : 1280;
+         var height:Number = stage != null ? stage.stageHeight : 720;
+         if(this.aimp_round_end_layer != null)
+         {
+            return;
+         }
+         try
+         {
+            if(this.aimp_mission_wait_layer == null)
+            {
+               this.aimp_mission_wait_layer = new Sprite();
+               this.aimp_mission_wait_layer.mouseEnabled = false;
+               this.aimp_mission_wait_layer.mouseChildren = false;
+               this.aimp_mission_wait_layer.graphics.beginFill(0,0.75);
+               this.aimp_mission_wait_layer.graphics.drawRect(0,0,width,height);
+               this.aimp_mission_wait_layer.graphics.endFill();
+               this.aimp_mission_wait_title = this.aimp_create_round_end_text("",52,width,height * 0.36);
+               this.aimp_mission_wait_layer.addChild(this.aimp_mission_wait_title);
+               this.aimp_mission_wait_text = this.aimp_create_round_end_text("",28,width,height * 0.36 + 80);
+               this.aimp_mission_wait_layer.addChild(this.aimp_mission_wait_text);
+               addChild(this.aimp_mission_wait_layer);
+            }
+            this.aimp_mission_wait_title.text = title == "" ? "MISSION COMPLETE" : title;
+            this.aimp_mission_wait_text.text = message == "" ? "Waiting for the other players..." : message;
+            setChildIndex(this.aimp_mission_wait_layer,numChildren - 1);
+            this.aimp_send_bridge_message("MISSION_WAIT_ACK|source=pickup_overlay|phase=gameplay|result=displayed|sessionId=" + this.aimp_encode_bridge_value(this.aimp_get_bridge_value(param1,"sessionId")) + "|generation=" + this.aimp_encode_bridge_value(this.aimp_get_bridge_value(param1,"generation")));
+         }
+         catch(error:Error)
+         {
+            this.aimp_log_bridge("error","mission_wait","Mission wait overlay failed: " + error.message);
+         }
+      }
+
+      private function aimp_hide_mission_wait() : void
+      {
+         if(this.aimp_mission_wait_layer != null && this.aimp_mission_wait_layer.parent != null)
+         {
+            this.aimp_mission_wait_layer.parent.removeChild(this.aimp_mission_wait_layer);
+         }
+         this.aimp_mission_wait_layer = null;
+         this.aimp_mission_wait_title = null;
+         this.aimp_mission_wait_text = null;
+      }
+
       private function aimp_create_round_end_text(param1:String, param2:int, param3:Number, param4:Number) : TextField
       {
          var _loc5_:TextField = new TextField();

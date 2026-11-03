@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 
 namespace aimp::player_lifecycle {
 namespace {
@@ -31,6 +32,12 @@ struct DeathEvent {
 std::atomic<bool> gInstalled{false};
 std::atomic<bool> gEnabled{false};
 std::atomic<std::uint64_t> gLocalDeathSequence{0};
+std::atomic<std::uint64_t> gLocalLevelExitSequence{0};
+// Diagnostics only: last observed level-exit decision, drained on the worker.
+std::atomic<std::uint64_t> gLevelExitObserved{0}, gLevelExitAllowed{0}, gLevelExitDrained{0};
+std::atomic<std::uint32_t> gLevelExitLastPrimitive{0};
+std::atomic<std::int32_t> gLevelExitLastMode{-1};
+std::atomic<std::uint64_t> gMissionCompleteObserved{0}, gMissionCompleteDrained{0};
 const void* gGlobalRootAddress{};
 // Published before HookManager resumes patched threads. Neither destination
 // is cleared at logical shutdown: an in-flight naked detour still needs it.
@@ -131,6 +138,15 @@ int __stdcall DecideLocalDeath(const std::uintptr_t victim) noexcept {
     return 1;
 }
 
+std::optional<std::int32_t> ReadGameplayMode() noexcept {
+    const auto root = crash_guard::SafeRead<std::uintptr_t>(gGlobalRootAddress);
+    if (!root || *root == 0U) return std::nullopt;
+    const auto manager = crash_guard::SafeRead<std::uintptr_t>(
+        reinterpret_cast<const void*>(*root + 0x48U));
+    if (!manager || *manager == 0U) return std::nullopt;
+    return crash_guard::SafeRead<std::int32_t>(reinterpret_cast<const void*>(*manager + 0x14U));
+}
+
 #if defined(_MSC_VER) && defined(_M_IX86)
 __declspec(naked) void LocalDeathBoundaryDetour() {
     __asm {
@@ -226,6 +242,34 @@ std::uint64_t LocalDeathSequence() noexcept {
     return gLocalDeathSequence.load(std::memory_order_acquire);
 }
 
+// Same session/mode contract as the death boundary: only an AIMP gameplay
+// session suppresses the retail transition; solo play and frontend keep it.
+bool DecideLevelExit(const std::uint32_t primitive) noexcept {
+    if (!gEnabled.load(std::memory_order_acquire) || !LevelExitPrimitive(primitive)) return false;
+    const auto mode = ReadGameplayMode();
+    gLevelExitObserved.fetch_add(1U, std::memory_order_relaxed);
+    gLevelExitLastPrimitive.store(primitive, std::memory_order_relaxed);
+    gLevelExitLastMode.store(mode.value_or(-1), std::memory_order_relaxed);
+    if (!world_actions::SessionAuthorityBound() || !mode || *mode == 0 || *mode == 3) {
+        gLevelExitAllowed.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+    gLocalLevelExitSequence.fetch_add(1U, std::memory_order_acq_rel);
+    return true;
+}
+
+std::uint64_t LocalLevelExitSequence() noexcept {
+    return gLocalLevelExitSequence.load(std::memory_order_acquire);
+}
+
+void ObserveMissionComplete() noexcept {
+    if (!gEnabled.load(std::memory_order_acquire) || !world_actions::SessionAuthorityBound()) return;
+    const auto mode = ReadGameplayMode();
+    if (!mode || *mode == 0 || *mode == 3) return;
+    gMissionCompleteObserved.fetch_add(1U, std::memory_order_relaxed);
+    gLocalLevelExitSequence.fetch_add(1U, std::memory_order_acq_rel);
+}
+
 void Shutdown() noexcept {
     gEnabled.store(false, std::memory_order_release);
 }
@@ -266,6 +310,23 @@ void DrainDiagnostics(Diagnostics& diagnostics) {
                 : (event.decision == Decision::NoSession
                     ? "[PlayerLifecycle] retail GameOver allowed: no active AIMP session"
                     : "[PlayerLifecycle] retail path allowed: native gameplay mode inactive"));
+    }
+    const auto observed = gLevelExitObserved.load(std::memory_order_relaxed);
+    if (observed != gLevelExitDrained.exchange(observed, std::memory_order_relaxed)) {
+        diagnostics.Log("info", "playerlifecycle_level_exit",
+            "[PlayerLifecycle] retail level exit (GoToFrontend/SwitchLevel) observed",
+            {{"observed", Diagnostics::Unsigned(observed), true},
+             {"suppressed", Diagnostics::Unsigned(LocalLevelExitSequence()), true},
+             {"retailAllowed", Diagnostics::Unsigned(gLevelExitAllowed.load(std::memory_order_relaxed)), true},
+             {"lastPrimitive", Diagnostics::Unsigned(gLevelExitLastPrimitive.load(std::memory_order_relaxed)), true},
+             {"lastGameplayMode", std::to_string(gLevelExitLastMode.load(std::memory_order_relaxed)), true}});
+    }
+    const auto completed = gMissionCompleteObserved.load(std::memory_order_relaxed);
+    if (completed != gMissionCompleteDrained.exchange(completed, std::memory_order_relaxed)) {
+        diagnostics.Log("info", "playerlifecycle_mission_complete",
+            "[PlayerLifecycle] local terminal HUD trigger executed; completion reported before Flash dispatch.",
+            {{"observed", Diagnostics::Unsigned(completed), true},
+             {"levelExitSequence", Diagnostics::Unsigned(LocalLevelExitSequence()), true}});
     }
     if (dropped != 0U) {
         diagnostics.Log("warning", "playerlifecycle_diagnostics_overflow",

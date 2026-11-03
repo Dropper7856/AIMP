@@ -3,7 +3,7 @@ namespace AIMP.Protocol;
 public static class WorldManifestConstants
 {
     public const uint FormatVersion = 9;
-    public const uint CompilerVersion = 0x0010000D; // WS3 WM09 Patch 5.1 relaxed relevant-frontier CompositeInput carriers
+    public const uint CompilerVersion = 0x0010000E; // PlayerLifecycle terminal HUD endpoints
     public const string BinaryMagic = "AIMPWM09";
 }
 
@@ -91,7 +91,8 @@ public enum WorldEntityFlags : ushort
     HasOverrides = 1 << 5,
     SourceFromPak = 1 << 6,
     SourceFromBin = 1 << 7,
-    RuntimeAddressable = 1 << 8
+    RuntimeAddressable = 1 << 8,
+    PlayerMissionComplete = 1 << 9
 }
 
 public readonly record struct WorldEntityId(ulong High, ulong Low)

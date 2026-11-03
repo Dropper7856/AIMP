@@ -385,6 +385,7 @@ public:
     // and semantic-contract transport. PrimitiveType never decides by
     // owner/GUID at runtime; the compiler already encoded the semantic
     // disposition and contract in the causal profile.
+    [[nodiscard]] bool IsPlayerMissionCompleteEndpoint(const WorldEntityId& id) const noexcept;
     [[nodiscard]] std::optional<std::uint32_t> FindWorldEntityPrimitiveType(
         const WorldEntityId& id) const noexcept;
     [[nodiscard]] std::optional<WorldEntityId> IdentifyRuntimeEntity(

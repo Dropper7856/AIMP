@@ -9,7 +9,7 @@
 namespace aimp {
 
 inline constexpr std::uint32_t kWorldManifestFormatVersion = 9U;
-inline constexpr std::uint32_t kWorldManifestCompilerVersion = 0x0010000DU;
+inline constexpr std::uint32_t kWorldManifestCompilerVersion = 0x0010000EU;
 
 // WorldSync keeps transport identity independent from CATHODE execution. The
 // registry may discover all domains; v12.5 only exposes evidence-backed generic
@@ -49,6 +49,7 @@ enum WorldEntityFlags : std::uint16_t {
     WorldEntityFlagSourceFromPak = 1U << 6U,
     WorldEntityFlagSourceFromBin = 1U << 7U,
     WorldEntityFlagRuntimeAddressable = 1U << 8U,
+    WorldEntityFlagPlayerMissionComplete = 1U << 9U,
 };
 
 struct WorldEntityId final {

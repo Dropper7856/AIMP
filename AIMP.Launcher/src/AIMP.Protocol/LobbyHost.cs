@@ -265,6 +265,7 @@ public sealed partial class LobbyHost : IAsyncDisposable
                 _sessionPreparedPeers.Clear();
                 _sessionReleasedGeneration = 0;
                 _deadPeers.Clear();
+                _finishedPeers.Clear();
                 _collectedItems.Clear();
                 ClearSpawnDecisionsLocked();
                 payload = new LobbyStartPayload(
@@ -321,18 +322,22 @@ public sealed partial class LobbyHost : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         RoundEndedPayload? ended;
+        RoundProgressPayload? progress;
         lock (_stateLock)
         {
+            // A finished participant left the level alive; a later local
+            // death edge (outro, cleanup) must not reclassify it.
             if (!string.Equals(_state, "Starting", StringComparison.Ordinal)
                 || payload.LevelGeneration != _levelGeneration
+                || _finishedPeers.Contains(payload.PeerId)
                 || !_deadPeers.Add(payload.PeerId)) return;
+            progress = CreateRoundProgressLocked();
             ended = TryEndRoundLocked();
         }
 
         Log?.Invoke(this, $"Participant {payload.PeerId} died in generation {payload.LevelGeneration}.");
         PlayerDeathReceived?.Invoke(this, payload);
-        if (ended is not null)
-            await PublishRoundEndedAsync(ended, cancellationToken).ConfigureAwait(false);
+        await PublishRoundOutcomeAsync(progress, ended, cancellationToken).ConfigureAwait(false);
     }
 
     // A departed participant can no longer survive: re-evaluate the round so
@@ -340,31 +345,34 @@ public sealed partial class LobbyHost : IAsyncDisposable
     private async Task EvaluateRoundAfterDepartureAsync()
     {
         RoundEndedPayload? ended;
+        RoundProgressPayload? progress;
         lock (_stateLock)
         {
             if (!string.Equals(_state, "Starting", StringComparison.Ordinal)) return;
+            progress = CreateRoundProgressLocked();
             ended = TryEndRoundLocked();
         }
 
-        if (ended is null) return;
-        try { await PublishRoundEndedAsync(ended, _shutdown.Token).ConfigureAwait(false); }
+        try { await PublishRoundOutcomeAsync(progress, ended, _shutdown.Token).ConfigureAwait(false); }
         catch (OperationCanceledException) when (_shutdown.IsCancellationRequested) { }
     }
 
     // Caller holds _stateLock. Ends the round only when the Host and every
-    // connected client of the active generation reported a terminal death.
+    // connected client of the active generation is terminal: dead or finished.
     private RoundEndedPayload? TryEndRoundLocked()
     {
-        if (!_deadPeers.Contains(HostPeerId)
-            || _clients.Keys.Any(peerId => !_deadPeers.Contains(peerId))) return null;
+        if (!RoundTerminalLocked(HostPeerId)
+            || _clients.Keys.Any(peerId => !RoundTerminalLocked(peerId))) return null;
+        var reason = RoundEndReasonLocked();
         _state = "Lobby";
         _sessionPreparedPeers.Clear();
         _sessionReleasedGeneration = 0;
         _deadPeers.Clear();
+        _finishedPeers.Clear();
         _collectedItems.Clear();
         ClearSpawnDecisionsLocked();
         var payload = new RoundEndedPayload(SessionId, _levelGeneration,
-            "AllPlayersDead", RoundReturnDelayMilliseconds);
+            reason, RoundReturnDelayMilliseconds);
         ModelValidation.Validate(payload);
         return payload;
     }
@@ -1253,6 +1261,11 @@ public sealed partial class LobbyHost : IAsyncDisposable
 
                 case MessageType.PlayerDeath:
                     await HandlePlayerDeathAsync(state, frame.Payload, cancellationToken)
+                        .ConfigureAwait(false);
+                    break;
+
+                case MessageType.PlayerMissionComplete:
+                    await HandlePlayerMissionCompleteAsync(state, frame.Payload, cancellationToken)
                         .ConfigureAwait(false);
                     break;
 
