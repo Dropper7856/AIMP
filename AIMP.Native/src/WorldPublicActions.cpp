@@ -4,6 +4,7 @@
 
 #include "aimp/BuildProfile.h"
 #include "aimp/CathodePrimitiveExecutor.h"
+#include "aimp/PlayerLifecycle.h"
 #include "aimp/HookManager.h"
 #include "aimp/ReplicationCore.h"
 #include "aimp/SignatureResolver.h"
@@ -3356,6 +3357,21 @@ std::uint8_t CaptureScheduledInput(WorldEntityRegistry& registry, void* manager,
     return 1U;
 }
 
+// Generic mission completion boundary for every map: the trigger of a retail
+// level-exit primitive (GoToFrontend/SwitchLevel) is consumed here. In an AIMP
+// gameplay session it is suppressed and reported; the Host returns everyone to
+// the lobby once all participants are finished or dead.
+bool LevelExitSuppressed(WorldEntityRegistry& registry, void** target, void* item) noexcept {
+    std::uint32_t input{};
+    if (!ReadPublicInput(static_cast<const std::uint32_t*>(item), input) ||
+        input != player_lifecycle::kTriggerInput) return false;
+    const auto id = registry.IdentifyRuntimeEntity(ExecutionFromShared(ReadWorkHolder(target)));
+    if (!id) return false;
+    const auto primitive = registry.FindWorldEntityPrimitiveType(*id);
+    return primitive && player_lifecycle::LevelExitPrimitive(*primitive) &&
+        player_lifecycle::DecideLevelExit(*primitive);
+}
+
 std::uint8_t __fastcall WorkExecuteDetour(void* manager, void*, void** target,
                                          void** owner, void** itemHolder) {
     const auto original = reinterpret_cast<WorkExecuteFn>(gExecuteTrampoline.load(std::memory_order_acquire));
@@ -3368,6 +3384,7 @@ std::uint8_t __fastcall WorkExecuteDetour(void* manager, void*, void** target,
         return original(manager, target, owner, itemHolder);
     // Retail dereferences this holder immediately (009266BE/00926705).
     void* item = itemHolder == nullptr ? nullptr : *itemHolder;
+    if (LevelExitSuppressed(*registry, target, item)) return 0U;
     const auto epoch = gEpoch.load(std::memory_order_relaxed);
     void* retainedParent = ReadRetainedParent(item);
     const auto parentContext = ParentContext(retainedParent, epoch);

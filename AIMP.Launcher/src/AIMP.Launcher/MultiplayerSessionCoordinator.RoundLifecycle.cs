@@ -11,6 +11,9 @@ internal sealed partial class MultiplayerSessionCoordinator
 {
     private const string RoundEndTitle = "GAME OVER";
     private const string RoundEndMessage = "All players are dead.";
+    private const string MissionCompleteReason = "MissionComplete";
+    private const string MissionCompleteTitle = "MISSION COMPLETE";
+    private const string MissionCompleteMessage = "Every player has finished.";
     private readonly record struct DeathReport(LobbyHost? Host, LobbyClient? Client, int Generation);
     private int _deathReportedGeneration;
     private int _roundEndingGeneration;
@@ -62,8 +65,12 @@ internal sealed partial class MultiplayerSessionCoordinator
 
     private void OnNativePlayerLifecycleStateChanged(
         object? sender,
-        NativePlayerLifecycleStatePayload value) =>
-        _ = ReportLocalDeathAsync(value);
+        NativePlayerLifecycleStatePayload value)
+    {
+        var (died, finished) = AcceptLifecycleEdges(value);
+        if (died) _ = ReportLocalDeathAsync(value);
+        if (finished) _ = ReportLocalMissionCompleteAsync(value);
+    }
 
     private async Task ReportLocalDeathAsync(NativePlayerLifecycleStatePayload value)
     {
@@ -84,7 +91,8 @@ internal sealed partial class MultiplayerSessionCoordinator
     {
         lock (_stateGate)
         {
-            if (_start is null || _deathReportedGeneration == _start.LevelGeneration) return null;
+            if (_start is null || _deathReportedGeneration == _start.LevelGeneration
+                || _missionCompleteReportedGeneration == _start.LevelGeneration) return null;
             if (_host is null && _client is null) return null;
             _deathReportedGeneration = _start.LevelGeneration;
             return new DeathReport(_host, _client, _start.LevelGeneration);
@@ -243,10 +251,11 @@ internal sealed partial class MultiplayerSessionCoordinator
     {
         var value = fence.Round;
         var seconds = (value.ReturnDelayMilliseconds + 999) / 1000;
+        var victory = value.Reason == MissionCompleteReason;
         return _bridge.SendAsync("ROUND_END", new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            ["title"] = RoundEndTitle,
-            ["message"] = RoundEndMessage,
+            ["title"] = victory ? MissionCompleteTitle : RoundEndTitle,
+            ["message"] = victory ? MissionCompleteMessage : RoundEndMessage,
             ["seconds"] = seconds.ToString(CultureInfo.InvariantCulture),
             ["generation"] = value.LevelGeneration.ToString(CultureInfo.InvariantCulture),
             ["sessionId"] = value.SessionId.ToString("D"),
@@ -406,6 +415,7 @@ internal sealed partial class MultiplayerSessionCoordinator
         _roundReturnFence = null;
         _deathReportedGeneration = 0;
         _roundEndingGeneration = 0;
+        ClearMissionCompleteState();
         _frontendLobbyReturnRole = null;
     }
 }

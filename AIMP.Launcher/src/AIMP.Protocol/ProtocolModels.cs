@@ -111,8 +111,27 @@ public sealed record PlayerDeathPayload(
     ulong PeerId,
     int LevelGeneration);
 
-// Host -> Clients: every participant of the generation is dead. The Host is
-// already back in Lobby; peers show the end message, then return to frontend.
+// Client -> Host: the sender's own player reached a retail level exit
+// (GoToFrontend/SwitchLevel) during this launch generation. It is finished,
+// not dead: it waits for the remaining participants.
+public sealed record PlayerMissionCompletePayload(
+    Guid SessionId,
+    ulong PeerId,
+    int LevelGeneration);
+
+// Host -> Clients: participants of the active generation that finished the
+// mission or died. Used for the "waiting for players x/N" screen.
+public sealed record RoundProgressPayload(
+    Guid SessionId,
+    int LevelGeneration,
+    int Finished,
+    int Dead,
+    int Participants);
+
+// Host -> Clients: every participant of the generation is dead or finished.
+// Reason "MissionComplete" when at least one finished, else "AllPlayersDead".
+// The Host is already back in Lobby; peers show the end message, then return
+// to frontend.
 public sealed record RoundEndedPayload(
     Guid SessionId,
     int LevelGeneration,
@@ -242,7 +261,8 @@ public sealed record NativePlayerEquipmentStatePayload(
 public sealed record NativePlayerLifecycleStatePayload(
     int SchemaVersion,
     ulong DeathSequence,
-    bool LocalPlayerDead);
+    bool LocalPlayerDead,
+    ulong LevelExitSequence = 0);
 
 public sealed record NativeItemSyncPickupPayload(
     int SchemaVersion,

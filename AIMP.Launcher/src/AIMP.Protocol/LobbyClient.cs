@@ -547,6 +547,10 @@ public sealed partial class LobbyClient : IAsyncDisposable
                         WorldRecoveryStatusReceived?.Invoke(this, recoveryStatus);
                         break;
 
+                    case MessageType.RoundProgress:
+                        HandleRoundProgress(frame.Payload);
+                        break;
+
                     case MessageType.RoundEnded:
                         var roundEnded = JsonPayload.Deserialize<RoundEndedPayload>(frame.Payload.Span);
                         ModelValidation.Validate(roundEnded);

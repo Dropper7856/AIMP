@@ -2443,6 +2443,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         host.SessionReleased += OnSessionReleased;
         host.GameplayReadyReceived += OnGameplayReady;
         host.RoundEnded += OnRoundEnded;
+        host.RoundProgressChanged += OnRoundProgress;
         host.MissionSignalCommitted += OnMissionSignalCommitted;
         host.MissionPreparationFailed += OnNetworkError;
         host.ItemCollected += OnItemCollected;
@@ -2469,6 +2470,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         host.SessionReleased -= OnSessionReleased;
         host.GameplayReadyReceived -= OnGameplayReady;
         host.RoundEnded -= OnRoundEnded;
+        host.RoundProgressChanged -= OnRoundProgress;
         host.MissionSignalCommitted -= OnMissionSignalCommitted;
         host.MissionPreparationFailed -= OnNetworkError;
         host.ItemCollected -= OnItemCollected;
@@ -2494,6 +2496,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         client.SessionReleased += OnSessionReleased;
         client.GameplayReadyReceived += OnGameplayReady;
         client.RoundEnded += OnRoundEnded;
+        client.RoundProgressReceived += OnRoundProgress;
         client.MissionSignalCommitted += OnMissionSignalCommitted;
         client.ItemCollected += OnItemCollected;
         client.ItemSpawnDecided += OnItemSpawnDecided;
@@ -2522,6 +2525,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         client.SessionReleased -= OnSessionReleased;
         client.GameplayReadyReceived -= OnGameplayReady;
         client.RoundEnded -= OnRoundEnded;
+        client.RoundProgressReceived -= OnRoundProgress;
         client.MissionSignalCommitted -= OnMissionSignalCommitted;
         client.ItemCollected -= OnItemCollected;
         client.ItemSpawnDecided -= OnItemSpawnDecided;

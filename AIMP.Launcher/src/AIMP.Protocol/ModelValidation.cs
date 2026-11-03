@@ -88,6 +88,30 @@ public static class ModelValidation
         }
     }
 
+    public static void Validate(PlayerMissionCompletePayload? value)
+    {
+        if (value is null
+            || value.SessionId == Guid.Empty
+            || value.PeerId == 0
+            || value.LevelGeneration < 1)
+        {
+            throw new ProtocolException("The player mission-complete payload is invalid.");
+        }
+    }
+
+    public static void Validate(RoundProgressPayload? value)
+    {
+        if (value is null
+            || value.SessionId == Guid.Empty
+            || value.LevelGeneration < 1
+            || value.Participants is < 1 or > ProtocolConstants.MaximumLobbyCapacity
+            || value.Finished < 0 || value.Dead < 0
+            || value.Finished + value.Dead > value.Participants)
+        {
+            throw new ProtocolException("The round-progress payload is invalid.");
+        }
+    }
+
     public static void Validate(RoundEndedPayload? value)
     {
         if (value is null
@@ -103,10 +127,13 @@ public static class ModelValidation
 
     public static void Validate(NativePlayerLifecycleStatePayload? value)
     {
+        // Schema 2 adds the monotonic local level-exit edge. A state must carry
+        // at least one terminal edge (death or level exit).
         if (value is null
-            || value.SchemaVersion != 1
-            || value.DeathSequence == 0
-            || !value.LocalPlayerDead)
+            || value.SchemaVersion is not (1 or 2)
+            || (value.SchemaVersion == 1 && (value.DeathSequence == 0 || !value.LocalPlayerDead))
+            || (value.LocalPlayerDead != (value.DeathSequence != 0))
+            || (value.DeathSequence == 0 && value.LevelExitSequence == 0))
         {
             throw new ProtocolException("The native player-lifecycle state is invalid.");
         }

@@ -736,21 +736,24 @@ void LauncherIPC::PublishAISyncTraffic() {
 
 void LauncherIPC::PublishPlayerLifecycleTraffic() {
     const auto sequence = player_lifecycle::LocalDeathSequence();
+    const auto levelExit = player_lifecycle::LocalLevelExitSequence();
     if (!sessionConfigured_.load(std::memory_order_acquire) ||
         !netzReadySent_.load(std::memory_order_acquire)) {
-        // A death outside an active session is never a round event; do not
-        // replay it to a Launcher that connects or configures later.
+        // A death or level exit outside an active session is never a round
+        // event; do not replay it to a Launcher that connects later.
         publishedDeathSequence_ = sequence;
+        publishedLevelExitSequence_ = levelExit;
         return;
     }
-    if (sequence == publishedDeathSequence_) return;
+    if (sequence == publishedDeathSequence_ && levelExit == publishedLevelExitSequence_) return;
 
-    // Retried every worker tick until queued: the Host needs this exact edge
-    // to decide that every participant of the round is dead.
+    // Retried every worker tick until queued: the Host needs these exact edges
+    // to decide that every participant of the round is dead or finished.
     std::ostringstream json;
-    json << "{\"schemaVersion\":1"
+    json << "{\"schemaVersion\":2"
          << ",\"deathSequence\":" << sequence
-         << ",\"localPlayerDead\":true"
+         << ",\"localPlayerDead\":" << (sequence != 0U ? "true" : "false")
+         << ",\"levelExitSequence\":" << levelExit
          << '}';
     if (Queue(
             protocol::MessageType::PlayerLifecycleState,
@@ -758,6 +761,7 @@ void LauncherIPC::PublishPlayerLifecycleTraffic() {
             localSequence_.fetch_add(1U, std::memory_order_relaxed),
             JsonBytes(json.str()))) {
         publishedDeathSequence_ = sequence;
+        publishedLevelExitSequence_ = levelExit;
     }
 }
 

@@ -1,0 +1,112 @@
+using AIMP.Protocol;
+using System.Globalization;
+
+namespace AIMP.Launcher;
+
+// Mission completion: native PlayerLifecycle suppresses a retail level exit
+// (GoToFrontend/SwitchLevel, shared by every map) inside a gameplay session and
+// reports it here. The finished player waits on a PICKUPOVERLAY screen while
+// the Host counts finished and dead participants; RoundEnded(MissionComplete)
+// then reuses the game-over return to the lobby.
+internal sealed partial class MultiplayerSessionCoordinator
+{
+    private ulong _nativeDeathEdge;
+    private ulong _nativeLevelExitEdge;
+    private int _missionCompleteReportedGeneration;
+    private RoundProgressPayload? _roundProgress;
+
+    // Native sequences are process-cumulative and published only on change.
+    // A decrease means AI.exe restarted; its counters begin again at zero.
+    private (bool Died, bool Finished) AcceptLifecycleEdges(NativePlayerLifecycleStatePayload value)
+    {
+        lock (_stateGate)
+        {
+            if (value.DeathSequence < _nativeDeathEdge || value.LevelExitSequence < _nativeLevelExitEdge)
+                _nativeDeathEdge = _nativeLevelExitEdge = 0;
+            var died = value.LocalPlayerDead && value.DeathSequence != _nativeDeathEdge;
+            var finished = value.LevelExitSequence != _nativeLevelExitEdge;
+            _nativeDeathEdge = value.DeathSequence;
+            _nativeLevelExitEdge = value.LevelExitSequence;
+            return (died, finished);
+        }
+    }
+
+    private async Task ReportLocalMissionCompleteAsync(NativePlayerLifecycleStatePayload value)
+    {
+        if (CaptureMissionCompleteReport() is not { } report) return;
+        _diagnostics.Log("PlayerLifecycle", $"Local level exit #{value.LevelExitSequence} reported as " +
+            $"mission complete for generation {report.Generation}.");
+        await ShowMissionWaitAsync(report.Generation).ConfigureAwait(false);
+        try { await SendLocalMissionCompleteAsync(report).ConfigureAwait(false); }
+        catch (Exception exception) when (exception is IOException or ObjectDisposedException
+            or InvalidOperationException or ProtocolException or OperationCanceledException)
+        {
+            _diagnostics.Log("PlayerLifecycle", $"Local mission-complete report failed: {exception.Message}");
+        }
+    }
+
+    // One terminal report per launch generation: dead or finished, never both.
+    private DeathReport? CaptureMissionCompleteReport()
+    {
+        lock (_stateGate)
+        {
+            if (_start is null || _missionCompleteReportedGeneration == _start.LevelGeneration
+                || _deathReportedGeneration == _start.LevelGeneration) return null;
+            if (_host is null && _client is null) return null;
+            _missionCompleteReportedGeneration = _start.LevelGeneration;
+            return new DeathReport(_host, _client, _start.LevelGeneration);
+        }
+    }
+
+    private Task SendLocalMissionCompleteAsync(DeathReport report) => report.Host is not null
+        ? report.Host.ReportHostMissionCompleteAsync(report.Generation, _lifetime.Token)
+        : report.Client!.SendMissionCompleteAsync(report.Generation, _lifetime.Token);
+
+    private void OnRoundProgress(object? sender, RoundProgressPayload value)
+    {
+        lock (_stateGate)
+        {
+            if (!IsCurrentLobbySource(sender, value.SessionId) || _start is null
+                || _start.LevelGeneration != value.LevelGeneration) return;
+            _roundProgress = value;
+            if (_missionCompleteReportedGeneration != value.LevelGeneration) return;
+        }
+        _ = ShowMissionWaitAsync(value.LevelGeneration);
+    }
+
+    private async Task ShowMissionWaitAsync(int generation)
+    {
+        Dictionary<string, string> values;
+        lock (_stateGate)
+        {
+            if (_start is null || _start.LevelGeneration != generation
+                || _roundEndingGeneration == generation) return;
+            values = MissionWaitFields(_start.SessionId, generation, _roundProgress);
+        }
+        try { await _bridge.SendAsync("MISSION_WAIT", values, _lifetime.Token).ConfigureAwait(false); }
+        catch (Exception exception) when (exception is IOException or ObjectDisposedException
+            or OperationCanceledException)
+        { _diagnostics.Log("PlayerLifecycle", $"Mission wait HUD deferred: {exception.Message}"); }
+    }
+
+    internal static Dictionary<string, string> MissionWaitFields(
+        Guid sessionId, int generation, RoundProgressPayload? progress) => new(StringComparer.Ordinal)
+    {
+        ["title"] = MissionCompleteTitle,
+        ["message"] = MissionWaitMessage(progress is not null && progress.LevelGeneration == generation
+            ? progress : null),
+        ["sessionId"] = sessionId.ToString("D"),
+        ["generation"] = generation.ToString(CultureInfo.InvariantCulture)
+    };
+
+    internal static string MissionWaitMessage(RoundProgressPayload? progress) => progress is null
+        ? "Waiting for the other players..."
+        : $"Waiting for players: {progress.Finished}/{progress.Participants} finished"
+          + (progress.Dead > 0 ? $", {progress.Dead} dead" : "");
+
+    private void ClearMissionCompleteState()
+    {
+        _missionCompleteReportedGeneration = 0;
+        _roundProgress = null;
+    }
+}

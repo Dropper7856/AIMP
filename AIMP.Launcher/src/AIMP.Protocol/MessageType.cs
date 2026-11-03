@@ -99,6 +99,8 @@ public enum MessageType : ushort
     AISyncExecutionNetworkRetry = 144, // Host -> Client only; exact Waiting token, not a new command.
     AISyncRouteNetwork = 145, // Host -> Client solved route tied to a native command part.
     AISyncCausalStateNetwork = 146, // Host -> Client events in the execution sender.
+    PlayerMissionComplete = 147, // Client -> Host only; the sender reached a retail level exit.
+    RoundProgress = 148, // Host -> Clients only; finished/dead participants of the round.
 
     TestModeConfigure = 200,
     CapabilityQuery = 201,
