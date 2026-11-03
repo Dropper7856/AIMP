@@ -68,6 +68,17 @@ internal static class WorldReplicationSemanticCatalog
         WorldReplicationContractKind.StateTransition,
         Routing.Direct, false, true, false, true, true);
 
+    // Existing strict native hooks certify the Door force_open/force_close
+    // handlers. Capture their immediately preceding output, preserving its
+    // real CATHODE callback; never synthesize a Door self-edge or player input.
+    internal const uint DoorPrimitiveType = 0xAF6549BBU;
+    internal const uint DoorForceOpenInput = 0x4E85BB2DU;
+    internal const uint DoorForceCloseInput = 0x7D4FFD73U;
+    private static readonly Semantics DoorForceEvent = new(
+        Effect.Shared, WorldReplicationSemanticClass.SharedWorldMutation,
+        WorldReplicationContractKind.Event,
+        Routing.Direct, false, true, false, true, true);
+
     // Exact supplied AI.exe (SHA-256 00d6...8364) / AI.exe.c proves the
     // PLAY_ENVIRONMENT_ANIMATION generated class constructor at FUN_0047AE20
     // installs vtable RVA 0x00DC8AC0; the current strict BuildProfile retains
@@ -90,6 +101,8 @@ internal static class WorldReplicationSemanticCatalog
         {
             [(LogicSwitchPrimitiveType, LogicSwitchSetTrueInputShortGuid)] = LogicSwitchConvergentStateInput,
             [(LogicSwitchPrimitiveType, LogicSwitchSetFalseInputShortGuid)] = LogicSwitchConvergentStateInput,
+            [(DoorPrimitiveType, DoorForceOpenInput)] = DoorForceEvent,
+            [(DoorPrimitiveType, DoorForceCloseInput)] = DoorForceEvent,
         };
 
     private static readonly IReadOnlyDictionary<uint, Semantics> ByPrimitiveType =

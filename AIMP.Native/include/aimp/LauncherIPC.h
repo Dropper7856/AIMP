@@ -249,6 +249,8 @@ private:
     mutable std::mutex experimentalStateMutex_;
     std::deque<std::vector<std::byte>> outgoing_;
     std::size_t outgoingBytes_{};
+    // Adaptive polling state owned by the worker.
+    bool workerTrafficObserved_{};
     std::atomic<std::uint64_t> localSequence_{1};
     std::atomic<std::uint64_t> experimentalEpoch_{1};
     std::atomic<std::uint64_t> experimentalDispatchSequence_{1};

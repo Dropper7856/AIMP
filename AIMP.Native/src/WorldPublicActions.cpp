@@ -1,5 +1,8 @@
 #include "aimp/AISync.h"
 #include "aimp/WorldPublicActions.h"
+#include "aimp/PlayerLocalControls.h"
+#include "aimp/DeferredDiagnosticBuffer.h"
+#include "aimp/Diagnostics.h"
 #include "aimp/RuntimeFeatureFlags.h"
 
 #include "aimp/BuildProfile.h"
@@ -410,6 +413,8 @@ struct RootApplyTraceRecord final {
 };
 
 std::mutex gRootApplyTraceMutex;
+std::mutex gRootApplyFileMutex;
+DeferredDiagnosticBuffer<RootApplyTraceRecord, 8192U> gDeferredRootJournal;
 HANDLE gRootApplyTraceFile{INVALID_HANDLE_VALUE};
 HANDLE gRootApplyJournalFile{INVALID_HANDLE_VALUE};
 std::wstring gRootApplyTracePath;
@@ -589,7 +594,8 @@ void AppendRootApplyJournalLocked(const RootApplyTraceRecord& record) noexcept {
     }
 }
 
-void WriteRootApplyTraceLocked() noexcept {
+void WriteRootApplyTraceLocked(const RootApplyTraceRecord& current, bool hasCurrent,
+    const RootApplyTraceRecord& completed, bool hasCompleted) noexcept {
     if (!EnsureRootApplyTraceOpenLocked()) return;
     try {
         std::ostringstream stream;
@@ -597,10 +603,10 @@ void WriteRootApplyTraceLocked() noexcept {
                << ",\"tid\":" << GetCurrentThreadId()
                << ",\"writeTickMs\":" << GetTickCount64()
                << ",\"current\":";
-        if (gRootApplyTraceHasCurrent) AppendRootApplyRecordJson(stream, gRootApplyTraceCurrent);
+        if (hasCurrent) AppendRootApplyRecordJson(stream, current);
         else stream << "null";
         stream << ",\"lastCompleted\":";
-        if (gRootApplyTraceHasCompleted) AppendRootApplyRecordJson(stream, gRootApplyTraceCompleted);
+        if (hasCompleted) AppendRootApplyRecordJson(stream, completed);
         else stream << "null";
         stream << "}\r\n";
         const auto text = stream.str();
@@ -633,27 +639,16 @@ void UpdateRootApplyTrace(RootApplyTraceRecord& record,
         gStats.rootApplyTraceLastCompletedSequence.store(record.authoritySequence, std::memory_order_relaxed);
     }
     gStats.rootApplyTraceCurrentStage.store(static_cast<std::uint32_t>(stage), std::memory_order_relaxed);
-    // 5.14 performance pass: the forensic recorder used to serialize and write
-    // every intermediate stage on the engine/replay thread.  That was useful
-    // while isolating the 5.12/5.13 crashes, but synchronous per-stage I/O can
-    // stall gameplay for one or more scheduler quanta.  Keep only durable
-    // transaction boundaries in the append journal; the overwrite trace still
-    // records the dangerous native invoke boundary plus terminal disposition.
+    // Keep terminal ROOT evidence in memory for the diagnostic worker. Even
+    // terminal-only synchronous I/O overwhelmed the high-volume replay path.
     const auto journalBoundary =
         stage == RootApplyTraceStage::Completed ||
         stage == RootApplyTraceStage::Rejected;
     if (record.scope == 0U && journalBoundary)
-        AppendRootApplyJournalLocked(record);
+        static_cast<void>(gDeferredRootJournal.Push(record));
 
-    // Descendants remain in bounded in-memory diagnostics.  The compact trace
-    // is enough to identify a crash inside the native invoke while avoiding the
-    // old RebuildContext write on every reconstructed carrier.
-    const auto traceBoundary =
-        stage == RootApplyTraceStage::InjectExecute ||
-        stage == RootApplyTraceStage::Completed ||
-        stage == RootApplyTraceStage::Rejected;
-    if (record.scope == 0U && traceBoundary)
-        WriteRootApplyTraceLocked();
+    // The worker snapshots current/completed under this short memory lock.
+    // File I/O never holds the lock used by the gameplay thread.
 }
 
 void TraceRemoteDescendant(const ContextTrace& cause,
@@ -727,11 +722,9 @@ void TraceRootIngress(
     gRootApplyTraceHasCurrent = true;
     gStats.rootApplyTraceCurrentStage.store(
         static_cast<std::uint32_t>(RootApplyTraceStage::Ingress), std::memory_order_relaxed);
-    // The compact overwrite trace captures in-flight ingress.  The append
-    // journal is terminal-only in 5.14, which cuts journal traffic to one
-    // durable summary per ROOT while still preserving the current ROOT if the
-    // process crashes or stalls before completion.
-    WriteRootApplyTraceLocked();
+    // The in-memory ingress is immediately visible to diagnostics; the file
+    // snapshot follows on the worker cadence and can lag a sudden process crash.
+    // Persist the latest ingress from the diagnostics worker.
 }
 
 class RootApplyTraceScope final {
@@ -2830,7 +2823,17 @@ void OutputCapture(void* self, void** instance, const std::uint32_t* input,
     auto* registry = gRegistry.load(std::memory_order_acquire);
     const auto epoch = gEpoch.load(std::memory_order_relaxed);
     const auto origin = CurrentOrigin();
-    if (origin != Origin::None || replication_core::RemoteApplyActive() || !Enabled() ||
+    bool eventSidecar = false;
+    if (origin == Origin::LocalRoot && registry != nullptr) {
+        void* candidate{}; void* candidateParent{}; std::uint32_t port{}; bool payloadless{};
+        if (ReadPublicArguments(instance, input, callback, candidate, port, candidateParent, payloadless)) {
+            const auto id = registry->IdentifyRuntimeEntity(candidate);
+            const auto profile = id ? registry->FindEmittedOutputCausalProfile(*id, port) : std::nullopt;
+            eventSidecar = profile && profile->CertifiedEmittedEventCarrierBoundary() &&
+                !CurrentRootOwnsEvent(profile->semanticTargetEntity, profile->semanticOperation);
+        }
+    }
+    if ((origin != Origin::None && !eventSidecar) || replication_core::RemoteApplyActive() || !Enabled() ||
         registry == nullptr || !registry->RuntimeCaptureReady()) {
         original(self, instance, input, callback, delay, tail);
         return;
@@ -2893,7 +2896,8 @@ void OutputCapture(void* self, void** instance, const std::uint32_t* input,
     // Patch 5.3 moves Event authority to the earlier CATHODE scheduler edge.
     // Never publish an Event again from EmittedOutput; the local retail path
     // remains untouched and a SchedulerEdge ROOT owns the network copy.
-    if (profile->replicationContractKind == WorldReplicationContractKind::Event) {
+    const bool eventCarrier = profile->CertifiedEmittedEventCarrierBoundary();
+    if (profile->replicationContractKind == WorldReplicationContractKind::Event && !eventCarrier) {
         gStats.authorityRetailPreserved.fetch_add(1U, std::memory_order_relaxed);
         finishLocal();
         return;
@@ -2941,6 +2945,9 @@ void OutputCapture(void* self, void** instance, const std::uint32_t* input,
     event.flags = parent != nullptr ? kPublicRootDetachedCallback : kPublicRootExternalInvocation;
     event.causalSerial = stamp.chainId;
     event.segmentSerial = stamp.chainId;
+    // Keep Events outside state-reconciliation transactions, just as the
+    // scheduler Event boundary does. Submit assigns a fresh observation cause.
+    if (eventCarrier) event.causalSerial = event.segmentSerial = 0U;
     auto cause = gFrame != nullptr && gFrame->epoch == epoch ? gFrame->cause : TaskCause(parent, epoch);
     event.actorKind = stamp.source == CausalSource::Player ? PublicActorKind::SourcePlayer : PublicActorKind::Authority;
     cause.actorKind = static_cast<std::uint8_t>(event.actorKind);
@@ -3407,6 +3414,16 @@ std::uint8_t __fastcall WorkExecuteDetour(void* manager, void*, void** target,
     CausalStamp causalStamp{};
     auto cause = TaskCause(item, epoch);
     MergeParentContext(parentContext, origin, causalStamp, cause);
+    // Delayed remote descendants execute after the RemoteApply TLS scope has
+    // returned. Use restored lineage as well as TLS to protect local controls.
+    if (origin == Origin::RemoteRoot || CurrentOrigin() == Origin::RemoteRoot ||
+        replication_core::RemoteApplyActive()) {
+        const auto targetId = registry->IdentifyRuntimeEntity(
+            ExecutionFromShared(ReadWorkHolder(target)));
+        const auto primitive = targetId
+            ? registry->FindWorldEntityPrimitiveType(*targetId).value_or(0U) : 0U;
+        if (SuppressRemotePlayerControl(primitive, true)) return 0U;
+    }
     const auto itemStamp = FindCausalStamp(item, epoch);
     if (!causalStamp.Valid()) causalStamp = itemStamp;
     if (origin != Origin::None) {
@@ -3566,6 +3583,19 @@ bool SchedulerEdgeLocalSidecarCaptureActive() noexcept {
     return Installed() && !gSchedulerEdgeRetailScope && CurrentOrigin() == Origin::LocalRoot &&
         rootKind != static_cast<std::uint8_t>(world_interactions::PublicRootKind::SchedulerEdge) &&
         rootKind != static_cast<std::uint8_t>(world_interactions::PublicRootKind::CanonicalCompositeInput);
+}
+
+bool CurrentRootOwnsEvent(const WorldEntityId& target, const std::uint32_t input) noexcept {
+    const auto* registry = gRegistry.load(std::memory_order_acquire);
+    const auto epoch = gEpoch.load(std::memory_order_relaxed);
+    const auto* cause = gPublicEpoch == epoch && gPublicCause.rootKind != 0U ? &gPublicCause :
+        gFrame != nullptr && gFrame->epoch == epoch ? &gFrame->cause : nullptr;
+    if (registry == nullptr || cause == nullptr ||
+        cause->rootKind != static_cast<std::uint8_t>(world_interactions::PublicRootKind::EmittedOutput))
+        return false;
+    const auto profile = registry->FindEmittedOutputCausalProfile(cause->owner, cause->input);
+    return profile && profile->CertifiedEmittedEventCarrierBoundary() &&
+        profile->semanticTargetEntity == target && profile->semanticOperation == input;
 }
 
 bool SchedulerEdgeRemoteNaturalCaptureActive() noexcept {
@@ -4555,12 +4585,38 @@ void ResetForGeneration() noexcept {
     gEnabled.store(Installed(), std::memory_order_release);
 }
 
+void DrainDiagnosticFiles(aimp::Diagnostics& diagnostics) noexcept {
+    try {
+        RootApplyTraceRecord current{}, completed{};
+        bool hasCurrent{}, hasCompleted{};
+        {
+            std::lock_guard lock(gRootApplyTraceMutex);
+            current = gRootApplyTraceCurrent;
+            completed = gRootApplyTraceCompleted;
+            hasCurrent = gRootApplyTraceHasCurrent;
+            hasCompleted = gRootApplyTraceHasCompleted;
+        }
+        const auto records = gDeferredRootJournal.Drain();
+        const auto dropped = gDeferredRootJournal.TakeDropped();
+        {
+            std::lock_guard lock(gRootApplyFileMutex);
+            for (const auto& record : records) AppendRootApplyJournalLocked(record);
+            if (hasCurrent || hasCompleted)
+                WriteRootApplyTraceLocked(current, hasCurrent, completed, hasCompleted);
+        }
+        if (dropped != 0U)
+            diagnostics.Log("warning", "worldsync_diagnostic_records_dropped",
+                "Diagnostic journal buffer overflow; gameplay events are unaffected.",
+                {{"count", std::to_string(dropped)}});
+    } catch (...) { }
+}
+
 void BeginLogicalShutdown() noexcept {
     gEnabled.store(false, std::memory_order_release);
     gEpoch.fetch_add(1U, std::memory_order_acq_rel);
     gRegistry.store(nullptr, std::memory_order_release);
     {
-        std::lock_guard lock(gRootApplyTraceMutex);
+        std::lock_guard lock(gRootApplyFileMutex);
         if (gRootApplyTraceFile != INVALID_HANDLE_VALUE) {
             static_cast<void>(FlushFileBuffers(gRootApplyTraceFile));
             CloseHandle(gRootApplyTraceFile);

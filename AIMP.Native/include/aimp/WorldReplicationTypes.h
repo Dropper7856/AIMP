@@ -9,7 +9,7 @@
 namespace aimp {
 
 inline constexpr std::uint32_t kWorldManifestFormatVersion = 9U;
-inline constexpr std::uint32_t kWorldManifestCompilerVersion = 0x0010000EU;
+inline constexpr std::uint32_t kWorldManifestCompilerVersion = 0x00100010U;
 
 // WorldSync keeps transport identity independent from CATHODE execution. The
 // registry may discover all domains; v12.5 only exposes evidence-backed generic
@@ -179,6 +179,7 @@ enum WorldReplicationRelevanceEvidence : std::uint32_t {
     WorldReplicationEvidenceStateTransitionCarrier = 1U << 23U,
     WorldReplicationEvidenceCompositeStateTransitionCarrier = 1U << 24U,
     WorldReplicationEvidenceCompositeRelevantFrontierRelaxed = 1U << 25U,
+    WorldReplicationEvidenceEmittedEventCarrier = 1U << 26U,
 };
 
 inline constexpr std::uint32_t kWorldReplicationDispositionMask = 0x7U;
@@ -203,7 +204,8 @@ inline constexpr std::uint32_t kWorldReplicationKnownEvidenceMask =
     WorldReplicationEvidenceExactInputSemantic |
     WorldReplicationEvidenceStateTransitionCarrier |
     WorldReplicationEvidenceCompositeStateTransitionCarrier |
-    WorldReplicationEvidenceCompositeRelevantFrontierRelaxed;
+    WorldReplicationEvidenceCompositeRelevantFrontierRelaxed |
+    WorldReplicationEvidenceEmittedEventCarrier;
 
 struct WorldCompositePublicInputCausalProfile final {
     WorldEntityId ownerCompositeInstance{};
@@ -269,6 +271,14 @@ struct WorldCompositePublicInputCausalProfile final {
             !Has(WorldCausalDependencyUnknown | WorldCausalDependencyTruncated) &&
             HasRelevanceEvidence(WorldReplicationEvidenceStateTransitionCarrier);
     }
+    [[nodiscard]] constexpr bool CertifiedEmittedEventCarrierBoundary() const noexcept {
+        return endpointKind == 2U &&
+            RelevanceDisposition() == WorldReplicationRelevanceDisposition::ReplicateCarrier &&
+            replicationContractKind == WorldReplicationContractKind::Event &&
+            HasSemanticContract() && Has(WorldCausalDependencyWorldEffect) &&
+            !Has(WorldCausalDependencyUnknown | WorldCausalDependencyTruncated) &&
+            HasRelevanceEvidence(WorldReplicationEvidenceEmittedEventCarrier);
+    }
     [[nodiscard]] constexpr bool CertifiedCompositeStateTransitionCarrierBoundary() const noexcept {
         const bool relaxedFrontier =
             HasRelevanceEvidence(WorldReplicationEvidenceCompositeRelevantFrontierRelaxed);
@@ -301,6 +311,7 @@ struct WorldCompositePublicInputCausalProfile final {
         // replay boundary. All other carriers
         // retain the conservative actor-independent-domain requirement.
         return CertifiedExactIntrinsicBoundary() ||
+            CertifiedEmittedEventCarrierBoundary() ||
             CertifiedStateTransitionCarrierBoundary() ||
             ActorIndependentWorldDomain();
     }

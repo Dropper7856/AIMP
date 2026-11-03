@@ -585,6 +585,20 @@ public sealed partial class LobbyHost : IAsyncDisposable
     public bool IsCurrentWorldAuthorityContext(WorldAuthorityContextIdentity authorityContext) =>
         _worldAuthority.IsCurrentAuthorityContext(authorityContext);
 
+    private long _hostCommitLogTick;
+    private long _hostCommitCount;
+
+    // One summary per second: busy maps commit hundreds of transactions per second.
+    private void LogHostGameplayCommitted(WorldAuthorityContextIdentity authorityContext, ulong endSequence)
+    {
+        var count = Interlocked.Increment(ref _hostCommitCount);
+        var now = Environment.TickCount64;
+        var last = Interlocked.Read(ref _hostCommitLogTick);
+        if (now - last < 1_000 || Interlocked.CompareExchange(ref _hostCommitLogTick, now, last) != last) return;
+        Log?.Invoke(this, $"WS3 HostGameplayCommitted: generation={authorityContext.WorldGeneration} " +
+            $"epoch={authorityContext.Epoch} committed={count} through={endSequence}.");
+    }
+
     public bool ReportWorldGameplayCommitted(
         WorldAuthorityContextIdentity authorityContext,
         ulong startSequence,
@@ -594,9 +608,7 @@ public sealed partial class LobbyHost : IAsyncDisposable
         if (_worldAuthority.TryCommitHostGameplayTransaction(
                 authorityContext, startSequence, endSequence, out rejection))
         {
-            Log?.Invoke(this,
-                $"WS3 HostGameplayCommitted: generation={authorityContext.WorldGeneration} " +
-                $"epoch={authorityContext.Epoch} transaction={startSequence}-{endSequence}.");
+            LogHostGameplayCommitted(authorityContext, endSequence);
             return true;
         }
 

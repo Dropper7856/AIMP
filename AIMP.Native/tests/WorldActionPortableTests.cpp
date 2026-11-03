@@ -1,6 +1,14 @@
 #include "aimp/WorldActionLineage.h"
 #include "aimp/WorldInteractionAdapters.h"
 #include "aimp/WorldPublicActions.h"
+#include "aimp/LocalObservationLedger.h"
+#include "aimp/OrderedTransactionBatch.h"
+#include "aimp/DeferredDiagnosticBuffer.h"
+#include "aimp/PlayerLocalControls.h"
+#include "aimp/WorldSemanticReconciliation.h"
+#include "aimp/CausalPublicationPolicy.h"
+#include "aimp/IpcWriteBatch.h"
+#include "aimp/SelfClockedRootFilter.h"
 
 #if defined(NDEBUG)
 #undef NDEBUG // These checks must also execute in the Release test binary.
@@ -19,6 +27,195 @@ int main() {
     using namespace aimp;
     using namespace world_actions;
     using namespace world_interactions;
+
+    // A per-frame CATHODE loop (light flicker) becomes local after its burst;
+    // a door toggled by a player keeps replicating. A quiet loop is released.
+    {
+        SelfClockedRootFilter filter;
+        using D = SelfClockedRootFilter::Decision;
+        for (std::uint32_t i = 0U; i < SelfClockedRootFilter::kBurstLimit; ++i)
+            assert(filter.Observe(42U, 1000U + i * 16U) == D::Replicate);
+        assert(filter.Observe(42U, 1200U) == D::BecameLocal);
+        assert(filter.Observe(42U, 1216U) == D::Local);
+        assert(filter.Observe(42U, 9000U) == D::Replicate);
+        for (std::uint64_t t = 0U; t < 20U; ++t)
+            assert(filter.Observe(7U, 1000U + t * 400U) == D::Replicate);
+        assert(filter.Observe(0U, 1000U) == D::Replicate);
+        filter.Clear();
+        assert(filter.Observe(42U, 1216U) == D::Replicate);
+    }
+
+    // A byte-stream write keeps frame order and honors both batch limits.
+    std::deque<std::vector<std::byte>> frames{{std::byte{1}, std::byte{2}},
+        {std::byte{3}}, {std::byte{4}, std::byte{5}}};
+    std::size_t queuedBytes = 5U;
+    std::vector<std::byte> wireBatch;
+    assert(TakeIpcWriteBatch(frames, queuedBytes, wireBatch, 64U, 3U) == 2U);
+    assert(wireBatch == (std::vector<std::byte>{std::byte{1}, std::byte{2}, std::byte{3}}));
+    assert(queuedBytes == 2U && frames.size() == 1U);
+    assert(TakeIpcWriteBatch(frames, queuedBytes, wireBatch, 1U, 1U) == 0U);
+    assert(queuedBytes == 2U && frames.size() == 1U);
+    assert(TakeIpcWriteBatch(frames, queuedBytes, wireBatch, 1U, 3U) == 1U);
+    assert(queuedBytes == 0U && frames.empty() && wireBatch.front() == std::byte{4});
+
+    WorldCompositePublicInputCausalProfile eventProfile{};
+    eventProfile.endpointKind = 2U;
+    eventProfile.dependencyFlags = WorldCausalDependencyWorldEffect | WorldCausalDependencyPlayer | WorldCausalDependencyUI;
+    eventProfile.replicationContractKind = WorldReplicationContractKind::Event;
+    eventProfile.semanticTargetEntity = {1U, 2U};
+    eventProfile.semanticOperation = 0x4E85BB2DU;
+    eventProfile.replicationRelevance = static_cast<std::uint32_t>(WorldReplicationRelevanceDisposition::ReplicateCarrier) |
+        WorldReplicationEvidenceEmittedEventCarrier;
+    assert(eventProfile.CertifiedEmittedEventCarrierBoundary() && eventProfile.NetworkReplicableBoundary());
+    eventProfile.dependencyFlags |= WorldCausalDependencyUnknown;
+    assert(!eventProfile.CertifiedEmittedEventCarrierBoundary() && !eventProfile.NetworkReplicableBoundary());
+    eventProfile.dependencyFlags = WorldCausalDependencyWorldEffect;
+    eventProfile.endpointKind = 3U;
+    assert(!eventProfile.CertifiedEmittedEventCarrierBoundary());
+
+    // Regression: thousands of ROOTs in one scheduler turn must become
+    // publishable before that turn unwinds. Full transaction segments retain
+    // their original 32-member boundaries; the last short group stays private.
+    static_assert(replication_core::kWorldIntentQueueCapacity >= 4096U);
+    struct PublicationRoot { std::uint64_t cause; unsigned generation, ordinal; };
+    std::vector<PublicationRoot> stagedPublication;
+    std::vector<unsigned> publishedOrdinals;
+    const auto samePublicationGroup = [](const auto& a, const auto& b) {
+        return a.cause == b.cause && a.generation == b.generation;
+    };
+    for (unsigned i = 0U; i < 5000U; ++i) {
+        stagedPublication.push_back({1U, 1U, i});
+        const auto prefix = replication_core::StableCausalPublicationPrefix(
+            stagedPublication, kMaximumTransactionRoots, samePublicationGroup);
+        if (prefix != 0U) {
+            assert(prefix == kMaximumTransactionRoots);
+            for (std::size_t j = 0U; j < prefix; ++j) publishedOrdinals.push_back(stagedPublication[j].ordinal);
+            stagedPublication.erase(stagedPublication.begin(), stagedPublication.begin() + prefix);
+        }
+        assert(stagedPublication.size() < kMaximumTransactionRoots);
+    }
+    assert(publishedOrdinals.size() == 4992U && stagedPublication.size() == 8U);
+    stagedPublication.push_back({1U, 2U, 5000U}); // generation closes the old short group
+    const auto shortPrefix = replication_core::StableCausalPublicationPrefix(
+        stagedPublication, kMaximumTransactionRoots, samePublicationGroup);
+    assert(shortPrefix == 8U);
+    for (const auto& pending : stagedPublication) publishedOrdinals.push_back(pending.ordinal); // final seal
+    assert(publishedOrdinals.size() == 5001U);
+    for (unsigned i = 0U; i < publishedOrdinals.size(); ++i) assert(publishedOrdinals[i] == i);
+    stagedPublication = {{1U,1U,0U},{2U,1U,1U},{2U,1U,2U}};
+    assert(replication_core::StableCausalPublicationPrefix(stagedPublication,
+        kMaximumTransactionRoots, samePublicationGroup) == 1U);
+
+    // A replayed interaction must not consume the receiver's pad or show its
+    // action prompt. The initiating player's local controls remain untouched.
+    for (const auto type : {0x1728F297U, 0x324DBAB5U, 0x73E92EC1U, 0x71E671A8U}) {
+        assert(SuppressRemotePlayerControl(type, true));
+        assert(!SuppressRemotePlayerControl(type, false));
+    }
+    for (const auto worldOrDisplay : {0xAF6549BBU, 0x0E423FCCU, 0xB9B4A894U})
+        assert(!SuppressRemotePlayerControl(worldOrDisplay, true));
+
+    // A high-level Start/Stop may have a lazy, absent semantic descendant.
+    // Replay the certified parent through retail; never synthesize a child
+    // state, skip the event, or relax the lower ScheduledInput reader rules.
+    using namespace semantic_reconciliation;
+    WorldCompositePublicInputCausalProfile lazyChild{};
+    lazyChild.endpointKind = 1U;
+    lazyChild.dependencyFlags = WorldCausalDependencyWorldEffect;
+    lazyChild.replicationRelevance = static_cast<std::uint32_t>(WorldReplicationRelevanceDisposition::ReplicateCarrier) |
+        WorldReplicationEvidenceCompositeStateTransitionCarrier | WorldReplicationEvidenceCompleteDescendantFrontier;
+    lazyChild.replicationContractKind = WorldReplicationContractKind::StateTransition;
+    lazyChild.semanticTargetEntity = {1U, 1U};
+    lazyChild.semanticOperation = 0xD2B3CC2BU;
+    assert(CanReplayCarrierWithoutDescendantState(lazyChild, StateReadStatus::RuntimeUnavailable));
+    for (const auto fault : {StateReadStatus::NativeFault, StateReadStatus::InvalidState,
+         StateReadStatus::ReaderUnsupported, StateReadStatus::Resolved})
+        assert(!CanReplayCarrierWithoutDescendantState(lazyChild, fault));
+    lazyChild.endpointKind = 3U;
+    assert(!CanReplayCarrierWithoutDescendantState(lazyChild, StateReadStatus::RuntimeUnavailable));
+    lazyChild.endpointKind = 1U;
+    lazyChild.dependencyFlags |= WorldCausalDependencyTruncated;
+    assert(!CanReplayCarrierWithoutDescendantState(lazyChild, StateReadStatus::RuntimeUnavailable));
+
+    DeferredDiagnosticBuffer<std::uint64_t, 4U> diagnosticBuffer;
+    for (std::uint64_t i = 0; i < 4U; ++i) assert(diagnosticBuffer.Push(i));
+    assert(!diagnosticBuffer.Push(99U) && diagnosticBuffer.TakeDropped() == 1U);
+    assert(diagnosticBuffer.TakeDropped() == 0U);
+    const auto diagnosticBatch = diagnosticBuffer.Drain();
+    assert((diagnosticBatch == std::vector<std::uint64_t>{0U, 1U, 2U, 3U}));
+    assert(diagnosticBuffer.Push(4U));
+    assert((diagnosticBuffer.Drain() == std::vector<std::uint64_t>{4U}));
+    assert(diagnosticBuffer.Drain().empty());
+
+    // Burst processing preserves FIFO head blocking, atomic transactions and
+    // both work/time limits. No sleeps or engine objects are needed.
+    std::size_t calls = 0U;
+    const auto fixedClock = [] { return 0ULL; };
+    assert(replication_core::DrainOrderedTransactionBatch(64U,
+        [&](std::size_t) { ++calls; return 1U; }, fixedClock) == 64U && calls == 64U);
+    calls = 0U;
+    assert(replication_core::DrainOrderedTransactionBatch(64U,
+        [&](std::size_t) { ++calls; return 0U; }, fixedClock) == 0U && calls == 1U);
+    calls = 0U;
+    assert(replication_core::DrainOrderedTransactionBatch(4U,
+        [&](std::size_t) { ++calls; return 32U; }, fixedClock) == 32U && calls == 1U);
+    calls = 0U;
+    std::uint64_t batchTime = 0U;
+    assert(replication_core::DrainOrderedTransactionBatch(64U,
+        [&](std::size_t) { ++calls; batchTime += 2U; return 1U; },
+        [&] { return batchTime; }) == 1U && calls == 1U);
+    calls = 0U;
+    assert(replication_core::DrainOrderedTransactionBatch(0U,
+        [&](std::size_t) { ++calls; return 1U; }, fixedClock) == 0U && calls == 0U);
+
+    // A delayed authority echo must not exhaust one slot per observation.
+    LocalObservationLedger<64U> observations;
+    for (std::uint64_t i = 1U; i <= 200000U; ++i) assert(observations.Remember(i));
+    assert(observations.Pending() == 200000U && observations.Ranges() == 1U);
+    assert(observations.Remember(1500U) && observations.Pending() == 200000U);
+    for (std::uint64_t i = 1U; i <= 200000U; ++i) {
+        assert(observations.Contains(i));
+        assert(observations.Consume(i));
+        assert(!observations.Contains(i));
+    }
+    assert(observations.Pending() == 0U && observations.Ranges() == 0U);
+    assert(observations.HighWater() == 200000U);
+    assert(observations.Remember(3U) && observations.Remember(1U) && observations.Remember(2U));
+    assert(observations.Ranges() == 1U && observations.Consume(2U));
+    assert(observations.Ranges() == 2U && observations.Contains(1U) && observations.Contains(3U));
+    assert(!observations.Contains(2U) && !observations.Remember(0U));
+    observations.Clear();
+    assert(observations.Pending() == 0U && observations.HighWater() == 0U);
+    LocalObservationLedger<2U> fragmented;
+    for (auto serial : {1ULL, 2ULL, 3ULL, 5ULL}) assert(fragmented.Remember(serial));
+    assert(!fragmented.Remember(7U) && !fragmented.Consume(2U));
+    assert(fragmented.Pending() == 4U && fragmented.Contains(2U) && fragmented.Contains(5U));
+    assert(fragmented.SplitRefused() == 1U && fragmented.Consume(5U) && fragmented.Consume(2U));
+    assert(fragmented.Contains(1U) && fragmented.Contains(3U) && !fragmented.Contains(2U));
+    for (auto salt : {0ULL, 1ULL, 0xDEADBEEF12345678ULL, UINT64_MAX}) {
+        for (std::uint64_t serial = 1U; serial < 10000U; ++serial) {
+            const auto id = salt ^ (serial * kObservationMultiplier);
+            if (id != 0U) assert(ObservationSerial(id, salt) == serial);
+        }
+    }
+    LocalObservationLedger<64U> reordered;
+    std::unordered_map<std::uint64_t, bool> expectedObservations;
+    std::mt19937 observationRandom(360U);
+    for (std::size_t step = 0U; step < 20000U; ++step) {
+        const auto serial = 1U + observationRandom() % 512U;
+        if (observationRandom() % 2U == 0U) {
+            if (reordered.Remember(serial)) expectedObservations[serial] = true;
+        } else if (reordered.Consume(serial)) {
+            assert(expectedObservations.erase(serial) == 1U);
+        }
+        assert(reordered.Pending() == expectedObservations.size());
+        for (std::uint64_t key = 1U; key <= 512U; ++key)
+            assert(reordered.Contains(key) == expectedObservations.contains(key));
+    }
+    LocalObservationLedger<2U> wrapBoundary;
+    assert(wrapBoundary.Remember(UINT64_MAX) && wrapBoundary.Remember(UINT64_MAX - 1U));
+    assert(wrapBoundary.Ranges() == 1U && wrapBoundary.Consume(UINT64_MAX));
+    assert(wrapBoundary.Contains(UINT64_MAX - 1U) && !wrapBoundary.Contains(UINT64_MAX));
 
     static_assert(kAllAdmissionSecurityMask == 0x3FFFU);
     static_assert(static_cast<std::uint32_t>(AdmissionSecurityGate::ForbiddenBehaviorInputs) == 0x0001U);

@@ -7,6 +7,23 @@ namespace AIMP.Protocol.Tests;
 
 internal static class LauncherTests
 {
+    internal static Task NativeManifestVersionAgreementAsync()
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
+        {
+            var header = Path.Combine(directory.FullName, "AIMP.Native", "include", "aimp", "WorldReplicationTypes.h");
+            if (!File.Exists(header)) continue;
+            var native = System.Text.RegularExpressions.Regex.Match(File.ReadAllText(header),
+                @"kWorldManifestCompilerVersion\s*=\s*0x([0-9A-Fa-f]+)U");
+            AssertEx.True(native.Success, "Native WorldManifest compiler-version constant was not found.");
+            AssertEx.Equal(WorldManifestConstants.CompilerVersion,
+                Convert.ToUInt32(native.Groups[1].Value, 16),
+                "The managed compiler and native manifest reader must accept the same generation.");
+            return Task.CompletedTask;
+        }
+        throw new InvalidOperationException("Native WorldManifest version header was not found.");
+    }
+
     internal static Task NativeBuildVersionAgreementAsync()
     {
         for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)

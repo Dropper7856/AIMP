@@ -6,6 +6,8 @@
 #include "aimp/AISyncHostProducer.h"
 #include "aimp/VoiceSync.h"
 #include "aimp/LauncherIPC.h"
+#include "aimp/IpcWriteBatch.h"
+#include "aimp/WorldSemanticReconciliation.h"
 #include "aimp/CharacterIncarnation.h"
 
 #include "aimp/BuildProfile.h"
@@ -959,8 +961,9 @@ void LauncherIPC::PublishWorldReplicationTraffic() {
     // bounded batch each worker pass; the worker writes the whole outgoing
     // batch before sleeping again.
     WorldIntent intent{};
-    for (std::size_t count = 0U; count < 64U &&
+    for (std::size_t count = 0U; count < 128U &&
          replication_core::TryPopOutboundIntent(intent); ++count) {
+        workerTrafficObserved_ = true;
         std::vector<std::byte> payload;
         if (!world_replication_codec::EncodeIntent(intent, payload) ||
             !Queue(
@@ -983,8 +986,9 @@ void LauncherIPC::PublishWorldReplicationTraffic() {
     }
 
     WorldMutationResult mutationResult{};
-    for (std::size_t count = 0U; count < 64U &&
+    for (std::size_t count = 0U; count < 128U &&
          replication_core::TryPopMutationResult(mutationResult); ++count) {
+        workerTrafficObserved_ = true;
         std::vector<std::byte> payload;
         if (mutationResult.nativeDispatchId == 0U ||
             !world_replication_codec::EncodeResult(mutationResult, payload) ||
@@ -1268,7 +1272,7 @@ bool LauncherIPC::Queue(
         // Only the pipe worker may drain it; engine-thread publishers stay bounded
         // and never wait on pipe I/O. Preserve FIFO order and the existing limits.
         if (GetCurrentThreadId() != workerThreadId_.load(std::memory_order_acquire) ||
-            !FlushOutgoing(1U)) return false;
+            !FlushOutgoing(kMaximumQueuedFrames)) return false;
     }
 }
 
@@ -1293,6 +1297,7 @@ void LauncherIPC::Run() {
             "Named-pipe client started; it cannot invoke engine callbacks.");
 
         while (running_.load(std::memory_order_acquire)) {
+            workerTrafficObserved_ = false;
             if (!connected_.load(std::memory_order_acquire)) {
                 if (!TryConnect()) {
                     WaitStop(500);
@@ -1335,13 +1340,11 @@ void LauncherIPC::Run() {
             PublishAISyncExecutionTraffic();
             PublishAISyncHostTraffic();
 
-            if (!FlushOutgoing(96U)) continue;
+            if (!FlushOutgoing(256U)) continue;
 
-            // The worker is dedicated to IPC and is cheap to sample at 100 Hz.
-            // This bounds local WorldIntent pickup and launcher->DLL receive
-            // latency to roughly 10 ms instead of coupling it to the old 250 ms
-            // bootstrap diagnostics loop.
-            WaitStop(10);
+            // Poll at 1 ms while traffic is flowing, back off to 10 ms when
+            // idle. All protocol families still receive a turn on every pass.
+            WaitStop(workerTrafficObserved_ ? 1U : 10U);
         }
 
         Disconnect("ipc_worker_exit");
@@ -1364,19 +1367,21 @@ void LauncherIPC::Run() {
 }
 
 bool LauncherIPC::FlushOutgoing(const std::size_t maximumFrames) {
-    for (std::size_t count = 0U; count < maximumFrames; ++count) {
-        std::vector<std::byte> outgoing;
+    std::vector<std::byte> outgoing;
+    for (std::size_t count = 0U; count < maximumFrames;) {
+        std::size_t batchFrames{};
         {
             std::lock_guard lock(outgoingMutex_);
             if (outgoing_.empty()) break;
-            outgoing = std::move(outgoing_.front());
-            outgoing_.pop_front();
-            outgoingBytes_ -= outgoing.size();
+            batchFrames = TakeIpcWriteBatch(outgoing_, outgoingBytes_, outgoing,
+                maximumFrames - count, kMaximumIpcPayload + protocol::kWireHeaderBytes);
         }
+        if (batchFrames == 0U) return false;
         if (!WriteFrame(outgoing)) {
             Disconnect("queued_write_failed");
             return false;
         }
+        count += batchFrames;
     }
     return true;
 }
@@ -1604,7 +1609,7 @@ bool LauncherIPC::HandleAISyncFrame(const protocol::Frame& frame) {
 }
 
 bool LauncherIPC::ReceiveAvailable() {
-    constexpr std::size_t kMaximumReceiveBatch = 32U;
+    constexpr std::size_t kMaximumReceiveBatch = 128U;
     for (std::size_t batch = 0U; batch < kMaximumReceiveBatch; ++batch) {
         const auto pipe = pipe_.load(std::memory_order_acquire);
         if (pipe == INVALID_HANDLE_VALUE) {
@@ -1668,6 +1673,7 @@ bool LauncherIPC::ReceiveAvailable() {
             Disconnect("ipc_message_validation_failed");
             return false;
         }
+        workerTrafficObserved_ = true;
     }
     return true;
 }
@@ -3936,7 +3942,25 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
               Diagnostics::Unsigned(replication.controlledRemoteApplySuppressedCount), true},
              {"worldOriginEchoSuppressed", Diagnostics::Unsigned(interactions.originEchoSuppressed), true},
              {"worldEchoTableFull", Diagnostics::Unsigned(interactions.echoTableFull), true},
+             {"observationPending", Diagnostics::Unsigned(interactions.observationPending), true},
+             {"observationHighWater", Diagnostics::Unsigned(interactions.observationHighWater), true},
+             {"observationRanges", Diagnostics::Unsigned(interactions.observationRanges), true},
+             {"observationRangeCapacity", "4096", true},
+             {"observationOldestSerial", Diagnostics::Unsigned(interactions.observationOldestSerial), true},
+             {"observationRemembered", Diagnostics::Unsigned(interactions.observationRemembered), true},
+             {"observationEchoed", Diagnostics::Unsigned(interactions.observationEchoed), true},
+             {"observationRetired", Diagnostics::Unsigned(interactions.observationRetired), true},
+             {"observationMissing", Diagnostics::Unsigned(interactions.observationMissing), true},
+             {"observationSplitRefused", Diagnostics::Unsigned(interactions.observationSplitRefused), true},
+             {"worldOutboundPending", Diagnostics::Unsigned(replication.outboundPendingCount), true},
+             {"worldOutboundReserved", Diagnostics::Unsigned(replication.outboundReservedCount), true},
+              {"worldOutboundCapacity", Diagnostics::Unsigned(replication.outboundCapacity), true},
+              {"worldOutboundHighWater", Diagnostics::Unsigned(replication.outboundHighWater), true},
+              {"worldOutboundCapacityRejected", Diagnostics::Unsigned(replication.outboundCapacityRejected), true},
+             {"worldOutboundPopped", Diagnostics::Unsigned(replication.outboundPoppedCount), true},
              {"worldIntentQueueRejected", Diagnostics::Unsigned(interactions.intentQueueRejected), true}});
+        world_actions::DrainDiagnosticFiles(*diagnostics_);
+        semantic_reconciliation::DrainDiagnosticFiles();
         for (std::uint32_t index = 0U; index < ws3.relevanceTopCount; ++index) {
             const auto& producer = ws3.relevanceTop[index];
             diagnostics_->Log(

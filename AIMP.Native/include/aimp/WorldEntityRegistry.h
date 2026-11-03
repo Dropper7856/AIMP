@@ -242,6 +242,7 @@ struct CompositePublicInputManifestDiagnostics final {
 };
 
 class WorldEntityRegistry final {
+    friend struct WorldManifestRuntimeTestAccess;
 public:
     WorldEntityRegistry(
         const SignatureResolver& resolver,

@@ -3,7 +3,7 @@ namespace AIMP.Protocol;
 public static class WorldManifestConstants
 {
     public const uint FormatVersion = 9;
-    public const uint CompilerVersion = 0x0010000E; // PlayerLifecycle terminal HUD endpoints
+    public const uint CompilerVersion = 0x00100010; // Exact emitted Door force-event carriers
     public const string BinaryMagic = "AIMPWM09";
 }
 
@@ -246,7 +246,8 @@ public enum WorldReplicationRelevanceEvidence : uint
     // known relevant semantic descendants while tolerating non-truncated
     // UnknownDependency side paths and cyclic routing. This intentionally opens
     // the high-level boundary without changing the fixed-width manifest layout.
-    CompositeRelevantFrontierRelaxed = 1U << 25
+    CompositeRelevantFrontierRelaxed = 1U << 25,
+    EmittedEventCarrier = 1U << 26
 }
 
 public static class WorldReplicationRelevanceCodec
@@ -272,7 +273,8 @@ public static class WorldReplicationRelevanceCodec
             WorldReplicationRelevanceEvidence.ExactInputSemantic |
             WorldReplicationRelevanceEvidence.StateTransitionCarrier |
             WorldReplicationRelevanceEvidence.CompositeStateTransitionCarrier |
-            WorldReplicationRelevanceEvidence.CompositeRelevantFrontierRelaxed);
+            WorldReplicationRelevanceEvidence.CompositeRelevantFrontierRelaxed |
+            WorldReplicationRelevanceEvidence.EmittedEventCarrier);
 
     public static uint Pack(
         WorldReplicationRelevanceDisposition disposition,

@@ -4,6 +4,7 @@ internal static class Program
 {
     private static readonly TestCase[] Tests =
     {
+        new("WorldSync bounded dispatch pipeline", WorldDispatchWindowTests.CapacityAndOrderAsync),
         new("MissionSync authored completion frontier", MissionFrontierTests.SelectionAsync),
         new("MissionSync survival objective frontiers", MissionFrontierTests.SurvivalAsync),
         new("MissionSync proxied composite milestone frontiers", MissionFrontierTests.ProxyAsync),
@@ -111,6 +112,7 @@ internal static class Program
         new("Voice lobby ownership and restart", VoiceTests.LobbyAsync),
         new("WS3 wire, authority and manifest", ProtocolTests.WorldPublicActionContractAsync),
         new("WS3 local effect boundary", WorldPublicActionTests.LocalEffectBoundaryAsync),
+        new("WS3 retail Door event carriers", WorldPublicActionTests.RetailDoorEventCarriersAsync),
         new("Lobby lifecycle", ProtocolTests.LobbyLifecycleAsync),
         new("Lobby manifest preflight", PreparationTests.LobbyManifestPreflightAsync),
         new("Session loading barrier", PreparationTests.SessionReleaseBarrierAsync),
@@ -125,6 +127,7 @@ internal static class Program
         new("Launcher reset path boundary", LauncherResetTests.RefusesOutsideSettingsPathAsync),
         new("AI process selection", LauncherTests.ProcessSelectionAsync),
         new("Launcher native build version agreement", LauncherTests.NativeBuildVersionAgreementAsync),
+        new("WorldManifest native compiler version agreement", LauncherTests.NativeManifestVersionAgreementAsync),
         new("Native DLL priority", LauncherTests.NativeDllPriorityAsync),
         new("Native module matching", LauncherTests.NativeModuleMatchingAsync),
         new("Diagnostics export", LauncherTests.DiagnosticsExportAsync),

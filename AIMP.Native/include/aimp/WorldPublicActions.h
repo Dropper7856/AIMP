@@ -5,7 +5,10 @@
 #include <array>
 #include <memory>
 
+namespace aimp { class Diagnostics; }
+
 namespace aimp::world_actions {
+void DrainDiagnosticFiles(aimp::Diagnostics& diagnostics) noexcept;
 
 // WS3 v0.11.4.63 experimental admission controls. A set bit means the
 // corresponding safety gate is enforced (STRICT). Clearing a bit opens only
@@ -545,6 +548,7 @@ enum class DoorLockStateSubmission : std::uint8_t {
 // commit without replaying the effect twice. SchedulerEdge's own retail replay
 // is excluded from both paths.
 [[nodiscard]] bool SchedulerEdgeLocalSidecarCaptureActive() noexcept;
+[[nodiscard]] bool CurrentRootOwnsEvent(const WorldEntityId& target, std::uint32_t input) noexcept;
 [[nodiscard]] bool SchedulerEdgeRemoteNaturalCaptureActive() noexcept;
 void RememberRemoteNaturalSchedulerEdge(
     const WorldEntityId& source, const WorldEntityId& target,
