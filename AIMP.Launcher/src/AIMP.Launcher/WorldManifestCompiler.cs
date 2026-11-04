@@ -47,6 +47,8 @@ internal sealed class WorldManifestCompiler
     private readonly HashSet<uint> _instantiatedCompositeIds = new();
 
     private WorldEntityId _mapContentId;
+    private Commands? _compositeLookupSource;
+    private Dictionary<uint, Composite> _compositeLookup = new();
     private uint _excludedAimpCompositeCount;
     private uint _excludedAimpEntityCount;
 
@@ -344,7 +346,7 @@ internal sealed class WorldManifestCompiler
 
         _instantiatedCompositeIds.Add(compositeId);
         var pathId = InternPath(path, manifestNamespaceId, runtimeBaseInstanceId);
-        var hierarchyHash = _paths.Single(value => value.PathId == pathId).HierarchyHash;
+        var hierarchyHash = _paths[checked((int)pathId - 1)].HierarchyHash;
 
         var allLocalEntities = composite.GetEntities()
             .Where(static value => value is not null)
@@ -355,7 +357,7 @@ internal sealed class WorldManifestCompiler
         foreach (var entity in allLocalEntities)
         {
             if (entity is not FunctionEntity function) continue;
-            var childComposite = commands.GetComposite(function.function);
+            var childComposite = FindComposite(commands, function.function);
             if (childComposite is null || !IsAimpCompositeName(childComposite.name)) continue;
 
             excludedLocalEntityIds.Add(entity.shortGUID.AsUInt32);
@@ -403,7 +405,7 @@ internal sealed class WorldManifestCompiler
                 _zones.Add(new WorldZoneDescriptor(descriptor.EntityId, descriptor.ZoneId, pathId, descriptor.EntityName));
             }
 
-            if (entity is FunctionEntity function && commands.GetComposite(function.function) is not null)
+            if (entity is FunctionEntity function && FindComposite(commands, function.function) is not null)
             {
                 foreach (var parameter in function.parameters)
                 {
@@ -491,7 +493,7 @@ internal sealed class WorldManifestCompiler
         foreach (var entity in allLocalEntities)
         {
             if (entity is not FunctionEntity function) continue;
-            var childComposite = commands.GetComposite(function.function);
+            var childComposite = FindComposite(commands, function.function);
             if (childComposite is null) continue;
 
             var childPath = new List<uint>(path.Count + 1);
@@ -519,7 +521,7 @@ internal sealed class WorldManifestCompiler
         if (entity is FunctionEntity function)
         {
             primitiveType = function.function.AsUInt32;
-            var childComposite = commands.GetComposite(function.function);
+            var childComposite = FindComposite(commands, function.function);
             if (childComposite is not null)
             {
                 primitiveName = childComposite.name ?? $"Composite_0x{primitiveType:X8}";
@@ -599,11 +601,11 @@ internal sealed class WorldManifestCompiler
         && function.parameters.Any(parameter => parameter.name == ShortGuidUtils.Generate("layer_name")
             && parameter.content is cString { value: "ChallengeMapOverlay" });
 
-    private static WorldEntityKind GetKind(Commands commands, Entity entity)
+    private WorldEntityKind GetKind(Commands commands, Entity entity)
     {
         if (entity is FunctionEntity function)
         {
-            return commands.GetComposite(function.function) is null ? WorldEntityKind.Function : WorldEntityKind.CompositeInstance;
+            return FindComposite(commands, function.function) is null ? WorldEntityKind.Function : WorldEntityKind.CompositeInstance;
         }
         if (entity is VariableEntity) return WorldEntityKind.Variable;
         if (entity is ProxyEntity) return WorldEntityKind.Proxy;
@@ -1764,9 +1766,25 @@ internal sealed class WorldManifestCompiler
         _references.Clear();
         _zones.Clear();
         _instantiatedCompositeIds.Clear();
+        _compositeLookupSource = null;
+        _compositeLookup = new();
         _mapContentId = default;
         _excludedAimpCompositeCount = 0;
         _excludedAimpEntityCount = 0;
+    }
+
+    // CathodeLib's GetComposite(ShortGuid) scans every composite, and the
+    // traversal asks several times per entity. Same first match, indexed once.
+    private Composite? FindComposite(Commands commands, ShortGuid id)
+    {
+        if (!ReferenceEquals(commands, _compositeLookupSource))
+        {
+            _compositeLookup = new Dictionary<uint, Composite>();
+            foreach (var composite in commands.Entries)
+                if (composite is not null) _compositeLookup.TryAdd(composite.shortGUID.AsUInt32, composite);
+            _compositeLookupSource = commands;
+        }
+        return _compositeLookup.GetValueOrDefault(id.AsUInt32);
     }
 
     private uint InternPath(IReadOnlyList<uint> steps, uint manifestNamespaceId, uint runtimeBaseInstanceId)

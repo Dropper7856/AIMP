@@ -75,6 +75,8 @@ public static class WorldManifestBinaryCodec
         return Convert.ToHexString(SHA256.HashData(stream.ToArray()));
     }
 
+    private const int FileBufferSize = 1 << 20;
+
     public static void Write(string path, WorldManifest manifest)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
@@ -83,7 +85,9 @@ public static class WorldManifestBinaryCodec
         var directory = Path.GetDirectoryName(Path.GetFullPath(path));
         if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
 
-        using var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
+        // Manifests are hundreds of MB written in small fields: a 4 KB buffer
+        // meant one WriteFile (and one antivirus scan) per 4 KB.
+        using var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, FileBufferSize, FileOptions.SequentialScan);
         using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: false);
 
         writer.Write(Encoding.ASCII.GetBytes(WorldManifestConstants.BinaryMagic));
@@ -132,7 +136,7 @@ public static class WorldManifestBinaryCodec
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
 
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, FileBufferSize, FileOptions.SequentialScan);
         using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: false);
 
         var magic = Encoding.ASCII.GetString(reader.ReadBytes(WorldManifestConstants.BinaryMagic.Length));
