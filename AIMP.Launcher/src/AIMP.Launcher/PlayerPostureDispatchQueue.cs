@@ -21,9 +21,12 @@ internal sealed class PlayerPostureDispatchQueue
     {
         var posture = value ?? _latest;
         torch ??= _latestTorch;
-        if (posture == _latest && torch == _latestTorch) return;
+        // Aim is replaceable at movement cadence; only on/off transitions need
+        // an ordered edge. Looking around must not saturate the posture queue.
+        var changed = posture != _latest || torch?.Enabled != _latestTorch?.Enabled;
         _latest = posture;
         _latestTorch = torch;
+        if (!changed) return;
         if (_pending.Count == Capacity) _pending.Dequeue();
         _pending.Enqueue((posture, torch));
     }

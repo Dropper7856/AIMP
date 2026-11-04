@@ -747,7 +747,8 @@ MovementSlot* FindOrAllocateSlot(
 
 void ReleaseSlot(MovementSlot& slot) noexcept {
     player_posture::Forget(slot.characterAddress.load(std::memory_order_acquire));
-    player_torch::Forget(slot.characterAddress.load(std::memory_order_acquire));
+    // Torch lifetime belongs to the representation, not its current Move/Idle
+    // mailbox. Traversal and paired actions can release motion while it lives.
     slot.remainingFrames.store(0U, std::memory_order_release);
     slot.leaseExpiresAtTickMs.store(0U, std::memory_order_release);
     slot.nativeStateActive.store(false, std::memory_order_release);
@@ -2580,10 +2581,6 @@ void PumpSlotOnEngineThread(
         return;
     }
 
-    // Lighting follows the actor even while traversal/paired cycles own motion.
-    if (phase == EnginePumpPhase::PostCharacterManager)
-        player_torch::PumpOnEngineThread(characterAddress);
-
     if (phase == EnginePumpPhase::PreCharacterManager &&
         player_posture::PumpOnEngineThread(characterAddress)) {
         if (slot.stopPending.load(std::memory_order_acquire)) {
@@ -3212,6 +3209,10 @@ void PumpOnEngineThread(const EnginePumpPhase phase) noexcept {
     for (auto& slot : gSlots) {
         PumpSlotOnEngineThread(slot, phase);
     }
+    // Run after all pose corrections, including for actors whose locomotion
+    // mailbox was released by a traversal/paired cycle this frame.
+    if (phase == EnginePumpPhase::PostCharacterManager)
+        player_torch::PumpAllOnEngineThread();
 }
 
 bool ArmDirection(
@@ -3557,10 +3558,10 @@ void Stop() noexcept {
 }
 
 void ForgetCharacter(const std::uintptr_t characterAddress) noexcept {
+    player_torch::Forget(characterAddress);
     if (auto* slot = FindSlot(characterAddress); slot != nullptr) ReleaseSlot(*slot);
     else {
         player_posture::Forget(characterAddress);
-        player_torch::Forget(characterAddress);
     }
 }
 
@@ -3614,7 +3615,11 @@ RuntimeSnapshot Snapshot() noexcept {
 
 RuntimeSnapshot Snapshot(const std::uintptr_t characterAddress) noexcept {
     const auto* slot = FindSlot(characterAddress);
-    return slot == nullptr ? RuntimeSnapshot{} : SnapshotSlot(*slot);
+    if (slot != nullptr) return SnapshotSlot(*slot);
+    RuntimeSnapshot result{};
+    result.characterAddress = characterAddress;
+    result.torch = player_torch::Snapshot(characterAddress);
+    return result;
 }
 
 

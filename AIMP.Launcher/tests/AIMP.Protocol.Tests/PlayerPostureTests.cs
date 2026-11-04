@@ -17,7 +17,7 @@ internal static class PlayerPostureTests
 
     internal static Task WireAsync()
     {
-        AssertEx.Equal((ushort)14, ProtocolConstants.Version);
+        AssertEx.Equal((ushort)29, ProtocolConstants.Version);
         var posture = Posture(ulong.MaxValue, true) with
         {
             DeepCrouched = true, InVent = true, VentIdA = uint.MaxValue, VentIdB = 42,

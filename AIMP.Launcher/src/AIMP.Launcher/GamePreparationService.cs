@@ -15,7 +15,7 @@ internal static class GamePreparationSynchronization
 
 public sealed class GamePreparationService
 {
-    private const int RecipeVersion = 8; // Remote NPC flamethrower notifies AI senses, shows its flames, pilot light and sounds at its muzzle, aims with the shotgun set; DLC levels only, Debug prepares other maps individually.
+    private const int RecipeVersion = 11; // Resolve the retail torch intensity binding instead of copying its unused fallback.
     private readonly object _sync = new();
     private readonly LauncherSettingsStore _settings;
     private readonly LauncherDiagnostics _diagnostics;

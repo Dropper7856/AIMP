@@ -351,6 +351,13 @@ if(BUILD_TESTING)
     set_target_properties(AIMP.PlayerPostureTests PROPERTIES
         VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
     add_test(NAME PlayerPostureAndTraversal COMMAND AIMP.PlayerPostureTests)
+    add_executable(AIMP.PlayerTorchRuntimeTests tests/PlayerTorchRuntimeTests.cpp src/PlayerTorchRuntime.cpp)
+    target_include_directories(AIMP.PlayerTorchRuntimeTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_definitions(AIMP.PlayerTorchRuntimeTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(AIMP.PlayerTorchRuntimeTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.PlayerTorchRuntimeTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME PlayerTorchRuntime COMMAND AIMP.PlayerTorchRuntimeTests)
     add_executable(AIMP.VoiceNativeAudioTests tests/VoiceNativeAudioTests.cpp)
     target_include_directories(AIMP.VoiceNativeAudioTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     target_compile_options(AIMP.VoiceNativeAudioTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)

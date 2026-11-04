@@ -25,6 +25,8 @@ internal static class Program
         new("PlayerSync torch stationary and moving", PlayerTorchTests.MovementAsync),
         new("PlayerSync torch edges and binding", PlayerTorchTests.EdgesAndBindingAsync),
         new("PlayerSync torch local coalescing and lifecycle", PlayerTorchTests.CoordinatorAsync),
+        new("PlayerSync torch isolated graph", PlayerTorchGraphTests.IsolationAsync),
+        new("PlayerSync torch retail graph isolation and serialization", PlayerTorchGraphTests.RetailAsync),
         new("Survival equipment selection isolation", RemoteEquipmentSelectionTests.SelectionAsync),
         new("Survival flare public activation admission", RemoteEquipmentSelectionTests.FlareActivationAsync),
         new("Survival flare retail graph", RemoteEquipmentSelectionTests.RetailFlareGraphAsync),

@@ -18,8 +18,8 @@ internal static class PlayerTorchTests
 
     internal static Task WireAsync()
     {
-        AssertEx.Equal((ushort)14, ProtocolConstants.Version);
-        foreach (var torch in new PlayerTorchSnapshot?[] { null, Off, On })
+        AssertEx.Equal((ushort)29, ProtocolConstants.Version);
+        foreach (var torch in new PlayerTorchSnapshot?[] { null, Off, On, new(true, 0, 0.6F, 0.8F), new(true, 0, -1, 0) })
         {
             var position = Position(1, torch, Crouched);
             ModelValidation.Validate(position);
@@ -31,6 +31,10 @@ internal static class PlayerTorchTests
         foreach (var json in new[] { "{}", "{\"enabled\":null}", "{\"enabled\":1}", "{\"enabled\":\"true\"}", "{\"enabled\":true,\"extra\":0}" })
             AssertEx.Throws<ProtocolException>(() => JsonPayload.Deserialize<PlayerTorchSnapshot>(Encoding.UTF8.GetBytes(json)));
         AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate((PlayerTorchSnapshot?)null));
+        foreach (var invalid in new PlayerTorchSnapshot[] {
+            new(true, 0, null, 1), new(true, 0, 0, 0), new(true, 2, 0, 0),
+            new(true, float.NaN, 0, 1), new(true, 0, float.PositiveInfinity, 1), new(false, 0, 0, 1) })
+            AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(invalid));
         var frame = FrameCodec.Encode(new AimpFrame(MessageType.PlayerPositionSnapshot, 0, 1,
             JsonPayload.Serialize(Position(1, On))));
         frame[4] = 8; frame[5] = 0;
@@ -73,7 +77,54 @@ internal static class PlayerTorchTests
         memory.Remove(character + LocalPlayerTorchReader.EquipmentOffset);
         AssertEx.False(reader.TryCapture(character, out var unreadable));
         AssertEx.True(unreadable is null); // unavailable never invents an off edge
+        AssertAimCapture();
         return Task.CompletedTask;
+    }
+
+    private static void AssertAimCapture()
+    {
+        const int module = 0x400000, character = 0x100000, equipment = 0x200000;
+        const int engine = 0x500000, manager = 0x600000, camera = 0x700000;
+        var memory = new Dictionary<nint, byte[]>
+        {
+            [character + LocalPlayerTorchReader.EnabledOffset] = new byte[] { 1 },
+            [character + LocalPlayerTorchReader.EquipmentOffset] = BitConverter.GetBytes(equipment),
+            [equipment + LocalPlayerTorchReader.LightOffset] = BitConverter.GetBytes(0x300000),
+            [equipment + LocalPlayerTorchReader.EmittedOffset] = new byte[] { 1 },
+            [module + LocalPlayerTorchReader.EngineGlobalRva] = BitConverter.GetBytes(engine),
+            [engine + LocalPlayerTorchReader.CameraManagerOffset] = BitConverter.GetBytes(manager),
+            [manager + LocalPlayerTorchReader.ActiveCameraOffset] = BitConverter.GetBytes(camera),
+            [manager + LocalPlayerTorchReader.FallbackCameraOffset] = BitConverter.GetBytes(camera)
+        };
+        var reader = new LocalPlayerTorchReader((address, output) =>
+        {
+            if (!memory.TryGetValue(address, out var data) || data.Length != output.Length) return false;
+            data.CopyTo(output, 0); return true;
+        });
+        void Rotate(float x, float y, float z, float w) =>
+            memory[camera + LocalPlayerTorchReader.CameraRotationOffset] =
+                new[] { x, y, z, w }.SelectMany(BitConverter.GetBytes).ToArray();
+        Rotate(0, 0, 0, 1);
+        AssertEx.True(reader.TryCapture(character, out var forward, module));
+        AssertEx.Equal(new PlayerTorchSnapshot(true, 0, 0, 1), forward!);
+        // Looking straight up is valid, independent of body yaw; fallback camera is used by retail too.
+        Rotate(-MathF.Sqrt(0.5F), 0, 0, MathF.Sqrt(0.5F));
+        memory[manager + LocalPlayerTorchReader.ActiveCameraOffset] = BitConverter.GetBytes(0);
+        AssertEx.True(reader.TryCapture(character, out var up, module));
+        AssertEx.True(up!.AimY > 0.999F && MathF.Abs(up.AimZ!.Value) < 0.0001F);
+        var arguments = RemoteMovementCommandFactory.Create(0x200000, new RemoteMovementPlan(
+            RemoteMovementAction.Stop, 0, 0, 1.1F, 10, 20, 30, 0.5F, 0, PlayerMoveType.Walk, 1.15073F, Torch: up));
+        ModelValidation.Validate(Command(arguments));
+        AssertEx.True(PlayerTorchCodec.TryDecodeDirection(arguments["playerTorchDirection"], out var decoded));
+        AssertEx.Equal(up, decoded!);
+        // Exhaustion clears requested before the equipment show/hide catches up.
+        memory[character + LocalPlayerTorchReader.EnabledOffset][0] = 0;
+        AssertEx.True(reader.TryCapture(character, out var depleted, module));
+        AssertEx.Equal(Off, depleted!);
+        memory[character + LocalPlayerTorchReader.EnabledOffset][0] = 1;
+        Rotate(float.NaN, 0, 0, 1);
+        AssertEx.True(reader.TryCapture(character, out var invalidCamera, module));
+        AssertEx.Equal(On, invalidCamera!); // camera unavailability must not swallow the real state
     }
 
     internal static Task CommandValidationAsync()
@@ -95,6 +146,16 @@ internal static class PlayerTorchTests
                 plan with { Action = RemoteMovementAction.Move, DirectionX = 1.15073F })));
         }
         AssertEx.False(RemoteMovementCommandFactory.CreateStop(0x200000).ContainsKey("playerTorch"));
+        var aimed = new Dictionary<string, string>(RemoteMovementCommandFactory.Create(0x200000,
+            new RemoteMovementPlan(RemoteMovementAction.Stop, 0, 0, 1.1F,
+                10, 20, 30, 0.5F, 0, PlayerMoveType.Walk, 1.15073F, Crouched, On)))
+            { ["playerTorchDirection"] = "0,0.6,0.8" };
+        ModelValidation.Validate(Command(aimed));
+        foreach (var text in new[] { "0,0", "0,0,0", "NaN,0,1", "2,0,0", "0,0,1,0", "0,,1" })
+            AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(Command(
+                new Dictionary<string, string>(aimed) { ["playerTorchDirection"] = text })));
+        aimed["playerTorch"] = "0";
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(Command(aimed)));
         return Task.CompletedTask;
     }
 
@@ -143,7 +204,30 @@ internal static class PlayerTorchTests
         AssertEx.True(track.TryAccept(Position(5, null), Now.AddMilliseconds(4)));
         AssertEx.Equal(Off, RemoteMovementPlanner.Create(track.Snapshot()!, Now.AddMilliseconds(4)).Torch!);
         AssertMovingEdge();
+        AssertAimUpdates();
         return Task.CompletedTask;
+    }
+
+    private static void AssertAimUpdates()
+    {
+        var track = new RemotePositionTrack();
+        track.TryAccept(Position(1, new(true, 0, 0, 1)), Now);
+        track.BindCharacter(0x200000);
+        Apply(track, Now);
+        track.TryAccept(Position(2, new(true, 0, 0.6F, 0.8F)), Now.AddMilliseconds(16));
+        AssertEx.False(track.Snapshot()!.TorchPending);
+        AssertEx.Equal(RemoteMovementAction.None, RemoteMovementPlanner.Create(track.Snapshot()!, Now.AddMilliseconds(16)).Action);
+        track.TryAccept(Position(3, new(true, 0, 1, 0)), Now.AddMilliseconds(34));
+        var vertical = Apply(track, Now.AddMilliseconds(34));
+        AssertEx.Equal(new PlayerTorchSnapshot(true, 0, 1, 0), vertical.Torch!);
+        var queue = new PlayerPostureDispatchQueue();
+        queue.Bind(Crouched, On);
+        queue.Complete(Crouched, On);
+        for (var i = 0; i < 100; ++i) queue.Observe(Crouched, new(true, 0, MathF.Sin(i), MathF.Cos(i)));
+        AssertEx.Equal(0, queue.Count); // looking around does not consume ordered edge capacity
+        queue.Observe(Crouched, Off);
+        AssertEx.Equal(1, queue.Count);
+        AssertEx.Equal(Off, queue.NextTorch!);
     }
 
     private static RemoteMovementPlan Apply(RemotePositionTrack track, DateTimeOffset now)
@@ -236,6 +320,10 @@ internal static class PlayerTorchTests
         AssertEx.Equal(On, enabled.Torch!);
         AssertEx.Equal(Crouched, enabled.Posture!);
         AssertEx.Equal(4UL, TakeLocal(fixture)!.Sequence);
+        AssertEx.True(TakeLocal(fixture) is null);
+        QueueLocal(fixture, Position(5, new(true, 0, 0, 1)));
+        QueueLocal(fixture, Position(6, new(true, 0, 1, 0)));
+        AssertEx.Equal(6UL, TakeLocal(fixture)!.Sequence); // direction updates coalesce, on/off edges do not
         AssertEx.True(TakeLocal(fixture) is null);
         AssertCoordinatorResets(fixture);
         return Task.CompletedTask;

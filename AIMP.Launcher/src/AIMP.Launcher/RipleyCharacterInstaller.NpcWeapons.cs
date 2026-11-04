@@ -41,7 +41,7 @@ internal static partial class RipleyCharacterInstaller
         sources.Aggregate(false, (changed, commands) =>
             EnsureNpcFlamethrowerNotifier(commands) | EnsureNpcFlamethrowerFlames(commands) |
             EnsureNpcFlamethrowerAimEffects(commands) | EnsureNpcFlamethrowerAttachments(commands) |
-            EnsureNpcFlamethrowerAnimationContext(commands) | changed);
+            EnsureNpcFlamethrowerAnimationContext(commands) | EnsureRemoteTorch(commands) | changed);
 
     // Character animation sets only give NPCs a stub WEAPON_HEAVY set: 22 clips
     // with a single centred aim pose, against 104 for WEAPON_SHOTGUN with the

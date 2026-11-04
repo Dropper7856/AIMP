@@ -33,7 +33,23 @@ int main() {
     Check(!aimp::player_torch::BuildYawTransform(0.0F,
         {std::numeric_limits<float>::infinity(), 3.0F, 4.0F}, light) && light == previousLight,
         "Reject invalid torch position");
-    static_assert(aimp::kProtocolVersion == 28U);
+    for (const auto direction : {std::array<float, 3>{0, 0.6F, 0.8F},
+             std::array<float, 3>{0, 1, 0}, std::array<float, 3>{0, -1, 0},
+             std::array<float, 3>{1, 0, 0}}) {
+        Check(aimp::player_torch::BuildAimTransform(direction, {2, 3, 4}, light), "Full camera ray is supported");
+        Check(std::abs(light[2] - direction[0]) < 0.00001F &&
+            std::abs(light[6] - direction[1]) < 0.00001F && std::abs(light[10] - direction[2]) < 0.00001F,
+            "Beam forward follows replicated camera ray including vertical aim");
+        const std::array<float, 3> right{light[0], light[4], light[8]}, up{light[1], light[5], light[9]};
+        Check(std::abs(right[0] * up[0] + right[1] * up[1] + right[2] * up[2]) < 0.00001F &&
+            std::abs(up[0] * up[0] + up[1] * up[1] + up[2] * up[2] - 1.0F) < 0.00001F,
+            "Beam basis remains orthonormal at vertical aim");
+        Check(light[3] == 2 && light[7] == 3 && light[11] == 4, "Remote origin preserved");
+    }
+    const auto validLight = light;
+    Check(!aimp::player_torch::BuildAimTransform({0, 0, 0}, {2, 3, 4}, light) && light == validLight,
+        "Invalid camera ray cannot mutate the transform");
+    static_assert(aimp::kProtocolVersion == 29U);
     using namespace aimp::player_posture;
     State value{};
     Check(Decode("0,0,0,0,0,0,0", value), "Standing state");
@@ -104,6 +120,25 @@ int main() {
     aimp::player_torch::Initialize(0x400000U);
     Check(aimp::player_torch::Publish(character, true, error), "Torch mailbox publication");
     Check(aimp::player_torch::Snapshot(character).desired, "Torch remains on without movement heartbeats");
+    const std::array<float, 3> aim{0, 0.6F, 0.8F};
+    Check(aimp::player_torch::Publish(character, true, error, &aim), "Replicated camera ray admitted");
+    Check(aimp::player_torch::Snapshot(character).hasDirection, "Camera direction is retained");
+    Check(aimp::player_torch::Publish(character, false, error), "Battery exhaustion switches off");
+    Check(!aimp::player_torch::Snapshot(character).hasDirection && !aimp::player_torch::Snapshot(character).desired,
+        "Off resets aim and does not inherit another lifetime");
+    for (const auto* text : {"0,0.6,0.8", "0,1,0", "0,-1,0", "1,0,0"}) {
+        const auto json = torchPrefix + "\"1\",\"playerTorchDirection\":\"" + text + "\"}}";
+        Check(aimp::experimental::DecodeGameCommand(std::as_bytes(std::span(json.data(), json.size())), request)
+            && request.characterDirectMove.hasPlayerTorchDirection, "Native IPC admits full camera direction");
+    }
+    for (const auto* text : {"0,0", "0,0,0", "NaN,0,1", "2,0,0", "0,0,1,0", "0,,1"}) {
+        const auto json = torchPrefix + "\"1\",\"playerTorchDirection\":\"" + text + "\"}}";
+        Check(!aimp::experimental::DecodeGameCommand(std::as_bytes(std::span(json.data(), json.size())), request),
+            "Native IPC rejects invalid aim");
+    }
+    const auto offAim = torchPrefix + "\"0\",\"playerTorchDirection\":\"0,0,1\"}}";
+    Check(!aimp::experimental::DecodeGameCommand(std::as_bytes(std::span(offAim.data(), offAim.size())), request),
+        "Native IPC rejects aim on disabled torch");
     aimp::player_torch::ForgetAll();
     Check(!aimp::player_torch::Snapshot(character).desired, "Torch lifetime cleanup");
     return failures == 0 ? 0 : 1;

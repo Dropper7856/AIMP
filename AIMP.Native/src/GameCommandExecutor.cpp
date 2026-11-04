@@ -3670,6 +3670,8 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteCharacterDirectMove(
         (command.hasMoveType && command.moveType > 3U) ||
         (command.hasPlayerTorch && (!command.hasReplicationPosition ||
          !command.hasReplicationYaw || !command.hasMoveType || !command.worldSpace)) ||
+        (command.hasPlayerTorchDirection && (!command.hasPlayerTorch || !command.playerTorchEnabled ||
+         !player_torch::ValidDirection(command.playerTorchDirection))) ||
         (command.hasPlayerPosture && (!command.hasReplicationPosition ||
          !command.hasReplicationYaw || !command.hasMoveType ||
          !player_posture::Valid(command.playerPosture))) ||
@@ -3704,7 +3706,8 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteCharacterDirectMove(
     const auto publishPlayerState = [&]() {
         if (command.hasPlayerTorch) {
             std::string torchError;
-            if (!player_torch::Publish(command.characterAddress, command.playerTorchEnabled, torchError)) {
+            if (!player_torch::Publish(command.characterAddress, command.playerTorchEnabled, torchError,
+                    command.hasPlayerTorchDirection ? &command.playerTorchDirection : nullptr)) {
                 result.statusCode = "PLAYER_TORCH_PUBLICATION_FAILED";
                 result.message = torchError;
                 return false;

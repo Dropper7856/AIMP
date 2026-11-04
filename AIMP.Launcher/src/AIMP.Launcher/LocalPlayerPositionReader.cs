@@ -252,7 +252,7 @@ internal sealed class LocalPlayerPositionReader : IDisposable
         movementProfileAvailable = TryReadMovementProfile(characterBase, out movementProfile);
         _postureReader.TryCapture(runtime.ModuleBase, characterBase, runtime.LevelGeneration, out var posture,
             () => TryReadCharacterBase(runtime.ModuleBase, out var after) && after == characterBase);
-        _torchReader.TryCapture(characterBase, out var torch);
+        _torchReader.TryCapture(characterBase, out var torch, runtime.ModuleBase);
         if (!TryReadCharacterBase(runtime.ModuleBase, out var current) || current != characterBase) return false;
         movementProfile = movementProfile with { Posture = posture, Torch = torch };
         return true;
