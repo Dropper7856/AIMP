@@ -3489,6 +3489,34 @@ bool FinishReplicatedInteraction(const std::uintptr_t characterAddress) noexcept
 #endif
 }
 
+// A non-lethal grab leaves a PlayerSync representation in its 4F victim cycle:
+// retail waits for the victim's PLAYER controller to get up, which a
+// representation (NPC controller) never provides, so it lay in T-pose and
+// RetailOwnsPhysicalCycle kept PlayerSync out for good. The caller proves that
+// the attacker has left the pair and the representation is alive.
+bool FinishOrphanedVictimCycle(const std::uintptr_t characterAddress, const std::uintptr_t expectedCycle) noexcept {
+    if (!GameplayLoaded() || gEnterIdleCycle == nullptr || expectedCycle == 0U) return false;
+    std::uintptr_t cycle{};
+    std::uint8_t state{};
+    if (!ReadNativeCycle(characterAddress, cycle, state) || cycle != expectedCycle || state != 0x4FU) return false;
+#if defined(_MSC_VER)
+    __try {
+#endif
+        gEnterIdleCycle(reinterpret_cast<void*>(cycle));
+        std::uintptr_t current{};
+        std::uint8_t currentState{};
+        const bool ended = ReadNativeCycle(characterAddress, current, currentState) && currentState != 0x4FU;
+        if (ended) if (auto* slot = FindSlot(characterAddress)) {
+            // The 4E destructor that normally clears +297/+29A already ran.
+            slot->pairedHoldReleaseRequested.store(true, std::memory_order_release);
+            slot->targetRevision.fetch_add(1U, std::memory_order_release);
+        }
+        return ended;
+#if defined(_MSC_VER)
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+#endif
+}
+
 bool Arm(
     const std::uintptr_t characterAddress,
     const float deltaX,

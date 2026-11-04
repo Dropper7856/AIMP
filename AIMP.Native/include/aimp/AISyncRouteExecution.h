@@ -49,6 +49,7 @@ struct Counters {
     std::uint32_t failureSite{},failureResult{},importStage{},contextCheck{};
     std::uint64_t appendPublished{},continuationPublished{},compoundRequests{};
     std::uint32_t lastAdmissionMode{},lastIncomingCount{},lastCompoundParts{};
+    std::uint64_t corridorJoins{}; // routes admitted from the actor's area on the Host corridor
 };
 [[nodiscard]] Counters Diagnostics() noexcept;
 // Copied values only. Wait reasons: 1=start area, 2=native boundary busy,

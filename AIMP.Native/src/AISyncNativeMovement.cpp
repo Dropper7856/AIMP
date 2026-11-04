@@ -18,7 +18,7 @@
 namespace aimp::ai_sync::execution {
 namespace {
 using namespace transactions;
-std::atomic<std::uint64_t> gUpdatesAfterLocalEnd{},gHostPathSteers{};
+std::atomic<std::uint64_t> gUpdatesAfterLocalEnd{},gHostPathSteers{},gFencedRestartsSkipped{};
 std::atomic<MarkerResolve> gMarkerResolve{};
 constexpr std::uintptr_t kScheduler=0x2CD0;
 struct MarkerBusyScope {
@@ -495,6 +495,16 @@ NativeOutcome NativeRequestAdapter::InvokeMovement(const Record& r,const LocalAc
             const auto quiet=movementRouteQuiet_?movementRouteQuiet_(movementCallsContext_,r):route_execution::CommandRetired(r.scope,r.owner,r.commandId);
             if(r.nativeKind!=1||r.movement.parts!=1||!primary->cancelled||
                 !quiet)return NativeOutcome::Rejected;
+            // The Host fenced this command's routes: every recreated request
+            // is refused at its first query, so each chase Update restarted
+            // and re-cancelled the Move (stutter). Accept the Update; hybrid
+            // recovery keeps following until the Host's next command.
+            route::Key fenced{};fenced.scope=r.scope;fenced.owner=r.owner;fenced.commandId=r.commandId;
+            route::Failure reason{};
+            if(r.movement.navigation==movement::Navigation::HostRoute&&route_runtime::CommandBlocked(fenced,reason)) {
+                primary->movement=r.movement;primary->revision=r.parameterRevision;
+                ++gFencedRestartsSkipped;return NativeOutcome::Admitted;
+            }
             if(!RestartMovement(*primary,r,actor)){MovementUnknown(r);return NativeOutcome::Unknown;}
             primary->movement=r.movement;primary->revision=r.parameterRevision;primary->unknown=false;
             ++gUpdatesAfterLocalEnd;return NativeOutcome::Admitted;
@@ -566,6 +576,7 @@ NativeOutcome NativeRequestAdapter::InvokeMovement(const Record& r,const LocalAc
     return NativeOutcome::Admitted;
 }
 std::uint64_t UpdatesAfterLocalEnd() noexcept { return gUpdatesAfterLocalEnd.load(std::memory_order_relaxed); }
+std::uint64_t FencedRestartsSkipped() noexcept { return gFencedRestartsSkipped.load(std::memory_order_relaxed); }
 void NativeRequestAdapter::SteerMovements() noexcept {
     // HostRoute is executed from imported native nodes. No waypoint targets,
     // speed correction, pose chasing or intermediate stop-distance overrides.

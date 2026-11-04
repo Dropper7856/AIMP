@@ -431,6 +431,19 @@ void EndpointRevisionPreservesAdmittedPrefix() {
     CHECK(FullAreaSegment(1,0.0F,1.0F)&&!FullAreaSegment(1,0.1F,1.0F));
     const std::array<std::uint32_t,2> same{7,7},crossing{7,8};
     CHECK(SameAreaTrace(0x40000000U,1.0F,7,same)&&!SameAreaTrace(0x40000000U,1.0F,7,crossing));
+    // Live auxiliary[3..5] (N+50) and a re-smoothed portal in the SAME
+    // element are not a different corridor; a different element is.
+    Graph whole{};whole.key=suffix.key;whole.auxiliary=complete.auxiliary;whole.statuses=complete.statuses;
+    whole.resourceCount=complete.resourceCount;whole.resources=complete.resources;
+    whole.nodeCount=2;whole.nodes[0]=complete.nodes[0];whole.nodes[1]=complete.nodes[1];whole.goal={8,2,9};
+    for(std::size_t i=0;i<9;++i)whole.nodes[1].vectors[i]=whole.goal[i%3];
+    whole.nodes[0].vectors[4]+=0.25F;whole.auxiliary[4]+=1.0F;
+    CHECK(PreserveEndpointPrefix(complete,whole,retained)&&retained.nodes[0]==complete.nodes[0]&&
+        retained.auxiliary==complete.auxiliary);
+    ++whole.nodes[0].ordinal;
+    CHECK(EndpointPrefixMismatch(complete,whole)==7U&&!PreserveEndpointPrefix(complete,whole,retained));
+    --whole.nodes[0].ordinal;whole.auxiliary[1]+=1.0F;
+    CHECK(EndpointPrefixMismatch(complete,whole)==5U);
 }
 void CompleteInstalledRoute() {
     auto host=std::make_unique<Harness>();host->graph.nodeCount=11;

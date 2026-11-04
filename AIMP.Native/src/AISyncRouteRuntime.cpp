@@ -46,7 +46,7 @@ std::uint64_t HostRoutesUnavailable() noexcept;
 std::atomic<std::uint32_t> gHostFailureSite{},gHostFailureResult{},gHostNavigationNodes{},gHostResultNodes{};
 std::atomic<std::uint32_t> gHostCaptureCheck{};
 std::atomic<std::uint32_t> gHostCaptureNode{UINT32_MAX},gHostMarkerIndex{UINT32_MAX},gHostMarkerKind{UINT32_MAX},gHostMarkerTypeRva{UINT32_MAX};
-std::atomic<std::uint64_t> gHostCaptureDeferred{};
+std::atomic<std::uint64_t> gHostCaptureDeferred{},gHostEndpointEditsSkipped{};
 std::atomic<std::uint32_t> gHostBlockState{},gHostBlockMode{},gHostStopBits{},gHostNodeType{},gHostMetadataBytes{};
 std::mutex gFailureGate;
 std::array<ClientFailure,64> gFailures{};
@@ -248,8 +248,14 @@ void PublishHostPath(const HostProtection& pin,std::uint32_t site,bool admission
     if(!admission) {
         route::Graph preserved{};
         if(!route::PreserveEndpointPrefix(*metadata->complete,graph,preserved)) {
-            gHostCaptureCheck=113;HostCaptureFailure(pin.local,site,route::Result::LocalInvalidity);++gBlocked;
-            static_cast<void>(source.BlockRoute(pin.command,pin.part,route::Failure::Unsupported));return;
+            // This edit is not a pure endpoint move of the published corridor
+            // (e.g. the chased target crossed into another area). Fencing the
+            // command dropped every later route of a whole chase and pushed
+            // the Client into hybrid recovery. Skip only this edit: the next
+            // native admission republishes the full Host corridor.
+            gHostCaptureCheck=1130U+route::EndpointPrefixMismatch(*metadata->complete,graph);
+            HostCaptureFailure(pin.local,site,route::Result::LocalInvalidity);
+            ++gHostEndpointEditsSkipped;return;
         }
         graph=preserved;
     }
@@ -476,5 +482,5 @@ Counters Diagnostics() noexcept{
     gHostBlockState.load(),gHostBlockMode.load(),gHostStopBits.load(),gHostNodeType.load(),gHostMetadataBytes.load(),
     gQueued.load(),gQueueRejected.load(),gEngineQueries.load(),gWorkerQueries.load(),gStrictQueries.load(),gUnownedQueries.load(),gRequeues.load(),
     queued,gLastQueueRejection.load(),gLastQueryOwnership.load(),gLastQueryPolicy.load(),gLastQueryKind.load(),
-    gHostCaptureDeferred.load(),gHostCaptureCheck.load(),gHostCaptureNode.load(),gHostMarkerIndex.load(),gHostMarkerKind.load(),gHostMarkerTypeRva.load()};}
+    gHostCaptureDeferred.load(),gHostCaptureCheck.load(),gHostCaptureNode.load(),gHostMarkerIndex.load(),gHostMarkerKind.load(),gHostMarkerTypeRva.load(),gHostEndpointEditsSkipped.load()};}
 }

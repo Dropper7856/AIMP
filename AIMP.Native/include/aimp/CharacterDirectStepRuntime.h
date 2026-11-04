@@ -212,6 +212,9 @@ bool ApplyReplicatedYaw(
 // Engine thread only: leave a completed authoritative attack via the retail
 // Idle transition/destructor. Never touches a victim's death cycle or health.
 bool FinishReplicatedInteraction(std::uintptr_t characterAddress) noexcept;
+// Ends exactly this remote player representation's orphaned 4F victim cycle
+// through retail's generic cycle Idle (0065BDD0). Engine thread.
+bool FinishOrphanedVictimCycle(std::uintptr_t characterAddress, std::uintptr_t expectedCycle) noexcept;
 
 // Any thread: an aborted or abandoned paired attack no longer owns this remote
 // player representation. The next engine pump clears the leaked retail grapple

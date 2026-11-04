@@ -1,8 +1,10 @@
 #include "aimp/AISyncNativeRequestAdapter.h"
 #include "aimp/AISyncExecutionCodec.h"
 #include "aimp/CharacterResourceAdmission.h"
+#include "aimp/CharacterDirectStepRuntime.h"
 #include <Windows.h>
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <initializer_list>
 
@@ -435,6 +437,25 @@ NativeOutcome NativeRequestAdapter::InvokePinned(const Record& r, const LocalAct
         return NativeOutcome::Unknown;
     }
 }
+// A backstage/frontstage event carries the Host body's pose at that native
+// transition. While hidden, retail moved the Host body along its own backstage
+// (vent) network, which the Client does not replay: without this the Client
+// emerged where it had entered, still inside the vent, its next Move walked
+// the vent again and re-hid it (the Alien killed while invisible). Place only
+// a body that is HIDDEN now, so no visible teleport exists; a visible body is
+// never moved by this path. The write is immediate (the hybrid's own
+// teleport primitive): retail's 007C6330 placement is deferred, so it used to
+// override the Host's explicit relocate issued right after a vent exit and
+// left the Client at the vent mouth, from where it re-entered the vent.
+void NativeRequestAdapter::PlaceHiddenAtTransition(const Record& r,const LocalActorBinding& actor) noexcept {
+    if((r.flags&HasGoal)==0||!std::isfinite(r.goalX)||!std::isfinite(r.goalY)||!std::isfinite(r.goalZ)||!std::isfinite(r.aux))return;
+    std::uint8_t hidden{};float x{},y{},z{};
+    if(!Read(actor.character+0x2DA,hidden)||!hidden||!Read(actor.character+0x70,x)||!Read(actor.character+0x74,y)||!Read(actor.character+0x78,z))return;
+    const auto dx=x-r.goalX,dy=y-r.goalY,dz=z-r.goalZ;
+    if(dx*dx+dy*dy+dz*dz<=0.0001F)return;
+    const float position[]{r.goalX,r.goalY,r.goalZ};
+    if(character_direct_step_runtime::ApplyAIRecoveryTransform(actor.character,position,r.aux))++transitionPlacements_;
+}
 NativeOutcome NativeRequestAdapter::InvokeLifecycle(const Record& r,const LocalActorBinding& actor) noexcept {
     __try {
         if(r.opcode!=Op::Submit)return NativeOutcome::Rejected;
@@ -449,10 +470,12 @@ NativeOutcome NativeRequestAdapter::InvokeLifecycle(const Record& r,const LocalA
                 reinterpret_cast<void(__thiscall*)(void*,const float*,float,std::uint32_t,std::uint32_t)>(base_+0x3C2710U)(
                     reinterpret_cast<void*>(actor.character),position,r.aux,r.mode,r.nativeKind==kDirectForcedRelocateKind?1U:0U);
         } else if(r.nativeKind==kBackstageKind) {
-            // Pose observations on this event never synthesize a placement.
-            // Explicit relocation has its own independently ordered kind.
+            // Hidden while placed: emerge at the Host's exit, or carry the
+            // just-hidden body to the Host's entry. Never a visible move.
+            if(r.mode==0U)PlaceHiddenAtTransition(r,actor);
             reinterpret_cast<void(__thiscall*)(void*,std::uint8_t)>(base_+0x38B140U)(
                 reinterpret_cast<void*>(actor.character),static_cast<std::uint8_t>(r.mode));
+            if(r.mode!=0U)PlaceHiddenAtTransition(r,actor);
         } else {
             std::uintptr_t table{},getter{};
             if(!Read(actor.character,table)||!Read(table+0x1C,getter)||getter<base_+0x1000U||getter>=base_+0xD9E13BU)
@@ -461,6 +484,7 @@ NativeOutcome NativeRequestAdapter::InvokeLifecycle(const Record& r,const LocalA
             LocalActorBinding current{};
             if(!animated||!Resolve(r,current)||current.character!=actor.character||current.runtimeId!=actor.runtimeId||
                 current.creationSerial!=actor.creationSerial)return NativeOutcome::Unknown;
+            PlaceHiddenAtTransition(r,actor);
             reinterpret_cast<void(__thiscall*)(void*)>(base_+0x3C0220U)(reinterpret_cast<void*>(animated));
         }
         LocalActorBinding after{};

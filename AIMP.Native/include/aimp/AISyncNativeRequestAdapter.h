@@ -178,6 +178,7 @@ private:
     [[nodiscard]] bool Resolve(const transactions::Record&, LocalActorBinding&) noexcept;
     [[nodiscard]] bool Live(const Lease&, const LocalActorBinding&) const noexcept;
     [[nodiscard]] transactions::NativeOutcome InvokePinned(const transactions::Record&, const LocalActorBinding&) noexcept;
+    void PlaceHiddenAtTransition(const transactions::Record&, const LocalActorBinding&) noexcept;
     [[nodiscard]] transactions::NativeOutcome InvokeLifecycle(const transactions::Record&, const LocalActorBinding&) noexcept;
     [[nodiscard]] Readiness CheckMovement(const transactions::Record&, const LocalActorBinding&) noexcept;
     [[nodiscard]] Readiness Resources(std::uintptr_t character) noexcept;
@@ -236,5 +237,7 @@ private:
 };
 // Host Updates accepted as no-op because the local Move had already ended.
 [[nodiscard]] std::uint64_t UpdatesAfterLocalEnd() noexcept;
+// Updates of a Host-fenced HostRoute command accepted without recreating it.
+[[nodiscard]] std::uint64_t FencedRestartsSkipped() noexcept;
 [[nodiscard]] std::uint64_t HostPathSteers() noexcept;
 } // namespace aimp::ai_sync::execution
