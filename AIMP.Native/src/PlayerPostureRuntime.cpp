@@ -49,17 +49,23 @@ Slot* Find(const std::uintptr_t character) noexcept {
 bool SetCrouch(const std::uintptr_t character, const bool crouch) noexcept {
 #if defined(_MSC_VER) && defined(_M_IX86)
     __try {
-        // CharacterManager consumes Modifiers+E and compares it with +1A.
-        // Setting only +2AF/tag lets that later consumer restore its old stance.
-        // Use the same native application path for local and NPC Characters.
+        // 687B60 consumes retail NPC StanceRequest kind 7 through these helpers
+        // (mode 1=stand, 2=crouch). They update the NPC's CROUCHED animation tag
+        // and +2AF, also read by sight/attack/stealth queries (6E3DB0, 7922F0).
+        // Writing only the player modifier path misses this NPC entry point.
+        using Stance = void(__thiscall*)(void*);
+        reinterpret_cast<Stance>(gModuleBase + (crouch ? 0x3CAE20U : 0x3CAE90U))(
+            reinterpret_cast<void*>(character));
         const auto desired = static_cast<std::uint8_t>(crouch);
         auto* modifiers = reinterpret_cast<std::uint8_t*>(character + 0x3E2CU);
         const auto current = *reinterpret_cast<std::uint8_t*>(character + 0x2AFU);
+        // Keep the later CharacterModifiers consumer consistent with this
+        // request, including representations carrying a player component.
         modifiers[0x0EU] = desired;
         if ((current != 0U) != crouch) modifiers[0x1AU] = static_cast<std::uint8_t>(current != 0U);
         using Apply = void(__thiscall*)(void*, void*);
         reinterpret_cast<Apply>(gModuleBase + 0x3D2AD0U)(modifiers, reinterpret_cast<void*>(character));
-        return true;
+        return (*reinterpret_cast<const std::uint8_t*>(character + 0x2AFU) != 0U) == crouch;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 #else
     static_cast<void>(character); static_cast<void>(crouch); return false;
@@ -175,24 +181,39 @@ bool EntryApproach(const std::uintptr_t character, const std::uintptr_t record,
     return std::isfinite(distance);
 }
 
-void ApplyPosture(const std::uintptr_t character, const State& desired) noexcept {
-    std::uint8_t inVent{}, crouched{};
+bool ApplyPosture(const std::uintptr_t character, const State& desired) noexcept {
+    std::uint8_t inVent{};
     std::uint32_t a{}, b{};
-    if (!Read(character + 0x2B4U, inVent)) return;
+    if (!Read(character + 0x2B4U, inVent)) return false;
     if ((desired.flags & 4U) != 0U) {
-        if (!Read(character + 0x4290U, a) || !Read(character + 0x4294U, b)) return;
+        if (!Read(character + 0x4290U, a) || !Read(character + 0x4294U, b)) return false;
         if ((inVent == 0U || a != desired.ventIdA || b != desired.ventIdB) &&
-            !EnterVent(character, desired.ventIdA, desired.ventIdB)) return;
-    } else if (inVent != 0U && !ExitVent(character)) return;
-    const auto shouldCrouch = (desired.flags & 5U) != 0U;
-    if (Read(character + 0x2AFU, crouched))
-        static_cast<void>(SetCrouch(character, shouldCrouch));
+            !EnterVent(character, desired.ventIdA, desired.ventIdB)) return false;
+    } else if (inVent != 0U && !ExitVent(character)) return false;
+    // A low-ceiling/deep crouch is still crouched even if its independent
+    // source flag was observed between two ordinary crouch transitions.
+    const auto shouldCrouch = (desired.flags & 7U) != 0U;
+    if (!SetCrouch(character, shouldCrouch)) return false;
     // Retail's low-ceiling component writes +2B0 only. +2B1 belongs to
     // interactions and must never be inferred from deep crouch.
     const auto deep = static_cast<std::uint8_t>((desired.flags & 2U) != 0U);
     std::uint8_t current{};
-    if (Read(character + 0x2B0U, current) && current != deep)
-        static_cast<void>(crash_guard::TryWrite(reinterpret_cast<void*>(character + 0x2B0U), &deep, sizeof(deep)));
+    if (!Read(character + 0x2B0U, current)) return false;
+    return current == deep || crash_guard::TryWrite(reinterpret_cast<void*>(character + 0x2B0U), &deep, sizeof(deep));
+}
+
+bool IsRemoteCharacter(const std::uintptr_t character) noexcept {
+    std::uintptr_t root{}, manager{}, players{}, definition{};
+    std::uint32_t count{};
+    if (!Read(character + 0x64U, definition) || definition < 0x10000U ||
+        !Read(gModuleBase + 0x12F0C88U, root) || !Read(root + 8U, manager) ||
+        !Read(manager + 0x84U, count) || count == 0U || count > 4U ||
+        !Read(manager + 0x80U, players) || players < 0x10000U) return false;
+    for (std::uint32_t i = 0U; i < count; ++i) {
+        std::uintptr_t player{};
+        if (!Read(players + i * sizeof(std::uintptr_t), player) || player == character) return false;
+    }
+    return true;
 }
 
 void Complete(const Slot& work, const bool started, const bool discard) noexcept {
@@ -267,6 +288,7 @@ bool PumpOnEngineThread(const std::uintptr_t character) noexcept {
         slot->approaching = false;
         work = *slot;
     }
+    if (!IsRemoteCharacter(character)) return false;
     std::uintptr_t cycle{}, owner{};
     std::uint8_t state{}, grappled{}, ready{};
     std::uint32_t health{};
@@ -339,13 +361,59 @@ bool PumpOnEngineThread(const std::uintptr_t character) noexcept {
         holdEntrance();
         return false;
     }
-    ApplyPosture(character, work.desired);
+    return false;
+}
+
+void ReconcileAllOnEngineThread() noexcept {
+    std::array<Slot, 40> work{};
     {
         std::lock_guard lock(gMutex);
-        if (auto* slot = Find(character); slot != nullptr && slot->epoch == work.epoch)
-            ++slot->diagnostics.postureApplications;
+        work = gSlots;
     }
-    return false;
+    for (const auto& item : work) {
+        if (item.character == 0U) continue;
+        auto result = item.diagnostics;
+        result.desiredCrouched = (item.desired.flags & 7U) != 0U;
+        result.desiredDeepCrouched = (item.desired.flags & 2U) != 0U;
+        result.stage = "character";
+        bool success{}, attempted{};
+        std::uintptr_t cycle{}, owner{};
+        std::uint8_t state{}, grappled{}, before{}, applied{}, deep{};
+        std::uint32_t health{};
+        if (!IsRemoteCharacter(item.character)) result.stage = "local-player-guard";
+        else if (!Read(item.character + 0x36CU, cycle) || !Read(cycle + 4U, owner) || owner != item.character ||
+            !Read(cycle + 0x1AU, state)) result.stage = "cycle";
+        else if (state == 0x16U || item.count != 0U) result.stage = "traversal";
+        else if (!Read(item.character + 0x297U, grappled) || grappled != 0U ||
+            !Read(item.character + 0x32CU, health) || health >= 3U ||
+            state == 0x42U || state == 0x4EU || state == 0x4FU || state == 0x47U) result.stage = "paired-or-dead";
+        else {
+            attempted = true;
+            result.stage = "apply";
+            const auto accepted = Read(item.character + 0x2AFU, before) && ApplyPosture(item.character, item.desired);
+            const auto readback = Read(item.character + 0x2AFU, applied) && Read(item.character + 0x2B0U, deep);
+            if (readback) {
+                result.appliedCrouched = applied != 0U;
+                result.appliedDeepCrouched = deep != 0U;
+            }
+            success = accepted && readback && (applied != 0U) == result.desiredCrouched &&
+                (deep != 0U) == result.desiredDeepCrouched;
+            result.stage = "apply-failed";
+            if (success) {
+                result.stage = applied != 0U ? "crouched" : "standing";
+                if ((before != 0U) != (applied != 0U)) ++result.crouchTransitions;
+            }
+        }
+        std::lock_guard lock(gMutex);
+        auto* slot = Find(item.character);
+        if (slot == nullptr || slot->epoch != item.epoch) continue;
+        // IPC can publish newer desired state during application. These fields
+        // describe this engine application; never replace the newer request.
+        if (success) ++result.postureApplications;
+        else if (attempted || result.stage == std::string_view("local-player-guard") ||
+            result.stage == std::string_view("cycle")) ++result.postureFailures;
+        slot->diagnostics = result;
+    }
 }
 
 void Forget(const std::uintptr_t character) noexcept {

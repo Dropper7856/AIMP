@@ -746,8 +746,7 @@ MovementSlot* FindOrAllocateSlot(
 }
 
 void ReleaseSlot(MovementSlot& slot) noexcept {
-    player_posture::Forget(slot.characterAddress.load(std::memory_order_acquire));
-    // Torch lifetime belongs to the representation, not its current Move/Idle
+    // Posture and torch belong to the representation, not its current Move/Idle
     // mailbox. Traversal and paired actions can release motion while it lives.
     slot.remainingFrames.store(0U, std::memory_order_release);
     slot.leaseExpiresAtTickMs.store(0U, std::memory_order_release);
@@ -3209,6 +3208,9 @@ void PumpOnEngineThread(const EnginePumpPhase phase) noexcept {
     for (auto& slot : gSlots) {
         PumpSlotOnEngineThread(slot, phase);
     }
+    // Move/Idle activation and the retail tick may overwrite stance. Reconcile
+    // after those consumers, even for a proxy without a locomotion mailbox.
+    player_posture::ReconcileAllOnEngineThread();
     // Run after all pose corrections, including for actors whose locomotion
     // mailbox was released by a traversal/paired cycle this frame.
     if (phase == EnginePumpPhase::PostCharacterManager)
@@ -3558,11 +3560,9 @@ void Stop() noexcept {
 }
 
 void ForgetCharacter(const std::uintptr_t characterAddress) noexcept {
+    player_posture::Forget(characterAddress);
     player_torch::Forget(characterAddress);
     if (auto* slot = FindSlot(characterAddress); slot != nullptr) ReleaseSlot(*slot);
-    else {
-        player_posture::Forget(characterAddress);
-    }
 }
 
 void ForgetAll() noexcept {
@@ -3618,6 +3618,7 @@ RuntimeSnapshot Snapshot(const std::uintptr_t characterAddress) noexcept {
     if (slot != nullptr) return SnapshotSlot(*slot);
     RuntimeSnapshot result{};
     result.characterAddress = characterAddress;
+    result.posture = player_posture::Snapshot(characterAddress);
     result.torch = player_torch::Snapshot(characterAddress);
     return result;
 }

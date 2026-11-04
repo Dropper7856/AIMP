@@ -2,7 +2,7 @@ namespace AIMP.Launcher;
 
 internal static class ProductInfo
 {
-    private const string BuildRevision = "391";
+    private const string BuildRevision = "392";
     internal const string LauncherVersion = "0.8.4." + BuildRevision;
-    internal const string ExpectedDllVersion = "0.11.4." + BuildRevision + "-player-torch";
+    internal const string ExpectedDllVersion = "0.11.4." + BuildRevision + "-player-crouch";
 }

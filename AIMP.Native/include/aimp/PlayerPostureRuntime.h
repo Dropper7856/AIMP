@@ -62,6 +62,9 @@ bool Publish(std::uintptr_t character, const State& state, std::string& error) n
 // Returns true while native traversal owns movement. No transform correction is
 // allowed then; retail completion releases ownership on its own.
 bool PumpOnEngineThread(std::uintptr_t character) noexcept;
+// Reconcile persistent stance after movement setup and after the retail tick,
+// including Characters without a locomotion mailbox. Never starts traversal.
+void ReconcileAllOnEngineThread() noexcept;
 // A lagging proxy approaches the authored entrance through normal locomotion;
 // the traversal starter itself has no distance check.
 bool ApproachTarget(std::uintptr_t character, float& x, float& y, float& z) noexcept;
@@ -71,6 +74,9 @@ void ForgetAll() noexcept;
 struct DiagnosticsSnapshot final {
     std::uint64_t postureApplications{}, traversalApplications{}, traversalRejections{};
     std::uint64_t activeRevision{}, pendingTraversals{};
+    std::uint64_t postureFailures{}, crouchTransitions{};
+    bool desiredCrouched{}, desiredDeepCrouched{}, appliedCrouched{}, appliedDeepCrouched{};
+    const char* stage{"pending"};
 };
 DiagnosticsSnapshot Snapshot(std::uintptr_t character) noexcept;
 
