@@ -15,7 +15,7 @@ internal static class GamePreparationSynchronization
 
 public sealed class GamePreparationService
 {
-    private const int RecipeVersion = 11; // Resolve the retail torch intensity binding instead of copying its unused fallback.
+    private const int RecipeVersion = 12; // Remote crouch animations (ANIMATION.PAK) for the E_RIPLEY representation.
     private readonly object _sync = new();
     private readonly LauncherSettingsStore _settings;
     private readonly LauncherDiagnostics _diagnostics;
@@ -214,6 +214,13 @@ public sealed class GamePreparationService
                 AssertGameStopped();
                 var levels = WorldManifestLevelDiscovery.Discover(game).Where(l => l.CanCompile).ToArray();
                 if (levels.Length == 0) throw new InvalidDataException("No playable levels were found.");
+                // Global, not level-bound: verified (and re-applied after a game
+                // file repair) on every preparation, even with a valid receipt.
+                Update("Character", 1, 0, levels.Length, string.Empty, "Preparing remote crouch animations");
+                var animationTimer = Stopwatch.StartNew();
+                RemoteCrouchAnimationInstaller.Install(game, token);
+                _diagnostics.Log("Preparation", $"Remote crouch animations ready in {animationTimer.Elapsed.TotalSeconds:F0}s.");
+                token.ThrowIfCancellationRequested();
                 var receiptPath = ReceiptPath(game);
                 var existing = TryReadReceipt(receiptPath);
                 if (existing != null && existing.RecipeVersion == RecipeVersion
@@ -221,7 +228,8 @@ public sealed class GamePreparationService
                     && SameDirectory(existing.GameDirectory, game)
                     && existing.Manifests.Length == levels.Length
                     && existing.Manifests.All(m => levels.Any(l => SameDirectory(l.LevelDirectory, m.LevelDirectory)))
-                    && StampsEqual(existing.Files, CaptureStamps(game, levels, existing.Manifests)))
+                    && StampsEqual(existing.Files, CaptureStamps(game, levels, existing.Manifests),
+                        Path.Combine(game, "DATA", "GLOBAL", "ANIMATION.PAK")))
                 {
                     Complete(existing);
                     return;
@@ -335,8 +343,13 @@ public sealed class GamePreparationService
         }, StringComparer.OrdinalIgnoreCase);
     }
 
-    private static bool StampsEqual(Dictionary<string, FileStamp> a, Dictionary<string, FileStamp> b) =>
-        a.Count == b.Count && b.All(pair => a.TryGetValue(pair.Key, out var value) && value == pair.Value);
+    // The animation installer above verifies its original/patched SHA-256 on
+    // every run. Updating only that independent global archive must not force
+    // a rebuild of all prepared level characters/manifests.
+    internal static bool StampsEqual(Dictionary<string, FileStamp> a, Dictionary<string, FileStamp> b,
+        string verifiedAnimation) => a.Count == b.Count && b.All(pair =>
+            a.TryGetValue(pair.Key, out var value) &&
+            (pair.Key.Equals(verifiedAnimation, StringComparison.OrdinalIgnoreCase) || value == pair.Value));
     private static PreparationReceipt? TryReadReceipt(string path)
     {
         try
@@ -373,7 +386,7 @@ public sealed class GamePreparationService
     private static GamePreparationDto EmptyStatus(string directory) => new(string.Empty, directory,
         string.IsNullOrWhiteSpace(directory) ? "NotConfigured" : "Idle", string.Empty, 0, 0, 0,
         string.Empty, "Select your game installation", string.Empty, null, null);
-    private sealed record FileStamp(long Length, long LastWriteTicks);
+    internal sealed record FileStamp(long Length, long LastWriteTicks);
     private sealed record PreparedManifestReceipt(string LevelDirectory, string ManifestPath,
         string BinarySha256, string CommandsPakSha256, string CommandsBinSha256);
     private sealed record PreparationReceipt(int RecipeVersion, uint CompilerVersion, string GameDirectory,

@@ -80,6 +80,7 @@ set(AIMP_CORE_SOURCES
     src/ParticipantRegistry.cpp
     src/PlayerSyncObserver.cpp
     src/PlayerPostureRuntime.cpp
+    src/PlayerAnimationClipCapture.cpp
     src/PlayerTorchRuntime.cpp
     src/MissionSync.cpp
     src/PlayerLifecycle.cpp
@@ -351,6 +352,13 @@ if(BUILD_TESTING)
     set_target_properties(AIMP.PlayerPostureTests PROPERTIES
         VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
     add_test(NAME PlayerPostureAndTraversal COMMAND AIMP.PlayerPostureTests)
+    add_executable(AIMP.PlayerPostureRuntimeTests tests/PlayerPostureRuntimeTests.cpp)
+    target_link_libraries(AIMP.PlayerPostureRuntimeTests PRIVATE AIMP.Core)
+    target_compile_definitions(AIMP.PlayerPostureRuntimeTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(AIMP.PlayerPostureRuntimeTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.PlayerPostureRuntimeTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME PlayerPostureRuntime COMMAND AIMP.PlayerPostureRuntimeTests)
     add_executable(AIMP.PlayerTorchRuntimeTests tests/PlayerTorchRuntimeTests.cpp src/PlayerTorchRuntime.cpp)
     target_include_directories(AIMP.PlayerTorchRuntimeTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     target_compile_definitions(AIMP.PlayerTorchRuntimeTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

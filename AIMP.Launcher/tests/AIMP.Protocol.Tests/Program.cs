@@ -19,6 +19,8 @@ internal static class Program
         new("PlayerSync posture wire and revisions", PlayerPostureTests.WireAsync),
         new("PlayerSync posture stationary and edges", PlayerPostureTests.MovementAsync),
         new("PlayerSync posture coherent memory capture", PlayerPostureTests.CaptureAsync),
+        new("PlayerSync retail crouch animation coverage", RemoteCrouchAnimationTests.RetailAsync),
+        new("PlayerSync crouch animation independent preparation", RemoteCrouchAnimationTests.PreparationReceiptAsync),
         new("PlayerSync torch wire", PlayerTorchTests.WireAsync),
         new("PlayerSync torch effective capture", PlayerTorchTests.CaptureAsync),
         new("PlayerSync torch IPC validation", PlayerTorchTests.CommandValidationAsync),

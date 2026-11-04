@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.391-player-torch";
+    "0.11.4.402-player-crouch";
 
 } // namespace aimp

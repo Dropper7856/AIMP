@@ -215,6 +215,8 @@ bool FinishReplicatedInteraction(std::uintptr_t characterAddress) noexcept;
 // Ends exactly this remote player representation's orphaned 4F victim cycle
 // through retail's generic cycle Idle (0065BDD0). Engine thread.
 bool FinishOrphanedVictimCycle(std::uintptr_t characterAddress, std::uintptr_t expectedCycle) noexcept;
+// Re-select retained clips through retail Idle on an ordinary NPC stance edge.
+bool RefreshPostureAnimations(std::uintptr_t characterAddress) noexcept;
 
 // Any thread: an aborted or abandoned paired attack no longer owns this remote
 // player representation. The next engine pump clears the leaked retail grapple

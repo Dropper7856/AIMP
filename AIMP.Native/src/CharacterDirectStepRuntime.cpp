@@ -7,6 +7,7 @@
 
 #include "aimp/CrashGuard.h"
 #include "aimp/HookManager.h"
+#include "aimp/PlayerAnimationClipCapture.h"
 #include "aimp/RuntimeFeatureFlags.h"
 
 #include <Windows.h>
@@ -746,8 +747,7 @@ MovementSlot* FindOrAllocateSlot(
 }
 
 void ReleaseSlot(MovementSlot& slot) noexcept {
-    player_posture::Forget(slot.characterAddress.load(std::memory_order_acquire));
-    // Torch lifetime belongs to the representation, not its current Move/Idle
+    // Posture and torch belong to the representation, not its current Move/Idle
     // mailbox. Traversal and paired actions can release motion while it lives.
     slot.remainingFrames.store(0U, std::memory_order_release);
     slot.leaseExpiresAtTickMs.store(0U, std::memory_order_release);
@@ -3175,7 +3175,19 @@ bool Install(
     // Removing it eliminates a full XMM/GPR save/restore on every retail NPC
     // locomotion submission without changing the native submission itself.
 
-    player_posture::Initialize(moduleBase);
+    if (!player_animation_clip_capture::Install(moduleBase, hooks, error)) {
+        std::string rollbackError;
+        hooks.UninstallFrom(hookCheckpoint, rollbackError);
+        error = "Remote animation clip probes: " + error;
+        return false;
+    }
+    if (!player_posture::InstallAimHook(moduleBase, hooks, error)) {
+        std::string rollbackError;
+        hooks.UninstallFrom(hookCheckpoint, rollbackError);
+        error = "Remote crouched aiming: " + error;
+        return false;
+    }
+    player_posture::Initialize(moduleBase, &RefreshPostureAnimations);
     player_torch::Initialize(moduleBase);
     gInstalled.store(true, std::memory_order_release);
     return true;
@@ -3209,6 +3221,9 @@ void PumpOnEngineThread(const EnginePumpPhase phase) noexcept {
     for (auto& slot : gSlots) {
         PumpSlotOnEngineThread(slot, phase);
     }
+    // Move/Idle activation and the retail tick may overwrite stance. Reconcile
+    // after those consumers, even for a proxy without a locomotion mailbox.
+    player_posture::ReconcileAllOnEngineThread();
     // Run after all pose corrections, including for actors whose locomotion
     // mailbox was released by a traversal/paired cycle this frame.
     if (phase == EnginePumpPhase::PostCharacterManager)
@@ -3490,6 +3505,32 @@ bool FinishReplicatedInteraction(const std::uintptr_t characterAddress) noexcept
 #endif
 }
 
+bool RefreshPostureAnimations(const std::uintptr_t characterAddress) noexcept {
+    if (!GameplayLoaded()) return false;
+    std::uintptr_t cycle{};
+    std::uint8_t state{}, grappled{};
+    std::uint32_t health{};
+    if (!ReadNativeCycle(characterAddress, cycle, state) ||
+        (!IsNativeIdleState(state) && state != kNpcLocomotionMoveState) ||
+        !GuardedReadValue(characterAddress + 0x297U, grappled) || grappled != 0U ||
+        !GuardedReadValue(characterAddress + 0x32CU, health) || health >= 3U) return false;
+    const MovementResourceLease resources(characterAddress);
+    if (!resources) return false;
+    if (state == kNpcLocomotionMoveState) {
+        auto* slot = FindSlot(characterAddress);
+        if (slot == nullptr || !PrepareNativeMovementAction(*slot, characterAddress)) return false;
+    }
+    const auto refreshed = player_posture::RefreshAnimationCycle(characterAddress,
+        reinterpret_cast<std::uintptr_t>(gEnterIdleCycle),
+        reinterpret_cast<std::uintptr_t>(gActivateLocomotionCycle));
+    if (auto* slot = FindSlot(characterAddress)) {
+        AppendLocomotionFlight(refreshed
+            ? (state == kNpcLocomotionMoveState ? "posture_move_refresh" : "posture_idle_refresh")
+            : "posture_refresh_failed", *slot, characterAddress, cycle, state);
+    }
+    return refreshed;
+}
+
 // A non-lethal grab leaves a PlayerSync representation in its 4F victim cycle:
 // retail waits for the victim's PLAYER controller to get up, which a
 // representation (NPC controller) never provides, so it lay in T-pose and
@@ -3558,11 +3599,9 @@ void Stop() noexcept {
 }
 
 void ForgetCharacter(const std::uintptr_t characterAddress) noexcept {
+    player_posture::Forget(characterAddress);
     player_torch::Forget(characterAddress);
     if (auto* slot = FindSlot(characterAddress); slot != nullptr) ReleaseSlot(*slot);
-    else {
-        player_posture::Forget(characterAddress);
-    }
 }
 
 void ForgetAll() noexcept {
@@ -3618,6 +3657,7 @@ RuntimeSnapshot Snapshot(const std::uintptr_t characterAddress) noexcept {
     if (slot != nullptr) return SnapshotSlot(*slot);
     RuntimeSnapshot result{};
     result.characterAddress = characterAddress;
+    result.posture = player_posture::Snapshot(characterAddress);
     result.torch = player_torch::Snapshot(characterAddress);
     return result;
 }
