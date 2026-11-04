@@ -47,21 +47,48 @@ namespace aimp::ai_sync::route {
 // Exact0044D320's same-handle/stop<=0 branch changes ONLY the terminal vectors
 // (all three equal the new goal) and B.goal. Any other mutation needs a fresh
 // native admission; it cannot be described as an endpoint-only revision.
-[[nodiscard]] inline bool PreserveEndpointPrefix(const Graph& complete,const Graph& remaining,Graph& output) noexcept {
-    if(!SameRouteCommand(complete.key,remaining.key)||complete.failure!=Failure::None||remaining.failure!=Failure::None||
-        !complete.nodeCount||complete.nodeCount>kMaxNodes||!remaining.nodeCount||remaining.nodeCount>complete.nodeCount||
-        !SameResources(complete,remaining)||complete.auxiliary!=remaining.auxiliary||complete.statuses!=remaining.statuses)return false;
+// Diagnostic reason for PreserveEndpointPrefix, 0 when the suffix is exact.
+// auxiliary[0..2] is R+10, the Host's query start copied into every capture.
+// auxiliary[3..5] is re-read from live N+50 by every CaptureInstalled and
+// moves with native progress/goal edits: comparing it refused every chase
+// endpoint edit (Host check 113) and every Client replacement (site 374).
+// The admitted graph keeps its own copy; it is not route identity.
+[[nodiscard]] inline std::uint32_t EndpointPrefixMismatch(const Graph& complete,const Graph& remaining) noexcept {
+    if(!SameRouteCommand(complete.key,remaining.key))return 1;
+    if(complete.failure!=Failure::None||remaining.failure!=Failure::None)return 2;
+    if(!complete.nodeCount||complete.nodeCount>kMaxNodes||!remaining.nodeCount||remaining.nodeCount>complete.nodeCount)return 3;
+    if(!SameResources(complete,remaining))return 4;
+    for(std::size_t i=0;i<3;++i)if(complete.auxiliary[i]!=remaining.auxiliary[i])return 5;
+    if(complete.statuses!=remaining.statuses)return 6;
+    // The corridor is its ordered native elements. A goal edit lets retail
+    // re-smooth portal points (vectors) inside those SAME elements, and the
+    // node at the cursor drops the markers it has already executed. Neither
+    // changes the corridor the Client already follows: 7 = element sequence
+    // changed (a real re-route, needs admission), 11 = later node's markers.
     const auto offset=complete.nodeCount-remaining.nodeCount;
-    for(std::size_t i=0;i+1<remaining.nodeCount;++i)if(complete.nodes[offset+i]!=remaining.nodes[i])return false;
+    for(std::size_t i=0;i+1<remaining.nodeCount;++i) {
+        const auto& before=complete.nodes[offset+i];const auto& now=remaining.nodes[i];
+        if(before.type!=now.type||before.resourceIndex!=now.resourceIndex||before.ordinal!=now.ordinal)return 7;
+        if(i&&before.markers!=now.markers)return 11;
+    }
     const auto& previous=complete.nodes[complete.nodeCount-1];
     const auto& terminal=remaining.nodes[remaining.nodeCount-1];
-    if(!SameNodeIdentity(previous,terminal))return false;
+    if(!SameNodeIdentity(previous,terminal))return 8;
     if(previous!=terminal||complete.goal!=remaining.goal) {
-        if(terminal.type!=2)return false;
-        for(std::size_t i=0;i<9;++i)if(terminal.vectors[i]!=remaining.goal[i%3])return false;
+        if(terminal.type!=2)return 9;
+        for(std::size_t i=0;i<9;++i)if(terminal.vectors[i]!=remaining.goal[i%3])return 10;
     }
+    return 0;
+}
+// CaptureInstalled observes the remaining Host suffix. Endpoint-only edits
+// must retain the first admitted prefix for a Client which has not consumed it.
+// Exact0044D320's same-handle/stop<=0 branch changes ONLY the terminal vectors
+// (all three equal the new goal) and B.goal. Any other mutation needs a fresh
+// native admission; it cannot be described as an endpoint-only revision.
+[[nodiscard]] inline bool PreserveEndpointPrefix(const Graph& complete,const Graph& remaining,Graph& output) noexcept {
+    if(EndpointPrefixMismatch(complete,remaining))return false;
     Graph next=complete;next.key=remaining.key;next.goal=remaining.goal;
-    next.nodes[next.nodeCount-1]=terminal;
+    next.nodes[next.nodeCount-1]=remaining.nodes[remaining.nodeCount-1];
     output=next;return true;
 }
 [[nodiscard]] inline bool EndpointRevision(const Graph& previous,const Graph& next) noexcept {

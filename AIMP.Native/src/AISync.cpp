@@ -478,9 +478,11 @@ struct PairTransaction final {
     bool sourceEndActionObserved{},sourceEndActionForwarded{};
     std::uint32_t exitTraceMask{};
     ULONGLONG firstRefusal{}; // first pre-entry refusal of this Host interaction
+    ULONGLONG hostLeftAt{}; // first pump seeing the Host source out of this pair
 };
 std::array<PairTransaction,kActors> gPairTransactions{}; // Qualified engine thread only.
 constexpr ULONGLONG kPairRefusalRetryMs=1000U;
+constexpr ULONGLONG kLocalVictimEndGraceMs=1500U;
 struct PairAdmissionFailure {
     std::uint64_t tick{},command{},serial{};
     std::uint32_t entityA{},entityB{},birth{},pairRevision{},result{},phase{},site{},stage{},reason{};
@@ -3527,6 +3529,38 @@ bool PairedVictimHeld(const std::uintptr_t victim) noexcept {
     }
     return false;
 }
+// The attacker left this representation's 4F (its linked source cycle is gone
+// or no longer the attacker's live 4E) while the representation is alive:
+// a non-lethal hit. Its real player already got up on its own machine.
+bool OrphanedParticipantVictim(const std::uintptr_t rep, std::uintptr_t& cycle) noexcept {
+    cycle = 0U;
+    std::uintptr_t table{}, owner{}, linked{}, source{}, current{};
+    std::uint8_t state{}, sourceState{};
+    if (!Read(rep + 0x36CU, cycle) || cycle == 0U || !Read(cycle, table) || table != gBase + 0x00EAE690U ||
+        !Read(cycle + 4U, owner) || owner != rep || !Read(cycle + 0x1AU, state) || state != 0x4FU ||
+        !LivingCharacter(rep) || !Read(cycle + 0xB0U, linked)) return false;
+    if (linked == 0U || !Read(cycle + 0x68U, source) || source == 0U) return true;
+    return !Read(source + 0x36CU, current) || current != linked ||
+        !Read(linked + 0x1AU, sourceState) || sourceState != 0x4EU;
+}
+constexpr ULONGLONG kOrphanedVictimGraceMs = 1000ULL;
+std::array<ULONGLONG, 32U> gOrphanedVictimSince{}; // indexed like gCurrent.participants
+std::atomic<std::uint64_t> gOrphanedVictimsReleased{};
+void ReleaseOrphanedParticipantVictims() noexcept {
+    if (!EngineThread() || !Stable()) return;
+    const auto now = GetTickCount64();
+    for (std::uint32_t i = 0U; i < gCurrent.participantCount && i < gOrphanedVictimSince.size(); ++i) {
+        const auto rep = ParticipantForPeer(gCurrent.participants[i].peer);
+        std::uintptr_t cycle{};
+        if (rep == 0U || rep == LocalPlayer() || !RegisteredPlayerRepresentation(rep) ||
+            PairReservedCharacter(rep) || !OrphanedParticipantVictim(rep, cycle)) { gOrphanedVictimSince[i] = 0U; continue; }
+        if (gOrphanedVictimSince[i] == 0U) { gOrphanedVictimSince[i] = now; continue; }
+        if (now - gOrphanedVictimSince[i] < kOrphanedVictimGraceMs) continue;
+        gOrphanedVictimSince[i] = 0U;
+        if (character_direct_step_runtime::FinishOrphanedVictimCycle(rep, cycle))
+            gOrphanedVictimsReleased.fetch_add(1U, std::memory_order_relaxed);
+    }
+}
 void ReleasePairedVictim(const std::uintptr_t victim) noexcept {
     if (victim == 0U || !RegisteredPlayerRepresentation(victim)) return;
     character_direct_step_runtime::RequestPairedVictimRelease(victim);
@@ -4367,6 +4401,26 @@ bool RemotePlayerVictimRetains(const std::uintptr_t cycle,const std::uintptr_t v
     return Read(cycle,table)&&table==gBase+0x00EAE5D0U&&Read(cycle+0x1AU,state)&&state==0x4EU&&
         Read(cycle+0xE5U,e5)&&e5==0U&&Read(gBase+0x012F0C8CU,enabled)&&enabled!=0U;
 }
+// The same 00664A10 retain branch, taken natively on a Client whose OWN player
+// is the victim: retail keeps the source until that player's game over, which
+// multiplayer suppresses, so the Alien stayed in 4E forever once the Host's
+// source had long left the pair. The Host decides when it ends.
+std::atomic<std::uint64_t> gLocalVictimEndRetained{},gLocalVictimEndsFinished{};
+bool LocalPlayerVictimRetains(const std::uintptr_t cycle,const std::uintptr_t victim) noexcept {
+    if(!LocalClientVictim(victim))return false;
+    std::uint8_t state{},e5{},flags{};std::uintptr_t table{};
+    return Read(cycle,table)&&table==gBase+0x00EAE5D0U&&Read(cycle+0x1AU,state)&&state==0x4EU&&
+        Read(cycle+0xE5U,e5)&&e5==0U&&Read(cycle+8U,flags)&&(flags&6U)==0U;
+}
+// 00664A10's end branch with E5==0 is exactly flags|=6 (FUN_0064EB90 runs
+// only when E5!=0). Forwarding End_Action again would re-take the retain
+// branch for a locally controlled victim.
+bool FinishRetainedLocalVictimEnd(const std::uintptr_t cycle) noexcept {
+    __try {
+        auto& flags=*reinterpret_cast<volatile std::uint8_t*>(cycle+8U);
+        flags=static_cast<std::uint8_t>(flags|6U);return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
 void __fastcall SourceGraphEventDetour(void* context, void*, const std::uint32_t event) noexcept {
     using Event = void(__thiscall*)(void*, std::uint32_t);
     const auto original = reinterpret_cast<Event>(gSourceGraphEventOriginal.load(std::memory_order_acquire));
@@ -4388,7 +4442,15 @@ void __fastcall SourceGraphEventDetour(void* context, void*, const std::uint32_t
     }
     original(context, event);
     std::uint8_t ended{};
-    if(tracked&&Read(cycle+8U,ended)&&(ended&6U)==6U)QueuePairTransactionEvent(notification);
+    if(tracked&&Read(cycle+8U,ended)) {
+        if((ended&6U)==6U)QueuePairTransactionEvent(notification);
+        else if(event!=0U&&event==EndActionEvent()&&LocalPlayerVictimRetains(cycle,victim)) {
+            // Retail itself took its retain branch: the victim is this
+            // Client's own player. Remember the marker exactly as above.
+            notification.retainedEndAction=true;QueuePairTransactionEvent(notification);
+            gLocalVictimEndRetained.fetch_add(1U,std::memory_order_relaxed);
+        }
+    }
     TracePairedGraph(source, victim, event, 1U, 1U);
 }
 void __fastcall VictimGraphEventDetour(void* context, void*, const std::uint32_t event) noexcept {
@@ -5254,8 +5316,17 @@ void AdvanceEndedPairSource(PairTransaction& pair) noexcept {
         source->streamPairRevision>=pair.carrier.interactionPairRevision&&source->streamCycleState!=0U&&
         source->streamCycleState!=0x4EU&&source->streamCycleState!=0x4FU;
     if(!hostLeft) {
+        pair.hostLeftAt=0U;
         RecordPairExit(pair,1U);++gEndedSourceExitsDeferred;return;
     }
+    const auto now=GetTickCount64();
+    if(!pair.hostLeftAt)pair.hostLeftAt=now;
+    // This Client's own player is the victim and retail retained the source.
+    // A dead victim may also have cut the source animation before its marker:
+    // once the Host has left for a grace period, nothing local can end it.
+    const bool localVictim=LocalPlayerVictimRetains(cycle,pair.binding.victim.character);
+    if(localVictim&&!pair.sourceEndActionObserved&&TerminalDeadCharacter(pair.binding.victim.character)&&
+        now-pair.hostLeftAt>=kLocalVictimEndGraceMs)pair.sourceEndActionObserved=true;
     const interactions::Memory memory{gBase,nullptr,[](void*,std::uintptr_t at,void* out,std::size_t size) noexcept {
         return crash_guard::TryCopy(out,reinterpret_cast<const void*>(at),size);
     }};
@@ -5276,11 +5347,12 @@ void AdvanceEndedPairSource(PairTransaction& pair) noexcept {
                 interactions::CheckSourceRetention(memory,pair.binding.source,pair.receipt.native,cycle)!=interactions::Check::Ready||
                 !Read(cycle+0xE5U,lethal)||lethal!=0U||!Read(cycle+0x44U,victim)||victim!=pair.binding.victim.character)return;
             pair.sourceEndActionForwarded=true; // Reentrant callbacks cannot dispatch twice.
-            if(!ForwardDeferredSourceEnd(original,cycle,event)) {
+            if(localVictim?!FinishRetainedLocalVictimEnd(cycle):!ForwardDeferredSourceEnd(original,cycle,event)) {
                 RecordPairExit(pair,6U,interactions::Check::Unknown);pair.revoked=true;
                 gPairRuntime.Invalidate(pair.binding.source);
                 execution_runtime::Fail(pair.key.scope,execution::Recovery::NativeUnavailable);return;
             }
+            if(localVictim)++gLocalVictimEndsFinished;
             ++gDeferredSourceEndsForwarded;RecordPairExit(pair,4U);
         }
     }
@@ -5296,7 +5368,10 @@ void AdvanceEndedPairSource(PairTransaction& pair) noexcept {
         !Read(cycle+0x19U,serial)||serial!=pair.receipt.native.sourceSerial||
         !Read(cycle+0x1AU,state)||state!=0x4EU||!Read(cycle+8U,flags)||(flags&6U)!=6U||
         !Read(character+0x2CD0U,schedulerOwner)||schedulerOwner!=character||
-        !Read(character+0x2CD0U+0x31CU,idleArgument))return;
+        !Read(character+0x2CD0U+0x31CU,idleArgument)) {
+        // Previously silent: Host left but this source has no local end yet.
+        RecordPairExit(pair,localVictim?7U:2U,exit);return;
+    }
     const character_direct_step_runtime::MovementResourceLease resources(character);
     const auto idle=reinterpret_cast<void(__thiscall*)(void*,std::uint32_t)>(gPairedIdleOriginal.load(std::memory_order_acquire));
     if(!resources||!idle||!PairIdentityLive(pair.source)||
@@ -9542,6 +9617,7 @@ void PumpOnEngineThread() noexcept {
     const profiling::Timer timing(profiling::Section::AiPump);
     if (!Installed() || !EngineThread()) return;
     PublishLocalIncarnation();
+    ReleaseOrphanedParticipantVictims();
     {
         const auto until = GetTickCount64() + kPairedParticipantVictimHoldMs;
         for (const auto& actor : gActors) {
@@ -9549,6 +9625,13 @@ void PumpOnEngineThread() noexcept {
             const auto flags = actor.desired.interactionFlags;
             if ((flags & InteractionTargetIsParticipant) == 0U ||
                 (flags & (InteractionCycleActive | InteractionPairValid)) == 0U) continue;
+            // PairValid persists after the pair (until the next interaction):
+            // holding on it alone froze the survivor until the session ended.
+            std::uintptr_t attackerCycle{};std::uint8_t attackerState{};
+            if ((flags & InteractionCycleActive) == 0U &&
+                (!Read(actor.character + 0x36CU, attackerCycle) || attackerCycle == 0U ||
+                 !Read(attackerCycle + 0x1AU, attackerState) ||
+                 (attackerState != 0x42U && attackerState != 0x47U && attackerState != 0x4EU))) continue;
             const auto victim = ParticipantForPeer(actor.desired.interactionTargetPeer);
             if (victim != 0U) PublishPairedParticipantVictim(victim, until);
         }
@@ -10382,7 +10465,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
         PairExitTrace sample{};std::uint64_t dropped{};
         {const std::lock_guard lock(gPairExitTraceGate);if(!gPairExitTraceCount)break;
             sample=gPairExitTraces[gPairExitTraceRead];gPairExitTraceRead=(gPairExitTraceRead+1U)%gPairExitTraces.size();--gPairExitTraceCount;dropped=gPairExitTraceDropped;}
-        diagnostics.Log("info","aisync_pair_exit","Source cleanup: stage1 awaiting Host exit, 2 awaiting local End_Action, 3 guard/resources pending, 4 deferred native End_Action forwarded, 5 retail Idle requested, 6 native call fault. No stage implies resource disposal; destructor receipts remain required.",
+        diagnostics.Log("info","aisync_pair_exit","Source cleanup: stage1 awaiting Host exit, 2 awaiting local End_Action, 3 guard/resources pending, 4 deferred native End_Action forwarded, 5 retail Idle requested, 6 native call fault, 7 Host left but local-player victim retains the source. No stage implies resource disposal; destructor receipts remain required.",
             {{"tick",Diagnostics::Unsigned(sample.tick),true},{"command",Diagnostics::Unsigned(sample.command),true},
              {"receiptSerial",Diagnostics::Unsigned(sample.receipt),true},{"stage",Diagnostics::Unsigned(sample.stage),true},
              {"entityA",Diagnostics::Unsigned(sample.entityA),true},{"entityB",Diagnostics::Unsigned(sample.entityB),true},
@@ -10461,6 +10544,9 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"clientCycleCallsReplayed", Diagnostics::Unsigned(gCycleCallsReplayed.load()), true},
          {"clientCycleCallsReplayFailed", Diagnostics::Unsigned(gCycleCallsReplayFailed.load()), true},
          {"endedSourceExitsDeferred", Diagnostics::Unsigned(gEndedSourceExitsDeferred.load()), true},
+         {"localVictimEndRetained", Diagnostics::Unsigned(gLocalVictimEndRetained.load()), true},
+         {"orphanedParticipantVictimsReleased", Diagnostics::Unsigned(gOrphanedVictimsReleased.load()), true},
+         {"localVictimEndsFinished", Diagnostics::Unsigned(gLocalVictimEndsFinished.load()), true},
          {"pairsAbandoned", Diagnostics::Unsigned(gPairsAbandoned.load()), true},
          {"pairConsumedActions", Diagnostics::Unsigned(execution::ConsumedActions()), true},
          {"hostNativeCallsDropped", Diagnostics::Unsigned(gNativeIntentDropped.load()), true},
@@ -10530,6 +10616,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"hostLastLossSite", Diagnostics::Unsigned(host_producer::Coverage().lastSite), true},
          {"hostBootstrapCancels", Diagnostics::Unsigned(host_producer::BootstrapCancels()), true},
          {"clientUpdatesAfterLocalEnd", Diagnostics::Unsigned(execution::UpdatesAfterLocalEnd()), true},
+         {"clientFencedRestartsSkipped", Diagnostics::Unsigned(execution::FencedRestartsSkipped()), true},
          {"clientHostPathSteers", Diagnostics::Unsigned(execution::HostPathSteers()), true},
          {"clientLifecycleTransitions", Diagnostics::Unsigned(gLifecycleTransitions.load()), true},
          {"hostSourceFailures", Diagnostics::Unsigned(host_producer::EngineProducer().LastFailure().count), true},
@@ -10572,6 +10659,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"routeHostNodeType", Diagnostics::Unsigned(routes.hostNodeType), true},
          {"routeHostMetadataBytes", Diagnostics::Unsigned(routes.hostMetadataBytes), true},
          {"routeHostCaptureDeferred", Diagnostics::Unsigned(routes.hostCaptureDeferred), true},
+         {"routeHostEndpointEditsSkipped", Diagnostics::Unsigned(routes.hostEndpointEditsSkipped), true},
          {"routeHostCaptureCheck", Diagnostics::Unsigned(routes.hostCaptureCheck), true},
          {"routeHostCaptureNode", Diagnostics::Unsigned(routes.hostCaptureNode), true},
          {"routeHostMarkerIndex", Diagnostics::Unsigned(routes.hostMarkerIndex), true},
@@ -10608,6 +10696,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"nativeRouteCompoundResets", Diagnostics::Unsigned(nativeRoutes.compoundRequests), true},
          {"nativeRouteLastAdmissionMode", Diagnostics::Unsigned(nativeRoutes.lastAdmissionMode), true},
          {"nativeRouteLastIncomingNodes", Diagnostics::Unsigned(nativeRoutes.lastIncomingCount), true},
+         {"nativeRouteCorridorJoins", Diagnostics::Unsigned(nativeRoutes.corridorJoins), true},
          {"nativeRouteLastCompoundParts", Diagnostics::Unsigned(nativeRoutes.lastCompoundParts), true},
          {"authoritativeRouteHooksAvailable", Diagnostics::Boolean(route_runtime::Available()), true},
          {"routesCaptured", Diagnostics::Unsigned(routes.captured), true},

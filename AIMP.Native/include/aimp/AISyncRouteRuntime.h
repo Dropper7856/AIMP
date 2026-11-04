@@ -46,6 +46,7 @@ struct Counters {
     std::uint64_t hostCaptureDeferred{};
     std::uint32_t hostCaptureCheck{};
     std::uint32_t hostCaptureNode{UINT32_MAX},hostMarkerIndex{UINT32_MAX},hostMarkerKind{UINT32_MAX},hostMarkerTypeRva{UINT32_MAX};
+    std::uint64_t hostEndpointEditsSkipped{};
 };
 [[nodiscard]] Counters Diagnostics() noexcept;
 // Bounded value-only failure records, copied on the engine thread and drained

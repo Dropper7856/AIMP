@@ -26,6 +26,7 @@ constexpr ULONGLONG kRouteWaitMilliseconds=2000;
 std::atomic<std::uint32_t> gFailureSite{},gFailureResult{},gImportStage{},gContextCheck{};
 std::atomic<std::uint64_t> gAppendPublished{},gContinuationPublished{},gCompoundRequests{};
 std::atomic<std::uint64_t> gOrphanQuarantined{},gOrphanQuarantineRejected{};
+std::atomic<std::uint64_t> gCorridorJoins{};
 std::atomic<std::uint32_t> gLastAdmissionMode{},gLastIncomingCount{},gLastCompoundParts{};
 bool gPumping{};
 template<class T> bool Read(std::uintptr_t at,T& value) noexcept {
@@ -308,6 +309,32 @@ bool StartsHere(Slot& slot,const Graph& graph,bool continuation=false) noexcept 
     if(slot.registry.Revalidate(first)!=route_identity::Result::Ok||!mesh_storage::Current(slot.pin->mesh))return false;
     slot.startCheck=0;return true;
 }
+// First Host corridor node k>0 lying in the given local area, or 0 if none.
+// Type 1 links cannot start a route (StartsHere refuses them as node 0).
+std::size_t CorridorIndex(Slot& slot,const Graph& graph,std::uint32_t area) noexcept {
+    if(!area)return 0;
+    for(std::size_t k=1;k<graph.nodeCount;++k) {
+        const auto& node=graph.nodes[k];route_identity::ElementMapping mapping{};
+        if(node.type!=1&&slot.registry.MapElement({graph.resources[node.resourceIndex],node.ordinal},mapping)==route_identity::Result::Ok&&
+            mapping.localReference==area)return k;
+    }
+    return 0;
+}
+// The Client's actor is not in the area where the Host route begins, but it
+// already stands further along that same Host corridor (it ran a little ahead
+// or the Host started its query from a slightly older pose). Join the Host's
+// own remaining suffix at the actor's actual area, exactly as a retained
+// continuation does. No Client path, connector or pose correction is made:
+// if the actor is not on the Host corridor the route is still refused.
+bool JoinCorridor(Slot& slot,const Graph& graph,Graph& output) noexcept {
+    if(!slot.startValid)return false;
+    const auto k=CorridorIndex(slot,graph,slot.queryOptions[0x94/4]);
+    if(!k)return false;
+    Graph suffix=graph;suffix.nodeCount=graph.nodeCount-k;suffix.nodes={};
+    std::copy_n(graph.nodes.begin()+static_cast<std::ptrdiff_t>(k),suffix.nodeCount,suffix.nodes.begin());
+    if(Validate(suffix)!=Result::Ok||!StartsHere(slot,suffix,true))return false;
+    output=suffix;return true;
+}
 // These writes consume the Host's endpoint command, not a selected Client
 // waypoint. 0044D320 would otherwise choose a local end polygon and edit N.
 bool Endpoint(std::uintptr_t b,const std::array<float,3>& goal) noexcept {
@@ -354,7 +381,10 @@ bool RemainingHostRange(Slot& slot,Graph& remaining) noexcept {
         slot.desired->auxiliary,remaining)!=Result::Ok)return false;
     remaining.statuses=slot.desired->statuses;
     Graph verified{};
-    return PreserveEndpointPrefix(*slot.desired,remaining,verified)&&verified==*slot.desired;
+    // Reported through gContextCheck as 300+reason when this refusal fails a slot.
+    if(const auto mismatch=EndpointPrefixMismatch(*slot.desired,remaining)){slot.startCheck=300U+mismatch;return false;}
+    if(!PreserveEndpointPrefix(*slot.desired,remaining,verified)||verified!=*slot.desired){slot.startCheck=320U;return false;}
+    return true;
 }
 bool NativeInvalidate(std::uintptr_t navigation) noexcept {
     // Exact0044D200: ECX=N, no stack arguments, RET at0044D314.
@@ -443,7 +473,8 @@ bool RequestReplacement(Slot& slot,const Graph& graph) noexcept {
     const auto& leadingNode=leading.graph->nodes[0];
     if(leadingNode.type==1||leading.slot->registry.MapElement(
         {leading.graph->resources[leadingNode.resourceIndex],leadingNode.ordinal},leadingArea)!=route_identity::Result::Ok||
-        currentArea!=leadingArea.localReference) {gReplacementReason=1U;++gReplacementWaits;return false;}
+        (currentArea!=leadingArea.localReference&&
+         (leading.continuation||!CorridorIndex(*leading.slot,*leading.graph,currentArea)))) {gReplacementReason=1U;++gReplacementWaits;return false;}
     if(slot.registry.Revalidate(first)!=route_identity::Result::Ok||!Current(slot))return false;
     gReplacementReason=0U;++gReplacementRequests;
     gLastCompoundParts=static_cast<std::uint32_t>(live);if(live>1)++gCompoundRequests;
@@ -514,7 +545,16 @@ bool Populate(Slot& slot) noexcept {
     // proves that identity and leaves the earlier range/cursor untouched.
     // For a retained continuation, the first point is the certified cursor
     // suffix, not the original Host query start (which is now behind us).
-    if(!StartsHere(slot,*graph,slot.continuation)) {Fail(slot,__LINE__,Result::LocalInvalidity);return false;}
+    Graph joined{};bool joining{};
+    if(!StartsHere(slot,*graph,slot.continuation)) {
+        const auto refused=slot.startCheck;
+        if(slot.continuation||refused!=203||!JoinCorridor(slot,*graph,joined)) {
+            slot.startCheck=refused;Fail(slot,__LINE__,Result::LocalInvalidity);return false;
+        }
+        const auto rejoined=slot.writer.CertifyAdmission(joined,slot.local,slot.protection,admission);
+        if(rejoined!=Result::Ok){Fail(slot,__LINE__,rejoined);return false;}
+        graph=&joined;joining=true;
+    }
     if(replacing) {
         const auto armed=slot.continuation?slot.writer.RearmContinuation(*graph,slot.local,slot.protection):
             slot.writer.Rearm(slot.writer.Identity(),*graph,slot.local,slot.protection);
@@ -528,6 +568,7 @@ bool Populate(Slot& slot) noexcept {
     gLastAdmissionMode=static_cast<std::uint32_t>(admission.mode);gLastIncomingCount=admission.incomingCount;
     if(admission.mode==AdmissionMode::Append)++gAppendPublished;
     if(slot.continuation)++gContinuationPublished;
+    if(joining)++gCorridorJoins;
     ++gPublished;return true;
 }
 using Query=void(__thiscall*)(void*,void*,void*,void*,void*);
@@ -756,7 +797,11 @@ bool RetireDestroyedRoute(Slot& slot) noexcept {
         !slot.pin->movement||!*slot.pin->movement||slot.pin->movement->Object()+0xC4!=slot.local.navigation)return false;
     const auto n=slot.local.navigation;
     // Never reset a navigation object now shared by a different live owner.
-    for(const auto& other:gState->slots)if(other&&other.get()!=&slot&&other->local.navigation==n&&!other->actorDestroyed)return false;
+    // Parts of the SAME revoked world are not live owners: requiring each to
+    // wait for the others deadlocked a mid-route round end at contextBlocker 4
+    // (every part revoked, none destroyed), freezing the next round's Client.
+    for(const auto& other:gState->slots)if(other&&other.get()!=&slot&&other->local.navigation==n&&
+        !other->actorDestroyed&&!(slot.worldRevoked&&other->worldRevoked))return false;
     if(!EmptyRing(n,0x28)||!EmptyRing(n,0x34)||!HistoryRing(n,0)||!HistoryRing(n))return false;
     for(const auto offset:{0x40U,0x44U,0x5CU,0x60U}) {
         std::uintptr_t value{};if(!Read(n+offset,value)||value)return false;
@@ -875,7 +920,7 @@ bool CommandRetired(const transactions::Scope& scope,const transactions::OwnerKe
         slot->binding.command.owner==owner&&slot->binding.command.command==command)return false;
     return true;
 }
-Counters Diagnostics() noexcept{return {gSuppressed.load(),gPublished.load(),gInstalled.load(),gReplacements.load(),gRejected.load(),gRetired.load(),gFailureCommand.load(),gFailureSite.load(),gFailureResult.load(),gImportStage.load(),gContextCheck.load(),gAppendPublished.load(),gContinuationPublished.load(),gCompoundRequests.load(),gLastAdmissionMode.load(),gLastIncomingCount.load(),gLastCompoundParts.load()};}
+Counters Diagnostics() noexcept{return {gSuppressed.load(),gPublished.load(),gInstalled.load(),gReplacements.load(),gRejected.load(),gRetired.load(),gFailureCommand.load(),gFailureSite.load(),gFailureResult.load(),gImportStage.load(),gContextCheck.load(),gAppendPublished.load(),gContinuationPublished.load(),gCompoundRequests.load(),gLastAdmissionMode.load(),gLastIncomingCount.load(),gLastCompoundParts.load(),gCorridorJoins.load()};}
 ReplacementReport ReplacementDiagnostics() noexcept {
     return {gReplacementRequests.load(),gReplacementCommits.load(),gReplacementWaits.load(),gReplacementCommand.load(),
         gReplacementReason.load(),gReplacementArea.load(),gReplacementExpected.load(),gReplacementParameters.load(),gReplacementRevision.load()};
