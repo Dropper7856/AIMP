@@ -216,7 +216,7 @@ public sealed class GamePreparationService
                 if (levels.Length == 0) throw new InvalidDataException("No playable levels were found.");
                 // Global, not level-bound: verified (and re-applied after a game
                 // file repair) on every preparation, even with a valid receipt.
-                Update("Character", 1, 0, levels.Length, string.Empty, "Preparing remote crouch animations");
+                Update("Checking", 1, 0, levels.Length, string.Empty, "Checking multiplayer assets");
                 var animationTimer = Stopwatch.StartNew();
                 RemoteCrouchAnimationInstaller.Install(game, token);
                 _diagnostics.Log("Preparation", $"Remote crouch animations ready in {animationTimer.Elapsed.TotalSeconds:F0}s.");
