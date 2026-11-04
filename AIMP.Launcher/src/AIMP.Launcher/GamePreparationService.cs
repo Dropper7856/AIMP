@@ -15,7 +15,7 @@ internal static class GamePreparationSynchronization
 
 public sealed class GamePreparationService
 {
-    private const int RecipeVersion = 4; // Remote NPC flamethrower notifies AI senses; DLC levels only, Debug prepares other maps individually.
+    private const int RecipeVersion = 8; // Remote NPC flamethrower notifies AI senses, shows its flames, pilot light and sounds at its muzzle, aims with the shotgun set; DLC levels only, Debug prepares other maps individually.
     private readonly object _sync = new();
     private readonly LauncherSettingsStore _settings;
     private readonly LauncherDiagnostics _diagnostics;
@@ -227,22 +227,39 @@ public sealed class GamePreparationService
                     return;
                 }
                 Update("Character", 2, 0, levels.Length, string.Empty, "Preparing multiplayer characters");
+                var timer = Stopwatch.StartNew();
                 RipleyCharacterInstaller.Install(game, new InlineProgress<RipleyInstallProgress>(p =>
                     Update("Character", 2 + (int)(38L * p.CompletedLevels / Math.Max(1, p.TotalLevels)),
                         p.CompletedLevels, p.TotalLevels, p.Level, p.Message)), token);
+                // The character step held every level's assets; return that memory
+                // before sizing the manifest workers on the free physical memory.
+                GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+                _diagnostics.Log("Preparation", $"Character assets ready for {levels.Length} levels in {timer.Elapsed.TotalSeconds:F0}s.");
+                token.ThrowIfCancellationRequested();
+                AssertGameStopped();
+                timer.Restart();
+                _diagnostics.Log("Preparation", $"Compiling {levels.Length} level manifests with up to {WorldManifestWorkerPool.WorkerCount(levels.Length)} workers.");
+                var levelProgress = new int[levels.Length];
+                var binaries = WorldManifestWorkerPool.CompileAll(levels.Select(l => l.LevelDirectory).ToArray(),
+                    (index, percentage) =>
+                    {
+                        lock (levelProgress)
+                        {
+                            levelProgress[index] = Math.Max(levelProgress[index], percentage);
+                            var total = levelProgress.Sum(value => (long)value);
+                            Update("Manifests", 40 + (int)(60L * total / (levels.Length * 100L)),
+                                levelProgress.Count(value => value >= 100), levels.Length,
+                                levels[index].DisplayName, "Preparing level data");
+                        }
+                    }, token);
+                _diagnostics.Log("Preparation", $"Level manifests compiled in {timer.Elapsed.TotalSeconds:F0}s.");
                 var manifests = new List<PreparedManifestReceipt>();
                 for (var i = 0; i < levels.Length; i++)
                 {
                     token.ThrowIfCancellationRequested();
-                    AssertGameStopped();
-                    var index = i;
                     var level = levels[i];
-                    var result = new WorldManifestCompiler().Compile(level.LevelDirectory, progress:
-                        new InlineProgress<WorldManifestCompilerProgress>(p => Update("Manifests",
-                            40 + (int)(60L * (index * 100L + p.Percentage) / (levels.Length * 100L)),
-                            index, levels.Length, level.DisplayName, "Preparing level data")));
                     // Validate the binary even for non-playable/cinematic levels with no World probe.
-                    var manifest = WorldManifestBinaryCodec.Read(result.BinaryPath);
+                    var manifest = WorldManifestBinaryCodec.Read(binaries[i]);
                     if (manifest.CompilerVersion != WorldManifestConstants.CompilerVersion)
                         throw new InvalidDataException("A world manifest was produced by an incompatible compiler.");
                     var world = ResolveWorldDirectory(level.LevelDirectory);
@@ -251,8 +268,8 @@ public sealed class GamePreparationService
                     if (!string.Equals(manifest.Source.CommandsPakSha256, pakHash, StringComparison.OrdinalIgnoreCase)
                         || !string.Equals(manifest.Source.CommandsBinSha256, binHash, StringComparison.OrdinalIgnoreCase))
                         throw new IOException("Level files changed while preparing a manifest. Retry preparation.");
-                    manifests.Add(new(level.LevelDirectory, result.BinaryPath,
-                        WorldReplicationCodec.ComputeManifestSha256(result.BinaryPath),
+                    manifests.Add(new(level.LevelDirectory, binaries[i],
+                        WorldReplicationCodec.ComputeManifestSha256(binaries[i]),
                         pakHash, binHash));
                 }
                 var array = manifests.ToArray();

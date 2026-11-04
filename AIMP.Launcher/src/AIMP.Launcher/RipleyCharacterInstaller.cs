@@ -87,16 +87,21 @@ internal static partial class RipleyCharacterInstaller
             progress?.Report(new(name, i, levels.Length, "Checking E_RIPLEY character assets"));
             if (string.Equals(Path.GetFullPath(levels[i]), Path.GetFullPath(sourcePath), StringComparison.OrdinalIgnoreCase))
             {
-                if (EnsureNpcWeaponScripts(source)) Publish(game, levels[i], source, global, closure, cancellationToken);
+                if (EnsureNpcWeaponScripts(source)) PublishScripts(game, levels[i], source, closure, cancellationToken);
                 present++;
             }
             else
             {
                 var destination = new Assets(levels[i], global);
                 var ripleyPresent = ContainsValidClosure(destination, closure);
-                if (!ripleyPresent) Import(source, destination, closure, cancellationToken);
-                if (EnsureNpcWeaponScripts(destination) | !ripleyPresent)
+                if (!ripleyPresent)
+                {
+                    Import(source, destination, closure, cancellationToken);
+                    EnsureNpcWeaponScripts(destination);
                     Publish(game, levels[i], destination, global, closure, cancellationToken);
+                }
+                else if (EnsureNpcWeaponScripts(destination))
+                    PublishScripts(game, levels[i], destination, closure, cancellationToken);
                 if (ripleyPresent) present++;
                 else imported++;
             }
@@ -125,9 +130,10 @@ internal static partial class RipleyCharacterInstaller
         return result;
     }
 
-    private static bool ContainsValidClosure(Assets destination, IReadOnlyList<Composite> required)
+    private static bool ContainsValidClosure(Assets destination, IReadOnlyList<Composite> required,
+        IEnumerable<Commands>? commandSources = null)
     {
-        foreach (var commands in destination.CommandSources)
+        foreach (var commands in commandSources ?? destination.CommandSources)
         {
             var existing = new List<Composite>();
             foreach (var source in required)
@@ -153,6 +159,41 @@ internal static partial class RipleyCharacterInstaller
         foreach (var parameter in entity.parameters)
             if (parameter.content is cResource resources)
                 foreach (var resource in resources.value) yield return resource;
+    }
+
+    // Per command source: every entity's structure and resolved resources, with
+    // renderables, collision mappings and animated models as table indices.
+    private static string[] ResourceSignature(Assets assets, IEnumerable<Commands> sources)
+    {
+        var renderables = IndexTable(assets.Renderables.Entries);
+        var collisions = IndexTable(assets.CollisionMaps.Entries);
+        var animations = IndexTable(assets.Animations.Entries);
+        static int Index(Dictionary<object, int> table, object? value) => value == null ? -2 : table.GetValueOrDefault(value, -1);
+        return sources.Select(commands =>
+        {
+            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            void Add(string value) => hash.AppendData(System.Text.Encoding.UTF8.GetBytes(value + "\n"));
+            foreach (var composite in commands.Entries.OrderBy(c => c.shortGUID.AsUInt32))
+            {
+                Add($"C {composite.shortGUID.AsUInt32} {composite.name}");
+                foreach (var entity in composite.GetEntities().OrderBy(e => e.shortGUID.AsUInt32))
+                {
+                    Add($"E {entity.shortGUID.AsUInt32} {entity.variant} {(entity as FunctionEntity)?.function.AsUInt32} {entity.parameters.Count} {entity.childLinks.Count}");
+                    foreach (var resource in ResourcesOf(entity))
+                        Add($"R {resource.resource_type} {resource.resource_id.AsUInt32} {resource.entityID.AsUInt32} {resource.position} {resource.rotation} " +
+                            $"{resource.PhysicsSystemIndex} {Index(collisions, resource.CollisionMapping)} {Index(animations, resource.AnimatedModel)} " +
+                            (resource.RenderableInstance == null ? "-" : string.Join(",", resource.RenderableInstance.Select(e => Index(renderables, e)))));
+                }
+            }
+            return Convert.ToHexString(hash.GetHashAndReset());
+        }).ToArray();
+    }
+
+    private static Dictionary<object, int> IndexTable<T>(IReadOnlyList<T> entries) where T : class
+    {
+        var table = new Dictionary<object, int>(System.Collections.Generic.ReferenceEqualityComparer.Instance);
+        for (var i = 0; i < entries.Count; i++) table.TryAdd(entries[i], i);
+        return table;
     }
 
     private static void ValidateClosure(Assets assets, IEnumerable<Composite> composites, Commands? commandSource = null)
@@ -392,6 +433,24 @@ internal static partial class RipleyCharacterInstaller
                 throw new InvalidDataException($"Unable to parse level asset: {SecondaryCommands.Filepath}.");
         }
 
+        // Only the level scripts changed: every other asset is already on disk.
+        // Commands serialize their resources against the loaded REDS, collision
+        // and animation tables, which this save leaves untouched.
+        internal void SaveScriptsTo(string stage)
+        {
+            Directory.CreateDirectory(Path.Combine(stage, "WORLD"));
+            foreach (var commands in CommandSources)
+                if (!commands.Save(Path.Combine(stage, "WORLD", Path.GetFileName(commands.Filepath))))
+                    throw new IOException($"Failed to stage {Path.GetFileName(commands.Filepath)}.");
+        }
+
+        internal Commands[] LoadStagedScripts(string stage) => CommandSources.Select(commands =>
+        {
+            var staged = new Commands(Path.Combine(stage, "WORLD", Path.GetFileName(commands.Filepath)), Animations, CollisionMaps, Renderables);
+            if (!staged.Loaded) throw new InvalidDataException($"Unable to parse staged {Path.GetFileName(commands.Filepath)}.");
+            return staged;
+        }).ToArray();
+
         internal void SaveTo(string stage)
         {
             Directory.CreateDirectory(Path.Combine(stage, "RENDERABLE"));
@@ -418,12 +477,42 @@ internal static partial class RipleyCharacterInstaller
     private sealed record Transaction(string LevelRelativePath, string State, TransactionFile[] Files);
 
     private static void Publish(string game, string levelPath, Assets destination, Global global,
-        IReadOnlyList<Composite> closure, CancellationToken token)
+        IReadOnlyList<Composite> closure, CancellationToken token) =>
+        Stage(game, (transactionRoot, stage) =>
+        {
+            destination.SaveTo(stage);
+            var staged = new Assets(stage, global);
+            if (!ContainsValidClosure(staged, closure)) throw new InvalidDataException("Staged E_RIPLEY validation failed.");
+            PublishStaged(game, levelPath, destination.WorldRoot, token, transactionRoot, stage,
+                () => ContainsValidClosure(new Assets(levelPath, global), closure));
+        });
+
+    // Script-only publication for a level that already holds E_RIPLEY. The
+    // staged scripts must reload with exactly the in-memory graph's resource
+    // references before they replace the originals.
+    private static void PublishScripts(string game, string levelPath, Assets destination,
+        IReadOnlyList<Composite> closure, CancellationToken token) =>
+        Stage(game, (transactionRoot, stage) =>
+        {
+            destination.SaveScriptsTo(stage);
+            var expected = ResourceSignature(destination, destination.CommandSources);
+            var staged = destination.LoadStagedScripts(stage);
+            var level = Path.GetFileName(levelPath);
+            if (!expected.SequenceEqual(ResourceSignature(destination, staged)))
+                throw new InvalidDataException($"Staged level scripts for {level} do not reload with the same resources.");
+            if (!ContainsValidClosure(destination, closure, staged))
+                throw new InvalidDataException($"Staged level scripts for {level} lost the E_RIPLEY character.");
+            if (EnsureNpcWeaponScripts(staged))
+                throw new InvalidDataException($"Staged level scripts for {level} lost the remote weapon scripts.");
+            PublishStaged(game, levelPath, destination.WorldRoot, token, transactionRoot, stage, () => true);
+        });
+
+    private static void Stage(string game, Action<string, string> publish)
     {
         var transactionRoot = Path.Combine(game, "AIMP", "PreparationBackups", "Ripley", Guid.NewGuid().ToString("N"));
         var stage = Path.Combine(transactionRoot, "stage");
         Directory.CreateDirectory(stage);
-        try { PublishCore(game, levelPath, destination, global, closure, token, transactionRoot, stage); }
+        try { publish(transactionRoot, stage); }
         finally
         {
             // Backups and the recovery journal remain. Temporary serializer
@@ -434,12 +523,9 @@ internal static partial class RipleyCharacterInstaller
         }
     }
 
-    private static void PublishCore(string game, string levelPath, Assets destination, Global global,
-        IReadOnlyList<Composite> closure, CancellationToken token, string transactionRoot, string stage)
+    private static void PublishStaged(string game, string levelPath, string worldRoot, CancellationToken token,
+        string transactionRoot, string stage, Func<bool> validatePublished)
     {
-        destination.SaveTo(stage);
-        var staged = new Assets(stage, global);
-        if (!ContainsValidClosure(staged, closure)) throw new InvalidDataException("Staged E_RIPLEY validation failed.");
         var files = Directory.EnumerateFiles(stage, "*", SearchOption.AllDirectories)
             .Select(f => Path.GetRelativePath(stage, f)).OrderBy(p => p, StringComparer.OrdinalIgnoreCase).ToArray();
         var changed = new List<TransactionFile>();
@@ -447,7 +533,7 @@ internal static partial class RipleyCharacterInstaller
         {
             token.ThrowIfCancellationRequested();
             var original = relative.StartsWith("WORLD" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
-                ? SafePath(destination.WorldRoot, Path.GetFileName(relative)) : SafePath(levelPath, relative);
+                ? SafePath(worldRoot, Path.GetFileName(relative)) : SafePath(levelPath, relative);
             var stagedFile = SafePath(stage, relative);
             var existed = File.Exists(original);
             var hash = existed ? Hash(original) : "";
@@ -474,8 +560,9 @@ internal static partial class RipleyCharacterInstaller
                 if (File.Exists(target) != file.Existed || (file.Existed && Hash(target) != file.OriginalHash))
                     throw new IOException($"Level assets changed during preparation: {target}.");
                 AtomicReplace(SafePath(stage, file.StageRelativePath), target);
+                if (Hash(target) != file.PublishedHash) throw new IOException($"Published level asset differs from its staged copy: {target}.");
             }
-            if (!ContainsValidClosure(new Assets(levelPath, global), closure)) throw new InvalidDataException("Published E_RIPLEY validation failed.");
+            if (!validatePublished()) throw new InvalidDataException("Published E_RIPLEY validation failed.");
             WriteJournal(transactionRoot, transaction with { State = "complete" });
         }
         catch

@@ -6,13 +6,18 @@ namespace AIMP.Launcher;
 internal static class WorldManifestCli
 {
     private const string CompileSwitch = "--compile-world-manifest";
+    internal const string WorkerSwitch = "--worker";
+    internal const string WorkerProgressPrefix = "AIMP_PROGRESS ";
+    internal const string WorkerResultPrefix = "AIMP_RESULT ";
 
     public static bool TryRun(string[] args, out int exitCode)
     {
         exitCode = 0;
         if (args.Length == 0 || !args[0].Equals(CompileSwitch, StringComparison.OrdinalIgnoreCase)) return false;
 
-        ToolConsole.AttachToParent();
+        // A preparation worker reports through redirected pipes, not a console.
+        var worker = args.Contains(WorkerSwitch, StringComparer.OrdinalIgnoreCase);
+        if (!worker) ToolConsole.AttachToParent();
 
         try
         {
@@ -35,6 +40,8 @@ internal static class WorldManifestCli
                     continue;
                 }
 
+                if (current.Equals(WorkerSwitch, StringComparison.OrdinalIgnoreCase)) continue;
+
                 if (current.Equals("--output", StringComparison.OrdinalIgnoreCase))
                 {
                     outputPath = RequireValue(args, ref index, current);
@@ -50,8 +57,12 @@ internal static class WorldManifestCli
                 throw new ArgumentException($"Unknown manifest compiler option '{current}'.");
             }
 
-            var result = new WorldManifestCompiler().Compile(sourcePath, outputPath, jsonPath, useCache);
-            WriteSummary(result);
+            var progress = worker
+                ? new WorkerProgress(value => Console.WriteLine(WorkerProgressPrefix + value.Percentage))
+                : null;
+            var result = new WorldManifestCompiler().Compile(sourcePath, outputPath, jsonPath, useCache, progress);
+            if (worker) Console.WriteLine(WorkerResultPrefix + result.BinaryPath);
+            else WriteSummary(result);
             return true;
         }
         catch (Exception exception)
@@ -81,6 +92,11 @@ internal static class WorldManifestCli
         Console.WriteLine($"  output={result.BinaryPath}");
         if (!string.IsNullOrWhiteSpace(result.JsonPath)) Console.WriteLine($"  json={result.JsonPath}");
         foreach (var warning in manifest.Warnings) Console.WriteLine($"  warning: {warning}");
+    }
+
+    private sealed class WorkerProgress(Action<WorldManifestCompilerProgress> report) : IProgress<WorldManifestCompilerProgress>
+    {
+        public void Report(WorldManifestCompilerProgress value) => report(value);
     }
 
     private static class ToolConsole
