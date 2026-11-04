@@ -15,7 +15,7 @@ internal static class GamePreparationSynchronization
 
 public sealed class GamePreparationService
 {
-    private const int RecipeVersion = 3; // Automatic preparation covers DLC levels only; Debug prepares other maps individually.
+    private const int RecipeVersion = 4; // Remote NPC flamethrower notifies AI senses; DLC levels only, Debug prepares other maps individually.
     private readonly object _sync = new();
     private readonly LauncherSettingsStore _settings;
     private readonly LauncherDiagnostics _diagnostics;

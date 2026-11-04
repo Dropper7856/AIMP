@@ -17,7 +17,7 @@ internal sealed record RipleyInstallResult(int LevelsImported, int AlreadyPresen
 /// instantiating an NPC or changing level entry points. All serializers run on staging
 /// paths; originals are backed up before an atomic, recoverable publication.
 /// </summary>
-internal static class RipleyCharacterInstaller
+internal static partial class RipleyCharacterInstaller
 {
     private const string SourceLevel = "PRODUCTION/DLC/BSPNOSTROMO_TWOTEAMS";
     private static readonly string[] RootNames = ["E_RIPLEY", "DisplayModel:E_RIPLEY"];
@@ -87,18 +87,18 @@ internal static class RipleyCharacterInstaller
             progress?.Report(new(name, i, levels.Length, "Checking E_RIPLEY character assets"));
             if (string.Equals(Path.GetFullPath(levels[i]), Path.GetFullPath(sourcePath), StringComparison.OrdinalIgnoreCase))
             {
+                if (EnsureNpcWeaponScripts(source)) Publish(game, levels[i], source, global, closure, cancellationToken);
                 present++;
             }
             else
             {
                 var destination = new Assets(levels[i], global);
-                if (ContainsValidClosure(destination, closure)) present++;
-                else
-                {
-                    Import(source, destination, closure, cancellationToken);
+                var ripleyPresent = ContainsValidClosure(destination, closure);
+                if (!ripleyPresent) Import(source, destination, closure, cancellationToken);
+                if (EnsureNpcWeaponScripts(destination) | !ripleyPresent)
                     Publish(game, levels[i], destination, global, closure, cancellationToken);
-                    imported++;
-                }
+                if (ripleyPresent) present++;
+                else imported++;
             }
             progress?.Report(new(name, i + 1, levels.Length, "E_RIPLEY character assets ready"));
         }
