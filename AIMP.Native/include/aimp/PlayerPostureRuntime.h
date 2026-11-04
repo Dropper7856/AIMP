@@ -6,6 +6,8 @@
 #include <string>
 #include <string_view>
 
+namespace aimp { class HookManager; }
+
 namespace aimp::player_posture {
 
 // Values are state/portable identities, never pointers from another process.
@@ -56,7 +58,12 @@ struct State final {
     return true;
 }
 
-void Initialize(std::uintptr_t moduleBase) noexcept;
+using AnimationRefresh = bool(*)(std::uintptr_t character) noexcept;
+void Initialize(std::uintptr_t moduleBase, AnimationRefresh refresh = nullptr) noexcept;
+bool InstallAimHook(std::uintptr_t moduleBase, HookManager& hooks, std::string& error);
+// Retail aim setup adapter; also exercised with a native-ABI test callback.
+using AimSetup = void(__thiscall*)(void*);
+void SetupAim(void* controller, AimSetup original);
 // IPC thread: bounded mailbox only. Character access belongs to PumpOnEngineThread.
 bool Publish(std::uintptr_t character, const State& state, std::string& error) noexcept;
 // Returns true while native traversal owns movement. No transform correction is
@@ -65,6 +72,10 @@ bool PumpOnEngineThread(std::uintptr_t character) noexcept;
 // Reconcile persistent stance after movement setup and after the retail tick,
 // including Characters without a locomotion mailbox. Never starts traversal.
 void ReconcileAllOnEngineThread() noexcept;
+// Rebuild the current ordinary cycle, keeping Move as Move and Idle as Idle.
+// Caller pins its resources and supplies the certified retail trampolines.
+bool RefreshAnimationCycle(std::uintptr_t character, std::uintptr_t idleEntry,
+    std::uintptr_t moveEntry) noexcept;
 // A lagging proxy approaches the authored entrance through normal locomotion;
 // the traversal starter itself has no distance check.
 bool ApproachTarget(std::uintptr_t character, float& x, float& y, float& z) noexcept;
@@ -76,6 +87,17 @@ struct DiagnosticsSnapshot final {
     std::uint64_t activeRevision{}, pendingTraversals{};
     std::uint64_t postureFailures{}, crouchTransitions{};
     bool desiredCrouched{}, desiredDeepCrouched{}, appliedCrouched{}, appliedDeepCrouched{};
+    // Flag readback alone does not establish that animation selection uses
+    // CROUCHED. Keep the last crouched sample after the player stands again.
+    std::uint64_t animationContextRepairs{};
+    std::uint64_t animationRefreshes{}, animationRefreshFailures{};
+    std::uint64_t crouchedAimApplications{};
+    std::uint32_t lastAimTree{}, lastAimStance{};
+    std::uint32_t animationDatabase{}, animationContext{}, animationContextReferences{};
+    std::uint32_t animationIdlePath{}, animationWalkPath{};
+    std::uint32_t lastCrouchDatabase{}, lastCrouchContext{}, lastCrouchReferences{};
+    std::uint32_t lastCrouchIdlePath{}, lastCrouchWalkPath{};
+    bool animationContextReadable{};
     const char* stage{"pending"};
 };
 DiagnosticsSnapshot Snapshot(std::uintptr_t character) noexcept;

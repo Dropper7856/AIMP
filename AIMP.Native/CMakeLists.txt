@@ -80,6 +80,7 @@ set(AIMP_CORE_SOURCES
     src/ParticipantRegistry.cpp
     src/PlayerSyncObserver.cpp
     src/PlayerPostureRuntime.cpp
+    src/PlayerAnimationClipCapture.cpp
     src/PlayerTorchRuntime.cpp
     src/MissionSync.cpp
     src/PlayerLifecycle.cpp

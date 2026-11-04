@@ -7,6 +7,7 @@
 
 #include "aimp/CrashGuard.h"
 #include "aimp/HookManager.h"
+#include "aimp/PlayerAnimationClipCapture.h"
 #include "aimp/RuntimeFeatureFlags.h"
 
 #include <Windows.h>
@@ -3174,7 +3175,19 @@ bool Install(
     // Removing it eliminates a full XMM/GPR save/restore on every retail NPC
     // locomotion submission without changing the native submission itself.
 
-    player_posture::Initialize(moduleBase);
+    if (!player_animation_clip_capture::Install(moduleBase, hooks, error)) {
+        std::string rollbackError;
+        hooks.UninstallFrom(hookCheckpoint, rollbackError);
+        error = "Remote animation clip probes: " + error;
+        return false;
+    }
+    if (!player_posture::InstallAimHook(moduleBase, hooks, error)) {
+        std::string rollbackError;
+        hooks.UninstallFrom(hookCheckpoint, rollbackError);
+        error = "Remote crouched aiming: " + error;
+        return false;
+    }
+    player_posture::Initialize(moduleBase, &RefreshPostureAnimations);
     player_torch::Initialize(moduleBase);
     gInstalled.store(true, std::memory_order_release);
     return true;
@@ -3490,6 +3503,32 @@ bool FinishReplicatedInteraction(const std::uintptr_t characterAddress) noexcept
 #if defined(_MSC_VER)
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 #endif
+}
+
+bool RefreshPostureAnimations(const std::uintptr_t characterAddress) noexcept {
+    if (!GameplayLoaded()) return false;
+    std::uintptr_t cycle{};
+    std::uint8_t state{}, grappled{};
+    std::uint32_t health{};
+    if (!ReadNativeCycle(characterAddress, cycle, state) ||
+        (!IsNativeIdleState(state) && state != kNpcLocomotionMoveState) ||
+        !GuardedReadValue(characterAddress + 0x297U, grappled) || grappled != 0U ||
+        !GuardedReadValue(characterAddress + 0x32CU, health) || health >= 3U) return false;
+    const MovementResourceLease resources(characterAddress);
+    if (!resources) return false;
+    if (state == kNpcLocomotionMoveState) {
+        auto* slot = FindSlot(characterAddress);
+        if (slot == nullptr || !PrepareNativeMovementAction(*slot, characterAddress)) return false;
+    }
+    const auto refreshed = player_posture::RefreshAnimationCycle(characterAddress,
+        reinterpret_cast<std::uintptr_t>(gEnterIdleCycle),
+        reinterpret_cast<std::uintptr_t>(gActivateLocomotionCycle));
+    if (auto* slot = FindSlot(characterAddress)) {
+        AppendLocomotionFlight(refreshed
+            ? (state == kNpcLocomotionMoveState ? "posture_move_refresh" : "posture_idle_refresh")
+            : "posture_refresh_failed", *slot, characterAddress, cycle, state);
+    }
+    return refreshed;
 }
 
 // A non-lethal grab leaves a PlayerSync representation in its 4F victim cycle:

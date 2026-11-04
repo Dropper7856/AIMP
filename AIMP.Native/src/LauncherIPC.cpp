@@ -6,6 +6,7 @@
 #include "aimp/AISyncHostProducer.h"
 #include "aimp/VoiceSync.h"
 #include "aimp/LauncherIPC.h"
+#include "aimp/PlayerAnimationClipCapture.h"
 #include "aimp/IpcWriteBatch.h"
 #include "aimp/WorldSemanticReconciliation.h"
 #include "aimp/CharacterIncarnation.h"
@@ -3355,6 +3356,7 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
             ? GameThreadDispatcherSnapshot{}
             : dispatcher_->Snapshot();
         const auto locomotion = character_direct_step_runtime::Snapshot();
+        player_animation_clip_capture::Export(*diagnostics_);
         diagnostics_->Log(
             "info",
             "native_runtime_snapshot",
@@ -3516,6 +3518,23 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
              {"remoteCrouchDesired", Diagnostics::Boolean(locomotion.posture.desiredCrouched), true},
              {"remoteDeepCrouchDesired", Diagnostics::Boolean(locomotion.posture.desiredDeepCrouched), true},
              {"remoteCrouchApplied", Diagnostics::Boolean(locomotion.posture.appliedCrouched), true},
+             {"remoteAnimationContextRepairs", Diagnostics::Unsigned(locomotion.posture.animationContextRepairs), true},
+             {"remoteAnimationRefreshes", Diagnostics::Unsigned(locomotion.posture.animationRefreshes), true},
+             {"remoteAnimationRefreshFailures", Diagnostics::Unsigned(locomotion.posture.animationRefreshFailures), true},
+             {"remoteCrouchedAimApplications", Diagnostics::Unsigned(locomotion.posture.crouchedAimApplications), true},
+             {"remoteLastAimTree", Diagnostics::Unsigned(locomotion.posture.lastAimTree), true},
+             {"remoteLastAimStance", Diagnostics::Unsigned(locomotion.posture.lastAimStance), true},
+             {"remoteAnimationContextReadable", Diagnostics::Boolean(locomotion.posture.animationContextReadable), true},
+             {"remoteAnimationDatabase", Diagnostics::Unsigned(locomotion.posture.animationDatabase), true},
+             {"remoteAnimationContext", Diagnostics::Unsigned(locomotion.posture.animationContext), true},
+             {"remoteAnimationContextReferences", Diagnostics::Unsigned(locomotion.posture.animationContextReferences), true},
+             {"remoteAnimationIdlePath", Diagnostics::Unsigned(locomotion.posture.animationIdlePath), true},
+             {"remoteAnimationWalkPath", Diagnostics::Unsigned(locomotion.posture.animationWalkPath), true},
+             {"remoteLastCrouchDatabase", Diagnostics::Unsigned(locomotion.posture.lastCrouchDatabase), true},
+             {"remoteLastCrouchContext", Diagnostics::Unsigned(locomotion.posture.lastCrouchContext), true},
+             {"remoteLastCrouchReferences", Diagnostics::Unsigned(locomotion.posture.lastCrouchReferences), true},
+             {"remoteLastCrouchIdlePath", Diagnostics::Unsigned(locomotion.posture.lastCrouchIdlePath), true},
+             {"remoteLastCrouchWalkPath", Diagnostics::Unsigned(locomotion.posture.lastCrouchWalkPath), true},
              {"remoteDeepCrouchApplied", Diagnostics::Boolean(locomotion.posture.appliedDeepCrouched), true},
              {"remotePostureStage", locomotion.posture.stage, false},
              {"remoteTraversalApplications", Diagnostics::Unsigned(locomotion.posture.traversalApplications), true},
