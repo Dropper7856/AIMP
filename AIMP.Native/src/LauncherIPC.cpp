@@ -3519,7 +3519,16 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
              {"remoteTorchFailures", Diagnostics::Unsigned(locomotion.torch.failures), true},
              {"remoteTorchCreations", Diagnostics::Unsigned(locomotion.torch.creations), true},
              {"remoteTorchDesired", locomotion.torch.desired ? "true" : "false", true},
-             {"remoteTorchEmitted", locomotion.torch.emitted ? "true" : "false", true}});
+             {"remoteTorchEmitted", locomotion.torch.emitted ? "true" : "false", true},
+             {"remoteTorchTransformSubmitted", Diagnostics::Boolean(locomotion.torch.transformSubmitted), true},
+             {"remoteTorchSocketOrigin", Diagnostics::Boolean(locomotion.torch.socketOrigin), true},
+             {"remoteTorchHasDirection", Diagnostics::Boolean(locomotion.torch.hasDirection), true},
+             {"remoteTorchRenderer", Diagnostics::Unsigned(locomotion.torch.renderer), true},
+             {"remoteTorchLastOnRenderer", Diagnostics::Unsigned(locomotion.torch.lastOnRenderer), true},
+             {"remoteTorchOnFrames", Diagnostics::Unsigned(locomotion.torch.onFrames), true},
+             {"remoteTorchRenderOnFrames", Diagnostics::Unsigned(locomotion.torch.renderOnFrames), true},
+             {"remoteTorchLastOnStage", locomotion.torch.lastOnStage, false},
+             {"remoteTorchStage", locomotion.torch.stage, false}});
         const auto ws3 = world_actions::Snapshot();
         const auto replication = replication_core::DiagnosticsSnapshot();
         const auto interactions = world_interactions::DiagnosticsSnapshot();

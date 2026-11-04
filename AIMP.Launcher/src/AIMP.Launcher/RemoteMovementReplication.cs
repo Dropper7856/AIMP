@@ -445,6 +445,8 @@ internal static class RemoteMovementCommandFactory
         var result = new Dictionary<string, string>(arguments, StringComparer.Ordinal);
         if (posture is not null) result["playerPosture"] = PlayerPostureCodec.Encode(posture);
         if (torch is not null) result["playerTorch"] = torch.Enabled ? "1" : "0";
+        if (torch is { Enabled: true, AimX: not null, AimY: not null, AimZ: not null })
+            result["playerTorchDirection"] = PlayerTorchCodec.EncodeDirection(torch);
         return result;
     }
 

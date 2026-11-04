@@ -1,6 +1,7 @@
 #include "aimp/ExperimentalProtocol.h"
 #include "aimp/NativeLimits.h"
 #include "aimp/WorldPublicActions.h"
+#include "aimp/PlayerTorchRuntime.h"
 
 #include <algorithm>
 #include <array>
@@ -1157,14 +1158,14 @@ bool DecodeGameCommand(
 
         if (command->stringValue == "CHARACTER_DIRECT_MOVE") {
             const auto argumentCount = arguments->objectValue.size();
-            if (argumentCount < 5U || argumentCount > 13U) {
+            if (argumentCount < 5U || argumentCount > 14U) {
                 return false;
             }
-            constexpr std::array<std::string_view, 13> allowedArguments{
+            constexpr std::array<std::string_view, 14> allowedArguments{
                 "characterAddress", "directionX", "directionZ", "intensity",
                 "frameCount", "directionSpace", "replicationPositionX",
                 "replicationPositionY", "replicationPositionZ", "replicationYaw",
-                "moveType", "playerPosture", "playerTorch"};
+                "moveType", "playerPosture", "playerTorch", "playerTorchDirection"};
             if (std::any_of(
                     arguments->objectValue.begin(),
                     arguments->objectValue.end(),
@@ -1342,6 +1343,12 @@ bool DecodeGameCommand(
                 output.characterDirectMove.hasPlayerTorch = true;
                 output.characterDirectMove.playerTorchEnabled = torch->stringValue == "1";
             } else if (arguments->objectValue.contains("playerTorch")) return false;
+            if (const auto* direction = Field(*arguments, "playerTorchDirection", JsonType::String)) {
+                if (!output.characterDirectMove.hasPlayerTorch || !output.characterDirectMove.playerTorchEnabled ||
+                    !player_torch::DecodeDirection(direction->stringValue, output.characterDirectMove.playerTorchDirection))
+                    return false;
+                output.characterDirectMove.hasPlayerTorchDirection = true;
+            } else if (arguments->objectValue.contains("playerTorchDirection")) return false;
             if (const auto* posture = Field(*arguments, "playerPosture", JsonType::String)) {
                 if (!hasReplicationPosition || !hasReplicationYaw || moveType == nullptr ||
                     !player_posture::Decode(posture->stringValue, output.characterDirectMove.playerPosture))

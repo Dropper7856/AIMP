@@ -220,7 +220,9 @@ public sealed record PlayerPostureSnapshot(
     [property: JsonRequired] bool TraversalActive);
 
 // Effective emitted beam state; retail battery/reload logic remains authoritative.
-public sealed record PlayerTorchSnapshot([property: JsonRequired] bool Enabled);
+public sealed record PlayerTorchSnapshot(
+    [property: JsonRequired] bool Enabled,
+    float? AimX = null, float? AimY = null, float? AimZ = null);
 
 public sealed record PlayerPositionSnapshotPayload(
     Guid SessionId,

@@ -3127,9 +3127,10 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     {
         var posture = value.Posture ?? _lastQueuedPosture;
         var torch = value.Torch ?? _lastQueuedTorch;
-        if (posture == _lastQueuedPosture && torch == _lastQueuedTorch) return;
+        var changed = posture != _lastQueuedPosture || torch?.Enabled != _lastQueuedTorch?.Enabled;
         _lastQueuedPosture = posture;
         _lastQueuedTorch = torch;
+        if (!changed) return;
         if (_pendingLocalPostureEdges.Count == PlayerPostureDispatchQueue.Capacity)
             _pendingLocalPostureEdges.Dequeue();
         _pendingLocalPostureEdges.Enqueue(value with { Posture = posture, Torch = torch });

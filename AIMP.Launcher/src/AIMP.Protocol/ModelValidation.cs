@@ -304,7 +304,7 @@ public static class ModelValidation
 
     public static void Validate(PlayerTorchSnapshot? value)
     {
-        if (value is null)
+        if (value is null || !PlayerTorchCodec.IsValid(value))
             throw new ProtocolException("The player-torch snapshot is invalid.");
     }
 
@@ -1110,7 +1110,7 @@ public static class ModelValidation
                 "directionSpace", "replicationPositionX", "replicationPositionY",
                 "replicationPositionZ",
                 "replicationYaw",
-                "moveType", "playerPosture", "playerTorch"
+                "moveType", "playerPosture", "playerTorch", "playerTorchDirection"
             };
             var hasDirectionSpace = value.Arguments.TryGetValue(
                 "directionSpace", out var directionSpaceText);
@@ -1128,7 +1128,8 @@ public static class ModelValidation
                 && hasReplicationPositionY && hasReplicationPositionZ;
             var hasPosture = value.Arguments.TryGetValue("playerPosture", out var postureText);
             var hasTorch = value.Arguments.TryGetValue("playerTorch", out var torchText);
-            var validCount = value.Arguments.Count is >= 5 and <= 13;
+            var hasTorchDirection = value.Arguments.TryGetValue("playerTorchDirection", out var torchDirection);
+            var validCount = value.Arguments.Count is >= 5 and <= 14;
             if (!validCount
                 || value.Arguments.Keys.Any(key => !allowed.Contains(key))
                 || required.Any(key => !value.Arguments.ContainsKey(key))
@@ -1183,6 +1184,8 @@ public static class ModelValidation
                 || (hasPosture && (!hasReplicationPosition
                     || !PlayerPostureCodec.TryDecode(postureText, out _)))
                 || (hasTorch && (!hasReplicationPosition || torchText is not ("0" or "1")))
+                || (hasTorchDirection && (!hasTorch || torchText != "1"
+                    || !PlayerTorchCodec.TryDecodeDirection(torchDirection, out _)))
                 || (hasReplicationYaw
                     && (!string.Equals(directionSpaceText, "world", StringComparison.Ordinal)
                         || !float.TryParse(replicationYawText, NumberStyles.Float,

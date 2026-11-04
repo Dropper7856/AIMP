@@ -52,6 +52,8 @@ struct CharacterDirectMoveCommand {
     player_posture::State playerPosture{};
     bool hasPlayerTorch{};
     bool playerTorchEnabled{};
+    bool hasPlayerTorchDirection{};
+    std::array<float, 3> playerTorchDirection{};
 };
 
 struct CharacterDirectStepCommand {
