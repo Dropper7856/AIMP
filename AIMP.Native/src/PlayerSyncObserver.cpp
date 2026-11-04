@@ -21,6 +21,11 @@ constexpr std::uintptr_t kEquipmentActiveOffset = 0x1510U;
 constexpr std::uintptr_t kAimPrimaryOffset = 0x00A1U;
 constexpr std::uintptr_t kPresentationStateObjectOffset = 0x152CU;
 constexpr std::uintptr_t kPresentationStateOffset = 0x04U;
+// Common item resources (FUN_00792200 sets +E0; FUN_007A0690 totals
+// +E0 + +DC + reserve, for the player as for NPCs).
+constexpr std::uintptr_t kItemClipOffset = 0xE0U;
+constexpr std::uintptr_t kItemChamberOffset = 0xDCU;
+constexpr std::uintptr_t kItemCapacityOffset = 0xECU;
 
 bool ValidEquipmentIndex(const std::int32_t value) noexcept {
     return value >= -1 && value <= 64;
@@ -50,6 +55,35 @@ std::int32_t FlareIdentity(std::uintptr_t player, std::int32_t slot) noexcept {
 #else
     (void)player;
     return slot;
+#endif
+}
+
+// The trigger is an input: a remote Character holds its own, effectively
+// unlimited NPC reserve (FUN_007A0690 adds 1000000), so replicating a held
+// trigger on an empty weapon made it fire, flames included, while the local
+// weapon only dry-fired. A held trigger counts as Primary only while the
+// local magazine is loaded. Items without a magazine are unaffected.
+// FUN_007829E0 is retail's current-item accessor: reads, then the current
+// wrapper's virtual getter.
+bool MagazineEmpty(const void* currentItem, const std::uintptr_t equipmentManager) noexcept {
+#if defined(_MSC_VER)
+    if (currentItem == nullptr || equipmentManager == 0U) return false;
+    using ItemFn = void*(__thiscall*)(void*);
+    __try {
+        const auto item = reinterpret_cast<std::uintptr_t>(reinterpret_cast<ItemFn>(
+            const_cast<void*>(currentItem))(reinterpret_cast<void*>(equipmentManager)));
+        if (item < 0x10000U) return false;
+        const auto clip = *reinterpret_cast<const volatile std::int32_t*>(item + kItemClipOffset);
+        const auto chamber = *reinterpret_cast<const volatile std::int32_t*>(item + kItemChamberOffset);
+        const auto capacity = *reinterpret_cast<const volatile std::int32_t*>(item + kItemCapacityOffset);
+        if (capacity <= 0 || capacity > 1000000 || clip < 0 || clip > 1000000 ||
+            chamber < 0 || chamber > 1000000) return false;
+        return clip + chamber == 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+#else
+    (void)currentItem;
+    (void)equipmentManager;
+    return false;
 #endif
 }
 
@@ -160,7 +194,8 @@ bool TryResolveAndReadEquipmentState(
 
 PlayerSyncObserver::PlayerSyncObserver(
     const SignatureResolver& resolver) noexcept
-    : globalStateRootAddress_(resolver.Resolve(SymbolId::GlobalStateRoot)) {}
+    : globalStateRootAddress_(resolver.Resolve(SymbolId::GlobalStateRoot)),
+      currentItemAddress_(resolver.Resolve(SymbolId::CharacterCurrentEquipmentItem)) {}
 
 bool PlayerSyncObserver::Available() const noexcept {
     return globalStateRootAddress_ != nullptr;
@@ -195,7 +230,8 @@ void PlayerSyncObserver::ObserveOnGameThread() noexcept {
     observed.presentationState = raw.presentationState;
     observed.equipmentActive = raw.equipmentActive != 0U;
     observed.aimHeld = (raw.aimPrimary & 0x00FFU) != 0U;
-    observed.primaryHeld = (raw.aimPrimary & 0xFF00U) != 0U;
+    observed.primaryHeld = (raw.aimPrimary & 0xFF00U) != 0U &&
+        !MagazineEmpty(currentItemAddress_, equipmentManager);
     observed.valid = true;
 
     const bool sameController = hasLastObserved_ && lastObserved_.valid &&

@@ -55,6 +55,7 @@ private:
         std::int32_t presentationState) noexcept;
 
     const void* globalStateRootAddress_{};
+    const void* currentItemAddress_{};
     // Single engine-thread writer, IPC-thread readers. Even values are stable;
     // odd values mean a publication is in progress.
     mutable std::atomic<std::uint64_t> sequence_{0};
