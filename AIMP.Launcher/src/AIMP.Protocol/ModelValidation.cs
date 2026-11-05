@@ -300,6 +300,13 @@ public static class ModelValidation
             throw new ProtocolException("The player-position snapshot is invalid.");
         if (value.Posture is not null) Validate(value.Posture);
         if (value.Torch is not null) Validate(value.Torch);
+        if (value.Hiding is not null) Validate(value.Hiding);
+    }
+
+    public static void Validate(PlayerHidingSnapshot? value)
+    {
+        if (value is null || !PlayerHidingCodec.IsValid(value))
+            throw new ProtocolException("The player-hiding snapshot is invalid.");
     }
 
     public static void Validate(PlayerTorchSnapshot? value)
@@ -1110,7 +1117,7 @@ public static class ModelValidation
                 "directionSpace", "replicationPositionX", "replicationPositionY",
                 "replicationPositionZ",
                 "replicationYaw",
-                "moveType", "playerPosture", "playerTorch", "playerTorchDirection"
+                "moveType", "playerPosture", "playerTorch", "playerTorchDirection", "playerHiding"
             };
             var hasDirectionSpace = value.Arguments.TryGetValue(
                 "directionSpace", out var directionSpaceText);
@@ -1129,7 +1136,8 @@ public static class ModelValidation
             var hasPosture = value.Arguments.TryGetValue("playerPosture", out var postureText);
             var hasTorch = value.Arguments.TryGetValue("playerTorch", out var torchText);
             var hasTorchDirection = value.Arguments.TryGetValue("playerTorchDirection", out var torchDirection);
-            var validCount = value.Arguments.Count is >= 5 and <= 14;
+            var hasHiding = value.Arguments.TryGetValue("playerHiding", out var hidingText);
+            var validCount = value.Arguments.Count is >= 5 and <= 15;
             if (!validCount
                 || value.Arguments.Keys.Any(key => !allowed.Contains(key))
                 || required.Any(key => !value.Arguments.ContainsKey(key))
@@ -1186,6 +1194,8 @@ public static class ModelValidation
                 || (hasTorch && (!hasReplicationPosition || torchText is not ("0" or "1")))
                 || (hasTorchDirection && (!hasTorch || torchText != "1"
                     || !PlayerTorchCodec.TryDecodeDirection(torchDirection, out _)))
+                || (hasHiding && (!hasReplicationPosition
+                    || !PlayerHidingCodec.TryDecode(hidingText, out _)))
                 || (hasReplicationYaw
                     && (!string.Equals(directionSpaceText, "world", StringComparison.Ordinal)
                         || !float.TryParse(replicationYawText, NumberStyles.Float,

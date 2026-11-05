@@ -85,6 +85,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private PlayerPostureSnapshot? _lastQueuedPosture;
     private PlayerTorchSnapshot? _torch;
     private PlayerTorchSnapshot? _lastQueuedTorch;
+    private PlayerHidingSnapshot? _hiding;
+    private PlayerHidingSnapshot? _lastQueuedHiding;
     private bool _positionSendRunning;
     private ulong _localPositionSequence;
     private NativePlayerEquipmentStatePayload? _localEquipmentState;
@@ -645,6 +647,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             _positionAvailable = positionAvailable;
             _posture = positionAvailable ? movementProfile.Posture : null;
             _torch = positionAvailable ? movementProfile.Torch : null;
+            _hiding = positionAvailable ? movementProfile.Hiding : null;
             if (positionAvailable)
             {
                 UpdateLocalMovementSpeed(now, position);
@@ -2766,6 +2769,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _pendingLocalPostureEdges.Clear();
         _lastQueuedPosture = null;
         _lastQueuedTorch = null;
+        _lastQueuedHiding = null;
         _positionSendRunning = false;
         _localPositionSequence = 0;
         // Native PlayerSync state belongs to the AI.exe runtime, not to a lobby
@@ -3068,7 +3072,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             _pendingLocalPosition = new PlayerPositionSnapshotPayload(_start.SessionId, peerId,
                 _start.LevelGeneration, ++_localPositionSequence, now.ToUnixTimeMilliseconds(),
                 _position.X, _position.Y, _position.Z, _yaw, _moveType, _nativeMoveSpeed, _posture, _torch,
-                incarnation);
+                incarnation, _hiding);
             QueueLocalPostureEdge(_pendingLocalPosition);
             if (_positionSendRunning) return false;
             _positionSendRunning = true;
@@ -3111,13 +3115,16 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     {
         var posture = value.Posture ?? _lastQueuedPosture;
         var torch = value.Torch ?? _lastQueuedTorch;
-        var changed = posture != _lastQueuedPosture || torch?.Enabled != _lastQueuedTorch?.Enabled;
+        var hiding = value.Hiding ?? _lastQueuedHiding;
+        var changed = posture != _lastQueuedPosture || torch?.Enabled != _lastQueuedTorch?.Enabled
+            || hiding != _lastQueuedHiding;
         _lastQueuedPosture = posture;
         _lastQueuedTorch = torch;
+        _lastQueuedHiding = hiding;
         if (!changed) return;
         if (_pendingLocalPostureEdges.Count == PlayerPostureDispatchQueue.Capacity)
             _pendingLocalPostureEdges.Dequeue();
-        _pendingLocalPostureEdges.Enqueue(value with { Posture = posture, Torch = torch });
+        _pendingLocalPostureEdges.Enqueue(value with { Posture = posture, Torch = torch, Hiding = hiding });
     }
 
     private void ClearPendingLocalPositions()
@@ -3126,6 +3133,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _pendingLocalPostureEdges.Clear();
         _lastQueuedPosture = null;
         _lastQueuedTorch = null;
+        _lastQueuedHiding = null;
     }
 
     private Task SendLocalPositionAsync(PlayerPositionSnapshotPayload value)

@@ -333,7 +333,8 @@ struct PresentationProbe final {
     std::uint32_t movementOwner{};
     std::uint32_t cycleType{}, stage{0xFFFFFFFFU}, withdrawState{0xFFFFFFFFU};
     float local[3]{}, authority[3]{}, victim[3]{}, authorityVictim[3]{};
-    std::uint8_t cycleState{}, cycleFlags{}, hidden{}, enabled{};
+    std::uint8_t cycleState{}, cycleFlags{}, hidden{}, invisible{}, enabled{};
+    bool invisibleReadable{};
     bool sourceGraphPresent{};
     navigation::HeadObservation navigationHead{};
     std::uint32_t authorityMoveType{}, requestedMoveType{0xFFFFFFFFU}, effectiveMoveType{0xFFFFFFFFU};
@@ -4685,6 +4686,9 @@ void SamplePresentation(Actor& actor, const ULONGLONG now, const std::uint32_t p
         sample.positionReadable = sample.positionReadable && readable;
         sample.authority[i] = state.position[i]; sample.authorityVictim[i] = state.interactionTargetPosition[i];
     }
+    // +2DA is backstage, +2D9 is independent render invisibility (including
+    // NPC_SetInvisible). A frontstage actor can still be invisible.
+    sample.invisibleReadable = Read(actor.character + 0x2D9U, sample.invisible);
     sample.visibilityReadable = Read(actor.character + 0x2DAU, sample.hidden) &&
         Read(actor.character + 0x2FAU, sample.enabled);
     std::uintptr_t cycle{}, table{};
@@ -11200,6 +11204,8 @@ void LogDiagnostics(Diagnostics& diagnostics) {
              {"stage", Diagnostics::Unsigned(sample.stage), true},
              {"withdrawState", Diagnostics::Unsigned(sample.withdrawState), true},
              {"hidden", Diagnostics::Unsigned(sample.hidden), true},
+             {"invisible", sample.invisibleReadable ? Diagnostics::Unsigned(sample.invisible) : "null", true},
+             {"invisibleReadable", Diagnostics::Boolean(sample.invisibleReadable), true},
              {"enabled", Diagnostics::Unsigned(sample.enabled), true},
              {"positionReadable", Diagnostics::Boolean(sample.positionReadable), true},
              {"victimReadable", Diagnostics::Boolean(sample.victimReadable), true},
