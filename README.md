@@ -170,8 +170,16 @@ For Debug, replace `Release` with `Debug`.
 
 ### 3. Assemble and Run a Local Build
 
+To **test the backend you just built** with an existing AI-MP installation, you do not need to reinstall the mod:
+
+1. Close AI-MP and make sure its local API process is no longer running.
+2. Open the build output directory: `AIMP.Launcher/src/AIMP.Launcher/bin/x64/Release/net8.0-windows/` (or the corresponding `Debug` directory for a Debug build).
+3. Copy **the contents of that directory** into `<AI-MP mod folder>\\resources\\api\\`, **replacing the existing files** with the newly built ones.
+4. Launch AI-MP again to test the updated backend.
+
+If you also rebuilt the native module, make sure the launcher uses the **matching `AIMP.NetZ.dll`** from that same compatible revision, rather than an older DLL left in another directory.
+
 - Use **Launcher / Native binaries built from the same compatible revision**.
-- Verify that the launcher selects the **correct** `AIMP.NetZ.dll`, not an older binary left in another build directory.
 - Use a compatible game installation; the launcher handles **automatic game preparation**.
 - Because the Electron/web frontend is **not part of this repository**, consult the frontend repository if you want to rebuild the complete user-facing application.
 
