@@ -188,9 +188,22 @@ If you also rebuilt the native module, make sure the launcher uses the **matchin
 
 ## Developer Mode
 
-By default, AI-MP focuses on **Survivor Mode**. To access experimental testing options, including **other maps** and **multiplayer experiments in the main campaign**, start the **AI-MP launcher** with the `-dev` launch argument.
+Developer Mode exposes experimental tools for testing **other maps** and investigating **multiplayer support for the main campaign**, beyond the currently supported Survivor Mode.
 
-You can add `-dev` to the launcher's shortcut or pass it when starting the launcher manually. No changes to the game files are required just to enable this mode.
+### Enable Developer Mode
+
+1. Start the **AI-MP launcher** with the `-dev` launch argument (for example, add it to the launcher's shortcut).
+2. **Launch the game** from AI-MP.
+3. Once in the game, open **Settings → Multiplayer** and enable the **Developer Mode** option.
+4. **Exit the game**. A new **Debug** menu will then appear in the AI-MP launcher.
+
+### Debug Menu
+
+The launcher’s **Debug** menu includes:
+
+- **Live Logs:** View diagnostic logs in real time.
+- **Performance:** Enable or disable individual modules in real time to isolate performance issues and test their impact.
+- **WorldManifest:** Select specific levels to generate their manifests and import the assets needed for multiplayer testing.
 
 **Warning:** Developer Mode is intended for testing and debugging. Additional maps and the main campaign are **not officially supported for stable multiplayer gameplay**. Expect broken objectives, unsynchronized interactions, crashes, and other issues.
 
