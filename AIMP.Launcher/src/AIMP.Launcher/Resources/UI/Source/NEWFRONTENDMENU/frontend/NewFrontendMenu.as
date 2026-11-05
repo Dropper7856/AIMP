@@ -268,6 +268,7 @@ package frontend
       private var _leaderboard_spinner_visible:Boolean;
       
       private var _campaignLevelIds:Array = [];
+      private var _developerModeAvailable:Boolean = false;
       private var _developerMode:Boolean = false;
       private var _developerItem:MenuItem;
       private var _voicePage:MenuItemExpandable;
@@ -300,6 +301,7 @@ package frontend
          this._voiceGainItem = new MenuItem("Microphone gain",this.voiceGainChanged);
          this._voiceVolumeItem = new MenuItem("Voice volume",this.voiceVolumeChanged);
          this._developerItem = new MenuItem("Developer mode: Off",this.developerToggle);
+         this._developerItem.visible = false;
          this._developerItem.description = "Experimental game mode and level selection. Campaign levels require game preparation after restarting the game.";
          this._voicePage.page.addItem(this._developerItem);
          this._voicePage.page.addItem(this._voiceEnabledItem);
@@ -315,7 +317,7 @@ package frontend
 
       private function developerToggle(event:MenuItemEvent) : void
       {
-         if(!this._voiceReady) return;
+         if(!this._voiceReady || !this._developerModeAvailable) return;
          this.voiceSend("DEVELOPER_MODE",{enabled:this._developerMode ? "0" : "1"});
       }
 
@@ -332,7 +334,9 @@ package frontend
       private function voiceSettings(values:Object) : void
       {
          this._voiceReady = true;
-         this._developerMode = values["developerMode"] == "1";
+         this._developerModeAvailable = values["developerModeAvailable"] == "1";
+         this._developerItem.visible = this._developerModeAvailable;
+         this._developerMode = this._developerModeAvailable && values["developerMode"] == "1";
          this._developerItem.name = "Developer mode: " + (this._developerMode ? "On" : "Off");
          this._voiceEnabled = values["enabled"] == "1";
          this._voiceMode = String(values["mode"]);
@@ -1103,7 +1107,9 @@ package frontend
          {
             this._directJoinPortValue = _loc5_;
          }
-         this._developerMode = param1["developerMode"] == "1";
+         this._developerModeAvailable = param1["developerModeAvailable"] == "1";
+         this._developerItem.visible = this._developerModeAvailable;
+         this._developerMode = this._developerModeAvailable && param1["developerMode"] == "1";
          this._campaignLevelIds = [];
          for(var i:int = 0; i < int(param1["developerLevelCount"]); i++)
          {

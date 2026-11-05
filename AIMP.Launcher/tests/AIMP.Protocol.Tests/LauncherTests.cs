@@ -552,7 +552,7 @@ internal static class LauncherTests
 
     private static void AssertSettingsRoundTrip(TemporaryDirectory temporary, string game)
     {
-        var store = new LauncherSettingsStore(temporary.Combine("settings.json"));
+        var store = new LauncherSettingsStore(temporary.Combine("settings.json"), developerModeAvailable: true);
         var playerId = Guid.NewGuid();
         store.Save(new LauncherSettings(game, "Ripley", "10.0.0.5", 28015, playerId));
         var loaded = store.Load();
@@ -606,7 +606,7 @@ internal static class LauncherTests
                 WorldSync3EmptyCallbackEnabled = false,
                 DeveloperMode = true
             }));
-        var toggleSettings = new LauncherSettingsStore(temporary.Combine("toggle-settings.json")).Load();
+        var toggleSettings = new LauncherSettingsStore(temporary.Combine("toggle-settings.json"), developerModeAvailable: true).Load();
         AssertEx.Equal("Toggle", toggleSettings.PlayerName);
         AssertEx.True(toggleSettings.DeveloperMode);
     }

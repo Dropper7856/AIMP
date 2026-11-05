@@ -20,12 +20,15 @@ internal sealed partial class MultiplayerSessionCoordinator
         new VoiceSessionContext(Guid.Empty, 0, 0, 0, 0, false, false, null, null));
 
     private Task HandleVoiceBridgeAsync(ScaleformBridgeMessage message, Func<string, IReadOnlyDictionary<string, string>?, Task<bool>>? reply = null) =>
-        string.Equals(message.Type.Trim(), "VOICE_SAVE_SETTINGS", StringComparison.OrdinalIgnoreCase)
-            ? SaveVoiceSettingsAsync(message, reply)
-            : SendVoiceSettingsAsync(reply);
+        message.Type.Trim().ToUpperInvariant() switch
+        {
+            "DEVELOPER_MODE" => SetDeveloperModeAsync(message, reply),
+            "VOICE_SAVE_SETTINGS" => SaveVoiceSettingsAsync(message, reply),
+            _ => SendVoiceSettingsAsync(reply)
+        };
 
     private static bool IsVoiceSettingsMessage(ScaleformBridgeMessage message) =>
-        message.Type.Trim().ToUpperInvariant() is "VOICE_GET_SETTINGS" or "VOICE_SAVE_SETTINGS";
+        message.Type.Trim().ToUpperInvariant() is "VOICE_GET_SETTINGS" or "VOICE_SAVE_SETTINGS" or "DEVELOPER_MODE";
 
     // The in-game pause menu has its own event-channel socket: answer on it, not
     // on the command channel, which belongs to the gameplay overlay.
@@ -41,6 +44,7 @@ internal sealed partial class MultiplayerSessionCoordinator
         var voice = (settings.Voice ?? new VoiceSettings()).Normalize();
         var values = new Dictionary<string, string>
         {
+            ["developerModeAvailable"] = _settingsStore.DeveloperModeAvailable ? "1" : "0",
             ["developerMode"] = settings.DeveloperMode ? "1" : "0",
             ["enabled"] = voice.Enabled ? "1" : "0", ["mode"] = voice.Mode,
             ["key"] = voice.PushToTalkKey.ToString(CultureInfo.InvariantCulture),

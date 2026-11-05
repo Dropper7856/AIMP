@@ -83,11 +83,12 @@ public sealed record SettingsResponse(
     string HostAddress,
     int Port,
     Guid PlayerId,
-    string SettingsPath);
+    string SettingsPath,
+    bool PlayerNameFromSteam);
 
 public sealed record UpdateSettingsRequest(
     string? GameDirectory,
-    string? PlayerName,
+    string? PlayerName, // Ignored: the player name is the Steam display name.
     string? HostAddress,
     int Port);
 

@@ -135,8 +135,7 @@ internal static class PlayerTorchGraphTests
         var assets = Activator.CreateInstance(type, BindingFlags.Instance | BindingFlags.NonPublic,
             null, new object[] { level, global }, null)!;
         object Field(string name) => type.GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(assets)!;
-        var sources = new[] { (Commands)Field("Commands"), Field("SecondaryCommands") as Commands }
-            .Where(c => c != null).Cast<Commands>().ToArray();
+        var sources = new[] { (Commands)Field("Commands") };
         foreach (var source in sources)
         {
             RipleyCharacterInstaller.EnsureRemoteTorch(source);

@@ -90,24 +90,34 @@ internal static partial class RipleyCharacterInstaller
                 if (EnsureNpcWeaponScripts(source)) PublishScripts(game, levels[i], source, closure, cancellationToken);
                 present++;
             }
-            else
-            {
-                var destination = new Assets(levels[i], global);
-                var ripleyPresent = ContainsValidClosure(destination, closure);
-                if (!ripleyPresent)
-                {
-                    Import(source, destination, closure, cancellationToken);
-                    EnsureNpcWeaponScripts(destination);
-                    Publish(game, levels[i], destination, global, closure, cancellationToken);
-                }
-                else if (EnsureNpcWeaponScripts(destination))
-                    PublishScripts(game, levels[i], destination, closure, cancellationToken);
-                if (ripleyPresent) present++;
-                else imported++;
-            }
+            else if (PrepareLevel(game, levels[i], name, source, global, closure, cancellationToken)) present++;
+            else imported++;
             progress?.Report(new(name, i + 1, levels.Length, "E_RIPLEY character assets ready"));
         }
         return new(imported, present);
+    }
+
+    // Returns whether E_RIPLEY was already present. Failures name the level.
+    private static bool PrepareLevel(string game, string levelPath, string name, Assets source, Global global,
+        IReadOnlyList<Composite> closure, CancellationToken token)
+    {
+        try
+        {
+            var destination = new Assets(levelPath, global);
+            if (ContainsValidClosure(destination, closure))
+            {
+                if (EnsureNpcWeaponScripts(destination)) PublishScripts(game, levelPath, destination, closure, token);
+                return true;
+            }
+            Import(source, destination, closure, token);
+            EnsureNpcWeaponScripts(destination);
+            Publish(game, levelPath, destination, global, closure, token);
+            return false;
+        }
+        catch (Exception error) when (error is InvalidDataException or IOException)
+        {
+            throw new InvalidDataException($"{name}: {error.Message}", error);
+        }
     }
 
     private static IReadOnlyList<Composite> DiscoverClosure(Commands commands, IEnumerable<Composite> roots)
@@ -154,18 +164,21 @@ internal static partial class RipleyCharacterInstaller
 
     private static IEnumerable<ResourceReference> ResourcesOf(Entity entity)
     {
+        // Retail COMMANDS.PAK can carry resource parameters with no value list.
         if (entity is FunctionEntity function && function.resources != null)
-            foreach (var resource in function.resources) yield return resource;
+            foreach (var resource in function.resources)
+                if (resource != null) yield return resource;
         foreach (var parameter in entity.parameters)
-            if (parameter.content is cResource resources)
-                foreach (var resource in resources.value) yield return resource;
+            if (parameter.content is cResource { value: not null } resources)
+                foreach (var resource in resources.value)
+                    if (resource != null) yield return resource;
     }
 
     // Per command source: every entity's structure and resolved resources, with
     // renderables, collision mappings and animated models as table indices.
     private static string[] ResourceSignature(Assets assets, IEnumerable<Commands> sources)
     {
-        var renderables = IndexTable(assets.Renderables.Entries);
+        var renderables = CanonicalRenderableTable(assets.Renderables.Entries);
         var collisions = IndexTable(assets.CollisionMaps.Entries);
         var animations = IndexTable(assets.Animations.Entries);
         static int Index(Dictionary<object, int> table, object? value) => value == null ? -2 : table.GetValueOrDefault(value, -1);
@@ -187,6 +200,24 @@ internal static partial class RipleyCharacterInstaller
             }
             return Convert.ToHexString(hash.GetHashAndReset());
         }).ToArray();
+    }
+
+    // CathodeLib writes a renderable reference as the first Equals-equal REDS
+    // entry (List.IndexOf). Retail REDS holds such duplicates, so compare that
+    // canonical index; grouping by (Model, Material) keeps the scan linear.
+    private static Dictionary<object, int> CanonicalRenderableTable(IReadOnlyList<RenderableElements.Element> entries)
+    {
+        var table = new Dictionary<object, int>(System.Collections.Generic.ReferenceEqualityComparer.Instance);
+        var groups = new Dictionary<(object, object), List<int>>();
+        for (var i = 0; i < entries.Count; i++)
+        {
+            var key = ((object?)entries[i].Model ?? string.Empty, (object?)entries[i].Material ?? string.Empty);
+            if (!groups.TryGetValue(key, out var firsts)) groups[key] = firsts = [];
+            var canonical = firsts.FirstOrDefault(j => entries[j].Equals(entries[i]), -1);
+            if (canonical < 0) firsts.Add(canonical = i);
+            table.TryAdd(entries[i], canonical);
+        }
+        return table;
     }
 
     private static Dictionary<object, int> IndexTable<T>(IReadOnlyList<T> entries) where T : class
@@ -218,7 +249,7 @@ internal static partial class RipleyCharacterInstaller
                         break;
                     case ResourceType.ANIMATED_MODEL when resource.AnimatedModel == null:
                     case ResourceType.COLLISION_MAPPING when resource.CollisionMapping == null:
-                        throw new InvalidDataException($"Unresolved character resource in {composite.name}.");
+                        throw new InvalidDataException($"Unresolved character resource {resource.resource_type} {resource.resource_id.AsUInt32} in {composite.name}.");
                     case ResourceType.DYNAMIC_PHYSICS_SYSTEM:
                     case ResourceType.EXCLUSIVE_MASTER_STATE_RESOURCE:
                         throw new InvalidDataException($"Character dependency {resource.resource_type} cannot be safely transferred.");
@@ -397,10 +428,8 @@ internal static partial class RipleyCharacterInstaller
         internal readonly CollisionMaps CollisionMaps;
         internal readonly EnvironmentAnimations Animations;
         internal readonly Commands Commands;
-        internal readonly Commands? SecondaryCommands;
-        internal IEnumerable<Commands> CommandSources => SecondaryCommands is { } secondary ? [Commands, secondary] : [Commands];
+        internal IEnumerable<Commands> CommandSources => [Commands];
         internal readonly bool HasPak;
-        internal readonly bool HasBin;
 
         internal Assets(string root, Global global)
         {
@@ -423,14 +452,12 @@ internal static partial class RipleyCharacterInstaller
             CollisionMaps = new(Path.Combine(world, "COLLISION.MAP"), Materials, Mappings);
             Animations = new(Path.Combine(world, "ENVIRONMENT_ANIMATION.DAT"), global.AnimationStrings_Debug);
             HasPak = File.Exists(Path.Combine(world, "COMMANDS.PAK"));
-            HasBin = File.Exists(Path.Combine(world, "COMMANDS.BIN"));
+            // AI.exe only loads COMMANDS.PAK. A COMMANDS.BIN next to it is editor
+            // output (OpenCAGE) that the game ignores and that can lag behind the
+            // PAK, e.g. after a Steam repair; it is neither validated nor rewritten.
             Commands = new(Path.Combine(world, HasPak ? "COMMANDS.PAK" : "COMMANDS.BIN"), Animations, CollisionMaps, Renderables);
-            if (HasPak && HasBin)
-                SecondaryCommands = new(Path.Combine(world, "COMMANDS.BIN"), Animations, CollisionMaps, Renderables);
             foreach (var file in new CathodeFile[] { Textures, Shaders, Collisions, Morphs, Materials, Models, Renderables, Mappings, CollisionMaps, Animations, Commands })
                 if (!file.Loaded) throw new InvalidDataException($"Unable to parse level asset: {file.Filepath}.");
-            if (SecondaryCommands is { Loaded: false })
-                throw new InvalidDataException($"Unable to parse level asset: {SecondaryCommands.Filepath}.");
         }
 
         // Only the level scripts changed: every other asset is already on disk.
@@ -465,8 +492,6 @@ internal static partial class RipleyCharacterInstaller
             Save(Textures); Save(Shaders); Save(Collisions); Save(Morphs);
             Save(Materials); Save(Mappings); Save(Models); Save(Renderables);
             Save(CollisionMaps); Save(Animations);
-            // PAK and BIN can contain independent level graphs. Preserve each
-            // graph's original composites and entry points when both are present.
             foreach (var commands in CommandSources)
                 if (!commands.Save(Path.Combine(stage, "WORLD", Path.GetFileName(commands.Filepath))))
                     throw new IOException($"Failed to stage {Path.GetFileName(commands.Filepath)}.");

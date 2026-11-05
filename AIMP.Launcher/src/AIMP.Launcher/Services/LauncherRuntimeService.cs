@@ -95,8 +95,11 @@ public sealed class LauncherRuntimeService : BackgroundService
         ArgumentNullException.ThrowIfNull(request);
         if (!GameInstallation.TryResolve(request.GameDirectory, out var game, out var error))
             return new SettingsValidationResponse(false, error, null, null, null, null);
+        // The player name is not editable: it is the Steam display name, or
+        // the last stored name when Steam is unavailable. request.PlayerName
+        // is accepted for compatibility and ignored.
         if (!MultiplayerSettingsValidation.TryValidate(
-                request.PlayerName, request.HostAddress, request.Port,
+                LoadSettingsOrDefault().PlayerName, request.HostAddress, request.Port,
                 out var playerName, out var host, out var port, out error))
             return new SettingsValidationResponse(false, error, game.GameDirectory, null, null, null);
         return new SettingsValidationResponse(
@@ -569,7 +572,8 @@ public sealed class LauncherRuntimeService : BackgroundService
         value.HostAddress,
         value.Port,
         value.PlayerId,
-        _settings.SettingsPath);
+        _settings.SettingsPath,
+        _settings.SteamPersonaName() is not null);
 
     private LauncherSettings LoadSettingsOrDefault()
     {

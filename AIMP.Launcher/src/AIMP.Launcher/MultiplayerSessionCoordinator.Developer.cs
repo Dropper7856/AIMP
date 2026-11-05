@@ -2,13 +2,13 @@ namespace AIMP.Launcher;
 
 internal sealed partial class MultiplayerSessionCoordinator
 {
-    private async Task SetDeveloperModeAsync(ScaleformBridgeMessage message)
+    private async Task SetDeveloperModeAsync(ScaleformBridgeMessage message,
+        Func<string, IReadOnlyDictionary<string, string>?, Task<bool>>? reply = null)
     {
         var value = message.Get("enabled");
         if (value is not ("0" or "1")) throw new InvalidOperationException("Invalid developer mode.");
-        var current = _settingsStore.Load();
-        _settingsStore.Save(current with { DeveloperMode = value == "1" });
-        await SendVoiceSettingsAsync().ConfigureAwait(false);
+        _settingsStore.SetDeveloperMode(value == "1");
+        await SendVoiceSettingsAsync(reply).ConfigureAwait(false);
         await SendConfigAsync().ConfigureAwait(false);
     }
 
@@ -27,9 +27,10 @@ internal sealed partial class MultiplayerSessionCoordinator
         || level.StartsWith("BSPNOSTROMO_", StringComparison.OrdinalIgnoreCase)
         || level.StartsWith("Salvage", StringComparison.OrdinalIgnoreCase) ? "Survival" : "Campaign";
 
-    private static Dictionary<string, string> AddDeveloperLevels(
+    private Dictionary<string, string> AddDeveloperLevels(
         LauncherSettings settings, Dictionary<string, string> values)
     {
+        values["developerModeAvailable"] = _settingsStore.DeveloperModeAvailable ? "1" : "0";
         values["developerMode"] = settings.DeveloperMode ? "1" : "0";
         var levels = settings.DeveloperMode
             ? WorldManifestLevelDiscovery.Discover(settings.GameDirectory, includeCampaign: true)

@@ -47,21 +47,30 @@ internal sealed class LauncherSettingsStore
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private readonly string _path;
+    private readonly Func<string?>? _steamPersona;
 
-    internal LauncherSettingsStore(string? path = null)
+    // steamPersona supplies the Steam display name. When it returns a name, it
+    // is the player name; the stored name is only a fallback without Steam.
+    internal LauncherSettingsStore(string? path = null, bool developerModeAvailable = false,
+        Func<string?>? steamPersona = null)
     {
         _path = path ?? DefaultPath();
+        DeveloperModeAvailable = developerModeAvailable;
+        _steamPersona = steamPersona;
     }
 
     internal string SettingsPath => _path;
+    internal bool DeveloperModeAvailable { get; }
+
+    internal string? SteamPersonaName() => _steamPersona?.Invoke();
 
     internal LauncherSettings Load()
     {
-        if (!File.Exists(_path)) return LauncherSettings.Empty.Normalize();
+        if (!File.Exists(_path)) return ForSession(LauncherSettings.Empty);
         var json = File.ReadAllText(_path);
         var settings = JsonSerializer.Deserialize<LauncherSettings>(json, JsonOptions)
             ?? LauncherSettings.Empty;
-        return settings.Normalize();
+        return ForSession(settings);
     }
 
     internal void Save(LauncherSettings settings)
@@ -69,8 +78,22 @@ internal sealed class LauncherSettingsStore
         ArgumentNullException.ThrowIfNull(settings);
         var directory = Path.GetDirectoryName(_path);
         if (!string.IsNullOrWhiteSpace(directory)) Directory.CreateDirectory(directory);
-        File.WriteAllText(_path, JsonSerializer.Serialize(settings.Normalize(), JsonOptions));
+        File.WriteAllText(_path, JsonSerializer.Serialize(ForSession(settings), JsonOptions));
     }
+
+    internal void SetDeveloperMode(bool enabled)
+    {
+        if (!DeveloperModeAvailable)
+            throw new InvalidOperationException("Restart the launcher with -dev to access Developer mode.");
+        Save(Load() with { DeveloperMode = enabled });
+    }
+
+    private LauncherSettings ForSession(LauncherSettings settings) =>
+        (settings with
+        {
+            DeveloperMode = DeveloperModeAvailable && settings.DeveloperMode,
+            PlayerName = SteamPersonaName() ?? settings.PlayerName
+        }).Normalize();
 
     private static string DefaultPath() => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),

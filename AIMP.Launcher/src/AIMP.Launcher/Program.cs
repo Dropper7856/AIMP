@@ -14,15 +14,16 @@ public static class Program
             return;
         }
 
-        var builder = WebApplication.CreateBuilder(args);
-        ConfigureServices(builder.Services);
+        var hostArguments = LauncherStartupOptions.Parse(args, out var developerModeAvailable);
+        var builder = WebApplication.CreateBuilder(hostArguments);
+        ConfigureServices(builder.Services, developerModeAvailable);
 
         var app = builder.Build();
         ConfigurePipeline(app);
         app.Run();
     }
 
-    private static void ConfigureServices(IServiceCollection services)
+    private static void ConfigureServices(IServiceCollection services, bool developerModeAvailable)
     {
         services.AddProblemDetails();
         services.AddCors(options => options.AddDefaultPolicy(policy => policy
@@ -33,7 +34,8 @@ public static class Program
             options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 
         services.AddSingleton(_ => new LauncherDiagnostics());
-        services.AddSingleton(_ => new LauncherSettingsStore());
+        services.AddSingleton(_ => new LauncherSettingsStore(developerModeAvailable: developerModeAvailable,
+            steamPersona: SteamPersona.Resolve));
         services.AddSingleton(provider => new GamePreparationService(
             provider.GetRequiredService<LauncherSettingsStore>(),
             provider.GetRequiredService<LauncherDiagnostics>(),
