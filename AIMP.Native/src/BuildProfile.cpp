@@ -1578,8 +1578,16 @@ BuildValidation ValidateExecutable(
         entrySection != result.actual.sections.end() &&
         alienImports;
     result.actual.fileVersion = QueryFileVersion(path);
-    result.hashMatch =
-        result.hashAvailable && result.actual.sha256 == profile.sha256;
+    // The historical profile digest is an OpenCAGE-patched copy of the Steam
+    // retail AI.exe. The unmodified retail file differs by 49 bytes only: the
+    // startup level and TEXT_%s strings, four CALL targets and two flag
+    // stores, none at a hooked or certified site. Both are the exact build.
+    static const auto kUnmodifiedRetailSha256 = Sha256(
+        "DDE66521798AAE8C39ED4E7A3400F561FCECFFF83619D1426B9E0CEDF5819A90");
+    result.hashMatch = result.hashAvailable &&
+        (result.actual.sha256 == profile.sha256 ||
+         (profile.sha256 == Retail2015Profile().sha256 &&
+          result.actual.sha256 == kUnmodifiedRetailSha256));
     result.metadataMatch =
         result.actual.machine == profile.machine &&
         result.actual.fileCharacteristics == profile.fileCharacteristics &&

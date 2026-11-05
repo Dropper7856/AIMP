@@ -38,6 +38,7 @@
 #include "aimp/PlayerSyncObserver.h"
 #include "aimp/PlayerLifecycle.h"
 #include "aimp/UIHeapGuard.h"
+#include "aimp/LevelIntegrityGuard.h"
 #include "aimp/LoadingContextGuard.h"
 #include "aimp/PairedTransformGuard.h"
 #include "aimp/TeardownReferenceGuard.h"
@@ -639,6 +640,20 @@ DWORD Bootstrap::RunImpl() {
             installed ? "All six retail GFx heap mutators now use their native critical sections (10 certified branches)."
                 : (heapError.empty() ? "UI heap synchronization requires the exact executable hash." : heapError));
         if (installed && !heapError.empty()) diagnostics.Log("warning", "ui_heap_guard_protection", heapError);
+    }
+
+    {
+        std::string integrityError;
+        const bool installed = validation.hashMatch &&
+            level_integrity_guard::Install(moduleBase, *hooks, integrityError);
+        diagnostics.Log(installed ? "info" : "error", "level_integrity_guard",
+            installed
+                ? (level_integrity_guard::AlreadyBypassed()
+                       ? "The executable already bypasses the MODELS_LEVEL.BIN and DLC fingerprints."
+                       : "MODELS_LEVEL.BIN and DLC fingerprints bypassed in memory (2 retail CALL sites).")
+                : (integrityError.empty()
+                       ? "Prepared levels require the exact executable hash; retail will quit on load."
+                       : integrityError));
     }
 
     {

@@ -88,6 +88,7 @@ set(AIMP_CORE_SOURCES
     src/PairedTransformGuard.cpp
     src/TeardownReferenceGuard.cpp
     src/UIHeapGuard.cpp
+    src/LevelIntegrityGuard.cpp
     src/MultiplayerPause.cpp
     src/ItemSync.cpp
     src/ThrowableSync.cpp
