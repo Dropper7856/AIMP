@@ -93,9 +93,13 @@ int main() {
     Initialize(image);
     std::string error;
     Check(Publish(character, true, anchor, error), "Entry publication accepted");
+    Check(History().hiddenEdges == 1 && History().hides == 0 &&
+        History().lastHiddenRequestedCharacter == character, "Publication history distinguishes requests from native hides");
     Check(actor[0x2D9] == 0 && manager[Flags(0)] == 7, "IPC never writes the engine objects");
     PumpAllOnEngineThread();
     Check(actor[0x2D9] == 1 && Snapshot(character).spotLocked, "Engine hides the remote body and locks the spot");
+    Check(History().hides == 1 && History().lastHiddenCharacter == character,
+        "History identifies the actual masked character");
     Check(manager[Flags(0)] == 4 && manager[Flags(1)] == 7 && manager[Flags(2)] == 7,
         "Only the occupied hiding interaction is disabled");
     manager[Flags(0)] = 0x87;
@@ -104,6 +108,8 @@ int main() {
     Check(Publish(character, false, {}, error), "Exit publication accepted");
     PumpAllOnEngineThread();
     Check(actor[0x2D9] == 0 && manager[Flags(0)] == 0x87, "Exit reveals the body and restores icon bits");
+    Check(Snapshot(character).hides == 0 && History().hides == 1 && History().shows == 1 &&
+        History().lastShownCharacter == character, "History survives per-stay mailbox release");
 
     Check(Publish(character, true, anchor, error), "First concurrent occupant");
     Check(Publish(other, true, anchor, error), "Second concurrent occupant");
@@ -137,7 +143,12 @@ int main() {
     Check(Publish(character, false, {}, error), "Exit after manager replacement");
     PumpAllOnEngineThread();
     Check(replacement[Flags(0)] == 4, "Old manager ownership cannot restore into a new table");
+    const auto history = History();
     ForgetAll();
+    Check(History().hides == history.hides && History().lastHiddenCharacter == history.lastHiddenCharacter,
+        "Cumulative history survives level cleanup");
+    Initialize(0);
+    Check(History().hides == 0 && History().lastHiddenCharacter == 0, "Initialization starts a new history");
     VirtualFree(memory, 0, MEM_RELEASE);
     return failures == 0 ? 0 : 1;
 }

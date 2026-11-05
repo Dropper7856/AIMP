@@ -67,6 +67,7 @@ std::mutex gMutex;
 std::uintptr_t gModuleBase{};
 std::uint64_t gEpoch{};
 int gAbi{-1};
+HistorySnapshot gHistory{};
 
 bool SameSpot(const Spot& left, const Spot& right) noexcept {
     return left.locked && right.locked && left.manager == right.manager &&
@@ -316,6 +317,7 @@ void PumpOnEngineThread(const std::uintptr_t character, const std::uintptr_t man
         if (!GuardRemoteCharacter(character)) {
             slot->diagnostics.stage = "local-player-guard";
             ++slot->diagnostics.failures;
+            ++gHistory.failures;
             return;
         }
         UpdateSpot(*slot, manager, slot->diagnostics.spotsLocked,
@@ -349,11 +351,19 @@ void PumpOnEngineThread(const std::uintptr_t character, const std::uintptr_t man
     if (applied) {
         if (success) {
             slot->concealedByUs = needHide;
-            if (needHide) ++slot->diagnostics.hides;
-            else ++slot->diagnostics.shows;
+            if (needHide) {
+                ++slot->diagnostics.hides;
+                ++gHistory.hides;
+                gHistory.lastHiddenCharacter = character;
+            } else {
+                ++slot->diagnostics.shows;
+                ++gHistory.shows;
+                gHistory.lastShownCharacter = character;
+            }
             slot->retryAt = 0U;
         } else {
             ++slot->diagnostics.failures;
+            ++gHistory.failures;
             slot->retryAt = slot->diagnostics.desired != desired ? 0U : GetTickCount64() + kRetryMilliseconds;
         }
     }
@@ -398,6 +408,7 @@ void Initialize(const std::uintptr_t moduleBase) noexcept {
     gSlots = {};
     gOrphanSpots = {};
     gAbi = -1;
+    gHistory = {};
     ++gEpoch;
 }
 
@@ -415,7 +426,13 @@ bool Publish(const std::uintptr_t character, const bool hidden, const std::array
         slot->character = character;
         slot->epoch = ++gEpoch;
     }
-    if (slot->diagnostics.desired != hidden) slot->retryAt = 0U;
+    if (slot->diagnostics.desired != hidden) {
+        slot->retryAt = 0U;
+        if (hidden) {
+            ++gHistory.hiddenEdges;
+            gHistory.lastHiddenRequestedCharacter = character;
+        } else ++gHistory.visibleEdges;
+    }
     // A different spot while still hidden: free the previous one first.
     if (hidden && slot->diagnostics.desired && slot->diagnostics.anchor != anchor) {
         Orphan(slot->spot);
@@ -466,5 +483,10 @@ DiagnosticsSnapshot Snapshot(const std::uintptr_t character) noexcept {
     std::scoped_lock lock(gMutex);
     const auto* slot = Find(character);
     return slot == nullptr ? DiagnosticsSnapshot{} : slot->diagnostics;
+}
+
+HistorySnapshot History() noexcept {
+    std::scoped_lock lock(gMutex);
+    return gHistory;
 }
 }

@@ -3356,6 +3356,7 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
             ? GameThreadDispatcherSnapshot{}
             : dispatcher_->Snapshot();
         const auto locomotion = character_direct_step_runtime::Snapshot();
+        const auto hidingHistory = player_hiding::History();
         player_animation_clip_capture::Export(*diagnostics_);
         diagnostics_->Log(
             "info",
@@ -3564,7 +3565,18 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
              {"remoteHidingSpotsLocked", Diagnostics::Unsigned(locomotion.hiding.spotsLocked), true},
              {"remoteHidingSpotsReleased", Diagnostics::Unsigned(locomotion.hiding.spotsReleased), true},
              {"remoteHidingSpotsMissing", Diagnostics::Unsigned(locomotion.hiding.spotsMissing), true},
-             {"remoteHidingStage", locomotion.hiding.stage, false}});
+             {"remoteHidingStage", locomotion.hiding.stage, false},
+             {"playerHidingHistoryHiddenEdges", Diagnostics::Unsigned(hidingHistory.hiddenEdges), true},
+             {"playerHidingHistoryVisibleEdges", Diagnostics::Unsigned(hidingHistory.visibleEdges), true},
+             {"playerHidingHistoryHides", Diagnostics::Unsigned(hidingHistory.hides), true},
+             {"playerHidingHistoryShows", Diagnostics::Unsigned(hidingHistory.shows), true},
+             {"playerHidingHistoryFailures", Diagnostics::Unsigned(hidingHistory.failures), true},
+             {"playerHidingHistoryLastHiddenRequestedCharacter", Diagnostics::Pointer(
+                  reinterpret_cast<const void*>(hidingHistory.lastHiddenRequestedCharacter)), false},
+             {"playerHidingHistoryLastHiddenCharacter", Diagnostics::Pointer(
+                  reinterpret_cast<const void*>(hidingHistory.lastHiddenCharacter)), false},
+             {"playerHidingHistoryLastShownCharacter", Diagnostics::Pointer(
+                  reinterpret_cast<const void*>(hidingHistory.lastShownCharacter)), false}});
         const auto ws3 = world_actions::Snapshot();
         const auto replication = replication_core::DiagnosticsSnapshot();
         const auto interactions = world_interactions::DiagnosticsSnapshot();

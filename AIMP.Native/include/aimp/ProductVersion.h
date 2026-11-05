@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.406-hiding-sync";
+    "0.11.4.407-hiding-diagnostics";
 
 } // namespace aimp
