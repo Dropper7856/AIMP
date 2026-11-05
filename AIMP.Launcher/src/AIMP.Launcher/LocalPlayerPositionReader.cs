@@ -258,6 +258,7 @@ internal sealed class LocalPlayerPositionReader : IDisposable
         _torchReader.TryCapture(characterBase, out var torch, runtime.ModuleBase);
         _hidingReader.TryCapture(runtime.ModuleBase, characterBase, runtime.LevelGeneration, out var hiding,
             () => TryReadCharacterBase(runtime.ModuleBase, out var after) && after == characterBase);
+        hiding = LocalPlayerHidingReader.WithPresentation(hiding, runtime, characterBase, DateTimeOffset.UtcNow);
         if (!TryReadCharacterBase(runtime.ModuleBase, out var current) || current != characterBase) return false;
         movementProfile = movementProfile with { Posture = posture, Torch = torch, Hiding = hiding };
         return true;

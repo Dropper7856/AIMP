@@ -33,7 +33,7 @@ internal static class RemoteCrouchAnimationTests
         var path = Environment.GetEnvironmentVariable("AIMP_TEST_ANIMATION_PAK");
         if (string.IsNullOrWhiteSpace(path))
         {
-            Console.WriteLine("SKIP retail crouch animation patch: AIMP_TEST_ANIMATION_PAK is not set.");
+            Console.WriteLine("SKIP retail crouch/hiding animation patch: AIMP_TEST_ANIMATION_PAK is not set.");
             return Task.CompletedTask;
         }
         var pak = new PAK2(path);
@@ -46,6 +46,10 @@ internal static class RemoteCrouchAnimationTests
         var original = AnimClipDatabase.Parse(pak.Entries.Single(e => e.Filename == dbPath).Content);
         var originalGlobalBytes = pak.Entries.Single(e => e.Filename == @"DATA\ANIM_SYS\ANIM_CLIP_DB.BIN").Content;
         var originalGlobal = GlobalClipDatabase.Parse(originalGlobalBytes);
+        using var dependencyReader = new BinaryReader(new MemoryStream(originalGlobalBytes));
+        var originalSections = AnimClipDatabase.ReadTable(dependencyReader, r => (r.ReadUInt32(), r.ReadUInt32()));
+        var characters = AnimClipDatabase.ReadTable(dependencyReader, r => (r.ReadUInt32(), r.ReadUInt32()))
+            .Keys.Select(k => k.Hash).ToArray();
         AssertEx.True(originalGlobalBytes.AsSpan().SequenceEqual(originalGlobal.Serialize()),
             "Retail blend parser must round-trip all 50 blend definitions and the final table exactly.");
         RemoteCrouchAnimationInstaller.Patch(pak);
@@ -60,6 +64,13 @@ internal static class RemoteCrouchAnimationTests
             AssertEx.Equal(aimed, crouched.Animations.Get(AnimClipDatabase.HashName(alias))!.Value,
                 "Crouched weapon aiming must use its armed full-body base: " + alias);
         var global = GlobalClipDatabase.Parse(pak.Entries.Single(e => e.Filename == @"DATA\ANIM_SYS\ANIM_CLIP_DB.BIN").Content);
+        using var patchedReader = new BinaryReader(new MemoryStream(pak.Entries.Single(e => e.Filename == @"DATA\ANIM_SYS\ANIM_CLIP_DB.BIN").Content));
+        var patchedSections = AnimClipDatabase.ReadTable(patchedReader, r => (r.ReadUInt32(), r.ReadUInt32()));
+        AssertEx.True(originalSections.Keys.SequenceEqual(patchedSections.Keys));
+        AssertEx.True(originalSections.Values.SequenceEqual(patchedSections.Values), "Preserve all resident/streamed clip mappings.");
+        AssertEx.True(original.BlendSets.Keys.SequenceEqual(patched.BlendSets.Keys));
+        AssertEx.True(original.BlendSets.Values.SequenceEqual(patched.BlendSets.Values));
+        VerifyHiding(pak, original, originalGlobal, patched, global, characters);
         foreach (var (alias, source) in new[] { ("locomotion_cycle_blend", @"HUMAN\LOCOMOTIONCYCLE"),
             ("aimed_locomotion_cycle_blend", @"HUMAN\AIMED_LOCOMOTION_CYCLE_BLEND") })
         {
@@ -99,6 +110,8 @@ internal static class RemoteCrouchAnimationTests
             var actual = patched.Contexts.Single(c => c.NameHash == context.NameHash);
             AssertEx.True(context.Animations.Keys.SequenceEqual(actual.Animations.Keys));
             AssertEx.True(context.Animations.Values.SequenceEqual(actual.Animations.Values));
+            AssertEx.True(context.BlendSets.Keys.SequenceEqual(actual.BlendSets.Keys));
+            AssertEx.True(context.BlendSets.Values.SequenceEqual(actual.BlendSets.Values));
         }
         var first = pak.Entries.Where(e => changed.Contains(e.Filename))
             .ToDictionary(e => e.Filename, e => SHA256.HashData(e.Content));
@@ -106,8 +119,91 @@ internal static class RemoteCrouchAnimationTests
         foreach (var entry in pak.Entries.Where(e => changed.Contains(e.Filename)))
             AssertEx.True(first[entry.Filename].AsSpan().SequenceEqual(SHA256.HashData(entry.Content)),
                 "Patch must be idempotent: " + entry.Filename);
-        Console.WriteLine("Retail NPC idle aliases, metadata, standing/weapon contexts and unrelated resources verified.");
+        VerifyRejectedHidingSource(pak);
+        Console.WriteLine("Retail NPC crouch/hiding aliases, dependencies, metadata, contexts, unrelated resources and idempotence verified.");
         return Task.CompletedTask;
+    }
+
+    private static readonly (string Name, uint Path)[] HidingClips =
+    [
+        ("player_hiding_high_enter", 2721887201U), ("player_hiding_high_idle", 579261719U),
+        ("player_hiding_high_exit", 921403137U), ("player_hiding_low_enter", 2481641574U),
+        ("player_hiding_low_idle", 3973604370U), ("player_hiding_low_exit", 2574502800U),
+    ];
+
+    private static void VerifyHiding(PAK2 pak, AnimClipDatabase original, GlobalClipDatabase originalGlobal,
+        AnimClipDatabase patched, GlobalClipDatabase global, uint[] characters)
+    {
+        var player = AnimClipDatabase.Parse(pak.Entries.Single(e => e.Filename == @"DATA\ANIM_SYS\2554777613_ANIM_CLIP_DB.BIN").Content);
+        var character = AnimClipDatabase.HashName("E_RIPLEY");
+        var expectedGroups = originalGlobal.Dependencies(character).ToHashSet();
+        foreach (var (name, path) in HidingClips)
+        {
+            var key = AnimClipDatabase.HashName(name);
+            var source = player.Animations.Get(key)!.Value;
+            AssertEx.Equal(new AnimClipDatabase.Clip(path, 0), source, "Retail hiding source identity: " + name);
+            AssertEx.Equal(source, patched.Animations.Get(key)!.Value, "Remote hiding alias: " + name);
+            var group = global.SectionGroup(source.Path)!.Value;
+            AssertEx.Equal(uint.MaxValue, global.SectionClipIndex(source.Path), "Retail hiding clips are streamed.");
+            AssertEx.Equal(source.Path, group, "Streamed section is keyed by the clip path.");
+            AssertEx.True(pak.Entries.Any(e => e.Filename == $@"DATA\ANIM_SYS\STREAMED\ANIM_CLIP_DB_SEC_{group}.BIN"));
+            AssertEx.False(global.Dependencies(character).Contains(group), "Do not request a streamed clip from RESIDENT.");
+            Console.WriteLine($"Hiding alias {name}: path={source.Path}, metadata={source.MetadataInstance}, section={group}, index={global.SectionClipIndex(source.Path)}");
+        }
+        foreach (var name in new[] { "fp_walk_f_crouch", "fp_walk_b_crouch", "fp_walk_l_crouch" })
+            expectedGroups.Add(global.SectionGroup(player.Animations.Get(AnimClipDatabase.HashName(name))!.Value.Path)!.Value);
+        expectedGroups.Add(global.SectionGroup(original.Context("WEAPON_SHOTGUN")!.Animations
+            .Get(AnimClipDatabase.HashName("cover_low_aim"))!.Value.Path)!.Value);
+        var dependencies = global.Dependencies(character);
+        AssertEx.True(expectedGroups.SetEquals(dependencies), "Load exactly the existing and required resident groups.");
+        AssertEx.Equal(originalGlobal.Dependencies(character).Count + expectedGroups
+            .Except(originalGlobal.Dependencies(character)).Count(), dependencies.Count, "Do not duplicate dependencies.");
+        foreach (var other in characters.Where(c => c != character))
+            AssertEx.True(originalGlobal.Dependencies(other).SequenceEqual(global.Dependencies(other)),
+                "Another character's dependencies changed: " + other);
+        foreach (var (hash, slot) in original.Animations.Keys)
+            AssertEx.Equal(original.Animations.Values[slot], patched.Animations.Get(hash)!.Value,
+                "Preserve existing base alias: " + hash);
+        AssertEx.Equal(original.Animations.Keys.Count + HidingClips.Count(c =>
+            !original.Animations.Contains(AnimClipDatabase.HashName(c.Name))), patched.Animations.Keys.Count);
+        var def = pak.Entries.Single(e => e.Filename == @"DATA\ANIM_SYS\SKELE\DEFS\569978346.BIN").Content;
+        AssertEx.Equal(AnimClipDatabase.HashName("FEMALENPC"), BitConverter.ToUInt32(def, 4));
+        AssertEx.True(Enumerable.Range(0, BitConverter.ToInt32(def, 12))
+            .Any(i => BitConverter.ToUInt32(def, 16 + i * 4) == AnimClipDatabase.HashName("FEMALEFP")));
+    }
+
+    private static void VerifyRejectedHidingSource(PAK2 pak)
+    {
+        var entry = pak.Entries.Single(e => e.Filename == @"DATA\ANIM_SYS\2554777613_ANIM_CLIP_DB.BIN");
+        var original = entry.Content;
+        try
+        {
+            foreach (var failure in new[] { "metadata", "missing", "section" })
+            {
+                var player = AnimClipDatabase.Parse(original);
+                var key = AnimClipDatabase.HashName("player_hiding_low_exit");
+                if (failure == "missing")
+                {
+                    var table = new AnimClipDatabase.Table<AnimClipDatabase.Clip>();
+                    foreach (var (hash, slot) in player.Animations.Keys.Where(k => k.Hash != key))
+                        table.Set(hash, player.Animations.Values[slot]);
+                    player.Animations = table;
+                }
+                else player.Animations.Set(key, failure == "metadata"
+                    ? player.Animations.Get(key)!.Value with { MetadataInstance = 1 }
+                    : new AnimClipDatabase.Clip(0, 0));
+                entry.Content = player.Serialize();
+                var before = pak.Entries.ToDictionary(e => e.Filename, e => SHA256.HashData(e.Content));
+                var rejected = false;
+                try { RemoteCrouchAnimationInstaller.Patch(pak); }
+                catch (InvalidDataException ex) when (ex.Message.Contains("player_hiding_low_exit")) { rejected = true; }
+                AssertEx.True(rejected, "Reject invalid hiding source before publishing package entries: " + failure);
+                foreach (var resource in pak.Entries)
+                    AssertEx.True(before[resource.Filename].AsSpan().SequenceEqual(SHA256.HashData(resource.Content)),
+                        "Rejected hiding patch modified resource: " + resource.Filename);
+            }
+        }
+        finally { entry.Content = original; }
     }
 
     private static void VerifyLocomotion(PAK2 pak, GlobalClipDatabase global, AnimClipDatabase db, byte[] retail, byte[] blend)

@@ -1159,14 +1159,14 @@ bool DecodeGameCommand(
 
         if (command->stringValue == "CHARACTER_DIRECT_MOVE") {
             const auto argumentCount = arguments->objectValue.size();
-            if (argumentCount < 5U || argumentCount > 15U) {
+            if (argumentCount < 5U || argumentCount > 16U) {
                 return false;
             }
-            constexpr std::array<std::string_view, 15> allowedArguments{
+            constexpr std::array<std::string_view, 16> allowedArguments{
                 "characterAddress", "directionX", "directionZ", "intensity",
                 "frameCount", "directionSpace", "replicationPositionX",
                 "replicationPositionY", "replicationPositionZ", "replicationYaw",
-                "moveType", "playerPosture", "playerTorch", "playerTorchDirection", "playerHiding"};
+                "moveType", "playerPosture", "playerTorch", "playerTorchDirection", "playerHiding", "playerHidingPresentation"};
             if (std::any_of(
                     arguments->objectValue.begin(),
                     arguments->objectValue.end(),
@@ -1356,6 +1356,12 @@ bool DecodeGameCommand(
                         output.characterDirectMove.playerHidingAnchor)) return false;
                 output.characterDirectMove.hasPlayerHiding = true;
             } else if (arguments->objectValue.contains("playerHiding")) return false;
+            if (const auto* presentation = Field(*arguments, "playerHidingPresentation", JsonType::String)) {
+                if (!output.characterDirectMove.hasPlayerHiding ||
+                    !player_hiding_presentation::Decode(presentation->stringValue,
+                        output.characterDirectMove.playerHidingPresentation)) return false;
+                output.characterDirectMove.hasPlayerHidingPresentation = true;
+            } else if (arguments->objectValue.contains("playerHidingPresentation")) return false;
             if (const auto* posture = Field(*arguments, "playerPosture", JsonType::String)) {
                 if (!hasReplicationPosition || !hasReplicationYaw || moveType == nullptr ||
                     !player_posture::Decode(posture->stringValue, output.characterDirectMove.playerPosture))

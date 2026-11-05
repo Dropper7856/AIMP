@@ -648,6 +648,7 @@ internal sealed class NativeRuntimeController : IDisposable
         session.PlayerSyncActionProduced += OnPlayerSyncActionProduced;
         session.PlayerLifecycleStateChanged += OnPlayerLifecycleStateChanged;
         session.CharacterIncarnationChanged += OnCharacterIncarnationChanged;
+        session.PlayerHidingStateChanged += OnPlayerHidingStateChanged;
         session.MissionSignalProduced += OnMissionSignalProduced;
         session.ItemSyncPickupProduced += OnItemSyncPickupProduced;
         session.ItemSyncSpawnProduced += OnItemSyncSpawnProduced;
@@ -672,6 +673,7 @@ internal sealed class NativeRuntimeController : IDisposable
         session.PlayerSyncActionProduced -= OnPlayerSyncActionProduced;
         session.PlayerLifecycleStateChanged -= OnPlayerLifecycleStateChanged;
         session.CharacterIncarnationChanged -= OnCharacterIncarnationChanged;
+        session.PlayerHidingStateChanged -= OnPlayerHidingStateChanged;
         session.MissionSignalProduced -= OnMissionSignalProduced;
         session.ItemSyncPickupProduced -= OnItemSyncPickupProduced;
         session.ItemSyncSpawnProduced -= OnItemSyncSpawnProduced;
@@ -718,6 +720,11 @@ internal sealed class NativeRuntimeController : IDisposable
     {
         if (sender is not DllIpcSession session || !ReferenceEquals(session, _ipc) || !session.IsReady) return;
         Update(state => NativeCharacterIncarnationBinding.Apply(state,value,session.ConnectionIdentity));
+    }
+    private void OnPlayerHidingStateChanged(object? sender, NativePlayerHidingStatePayload value)
+    {
+        if (sender is not DllIpcSession session || !ReferenceEquals(session, _ipc) || !session.IsReady) return;
+        Update(state => state with { LocalHiding = value, LocalHidingReceivedAt = DateTimeOffset.UtcNow });
     }
     private void OnPlayerLifecycleStateChanged(
         object? sender,

@@ -3102,7 +3102,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             if (_pendingLocalPostureEdges.TryDequeue(out var edge))
             {
                 if (_pendingLocalPosition?.Sequence == edge.Sequence) _pendingLocalPosition = null;
-                return edge;
+                return edge with { Hiding = PlayerPostureDispatchQueue.Advance(edge.Hiding,
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - edge.SentAtUnixMilliseconds) };
             }
             var value = _pendingLocalPosition;
             _pendingLocalPosition = null;
@@ -3117,7 +3118,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         var torch = value.Torch ?? _lastQueuedTorch;
         var hiding = value.Hiding ?? _lastQueuedHiding;
         var changed = posture != _lastQueuedPosture || torch?.Enabled != _lastQueuedTorch?.Enabled
-            || hiding != _lastQueuedHiding;
+            || !PlayerHidingPresentationCodec.SameTransition(hiding, _lastQueuedHiding);
         _lastQueuedPosture = posture;
         _lastQueuedTorch = torch;
         _lastQueuedHiding = hiding;

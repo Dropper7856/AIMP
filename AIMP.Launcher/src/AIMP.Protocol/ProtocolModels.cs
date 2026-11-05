@@ -228,7 +228,25 @@ public sealed record PlayerTorchSnapshot(
 // peers use it to hide the representation and mark that spot occupied.
 public sealed record PlayerHidingSnapshot(
     [property: JsonRequired] bool Hidden,
-    float? AnchorX = null, float? AnchorY = null, float? AnchorZ = null);
+    float? AnchorX = null, float? AnchorY = null, float? AnchorZ = null,
+    PlayerHidingPresentationSnapshot? Presentation = null);
+
+public enum PlayerHidingPhase { Entering = 1, Hidden = 2, Exiting = 3 }
+public enum PlayerHidingKind { Tall = 1, Low = 2 }
+
+// The key names the selected instance, never a process address. Elapsed time
+// permits late snapshots to settle without replaying an old door/sound cue.
+public sealed record PlayerHidingPresentationSnapshot(
+    [property: JsonRequired] PlayerHidingPhase Phase,
+    [property: JsonRequired] PlayerHidingKind Kind,
+    [property: JsonRequired] uint EntityShortGuid,
+    [property: JsonRequired] uint HierarchyHash,
+    [property: JsonRequired] ulong Transition,
+    [property: JsonRequired] uint ElapsedMilliseconds,
+    [property: JsonRequired] float X,
+    [property: JsonRequired] float Y,
+    [property: JsonRequired] float Z,
+    [property: JsonRequired] float Yaw);
 
 public sealed record PlayerPositionSnapshotPayload(
     Guid SessionId,
@@ -255,6 +273,10 @@ public enum PlayerActionKind
     Primary = 1,
     Reload = 2
 }
+
+// Local IPC observation. Addresses and construction serials never leave the PC.
+public sealed record NativePlayerHidingStatePayload(
+    int SchemaVersion, ulong NativeGeneration, uint Character, ulong Serial, string Presentation);
 
 public sealed record NativePlayerEquipmentStatePayload(
     int SchemaVersion,

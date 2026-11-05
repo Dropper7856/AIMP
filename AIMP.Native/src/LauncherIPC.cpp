@@ -10,6 +10,9 @@
 #include "aimp/IpcWriteBatch.h"
 #include "aimp/WorldSemanticReconciliation.h"
 #include "aimp/CharacterIncarnation.h"
+#include "aimp/PlayerHidingLocalCapture.h"
+#include "aimp/PlayerHidingPresentationRuntime.h"
+#include "aimp/HidingDoorPresentation.h"
 
 #include "aimp/BuildProfile.h"
 #include "aimp/CapabilityMatrix.h"
@@ -781,6 +784,35 @@ void LauncherIPC::PublishCharacterIncarnationTraffic() {
     }
 }
 
+void LauncherIPC::PublishPlayerHidingTraffic() {
+    if (!sessionConfigured_.load(std::memory_order_acquire) || !netzReadySent_.load(std::memory_order_acquire)) {
+        publishedHiding_.clear(); lastHidingPublication_ = 0; return;
+    }
+    const auto now = GetTickCount64();
+    if (now - lastHidingPublication_ < 16U) return;
+    const auto capture = player_hiding_local::Read();
+    if (!capture.valid || now < capture.capturedAt || now - capture.capturedAt > 500U ||
+        !character_incarnations::NativeRegistry().Current(capture.ticket)) return;
+    const auto& state = capture.state;
+    std::ostringstream text;
+    text.imbue(std::locale::classic());
+    text << std::setprecision(std::numeric_limits<float>::max_digits10);
+    if (state.phase == 0) text << '0';
+    else text << state.phase << ',' << state.kind << ',' << state.entityShortGuid << ',' << state.hierarchyHash
+        << ',' << state.transition << ',' << state.elapsedMilliseconds << ',' << state.position[0]
+        << ',' << state.position[1] << ',' << state.position[2] << ',' << state.yaw << ",0";
+    std::ostringstream json;
+    json << "{\"schemaVersion\":1,\"nativeGeneration\":" << capture.ticket.generation
+        << ",\"character\":" << capture.ticket.character << ",\"serial\":" << capture.ticket.serial
+        << ",\"presentation\":\"" << text.str() << "\"}";
+    const auto payload = json.str();
+    if (payload == publishedHiding_ && now - lastHidingPublication_ < 250U) return;
+    if (Queue(protocol::MessageType::PlayerHidingState, 0,
+            localSequence_.fetch_add(1U, std::memory_order_relaxed), JsonBytes(payload))) {
+        publishedHiding_ = payload; lastHidingPublication_ = now;
+    }
+}
+
 void LauncherIPC::PublishMissionSyncTraffic() {
     mission_sync::Signal signal{};
     for (std::size_t i = 0U; i < 16U && mission_sync::TryPeek(signal); ++i) {
@@ -1332,6 +1364,7 @@ void LauncherIPC::Run() {
             PublishPlayerSyncTraffic();
             PublishPlayerLifecycleTraffic();
             PublishCharacterIncarnationTraffic();
+            PublishPlayerHidingTraffic();
             PublishItemSyncTraffic();
             PublishMissionSyncTraffic();
             PublishItemSyncSpawnTraffic();
@@ -3357,6 +3390,26 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
             : dispatcher_->Snapshot();
         const auto locomotion = character_direct_step_runtime::Snapshot();
         const auto hidingHistory = player_hiding::History();
+        const auto hidingPresentation = player_hiding_presentation::Snapshot(locomotion.characterAddress);
+        const auto hidingDoor = hiding_door_presentation::Diagnostics();
+        diagnostics_->Log("info", "native_hiding_presentation_snapshot", "Remote hiding presentation state.",
+            {{"phase", Diagnostics::Unsigned(hidingPresentation.phase), true},
+             {"transition", Diagnostics::Unsigned(hidingPresentation.transition), true},
+             {"stage", hidingPresentation.stage, false},
+             {"applied", Diagnostics::Unsigned(hidingPresentation.applied), true},
+             {"failed", Diagnostics::Unsigned(hidingPresentation.failed), true},
+             {"stale", Diagnostics::Unsigned(hidingPresentation.stale), true},
+             {"completed", Diagnostics::Unsigned(hidingPresentation.completed), true},
+             {"active", Diagnostics::Boolean(hidingPresentation.active), true},
+             {"resource", Diagnostics::Unsigned(hidingPresentation.resourceToken), true},
+             {"clip", Diagnostics::Unsigned(hidingPresentation.animationToken), true},
+             {"doorCaptured", Diagnostics::Unsigned(hidingDoor.captured), true},
+             {"doorQueued", Diagnostics::Unsigned(hidingDoor.queued), true},
+             {"doorUnresolved", Diagnostics::Unsigned(hidingDoor.unresolved), true},
+             {"doorRejected", Diagnostics::Unsigned(hidingDoor.rejected), true},
+             {"doorFaults", Diagnostics::Unsigned(hidingDoor.nativeFaults), true},
+             {"doorTarget", Diagnostics::Unsigned(hidingDoor.lastTargetShortGuid), true},
+             {"doorHierarchy", Diagnostics::Unsigned(hidingDoor.lastHierarchyHash), true}});
         player_animation_clip_capture::Export(*diagnostics_);
         diagnostics_->Log(
             "info",

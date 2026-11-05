@@ -131,6 +131,7 @@ private:
     void PublishPlayerSyncTraffic();
     void PublishPlayerLifecycleTraffic();
     void PublishCharacterIncarnationTraffic();
+    void PublishPlayerHidingTraffic();
     void PublishItemSyncTraffic();
     void PublishMissionSyncTraffic();
     void PublishItemSyncSpawnTraffic();
@@ -180,6 +181,8 @@ private:
     std::uint64_t publishedLevelExitSequence_{}; // IPC-worker only.
     std::array<std::uint8_t,40> publishedCharacterIncarnation_{}; // IPC-worker only.
     bool characterIncarnationPublished_{};
+    std::string publishedHiding_; // IPC worker only.
+    std::uint64_t lastHidingPublication_{};
     bool buildValidated_{};
     std::string profileId_;
     std::string resolutionMode_;

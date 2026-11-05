@@ -1117,7 +1117,7 @@ public static class ModelValidation
                 "directionSpace", "replicationPositionX", "replicationPositionY",
                 "replicationPositionZ",
                 "replicationYaw",
-                "moveType", "playerPosture", "playerTorch", "playerTorchDirection", "playerHiding"
+                "moveType", "playerPosture", "playerTorch", "playerTorchDirection", "playerHiding", "playerHidingPresentation"
             };
             var hasDirectionSpace = value.Arguments.TryGetValue(
                 "directionSpace", out var directionSpaceText);
@@ -1137,7 +1137,8 @@ public static class ModelValidation
             var hasTorch = value.Arguments.TryGetValue("playerTorch", out var torchText);
             var hasTorchDirection = value.Arguments.TryGetValue("playerTorchDirection", out var torchDirection);
             var hasHiding = value.Arguments.TryGetValue("playerHiding", out var hidingText);
-            var validCount = value.Arguments.Count is >= 5 and <= 15;
+            var hasHidingPresentation = value.Arguments.TryGetValue("playerHidingPresentation", out var presentationText);
+            var validCount = value.Arguments.Count is >= 5 and <= 16;
             if (!validCount
                 || value.Arguments.Keys.Any(key => !allowed.Contains(key))
                 || required.Any(key => !value.Arguments.ContainsKey(key))
@@ -1196,6 +1197,8 @@ public static class ModelValidation
                     || !PlayerTorchCodec.TryDecodeDirection(torchDirection, out _)))
                 || (hasHiding && (!hasReplicationPosition
                     || !PlayerHidingCodec.TryDecode(hidingText, out _)))
+                || (hasHidingPresentation && (!hasHiding || (presentationText != "0"
+                    && !PlayerHidingPresentationCodec.TryDecode(presentationText, out _, out _))))
                 || (hasReplicationYaw
                     && (!string.Equals(directionSpaceText, "world", StringComparison.Ordinal)
                         || !float.TryParse(replicationYawText, NumberStyles.Float,

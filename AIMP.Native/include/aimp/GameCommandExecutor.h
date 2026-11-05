@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include "aimp/PlayerPostureRuntime.h"
+#include "aimp/PlayerHidingPresentation.h"
 
 namespace aimp {
 
@@ -57,6 +58,8 @@ struct CharacterDirectMoveCommand {
     bool hasPlayerHiding{};
     bool playerHidden{};
     std::array<float, 3> playerHidingAnchor{};
+    bool hasPlayerHidingPresentation{};
+    player_hiding_presentation::State playerHidingPresentation{};
 };
 
 struct CharacterDirectStepCommand {

@@ -48,6 +48,7 @@ public enum MessageType : ushort
     AISyncHostRoute = 42, // Host DLL -> Launcher solved native route.
     AISyncClientRoute = 43, // Launcher -> Client DLL authenticated native route.
     CharacterIncarnationState = 44, // DLL -> Launcher local lifetime, never a peer authority grant.
+    PlayerHidingState = 47, // DLL -> Launcher coherent local presentation observation.
     AISyncHostState = 45,
     AISyncClientState = 46,
 

@@ -15,13 +15,15 @@ namespace AIMP.Launcher;
 ///     walks (FEMALEFP), which E_RIPLEY may retarget through the existing
 ///     FEMALEFP-&gt;FEMALENPC mapping once FEMALEFP is one of its low-res sources
 ///     and the player's clip group is one of its dependencies.
-/// Upper-body weapon layers still come from the weapon contexts.
+/// Hiding entry/idle/exit aliases also use the player's FEMALEFP clips in the
+/// base table for isolated remote animation commands. Upper-body weapon layers
+/// still come from the weapon contexts.
 /// ANIMATION.PAK is global: the retail file is backed up once and every
 /// installation rebuilds the patched file from that backup.
 /// </summary>
 internal static class RemoteCrouchAnimationInstaller
 {
-    private const int PatchVersion = 5;
+    private const int PatchVersion = 6;
     private const string ClipDbEntry = @"DATA\ANIM_SYS\569978346_ANIM_CLIP_DB.BIN"; // E_RIPLEY
     private const string PlayerClipDbEntry = @"DATA\ANIM_SYS\2554777613_ANIM_CLIP_DB.BIN"; // 1ST_PERSON_RIPLEY
     private const string GlobalClipDbEntry = @"DATA\ANIM_SYS\ANIM_CLIP_DB.BIN";
@@ -34,6 +36,15 @@ internal static class RemoteCrouchAnimationInstaller
     private const string CrouchForward = "fp_walk_f_crouch"; // FEMALEFP\...\WALK_F_CROUCH (1ST_PERSON_RIPLEY)
     private const string CrouchBackward = "fp_walk_b_crouch";
     private const string CrouchLeft = "fp_walk_l_crouch";
+
+    private static readonly string[] HidingClips =
+    [
+        "player_hiding_high_enter", "player_hiding_high_idle", "player_hiding_high_exit",
+        "player_hiding_low_enter", "player_hiding_low_idle", "player_hiding_low_exit",
+    ];
+
+    private static IEnumerable<string> PlayerSources => Replacements.Where(r => r.PlayerClip)
+        .Select(r => r.Source).Concat(HidingClips).Distinct();
 
     private static readonly string[] Idles =
     [
@@ -173,14 +184,22 @@ internal static class RemoteCrouchAnimationInstaller
             if (!db.Animations.Contains(key)) throw new InvalidDataException($"E_RIPLEY has no '{name}' clip.");
             context.Animations.Set(key, crouchAim);
         }
-        // The player's crouched walks live in its own clip group.
+        foreach (var name in HidingClips)
+            db.Animations.Set(AnimClipDatabase.HashName(name), PlayerClip(player, name));
+
+        // Resident sources need character dependencies. Streamed hiding clips
+        // keep their native on-demand path; adding those hashes as resident
+        // dependencies would make the engine request nonexistent files.
         var globalEntry = Entry(pak, GlobalClipDbEntry);
         var global = GlobalClipDatabase.Parse(globalEntry.Content);
         if (!global.Serialize().AsSpan().SequenceEqual(globalEntry.Content))
             throw new InvalidDataException("The global animation database is not in the supported format.");
-        var playerWalk = player.Animations.Get(AnimClipDatabase.HashName(CrouchForward))!.Value;
-        var group = global.SectionGroup(playerWalk.Path) ?? throw new InvalidDataException("The player crouch walk has no clip section.");
-        global.AddDependency(AnimClipDatabase.HashName(Character), group);
+        foreach (var source in PlayerSources)
+        {
+            var clip = PlayerClip(player, source);
+            if (PlayerResidentSection(pak, global, clip, source) is uint group)
+                global.AddDependency(AnimClipDatabase.HashName(Character), group);
+        }
         global.AddDependency(AnimClipDatabase.HashName(Character), global.SectionGroup(crouchAim.Path)
             ?? throw new InvalidDataException("The crouched two-handed aim has no clip section."));
         var timing = new Dictionary<uint, RetailAnimationClipTiming>();
@@ -206,13 +225,15 @@ internal static class RemoteCrouchAnimationInstaller
                 Right.Select(AnimClipDatabase.HashName).ToHashSet());
             context.BlendSets.Set(AnimClipDatabase.HashName(alias), target);
         }
-        clipEntry.Content = db.Serialize();
-        globalEntry.Content = global.Serialize();
-
         // E_RIPLEY samples on its FEMALENPC low-res skeleton, which already has
         // a FEMALEFP mapping: allow FEMALEFP clips as a low-res source.
         var defEntry = Entry(pak, SkeletonDefEntry);
-        defEntry.Content = AddLowResSource(defEntry.Content, AnimClipDatabase.HashName(PlayerSkeleton));
+        var skeleton = AddLowResSource(defEntry.Content, AnimClipDatabase.HashName(PlayerSkeleton));
+        var clips = db.Serialize();
+        var dependencies = global.Serialize();
+        clipEntry.Content = clips;
+        globalEntry.Content = dependencies;
+        defEntry.Content = skeleton;
     }
 
     private static readonly (string Alias, string Source)[] LocomotionBlends =
@@ -224,6 +245,29 @@ internal static class RemoteCrouchAnimationInstaller
     private static AnimClipDatabase.Clip CrouchAim(AnimClipDatabase db) =>
         db.Context("WEAPON_SHOTGUN")?.Animations.Get(AnimClipDatabase.HashName("cover_low_aim"))
         ?? throw new InvalidDataException("E_RIPLEY has no full-body crouched two-handed aim pose.");
+
+    private static AnimClipDatabase.Clip PlayerClip(AnimClipDatabase player, string name)
+    {
+        var clip = player.Animations.Get(AnimClipDatabase.HashName(name))
+            ?? throw new InvalidDataException($"The player source clip '{name}' is missing.");
+        if (clip.MetadataInstance != 0)
+            throw new InvalidDataException($"Unsupported player clip metadata instance for '{name}'.");
+        return clip;
+    }
+
+    private static uint? PlayerResidentSection(PAK2 pak, GlobalClipDatabase global, AnimClipDatabase.Clip clip, string name)
+    {
+        var group = global.SectionGroup(clip.Path)
+            ?? throw new InvalidDataException($"The player clip '{name}' has no clip section.");
+        // Retail uses index -1 for streamed clips. Character dependency
+        // loading (00a389b0) always selects the RESIDENT directory.
+        var streamed = global.SectionClipIndex(clip.Path) == uint.MaxValue;
+        if (streamed && group != clip.Path)
+            throw new InvalidDataException($"Unsupported streamed section for player clip '{name}'.");
+        var directory = streamed ? "STREAMED" : "RESIDENT";
+        _ = Entry(pak, $@"DATA\ANIM_SYS\{directory}\ANIM_CLIP_DB_SEC_{group}.BIN");
+        return streamed ? null : group;
+    }
 
     private static AnimClipDatabase ParseExact(byte[] raw, string what)
     {
@@ -262,6 +306,9 @@ internal static class RemoteCrouchAnimationInstaller
         foreach (var name in AimedIdles)
             if (context.Animations.Get(AnimClipDatabase.HashName(name)) != CrouchAim(db))
                 throw new InvalidDataException($"Patched crouched aim lacks '{name}'.");
+        foreach (var name in HidingClips)
+            if (db.Animations.Get(AnimClipDatabase.HashName(name)) != PlayerClip(player, name))
+                throw new InvalidDataException($"Patched E_RIPLEY lacks hiding clip '{name}'.");
         var global = GlobalClipDatabase.Parse(Entry(pak, GlobalClipDbEntry).Content);
         foreach (var (alias, _) in LocomotionBlends)
         {
@@ -273,9 +320,13 @@ internal static class RemoteCrouchAnimationInstaller
                 BitConverter.ToUInt32(blend, 16) != AnimClipDatabase.HashName(CrouchedContext))
                 throw new InvalidDataException("Crouched locomotion blend uses the wrong clip database or context.");
         }
-        var walk = player.Animations.Get(AnimClipDatabase.HashName(CrouchForward))!.Value;
-        if (!global.Dependencies(AnimClipDatabase.HashName(Character)).Contains(global.SectionGroup(walk.Path)!.Value))
-            throw new InvalidDataException("Patched E_RIPLEY does not load the player crouch clips.");
+        foreach (var source in PlayerSources)
+        {
+            var clip = PlayerClip(player, source);
+            if (PlayerResidentSection(pak, global, clip, source) is uint group &&
+                !global.Dependencies(AnimClipDatabase.HashName(Character)).Contains(group))
+                throw new InvalidDataException($"Patched E_RIPLEY does not load player clip '{source}'.");
+        }
         var def = Entry(pak, SkeletonDefEntry).Content;
         if (!Enumerable.Range(0, BitConverter.ToInt32(def, LowResCountOffset))
                 .Any(i => BitConverter.ToUInt32(def, LowResSourcesOffset + i * 4) == AnimClipDatabase.HashName(PlayerSkeleton)))

@@ -2,6 +2,8 @@
 #include "aimp/ReplicationCore.h"
 #include "aimp/PlayerTorchRuntime.h"
 #include "aimp/PlayerHidingRuntime.h"
+#include "aimp/PlayerHidingPresentationRuntime.h"
+#include "aimp/HidingDoorPresentation.h"
 #include "aimp/MissionSync.h"
 
 #include "aimp/BuildProfile.h"
@@ -3676,6 +3678,8 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteCharacterDirectMove(
         (command.hasPlayerHiding && (!command.hasReplicationPosition ||
          !command.hasReplicationYaw || !command.hasMoveType || !command.worldSpace ||
          (command.playerHidden && !player_hiding::ValidAnchor(command.playerHidingAnchor)))) ||
+        (command.hasPlayerHidingPresentation && (!command.hasPlayerHiding ||
+         !player_hiding_presentation::Valid(command.playerHidingPresentation))) ||
         (command.hasPlayerPosture && (!command.hasReplicationPosition ||
          !command.hasReplicationYaw || !command.hasMoveType ||
          !player_posture::Valid(command.playerPosture))) ||
@@ -3720,9 +3724,19 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteCharacterDirectMove(
         if (command.hasPlayerHiding) {
             std::string hidingError;
             if (!player_hiding::Publish(command.characterAddress, command.playerHidden,
-                    command.playerHidingAnchor, hidingError)) {
+                    command.playerHidingAnchor, hidingError,
+                    command.hasPlayerHidingPresentation ? &command.playerHidingPresentation : nullptr)) {
                 result.statusCode = "PLAYER_HIDING_PUBLICATION_FAILED";
                 result.message = hidingError;
+                return false;
+            }
+        }
+        if (command.hasPlayerHidingPresentation) {
+            std::string error;
+            if (!player_hiding_presentation::Publish(command.characterAddress, command.playerHidingPresentation, error) ||
+                !hiding_door_presentation::Publish(command.characterAddress, command.playerHidingPresentation, error)) {
+                result.statusCode = "PLAYER_HIDING_PRESENTATION_FAILED";
+                result.message = error;
                 return false;
             }
         }

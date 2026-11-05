@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include "aimp/PlayerHidingPresentation.h"
 
 namespace aimp::player_hiding {
 // Launcher form: "0" visible, "1,x,y,z" hidden at that hiding-spot anchor.
@@ -12,7 +13,7 @@ bool ValidAnchor(const std::array<float, 3>& anchor) noexcept;
 void Initialize(std::uintptr_t moduleBase) noexcept;
 // IPC only publishes state. Native objects are accessed by the engine pump.
 bool Publish(std::uintptr_t character, bool hidden, const std::array<float, 3>& anchor,
-    std::string& error) noexcept;
+    std::string& error, const player_hiding_presentation::State* presentation = nullptr) noexcept;
 // True while the owner is hidden: the locomotion driver must not walk,
 // teleport or turn the representation.
 bool Hidden(std::uintptr_t character) noexcept;

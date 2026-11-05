@@ -66,6 +66,7 @@ internal sealed class DllIpcSession : IAsyncDisposable
 
     internal event EventHandler<NativePlayerLifecycleStatePayload>? PlayerLifecycleStateChanged;
     internal event EventHandler<NativeCharacterIncarnationState>? CharacterIncarnationChanged;
+    internal event EventHandler<NativePlayerHidingStatePayload>? PlayerHidingStateChanged;
 
     internal event EventHandler<NativeMissionSignalPayload>? MissionSignalProduced;
 
@@ -470,6 +471,15 @@ internal sealed class DllIpcSession : IAsyncDisposable
             case MessageType.PlayerLifecycleState: HandlePlayerLifecycleState(frame); return true;
             case MessageType.CharacterIncarnationState:
                 HandleCharacterIncarnation(frame);
+                return true;
+            case MessageType.PlayerHidingState:
+                if (!IsReady) throw new ProtocolException("Hiding observation arrived before the DLL handshake.");
+                var hiding = JsonPayload.Deserialize<NativePlayerHidingStatePayload>(frame.Payload.Span);
+                if (hiding.SchemaVersion != 1 || hiding.NativeGeneration == 0 || hiding.Character < 0x10000
+                    || hiding.Serial == 0 || (hiding.Presentation != "0"
+                        && !PlayerHidingPresentationCodec.TryDecode(hiding.Presentation, out _, out _)))
+                    throw new ProtocolException("Invalid native hiding observation.");
+                PlayerHidingStateChanged?.Invoke(this, hiding);
                 return true;
             case MessageType.MissionSignalProduced: HandleMissionSignal(frame); return true;
             case MessageType.ItemSyncPickup: HandleItemSyncPickup(frame); return true;

@@ -16,7 +16,8 @@ internal static class NativeCharacterIncarnationBinding
     internal static NativeRuntimeSnapshot Clear(NativeRuntimeSnapshot state) => state with
     {
         LocalCharacterGeneration = 0, LocalCharacterSerial = 0, LocalCharacterBase = 0,
-        LocalCharacterRuntimeId = 0, LocalCharacterOrigin = 0, LocalCharacterConnectionIdentity = Guid.Empty
+        LocalCharacterRuntimeId = 0, LocalCharacterOrigin = 0, LocalCharacterConnectionIdentity = Guid.Empty,
+        LocalHiding = null, LocalHidingReceivedAt = null
     };
 
     // The ticket can precede LevelState on IPC. Preserve a matching new-world

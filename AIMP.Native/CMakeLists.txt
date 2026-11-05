@@ -83,6 +83,9 @@ set(AIMP_CORE_SOURCES
     src/PlayerAnimationClipCapture.cpp
     src/PlayerTorchRuntime.cpp
     src/PlayerHidingRuntime.cpp
+    src/PlayerHidingPresentationRuntime.cpp
+    src/PlayerHidingLocalCapture.cpp
+    src/HidingDoorPresentation.cpp
     src/MissionSync.cpp
     src/PlayerLifecycle.cpp
     src/LoadingContextGuard.cpp
@@ -382,6 +385,18 @@ if(BUILD_TESTING)
     set_target_properties(AIMP.PlayerHidingRuntimeTests PROPERTIES
         VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
     add_test(NAME PlayerHidingRuntime COMMAND AIMP.PlayerHidingRuntimeTests)
+    add_executable(AIMP.PlayerHidingPresentationRuntimeTests tests/PlayerHidingPresentationRuntimeTests.cpp)
+    target_link_libraries(AIMP.PlayerHidingPresentationRuntimeTests PRIVATE AIMP.Core)
+    target_compile_options(AIMP.PlayerHidingPresentationRuntimeTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.PlayerHidingPresentationRuntimeTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME PlayerHidingPresentationRuntime COMMAND AIMP.PlayerHidingPresentationRuntimeTests)
+    add_executable(AIMP.HidingDoorPresentationTests tests/HidingDoorPresentationTests.cpp)
+    target_link_libraries(AIMP.HidingDoorPresentationTests PRIVATE AIMP.Core)
+    target_compile_options(AIMP.HidingDoorPresentationTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.HidingDoorPresentationTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME HidingDoorPresentation COMMAND AIMP.HidingDoorPresentationTests)
     add_executable(AIMP.VoiceNativeAudioTests tests/VoiceNativeAudioTests.cpp)
     target_include_directories(AIMP.VoiceNativeAudioTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     target_compile_options(AIMP.VoiceNativeAudioTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)

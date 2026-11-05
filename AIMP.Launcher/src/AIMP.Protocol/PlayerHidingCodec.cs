@@ -9,6 +9,7 @@ public static class PlayerHidingCodec
 
     public static bool IsValid(PlayerHidingSnapshot value)
     {
+        if (value.Presentation is { } presentation && !PlayerHidingPresentationCodec.IsValid(presentation)) return false;
         if (!value.Hidden) return value.AnchorX is null && value.AnchorY is null && value.AnchorZ is null;
         return value.AnchorX is { } x && value.AnchorY is { } y && value.AnchorZ is { } z
             && ValidCoordinate(x) && ValidCoordinate(y) && ValidCoordinate(z);

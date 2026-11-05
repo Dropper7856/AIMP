@@ -5,6 +5,9 @@
 #include "aimp/PlayerPostureRuntime.h"
 #include "aimp/PlayerTorchRuntime.h"
 #include "aimp/PlayerHidingRuntime.h"
+#include "aimp/PlayerHidingPresentationRuntime.h"
+#include "aimp/PlayerHidingLocalCapture.h"
+#include "aimp/HidingDoorPresentation.h"
 
 #include "aimp/CrashGuard.h"
 #include "aimp/HookManager.h"
@@ -2582,6 +2585,16 @@ void PumpSlotOnEngineThread(
         return;
     }
 
+    if (player_hiding_presentation::Active(characterAddress)) {
+        slot.initialPlacementPending.store(true, std::memory_order_release);
+        slot.nativeStateActive.store(false, std::memory_order_release);
+        slot.moveActive.store(false, std::memory_order_release);
+        slot.driveRequested.store(false, std::memory_order_release);
+        slot.certifiedCycleAddress.store(0U, std::memory_order_release);
+        slot.preparedTargetRevision.store(0U, std::memory_order_release);
+        return;
+    }
+
     if (phase == EnginePumpPhase::PreCharacterManager &&
         !player_hiding::Hidden(characterAddress) &&
         player_posture::PumpOnEngineThread(characterAddress)) {
@@ -3223,6 +3236,7 @@ bool Install(
     player_posture::Initialize(moduleBase, &RefreshPostureAnimations);
     player_torch::Initialize(moduleBase);
     player_hiding::Initialize(moduleBase);
+    player_hiding_presentation::Initialize(moduleBase, reinterpret_cast<std::uintptr_t>(gEnterIdleCycle));
     gInstalled.store(true, std::memory_order_release);
     return true;
 #endif
@@ -3250,7 +3264,15 @@ void PumpOnEngineThread(const EnginePumpPhase phase) noexcept {
     }
     if (!GameplayLoaded()) {
         ForgetAll();
+        // Empty value slots cannot access actors; release any pinned streamed
+        // clip requests on this engine thread while their DB is still owned.
+        player_hiding_presentation::PumpAllOnEngineThread();
         return;
+    }
+    if (phase == EnginePumpPhase::PreCharacterManager) {
+        player_hiding_local::PumpOnEngineThread();
+        hiding_door_presentation::PumpAllOnEngineThread();
+        player_hiding_presentation::PumpAllOnEngineThread();
     }
     for (auto& slot : gSlots) {
         PumpSlotOnEngineThread(slot, phase);
@@ -3631,6 +3653,8 @@ void Stop() noexcept {
         if (character == 0U || character == kReservedSlot) continue;
         std::string ignored;
         static_cast<void>(player_hiding::Publish(character, false, {}, ignored));
+        static_cast<void>(player_hiding_presentation::Publish(character, {}, ignored));
+        hiding_door_presentation::Forget(character);
         slot.remainingFrames.store(0U, std::memory_order_release);
         slot.stopPending.store(true, std::memory_order_release);
     }
@@ -3640,6 +3664,8 @@ void ForgetCharacter(const std::uintptr_t characterAddress) noexcept {
     player_posture::Forget(characterAddress);
     player_torch::Forget(characterAddress);
     player_hiding::Forget(characterAddress);
+    player_hiding_presentation::Forget(characterAddress);
+    hiding_door_presentation::Forget(characterAddress);
     if (auto* slot = FindSlot(characterAddress); slot != nullptr) ReleaseSlot(*slot);
 }
 
@@ -3647,6 +3673,9 @@ void ForgetAll() noexcept {
     player_posture::ForgetAll();
     player_torch::ForgetAll();
     player_hiding::ForgetAll();
+    player_hiding_presentation::ForgetAll();
+    player_hiding_local::ForgetAll();
+    hiding_door_presentation::ForgetAll();
     for (auto& slot : gSlots) {
         const auto character =
             slot.characterAddress.load(std::memory_order_acquire);
@@ -3663,6 +3692,8 @@ bool Stop(const std::uintptr_t characterAddress) noexcept {
     // Explicit teardown also releases a locker if locomotion already retired.
     std::string ignored;
     static_cast<void>(player_hiding::Publish(characterAddress, false, {}, ignored));
+    static_cast<void>(player_hiding_presentation::Publish(characterAddress, {}, ignored));
+    hiding_door_presentation::Forget(characterAddress);
     auto* slot = FindSlot(characterAddress);
     if (slot == nullptr) return true;
     slot->remainingFrames.store(0U, std::memory_order_release);

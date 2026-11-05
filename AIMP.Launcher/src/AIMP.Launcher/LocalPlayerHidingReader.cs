@@ -46,4 +46,19 @@ internal sealed class LocalPlayerHidingReader
     }
 
     internal void Reset() { _latched = null; _character = 0; _generation = 0; }
+
+    internal static PlayerHidingSnapshot? WithPresentation(PlayerHidingSnapshot? hiding,
+        NativeRuntimeSnapshot runtime, nint character, DateTimeOffset now)
+    {
+        var native = runtime.LocalHiding;
+        if (hiding is null || native is null || !runtime.IpcConnected
+            || native.NativeGeneration != (ulong)runtime.LevelGeneration
+            || native.NativeGeneration != runtime.LocalCharacterGeneration
+            || native.Serial != runtime.LocalCharacterSerial || native.Character != (uint)character
+            || native.Character != runtime.LocalCharacterBase || runtime.LocalHidingReceivedAt is not { } received
+            || now - received > TimeSpan.FromSeconds(1) || now < received
+            || !PlayerHidingPresentationCodec.TryDecode(native.Presentation, out var presentation, out _)) return hiding;
+        return PlayerPostureDispatchQueue.Advance(hiding with { Presentation = presentation },
+            (long)(now - received).TotalMilliseconds);
+    }
 }

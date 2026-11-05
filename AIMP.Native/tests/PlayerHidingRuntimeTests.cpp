@@ -50,6 +50,12 @@ int main() {
         "Native IPC admits the visible edge");
     Check(!decodeCommand(commandPrefix + "true}}"), "Native IPC refuses a non-string hiding field");
     Check(!decodeCommand(commandPrefix + "\"1,NaN,0,0\"}}"), "Native IPC refuses a malformed anchor");
+    const auto presentationText = std::string("1,1,") + std::to_string(0x5DC33E3EU) + ",456,1,20,10,20,30,0.5,1";
+    Check(decodeCommand(commandPrefix + "\"0\",\"playerHidingPresentation\":\"" + presentationText + "\"}}") &&
+        request.characterDirectMove.hasPlayerHidingPresentation && request.characterDirectMove.playerHidingPresentation.animate,
+        "Native IPC admits an early entry while the hidden flag is still false");
+    Check(!decodeCommand(commandPrefix + "\"0\",\"playerHidingPresentation\":\"1,1,123,456,1,20,10,20,30,0.5,1\"}}"),
+        "Native IPC rejects an unrelated entity as a hiding presentation");
     auto incomplete = commandPrefix + "\"0\"}}";
     const auto yawField = incomplete.find("\"replicationYaw\":\"0\",");
     incomplete.erase(yawField, std::strlen("\"replicationYaw\":\"0\","));
@@ -127,6 +133,22 @@ int main() {
     PumpAllOnEngineThread();
     Check(local[0x2D9] == 0 && manager[Flags(0)] == 0x87, "Local player guard also protects the interaction table");
     Forget(localAddress);
+    Icon(3, "AI_UI_INTERACT_HIDING", 100, 0x5DC33E3EU);
+    aimp::player_hiding_presentation::State presentation{1, 1, 0x5DC33E3EU, 1, 1, 0, anchor, 0.5F, true};
+    Check(Publish(character, false, {}, error, &presentation), "Early entry locks before concealment");
+    PumpAllOnEngineThread();
+    Check(actor[0x2D9] == 0 && manager[Flags(0)] == 0x87 && manager[Flags(3)] == 4,
+        "Exact key selects the intended instance instead of a nearer hiding spot");
+    presentation.phase = 2; presentation.transition = 2;
+    Check(Publish(character, true, anchor, error, &presentation), "Settled hidden phase");
+    PumpAllOnEngineThread();
+    presentation.phase = 3; presentation.transition = 3;
+    Check(Publish(character, true, anchor, error, &presentation), "Exit animation overrides delayed hidden flag");
+    PumpAllOnEngineThread();
+    Check(actor[0x2D9] == 0 && manager[Flags(3)] == 4, "Exit reveals the actor while retaining occupation");
+    Check(Publish(character, false, {}, error), "Completed exit releases the exact spot");
+    PumpAllOnEngineThread();
+    Check(manager[Flags(3)] == 7 && !Hidden(character), "Completion releases transition occupation");
     Check(Publish(character, true, anchor, error), "Re-enter before icon reuse");
     PumpAllOnEngineThread();
     Icon(0, "AI_UI_INTERACT_PICKUP", 10, 999);

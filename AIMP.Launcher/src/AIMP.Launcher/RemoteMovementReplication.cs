@@ -34,7 +34,8 @@ internal sealed record RemotePositionTrackSnapshot(
     PlayerTorchSnapshot? Torch = null,
     bool TorchPending = false,
     PlayerHidingSnapshot? Hiding = null,
-    bool HidingPending = false);
+    bool HidingPending = false,
+    bool HidingCanAnimate = false);
 
 internal sealed class RemotePositionTrack
 {
@@ -72,6 +73,7 @@ internal sealed class RemotePositionTrack
     private PlayerMoveType _lastCommandMoveType = PlayerMoveType.Walk;
     private float _lastCommandMoveSpeed = RemoteMovementPlanner.LegacyWalkFallbackMagnitude;
     private DateTimeOffset _lastCommandAtUtc;
+    private bool _hasSentBoundSnapshot;
 
     internal bool CommandMoving { get; private set; }
 
@@ -86,6 +88,7 @@ internal sealed class RemotePositionTrack
             _lastReceivedPosture = null; _lastReceivedTorch = null; _lastReceivedHiding = null;
             _postures.Bind(value.Posture, value.Torch, value.Hiding);
             CommandMoving = false; _lastCommandAtUtc = default; _lastCommandYaw = float.NaN;
+            _hasSentBoundSnapshot = false;
         }
         if (value.Posture is not null) _lastReceivedPosture = value.Posture;
         if (value.Torch is not null) _lastReceivedTorch = value.Torch;
@@ -115,6 +118,7 @@ internal sealed class RemotePositionTrack
         CommandMoving = false;
         _lastCommandAtUtc = default;
         _lastCommandYaw = float.NaN;
+        _hasSentBoundSnapshot = false;
     }
 
     private RemotePositionTrackSnapshot CreateSnapshot(PlayerPositionSnapshotPayload latest) =>
@@ -125,11 +129,16 @@ internal sealed class RemotePositionTrack
             _lastCommandYaw, _lastCommandMoveType, _lastCommandMoveSpeed,
             _lastCommandAtUtc, _postures.Next, _postures.HasPending && _postures.Next is not null,
             _postures.NextTorch, _postures.HasPending && _postures.NextTorch is not null,
-            _postures.NextHiding, _postures.HasPending && _postures.NextHiding is not null);
+            _postures.NextHiding, _postures.HasPending && _postures.NextHiding is not null,
+            _hasSentBoundSnapshot);
 
     internal void MarkCommand(RemoteMovementPlan plan, DateTimeOffset appliedAtUtc)
     {
-        if (plan.Action != RemoteMovementAction.None) _postures.Complete(plan.Posture, plan.Torch, plan.Hiding);
+        if (plan.Action != RemoteMovementAction.None)
+        {
+            _postures.Complete(plan.Posture, plan.Torch, plan.Hiding);
+            _hasSentBoundSnapshot = true;
+        }
         if (plan.Action == RemoteMovementAction.Move)
         {
             MarkMoveCommand(plan, appliedAtUtc);
@@ -298,7 +307,8 @@ internal sealed record RemoteMovementPlan(
     float NativeMoveSpeed,
     PlayerPostureSnapshot? Posture = null,
     PlayerTorchSnapshot? Torch = null,
-    PlayerHidingSnapshot? Hiding = null);
+    PlayerHidingSnapshot? Hiding = null,
+    bool HidingCanAnimate = false);
 
 internal static class RemoteMovementPlanner
 {
@@ -327,7 +337,7 @@ internal static class RemoteMovementPlanner
         var age = now - track.ReceivedAtUtc;
         if (age > SnapshotTimeout) return StalePlan(track);
         // A hidden representation is backstage at the locker; never walk it.
-        if (track.Hiding?.Hidden == true) return IdlePlan(track, now);
+        if (track.Hiding is { Hidden: true } or { Presentation: not null }) return IdlePlan(track, now);
         if (track.Previous is null || !track.ObservedMoving) return IdlePlan(track, now);
         var velocityLength = Length(track.EstimatedVelocityX, track.EstimatedVelocityZ);
         if (velocityLength <= float.Epsilon) return IdlePlan(track, now);
@@ -349,7 +359,7 @@ internal static class RemoteMovementPlanner
         return new(action, directionX, directionZ, BaseWalkIntensity,
             track.Latest.X, track.Latest.Y, track.Latest.Z,
             track.Latest.Yaw, track.RemoteStepDistance,
-            track.Latest.MoveType, nativeMoveSpeed, track.Posture, track.Torch, track.Hiding);
+            track.Latest.MoveType, nativeMoveSpeed, track.Posture, track.Torch, track.Hiding, track.HidingCanAnimate);
     }
 
     private static bool ShouldDispatchMove(
@@ -381,7 +391,7 @@ internal static class RemoteMovementPlanner
             0F, 0F, BaseWalkIntensity,
             track.Latest.X, track.Latest.Y, track.Latest.Z,
             track.Latest.Yaw, track.RemoteStepDistance,
-            track.Latest.MoveType, track.Latest.NativeMoveSpeed, track.Posture, track.Torch, track.Hiding);
+            track.Latest.MoveType, track.Latest.NativeMoveSpeed, track.Posture, track.Torch, track.Hiding, track.HidingCanAnimate);
     }
 
     private static RemoteMovementPlan StalePlan(RemotePositionTrackSnapshot track) =>
@@ -389,7 +399,7 @@ internal static class RemoteMovementPlanner
             0F, 0F, BaseWalkIntensity,
             track.Latest.X, track.Latest.Y, track.Latest.Z,
             track.Latest.Yaw, track.RemoteStepDistance,
-            track.Latest.MoveType, track.Latest.NativeMoveSpeed, track.Posture, track.Torch, track.Hiding);
+            track.Latest.MoveType, track.Latest.NativeMoveSpeed, track.Posture, track.Torch, track.Hiding, false);
 
     private static bool ShouldDispatchOrientation(
         RemotePositionTrackSnapshot track,
@@ -443,20 +453,25 @@ internal static class RemoteMovementCommandFactory
         RemoteMovementPlan plan) =>
         AddPlayerState(plan.Action == RemoteMovementAction.Stop
             ? CreateStop(characterBase, plan)
-            : CreateMove(characterBase, plan), plan.Posture, plan.Torch, plan.Hiding);
+            : CreateMove(characterBase, plan), plan.Posture, plan.Torch, plan.Hiding, plan.HidingCanAnimate);
 
     private static IReadOnlyDictionary<string, string> AddPlayerState(
         IReadOnlyDictionary<string, string> arguments, PlayerPostureSnapshot? posture,
-        PlayerTorchSnapshot? torch, PlayerHidingSnapshot? hiding)
+        PlayerTorchSnapshot? torch, PlayerHidingSnapshot? hiding, bool animate)
     {
         if (posture is null && torch is null && hiding is null) return arguments;
         // The remote torch uses a separate render entity. Concealing the body
         // alone must not leave a floating beam while an off sample is delayed.
-        if (hiding?.Hidden == true) torch = new PlayerTorchSnapshot(false);
+        if (hiding is { Hidden: true } or { Presentation: not null }) torch = new PlayerTorchSnapshot(false);
         var result = new Dictionary<string, string>(arguments, StringComparer.Ordinal);
         if (posture is not null) result["playerPosture"] = PlayerPostureCodec.Encode(posture);
         if (torch is not null) result["playerTorch"] = torch.Enabled ? "1" : "0";
-        if (hiding is not null) result["playerHiding"] = PlayerHidingCodec.Encode(hiding);
+        if (hiding is not null)
+        {
+            result["playerHiding"] = PlayerHidingCodec.Encode(hiding);
+            result["playerHidingPresentation"] = hiding.Presentation is { } presentation
+                ? PlayerHidingPresentationCodec.Encode(presentation, animate) : "0";
+        }
         if (torch is { Enabled: true, AimX: not null, AimY: not null, AimZ: not null })
             result["playerTorchDirection"] = PlayerTorchCodec.EncodeDirection(torch);
         return result;

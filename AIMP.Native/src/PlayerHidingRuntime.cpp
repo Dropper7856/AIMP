@@ -57,6 +57,8 @@ struct Slot final {
     // This runtime hid the body. Never reveal a body hidden by retail itself
     // (death, despawn, cinematic): only undo our own concealment.
     bool concealedByUs{};
+    bool occupied{};
+    std::array<std::uint32_t, 2> selectedKey{};
     Spot spot{};
     DiagnosticsSnapshot diagnostics{};
 };
@@ -188,7 +190,7 @@ float SlotDistance(const std::uintptr_t slot, const std::array<float, 3>& anchor
 // Resolve by key first (the spot may have moved), else the nearest hiding
 // prompt to the anchor. Returns false when no candidate exists or on fault.
 bool ResolveSpot(const std::uintptr_t manager, const std::array<float, 3>* anchor, Spot& spot,
-    float& distance) noexcept {
+    float& distance, const std::uint32_t* exactKey = nullptr) noexcept {
     __try {
         if (spot.locked && spot.manager != manager) spot = {};
         if (spot.locked && LiveSlot(spot.slot, spot.key)) return true;
@@ -209,6 +211,14 @@ bool ResolveSpot(const std::uintptr_t manager, const std::array<float, 3>* ancho
             }
             if (anchor == nullptr ||
                 std::strncmp(reinterpret_cast<const char*>(slot), kHidingPrompt, 0x40U) != 0) continue;
+            if (exactKey != nullptr) {
+                if (std::memcmp(reinterpret_cast<const void*>(slot + kSlotKey), exactKey, 8) == 0) {
+                    best = slot;
+                    bestDistance = SlotDistance(slot, *anchor);
+                    break;
+                }
+                continue;
+            }
             const auto candidate = SlotDistance(slot, *anchor);
             if (candidate <= bestDistance) { best = slot; bestDistance = candidate; }
         }
@@ -273,7 +283,7 @@ bool ApplyVisibility(std::uintptr_t, bool, bool&, const char*& stage) noexcept {
 }
 bool ReadConcealed(std::uintptr_t, bool&) noexcept { return false; }
 std::uintptr_t Manager() noexcept { return 0U; }
-bool ResolveSpot(std::uintptr_t, const std::array<float, 3>*, Spot&, float&) noexcept { return false; }
+bool ResolveSpot(std::uintptr_t, const std::array<float, 3>*, Spot&, float&, const std::uint32_t* = nullptr) noexcept { return false; }
 bool HoldSpot(Spot&) noexcept { return false; }
 bool ReleaseSpot(std::uintptr_t, Spot& spot) noexcept {
     const auto locked = spot.locked;
@@ -285,7 +295,7 @@ bool ReleaseSpot(std::uintptr_t, Spot& spot) noexcept {
 void UpdateSpot(Slot& state, const std::uintptr_t manager, std::uint64_t& locked,
     std::uint64_t& released, std::uint64_t& missing) noexcept {
     auto& spot = state.spot;
-    if (!state.diagnostics.desired) {
+    if (!state.occupied) {
         if (ReleaseSpot(manager, spot)) ++released;
         return;
     }
@@ -293,7 +303,8 @@ void UpdateSpot(Slot& state, const std::uintptr_t manager, std::uint64_t& locked
     const auto wasLocked = spot.locked;
     if (!wasLocked && GetTickCount64() < state.spotRetryAt) return;
     float distance{-1.0F};
-    if (!ResolveSpot(manager, &state.diagnostics.anchor, spot, distance)) {
+    if (!ResolveSpot(manager, &state.diagnostics.anchor, spot, distance,
+            state.selectedKey[0] != 0 ? state.selectedKey.data() : nullptr)) {
         // The icon vanished (deactivated): search the anchor again later.
         spot = {};
         state.spotRetryAt = GetTickCount64() + kRetryMilliseconds;
@@ -369,7 +380,7 @@ void PumpOnEngineThread(const std::uintptr_t character, const std::uintptr_t man
     }
     // Fully visible and spot freed: the mailbox is no longer needed. A new
     // hidden edge allocates it again.
-    if (!slot->diagnostics.desired && !slot->concealedByUs && !slot->spot.locked) *slot = {};
+    if (!slot->occupied && !slot->diagnostics.desired && !slot->concealedByUs && !slot->spot.locked) *slot = {};
 }
 }
 
@@ -413,41 +424,54 @@ void Initialize(const std::uintptr_t moduleBase) noexcept {
 }
 
 bool Publish(const std::uintptr_t character, const bool hidden, const std::array<float, 3>& anchor,
-    std::string& error) noexcept {
+    std::string& error, const player_hiding_presentation::State* presentation) noexcept {
     if (character < 0x10000U) { error = "Invalid remote hiding Character."; return false; }
     if (hidden && !ValidAnchor(anchor)) { error = "Invalid remote hiding anchor."; return false; }
+    if (presentation != nullptr && !player_hiding_presentation::Valid(*presentation)) {
+        error = "Invalid remote hiding presentation."; return false;
+    }
+    const auto phase = presentation != nullptr ? presentation->phase : 0U;
+    const auto occupied = hidden || phase != 0U;
+    const auto concealed = phase == 3U ? false : (hidden || phase == 2U);
+    const std::array<std::uint32_t, 2> key = phase != 0U
+        ? std::array<std::uint32_t, 2>{presentation->entityShortGuid, presentation->hierarchyHash}
+        : std::array<std::uint32_t, 2>{};
     std::scoped_lock lock(gMutex);
     auto* slot = Find(character);
     if (slot == nullptr) {
         // A visible owner without prior state needs no mailbox.
-        if (!hidden) return true;
+        if (!occupied) return true;
         for (auto& candidate : gSlots) if (candidate.character == 0U) { slot = &candidate; break; }
         if (slot == nullptr) { error = "Remote hiding mailbox capacity reached."; return false; }
         slot->character = character;
         slot->epoch = ++gEpoch;
     }
-    if (slot->diagnostics.desired != hidden) {
+    if (slot->diagnostics.desired != concealed) {
         slot->retryAt = 0U;
-        if (hidden) {
+        if (concealed) {
             ++gHistory.hiddenEdges;
             gHistory.lastHiddenRequestedCharacter = character;
         } else ++gHistory.visibleEdges;
     }
     // A different spot while still hidden: free the previous one first.
-    if (hidden && slot->diagnostics.desired && slot->diagnostics.anchor != anchor) {
+    if (occupied && slot->occupied && (slot->selectedKey != key ||
+            (key[0] == 0U && hidden && slot->diagnostics.anchor != anchor))) {
         Orphan(slot->spot);
         slot->spot = {};
         slot->spotRetryAt = 0U;
     }
-    slot->diagnostics.desired = hidden;
+    slot->diagnostics.desired = concealed;
+    slot->occupied = occupied;
+    slot->selectedKey = key;
     if (hidden) slot->diagnostics.anchor = anchor;
+    else if (phase != 0U) slot->diagnostics.anchor = presentation->position;
     return true;
 }
 
 bool Hidden(const std::uintptr_t character) noexcept {
     std::scoped_lock lock(gMutex);
     const auto* slot = Find(character);
-    return slot != nullptr && slot->diagnostics.desired;
+    return slot != nullptr && slot->occupied;
 }
 
 void PumpAllOnEngineThread() noexcept {

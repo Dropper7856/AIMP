@@ -58,6 +58,7 @@ enum class MessageType : std::uint16_t {
     AISyncHostRoute = 42, // Host DLL -> Launcher solved route for an admitted command.
     AISyncClientRoute = 43, // Launcher -> Client DLL authenticated command route.
     CharacterIncarnationState = 44, // DLL -> Launcher local THE_PLAYER ticket only.
+    PlayerHidingState = 47, // DLL -> Launcher local presentation observation only.
     AISyncHostState = 45, // Event carrier in the authoritative execution outbox.
     AISyncClientState = 46, // Admitted through the execution mailbox.
     MissionSignalProduced = 134,

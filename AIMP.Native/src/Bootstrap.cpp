@@ -51,6 +51,7 @@
 #include "aimp/SpawnCharacterTracker.h"
 #include "aimp/ReplicationCore.h"
 #include "aimp/WorldEntityRegistry.h"
+#include "aimp/HidingDoorPresentation.h"
 #include "aimp/WorldInteractionAdapters.h"
 #include "aimp/WorldAnimatedAdapters.h"
 #include "aimp/WorldPublicActions.h"
@@ -812,6 +813,9 @@ DWORD Bootstrap::RunImpl() {
         }
 
         std::string animatedAdapterError;
+        std::string hidingPresentationError;
+        if (!hiding_door_presentation::Initialize(*resolver, *worldRegistry, hidingPresentationError))
+            diagnostics.Log("warning", "hiding_door_presentation_rejected", hidingPresentationError);
         if (world_animated::Initialize(
                 *resolver, *hooks, *worldRegistry, animatedAdapterError)) {
             diagnostics.Log(
@@ -1631,6 +1635,7 @@ DWORD Bootstrap::RunImpl() {
     character_action_probe::BeginLogicalShutdown();
     world_interactions::BeginLogicalShutdown();
     world_animated::BeginLogicalShutdown();
+    hiding_door_presentation::BeginLogicalShutdown();
     replication_core::BeginLogicalShutdown();
     cathode_primitives::BeginLogicalShutdown();
     if (spawnTracker != nullptr) {

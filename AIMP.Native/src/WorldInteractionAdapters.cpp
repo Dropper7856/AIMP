@@ -12,6 +12,7 @@
 #include "aimp/ReplicationCore.h"
 #include "aimp/SignatureResolver.h"
 #include "aimp/WorldEntityRegistry.h"
+#include "aimp/HidingDoorPresentation.h"
 
 #include <Windows.h>
 #if defined(_MSC_VER)
@@ -4903,6 +4904,16 @@ void __fastcall QueueInputDetour(
     const auto original = reinterpret_cast<QueueInputFn>(
         gQueueInputTrampoline.load(std::memory_order_acquire));
     if (original == nullptr) return;
+    // These private presentation edges travel with PlayerSync. Let retail run
+    // its exact door/marker path once; keep it out of generic WorldSync ROOTs.
+    if (hiding_door_presentation::IsHidingDoorInput(sourceSharedRef, inputShortGuid,
+            targetDescriptor, delaySeconds)) {
+        original(manager, sourceSharedRef, inputShortGuid, targetDescriptor, callbackRecord,
+            delaySeconds, retailTailArgument);
+        static_cast<void>(hiding_door_presentation::ObserveAcceptedQueueInput(
+            sourceSharedRef, inputShortGuid, targetDescriptor, delaySeconds));
+        return;
+    }
     if (!runtime_features::Enabled(runtime_features::Feature::WorldSyncHooks)) {
         original(manager, sourceSharedRef, inputShortGuid, targetDescriptor, callbackRecord,
             delaySeconds, retailTailArgument);
@@ -8258,6 +8269,7 @@ void ResetSessionObservations() noexcept {
 }
 
 void ResetForGeneration() noexcept {
+    hiding_door_presentation::ResetForGeneration();
     world_actions::ResetForGeneration();
     gCompositePublicInputPreQueueBuilderUnknownTraceCount.store(0U, std::memory_order_relaxed);
     for (auto& slot : gCompositePublicInputPreQueueBuilderUnknownTrace) {

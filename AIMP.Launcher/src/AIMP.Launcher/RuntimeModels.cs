@@ -49,7 +49,9 @@ internal sealed record NativeRuntimeSnapshot(
     int RemoteCharacterGeneration = 0,
     ulong RemoteCharacterCreationSerial = 0,
     uint RemoteCharacterRuntimeId = 0,
-    Guid RemoteCharacterConnectionIdentity = default)
+    Guid RemoteCharacterConnectionIdentity = default,
+    NativePlayerHidingStatePayload? LocalHiding = null,
+    DateTimeOffset? LocalHidingReceivedAt = null)
 {
     internal static NativeRuntimeSnapshot Empty { get; } = new(
         false, 0, string.Empty, 0, string.Empty, false, false, string.Empty,
