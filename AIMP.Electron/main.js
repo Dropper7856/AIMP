@@ -280,7 +280,9 @@ async function createWindow(frontendUrl) {
       nodeIntegration: false,
       sandbox: true,
       devTools: false,
-      partition: 'aimp-launcher',
+      // "persist:" keeps the frontend's localStorage/cookies (onboarding,
+      // preferences) on disk; a bare partition name is in-memory only.
+      partition: 'persist:aimp-launcher',
     },
   });
 
