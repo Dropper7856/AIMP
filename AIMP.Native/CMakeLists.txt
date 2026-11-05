@@ -82,6 +82,7 @@ set(AIMP_CORE_SOURCES
     src/PlayerPostureRuntime.cpp
     src/PlayerAnimationClipCapture.cpp
     src/PlayerTorchRuntime.cpp
+    src/PlayerHidingRuntime.cpp
     src/MissionSync.cpp
     src/PlayerLifecycle.cpp
     src/LoadingContextGuard.cpp
@@ -373,6 +374,14 @@ if(BUILD_TESTING)
     set_target_properties(AIMP.PlayerTorchRuntimeTests PROPERTIES
         VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
     add_test(NAME PlayerTorchRuntime COMMAND AIMP.PlayerTorchRuntimeTests)
+    add_executable(AIMP.PlayerHidingRuntimeTests tests/PlayerHidingRuntimeTests.cpp)
+    target_link_libraries(AIMP.PlayerHidingRuntimeTests PRIVATE AIMP.Core)
+    target_include_directories(AIMP.PlayerHidingRuntimeTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_definitions(AIMP.PlayerHidingRuntimeTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(AIMP.PlayerHidingRuntimeTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.PlayerHidingRuntimeTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME PlayerHidingRuntime COMMAND AIMP.PlayerHidingRuntimeTests)
     add_executable(AIMP.VoiceNativeAudioTests tests/VoiceNativeAudioTests.cpp)
     target_include_directories(AIMP.VoiceNativeAudioTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     target_compile_options(AIMP.VoiceNativeAudioTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)

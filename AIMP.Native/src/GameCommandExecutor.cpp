@@ -1,6 +1,7 @@
 #include "aimp/GameCommandExecutor.h"
 #include "aimp/ReplicationCore.h"
 #include "aimp/PlayerTorchRuntime.h"
+#include "aimp/PlayerHidingRuntime.h"
 #include "aimp/MissionSync.h"
 
 #include "aimp/BuildProfile.h"
@@ -3672,6 +3673,9 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteCharacterDirectMove(
          !command.hasReplicationYaw || !command.hasMoveType || !command.worldSpace)) ||
         (command.hasPlayerTorchDirection && (!command.hasPlayerTorch || !command.playerTorchEnabled ||
          !player_torch::ValidDirection(command.playerTorchDirection))) ||
+        (command.hasPlayerHiding && (!command.hasReplicationPosition ||
+         !command.hasReplicationYaw || !command.hasMoveType || !command.worldSpace ||
+         (command.playerHidden && !player_hiding::ValidAnchor(command.playerHidingAnchor)))) ||
         (command.hasPlayerPosture && (!command.hasReplicationPosition ||
          !command.hasReplicationYaw || !command.hasMoveType ||
          !player_posture::Valid(command.playerPosture))) ||
@@ -3710,6 +3714,15 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteCharacterDirectMove(
                     command.hasPlayerTorchDirection ? &command.playerTorchDirection : nullptr)) {
                 result.statusCode = "PLAYER_TORCH_PUBLICATION_FAILED";
                 result.message = torchError;
+                return false;
+            }
+        }
+        if (command.hasPlayerHiding) {
+            std::string hidingError;
+            if (!player_hiding::Publish(command.characterAddress, command.playerHidden,
+                    command.playerHidingAnchor, hidingError)) {
+                result.statusCode = "PLAYER_HIDING_PUBLICATION_FAILED";
+                result.message = hidingError;
                 return false;
             }
         }

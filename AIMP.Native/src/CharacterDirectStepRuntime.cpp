@@ -4,6 +4,7 @@
 #include "aimp/AISyncExecutionPolicy.h"
 #include "aimp/PlayerPostureRuntime.h"
 #include "aimp/PlayerTorchRuntime.h"
+#include "aimp/PlayerHidingRuntime.h"
 
 #include "aimp/CrashGuard.h"
 #include "aimp/HookManager.h"
@@ -2582,12 +2583,43 @@ void PumpSlotOnEngineThread(
     }
 
     if (phase == EnginePumpPhase::PreCharacterManager &&
+        !player_hiding::Hidden(characterAddress) &&
         player_posture::PumpOnEngineThread(characterAddress)) {
         if (slot.stopPending.load(std::memory_order_acquire)) {
             ReleaseSlot(slot); // drop ownership without interrupting retail traversal cleanup
             return;
         }
         slot.initialPlacementPending.store(false, std::memory_order_release);
+        slot.nativeStateActive.store(false, std::memory_order_release);
+        slot.moveActive.store(false, std::memory_order_release);
+        slot.driveRequested.store(false, std::memory_order_release);
+        slot.certifiedCycleAddress.store(0U, std::memory_order_release);
+        slot.preparedTargetRevision.store(0U, std::memory_order_release);
+        return;
+    }
+
+    // A hidden owner is inside a locker: park the invisible representation and
+    // re-place it at the network target once the owner is visible again.
+    if (player_hiding::Hidden(characterAddress)) {
+        if (slot.stopPending.load(std::memory_order_acquire)) {
+            ReleaseSlot(slot);
+            return;
+        }
+        slot.driveRequested.store(false, std::memory_order_release);
+        // Stopping publication alone leaves retail's previous Move active.
+        // Cancel locomotion on the engine thread, preserving death/paired cycles.
+        std::uintptr_t cycle{};
+        std::uint8_t cycleState{};
+        if (!RetailOwnsPhysicalCycle(characterAddress) &&
+            !ai_sync::PairedParticipantVictim(characterAddress) &&
+            ReadNativeCycle(characterAddress, cycle, cycleState) &&
+            IsNativeLocomotionCycle(cycle)) {
+            const NativeCycleControlPlan stopped{};
+            static_cast<void>(WriteNativeCycleControl(cycle, stopped));
+            static_cast<void>(SubmitNativeRequest(characterAddress, 0.0F, 0.0F, 0.0F, 0.0F));
+            if (!IsNativeIdleState(cycleState)) static_cast<void>(CallNativeIdleTransition(slot, characterAddress));
+        }
+        slot.initialPlacementPending.store(true, std::memory_order_release);
         slot.nativeStateActive.store(false, std::memory_order_release);
         slot.moveActive.store(false, std::memory_order_release);
         slot.driveRequested.store(false, std::memory_order_release);
@@ -2841,6 +2873,7 @@ RuntimeSnapshot SnapshotSlot(const MovementSlot& slot) noexcept {
     RuntimeSnapshot result{};
     result.posture = player_posture::Snapshot(slot.characterAddress.load(std::memory_order_acquire));
     result.torch = player_torch::Snapshot(slot.characterAddress.load(std::memory_order_acquire));
+    result.hiding = player_hiding::Snapshot(slot.characterAddress.load(std::memory_order_acquire));
     result.characterAddress =
         slot.characterAddress.load(std::memory_order_acquire);
     result.remainingFrames =
@@ -3189,6 +3222,7 @@ bool Install(
     }
     player_posture::Initialize(moduleBase, &RefreshPostureAnimations);
     player_torch::Initialize(moduleBase);
+    player_hiding::Initialize(moduleBase);
     gInstalled.store(true, std::memory_order_release);
     return true;
 #endif
@@ -3226,8 +3260,10 @@ void PumpOnEngineThread(const EnginePumpPhase phase) noexcept {
     player_posture::ReconcileAllOnEngineThread();
     // Run after all pose corrections, including for actors whose locomotion
     // mailbox was released by a traversal/paired cycle this frame.
-    if (phase == EnginePumpPhase::PostCharacterManager)
+    if (phase == EnginePumpPhase::PostCharacterManager) {
         player_torch::PumpAllOnEngineThread();
+        player_hiding::PumpAllOnEngineThread();
+    }
 }
 
 bool ArmDirection(
@@ -3593,6 +3629,8 @@ void Stop() noexcept {
         const auto character =
             slot.characterAddress.load(std::memory_order_acquire);
         if (character == 0U || character == kReservedSlot) continue;
+        std::string ignored;
+        static_cast<void>(player_hiding::Publish(character, false, {}, ignored));
         slot.remainingFrames.store(0U, std::memory_order_release);
         slot.stopPending.store(true, std::memory_order_release);
     }
@@ -3601,12 +3639,14 @@ void Stop() noexcept {
 void ForgetCharacter(const std::uintptr_t characterAddress) noexcept {
     player_posture::Forget(characterAddress);
     player_torch::Forget(characterAddress);
+    player_hiding::Forget(characterAddress);
     if (auto* slot = FindSlot(characterAddress); slot != nullptr) ReleaseSlot(*slot);
 }
 
 void ForgetAll() noexcept {
     player_posture::ForgetAll();
     player_torch::ForgetAll();
+    player_hiding::ForgetAll();
     for (auto& slot : gSlots) {
         const auto character =
             slot.characterAddress.load(std::memory_order_acquire);
@@ -3620,6 +3660,9 @@ bool Stop(const std::uintptr_t characterAddress) noexcept {
         ForgetCharacter(characterAddress);
         return true;
     }
+    // Explicit teardown also releases a locker if locomotion already retired.
+    std::string ignored;
+    static_cast<void>(player_hiding::Publish(characterAddress, false, {}, ignored));
     auto* slot = FindSlot(characterAddress);
     if (slot == nullptr) return true;
     slot->remainingFrames.store(0U, std::memory_order_release);
@@ -3659,6 +3702,7 @@ RuntimeSnapshot Snapshot(const std::uintptr_t characterAddress) noexcept {
     result.characterAddress = characterAddress;
     result.posture = player_posture::Snapshot(characterAddress);
     result.torch = player_torch::Snapshot(characterAddress);
+    result.hiding = player_hiding::Snapshot(characterAddress);
     return result;
 }
 

@@ -49,7 +49,7 @@ int main() {
     const auto validLight = light;
     Check(!aimp::player_torch::BuildAimTransform({0, 0, 0}, {2, 3, 4}, light) && light == validLight,
         "Invalid camera ray cannot mutate the transform");
-    static_assert(aimp::kProtocolVersion == 29U);
+    static_assert(aimp::kProtocolVersion == 30U);
     using namespace aimp::player_posture;
     State value{};
     Check(Decode("0,0,0,0,0,0,0", value), "Standing state");

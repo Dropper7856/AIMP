@@ -6,6 +6,7 @@
 #include <string>
 #include "aimp/PlayerPostureRuntime.h"
 #include "aimp/PlayerTorchRuntime.h"
+#include "aimp/PlayerHidingRuntime.h"
 
 namespace aimp {
 
@@ -32,6 +33,7 @@ using NativeAITransitionGuard = bool(*)(std::uintptr_t characterAddress,
 struct RuntimeSnapshot {
     player_posture::DiagnosticsSnapshot posture{};
     player_torch::DiagnosticsSnapshot torch{};
+    player_hiding::DiagnosticsSnapshot hiding{};
     std::uintptr_t characterAddress{};
     std::uint32_t remainingFrames{};
     std::uint64_t activationAttempts{};

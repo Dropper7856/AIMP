@@ -224,6 +224,12 @@ public sealed record PlayerTorchSnapshot(
     [property: JsonRequired] bool Enabled,
     float? AimX = null, float? AimY = null, float? AimZ = null);
 
+// Owner-side locker state. The anchor is the hiding spot sampled by the owner;
+// peers use it to hide the representation and mark that spot occupied.
+public sealed record PlayerHidingSnapshot(
+    [property: JsonRequired] bool Hidden,
+    float? AnchorX = null, float? AnchorY = null, float? AnchorZ = null);
+
 public sealed record PlayerPositionSnapshotPayload(
     Guid SessionId,
     ulong PeerId,
@@ -240,7 +246,8 @@ public sealed record PlayerPositionSnapshotPayload(
     PlayerTorchSnapshot? Torch = null,
     // Source-owner allocated, monotone within this session/peer. Zero means
     // unavailable. Never a runtime ID or permission to enter a native pair.
-    uint CharacterIncarnation = 0);
+    uint CharacterIncarnation = 0,
+    PlayerHidingSnapshot? Hiding = null);
 
 public enum PlayerActionKind
 {

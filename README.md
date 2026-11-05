@@ -124,6 +124,14 @@ This separation is intentional: **the DLL understands engine objects; the launch
 | **AISync**           | Aims to synchronize **all AI**, not just the Alien, using host authority.                                | Target identity, behavior transitions, attacks, and continuity after a death.        |
 | **Diagnostics**      | Collects logs, versions, and state information needed to investigate incidents.                          | Avoid expensive telemetry and unnecessary sensitive data.                            |
 
+### Hiding places (experimental)
+
+The `feature/hiding-sync` branch (build 406, network/IPC protocol 30) sends the owner's hiding state with player movement. Once the retail `PLAYER_HIDING` flag is set, peers conceal the remote body, stop its locomotion and torch, and disable the occupied hiding interaction. Leaving reveals the body and releases the interaction. Character destruction, disconnection and level changes clear ownership. Entry and exit animations remain local.
+
+Each stay latches the owner's native hiding search position. Peers resolve the nearest `AI_UI_INTERACT_HIDING` interaction within three metres, then retain its local instance key. This spatial lookup needs two-PC validation for adjacent lockers and low compartments. It does not reserve a locker before entry or arbitrate simultaneous entries; the interaction stays disabled until the final known occupant leaves. AI search/capture decisions are outside this change.
+
+Two-PC acceptance: enter and leave both types of hiding place as host and client; check disappearance/reappearance, blocked use by another player, nearby lockers remaining usable, and release after a hidden player's disconnection or a level restart. Automated tests cover capture coherence, wire validation, ordered entry/exit, native visibility ABI and interaction lifetime using synthetic engine memory; they do not establish in-game rendering or AI behaviour.
+
 ## Requirements
 
 To **build the backend**, you need:

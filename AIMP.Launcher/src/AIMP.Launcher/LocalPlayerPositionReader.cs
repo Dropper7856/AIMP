@@ -90,7 +90,8 @@ internal readonly record struct LocalPlayerMovementProfile(
     float FastWalkSpeed,
     float RunSpeed,
     PlayerPostureSnapshot? Posture = null,
-    PlayerTorchSnapshot? Torch = null)
+    PlayerTorchSnapshot? Torch = null,
+    PlayerHidingSnapshot? Hiding = null)
 {
     internal float SpeedFor(PlayerMoveType moveType) => moveType switch
     {
@@ -212,6 +213,7 @@ internal sealed class LocalPlayerPositionReader : IDisposable
     private readonly Func<nint, int?> _readLocalInteger;
     private readonly LocalPlayerPostureReader _postureReader;
     private readonly LocalPlayerTorchReader _torchReader;
+    private readonly LocalPlayerHidingReader _hidingReader;
 
     internal LocalPlayerPositionReader()
     {
@@ -219,6 +221,7 @@ internal sealed class LocalPlayerPositionReader : IDisposable
         _readLocalInteger = ReadLocalInteger;
         _postureReader = new LocalPlayerPostureReader(ReadBlock);
         _torchReader = new LocalPlayerTorchReader(ReadBlock);
+        _hidingReader = new LocalPlayerHidingReader(ReadBlock);
     }
 
     internal string LastError { get; private set; } = string.Empty;
@@ -253,8 +256,10 @@ internal sealed class LocalPlayerPositionReader : IDisposable
         _postureReader.TryCapture(runtime.ModuleBase, characterBase, runtime.LevelGeneration, out var posture,
             () => TryReadCharacterBase(runtime.ModuleBase, out var after) && after == characterBase);
         _torchReader.TryCapture(characterBase, out var torch, runtime.ModuleBase);
+        _hidingReader.TryCapture(runtime.ModuleBase, characterBase, runtime.LevelGeneration, out var hiding,
+            () => TryReadCharacterBase(runtime.ModuleBase, out var after) && after == characterBase);
         if (!TryReadCharacterBase(runtime.ModuleBase, out var current) || current != characterBase) return false;
-        movementProfile = movementProfile with { Posture = posture, Torch = torch };
+        movementProfile = movementProfile with { Posture = posture, Torch = torch, Hiding = hiding };
         return true;
     }
 
@@ -436,6 +441,7 @@ internal sealed class LocalPlayerPositionReader : IDisposable
         _handle = null;
         _processId = 0;
         _postureReader.Reset();
+        _hidingReader.Reset();
         LastError = error;
     }
 
