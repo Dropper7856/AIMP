@@ -18,6 +18,7 @@
 - [Main Modules](#main-modules)
 - [Requirements](#requirements)
 - [Building the Backend](#building-the-backend)
+- [Developer Mode](#developer-mode)
 - [Contributing](#contributing)
 - [Safety, Compatibility, and Game Content](#safety-compatibility-and-game-content)
 
@@ -184,6 +185,14 @@ If you also rebuilt the native module, make sure the launcher uses the **matchin
 - Because the Electron/web frontend is **not part of this repository**, consult the frontend repository if you want to rebuild the complete user-facing application.
 
 **Important:** Never add `AI.exe`, DLCs, game PAK files, or proprietary binaries to this repository just to “make building easier.”
+
+## Developer Mode
+
+By default, AI-MP focuses on **Survivor Mode**. To access experimental testing options, including **other maps** and **multiplayer experiments in the main campaign**, start the **AI-MP launcher** with the `-dev` launch argument.
+
+You can add `-dev` to the launcher's shortcut or pass it when starting the launcher manually. No changes to the game files are required just to enable this mode.
+
+**Warning:** Developer Mode is intended for testing and debugging. Additional maps and the main campaign are **not officially supported for stable multiplayer gameplay**. Expect broken objectives, unsynchronized interactions, crashes, and other issues.
 
 ## Contributing
 
