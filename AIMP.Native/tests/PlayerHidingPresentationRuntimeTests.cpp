@@ -38,6 +38,25 @@ void OperationStub(std::uint8_t* code, std::uint32_t& calls, const std::uint8_t*
 int main() {
     using namespace aimp::player_hiding_presentation;
     State state{1U, 1U, 0x5DC33E3EU, 123U, 1U, 0U, {1.0F, 2.0F, 3.0F}, 0.5F, true};
+    Check(LocalPhase(0, false, state, 0, false, true) == 1U,
+        "Accepted entry starts before a scripted NPC clip or hidden flag exists");
+    state.elapsedMilliseconds = 750U;
+    Check(LocalPhase(1, true, state, 0, false, true) == 1U,
+        "First-person entry remains active on a different Character cycle");
+    Check(LocalPhase(1, true, state, 0, true, true) == 2U,
+        "Delayed native hiding flag settles the accepted entry");
+    Check(LocalPhase(1, true, state, 0, false, false) == 0U,
+        "Interrupted entry releases when its retail interaction flag clears");
+    Check(LocalPhase(0, false, state, 0, false, true) == 0U,
+        "An old entry latch cannot start late");
+    state.phase = 3U; state.elapsedMilliseconds = 0U;
+    Check(LocalPhase(2, false, state, 0, true, true) == 3U,
+        "Exact exit edge identifies exit before its Character clip is sampled");
+    Check(LocalPhase(3, true, state, 3, false, false) == 3U,
+        "An active exit survives hidden flag cleanup");
+    Check(LocalPhase(3, true, state, 0, false, false) == 0U,
+        "Completed exit clears once without replaying the retained door latch");
+    state.phase = 1U;
     aimp::ai_sync::native_intent::Payload intent{};
     for (std::uint32_t kind = 1U; kind <= 2U; ++kind) {
         for (std::uint32_t phase = 1U; phase <= 3U; ++phase) {

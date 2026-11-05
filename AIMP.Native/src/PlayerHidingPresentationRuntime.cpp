@@ -3,6 +3,7 @@
 #include "aimp/CharacterResourceAdmission.h"
 #include "aimp/CrashGuard.h"
 #include "aimp/HidingDoorPresentation.h"
+#include "aimp/HidingPresentationAudio.h"
 
 #include <Windows.h>
 #include <algorithm>
@@ -269,7 +270,8 @@ void Advance(Slot& slot, const std::uint64_t now) noexcept {
             if (Cancel(slot.character, slot.owned)) {
                 slot.owned = {}; d.playing = false; ++d.completed; d.stage = "completed";
             }
-        } else if (now - slot.startedAt > kMaximumPlaybackMs || slot.desired.phase == 0U) {
+        } else if (now - slot.startedAt > kMaximumPlaybackMs ||
+            (slot.desired.phase == 0U && ClassifyClip(slot.owned.animation).phase != 3U)) {
             if (Cancel(slot.character, slot.owned)) {
                 slot.owned = {}; d.playing = false; ++d.interrupted; d.stage = "cancelled";
             } else { d.stage = "cancel-deferred"; }
@@ -330,6 +332,7 @@ void Advance(Slot& slot, const std::uint64_t now) noexcept {
         ++d.failed; d.stage = "native-admission"; return;
     }
     slot.owned = current; slot.startedAt = now;
+    static_cast<void>(hiding_presentation_audio::PlayOnEngineThread(slot.character, slot.desired, age));
     ++d.applied; d.active = d.playing = true; d.stage = "playing";
 }
 }
@@ -419,10 +422,12 @@ DiagnosticsSnapshot Snapshot(const std::uintptr_t character) noexcept {
     return slot != nullptr ? slot->diagnostics : DiagnosticsSnapshot{};
 }
 void Forget(const std::uintptr_t character) noexcept {
+    hiding_presentation_audio::Forget(character);
     { const std::lock_guard lock(gMutex); if (auto* slot = Find(character)) *slot = {}; }
     { const std::lock_guard lock(gCaptureMutex); if (gCapture.character == character) gCapture = {}; }
 }
 void ForgetAll() noexcept {
+    hiding_presentation_audio::ForgetAll();
     { const std::lock_guard lock(gMutex); gSlots = {}; ++gEpoch; }
     { const std::lock_guard lock(gCaptureMutex); gCapture = {}; }
 }
@@ -431,9 +436,9 @@ bool CaptureLocalOnEngineThread(const std::uintptr_t character, State& output) n
     output = {};
     bool local{};
     Cycle before{}, after{};
-    std::uint8_t hiding{}, hidingAfter{};
+    std::uint8_t hiding{}, hidingAfter{}, interaction{}, interactionAfter{};
     if (gBase.load() == 0U || !IsLocal(character, local) || !local || !ReadCycle(character, before) ||
-        !Read(character + 0x4249U, hiding)) return false;
+        !Read(character + 0x4249U, hiding) || !Read(character + 0x425BU, interaction)) return false;
     const bool scripted = before.type == gBase.load() + kScriptedType && before.state == 0x12U &&
         before.graph != 0U && before.resource != 0U && (before.flags & 6U) == 0U;
     const auto clip = scripted ? ClassifyClip(before.animation) : ClipSelection{};
@@ -443,22 +448,30 @@ bool CaptureLocalOnEngineThread(const std::uintptr_t character, State& output) n
     if (!Read(character + 0x70U, position) || !Read(character + 0x174U, yaw) ||
         !ReadCycle(character, after) || !SameCycle(before, after) || before.graph != after.graph ||
         before.resource != after.resource || before.animation != after.animation || before.flags != after.flags ||
-        !Read(character + 0x4249U, hidingAfter) || hiding != hidingAfter) return false;
+        !Read(character + 0x4249U, hidingAfter) || hiding != hidingAfter ||
+        !Read(character + 0x425BU, interactionAfter) || interaction != interactionAfter) return false;
     const auto now = GetTickCount64();
     const std::lock_guard lock(gCaptureMutex);
     if (gCapture.character != character || gCapture.runtime != before.runtime ||
         (door && gCapture.generation != door->levelGeneration)) gCapture = {};
-    if (clip.phase == 0U && hiding == 0U) { gCapture = {}; return true; }
-    if (!door || !hiding_door_presentation::ValidSelection(door->state)) return false;
-    auto phase = clip.phase;
-    const auto kind = phase != 0U ? clip.kind : gCapture.state.kind;
-    if (phase == 0U) {
-        // A late hidden flag cannot rewind an already-observed exit.
-        if (gCapture.state.phase == 3U) { gCapture = {}; return true; }
-        if (hiding == 0U || gCapture.state.phase == 0U) return false;
-        phase = 2U;
+    if (!door || !hiding_door_presentation::ValidSelection(door->state)) {
+        if (hiding == 0U && clip.phase == 0U) { gCapture = {}; return true; }
+        return false;
     }
-    if (kind != door->state.kind || (phase == 3U ? door->state.phase != 3U : door->state.phase != 1U)) return false;
+    if (clip.phase != 0U && clip.kind != door->state.kind) return false;
+    const bool sameDoor = gCapture.doorTransition == door->state.transition &&
+        gCapture.state.entityShortGuid == door->state.entityShortGuid &&
+        gCapture.state.hierarchyHash == door->state.hierarchyHash;
+    const auto phase = LocalPhase(gCapture.state.phase, sameDoor, door->state,
+        clip.phase, hiding != 0U, interaction != 0U);
+    // Retain the consumed door identity after completion, so a repeated stale
+    // latch cannot start a second entry while its hidden flag is still false.
+    if (phase == 0U) {
+        gCapture.character = character; gCapture.runtime = before.runtime;
+        gCapture.generation = door->levelGeneration; gCapture.doorTransition = door->state.transition;
+        gCapture.state = door->state; gCapture.state.phase = 0U;
+        return true;
+    }
     const bool edge = gCapture.state.phase != phase || gCapture.doorTransition != door->state.transition ||
         gCapture.state.entityShortGuid != door->state.entityShortGuid || gCapture.state.hierarchyHash != door->state.hierarchyHash;
     State candidate = edge ? door->state : gCapture.state;

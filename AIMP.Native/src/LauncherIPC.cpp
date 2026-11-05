@@ -13,6 +13,7 @@
 #include "aimp/PlayerHidingLocalCapture.h"
 #include "aimp/PlayerHidingPresentationRuntime.h"
 #include "aimp/HidingDoorPresentation.h"
+#include "aimp/HidingPresentationAudio.h"
 
 #include "aimp/BuildProfile.h"
 #include "aimp/CapabilityMatrix.h"
@@ -3392,8 +3393,22 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
         const auto hidingHistory = player_hiding::History();
         const auto hidingPresentation = player_hiding_presentation::Snapshot(locomotion.characterAddress);
         const auto hidingDoor = hiding_door_presentation::Diagnostics();
+        const auto hidingLocal = player_hiding_local::Diagnostics();
+        const auto hidingAudio = hiding_presentation_audio::Snapshot(locomotion.characterAddress);
         diagnostics_->Log("info", "native_hiding_presentation_snapshot", "Remote hiding presentation state.",
-            {{"phase", Diagnostics::Unsigned(hidingPresentation.phase), true},
+            {{"audioStage", hidingAudio.stage, false},
+             {"audioEvent", hidingAudio.eventName, false},
+             {"audioPosted", Diagnostics::Unsigned(hidingAudio.posted), true},
+             {"audioFailed", Diagnostics::Unsigned(hidingAudio.failed), true},
+             {"audioPlayingId", Diagnostics::Unsigned(hidingAudio.playingId), true},
+             {"audioFilterInstalled", Diagnostics::Boolean(hidingAudio.filterInstalled), true},
+             {"audioMetadataObserved", Diagnostics::Unsigned(hidingAudio.metadataObserved), true},
+             {"audioMetadataSuppressed", Diagnostics::Unsigned(hidingAudio.metadataSuppressed), true},
+             {"localEntering", Diagnostics::Unsigned(hidingLocal.entering), true},
+             {"localHidden", Diagnostics::Unsigned(hidingLocal.hidden), true},
+             {"localExiting", Diagnostics::Unsigned(hidingLocal.exiting), true},
+             {"localUnavailable", Diagnostics::Unsigned(hidingLocal.unavailable), true},
+             {"phase", Diagnostics::Unsigned(hidingPresentation.phase), true},
              {"transition", Diagnostics::Unsigned(hidingPresentation.transition), true},
              {"stage", hidingPresentation.stage, false},
              {"applied", Diagnostics::Unsigned(hidingPresentation.applied), true},

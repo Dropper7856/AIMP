@@ -8,6 +8,7 @@
 #include "aimp/PlayerHidingPresentationRuntime.h"
 #include "aimp/PlayerHidingLocalCapture.h"
 #include "aimp/HidingDoorPresentation.h"
+#include "aimp/HidingPresentationAudio.h"
 
 #include "aimp/CrashGuard.h"
 #include "aimp/HookManager.h"
@@ -151,6 +152,8 @@ struct MovementSlot final {
     std::atomic<std::uint8_t> lastObservedNativeState{0U};
     std::atomic<bool> stopPending{false};
     std::atomic<bool> initialPlacementPending{false};
+    std::atomic<bool> hidingOwned{false};
+    std::atomic<std::uint64_t> hidingResumeAt{0U};
     std::atomic<bool> idleConverged{false};
     // A paired attack that aborted before retail's 4E destructor could clear
     // the victim's grapple bytes leaves the representation frozen.
@@ -668,6 +671,8 @@ void ResetPayload(MovementSlot& slot) noexcept {
     slot.lastObservedNativeState.store(0U, std::memory_order_release);
     slot.stopPending.store(false, std::memory_order_release);
     slot.initialPlacementPending.store(false, std::memory_order_release);
+    slot.hidingOwned.store(false, std::memory_order_release);
+    slot.hidingResumeAt.store(0U, std::memory_order_release);
     slot.idleConverged.store(false, std::memory_order_release);
     slot.nextIdleValidationTickMs.store(0U, std::memory_order_release);
     slot.certifiedCycleAddress.store(0U, std::memory_order_release);
@@ -2586,6 +2591,7 @@ void PumpSlotOnEngineThread(
     }
 
     if (player_hiding_presentation::Active(characterAddress)) {
+        slot.hidingOwned.store(true, std::memory_order_release);
         slot.initialPlacementPending.store(true, std::memory_order_release);
         slot.nativeStateActive.store(false, std::memory_order_release);
         slot.moveActive.store(false, std::memory_order_release);
@@ -2614,6 +2620,7 @@ void PumpSlotOnEngineThread(
     // A hidden owner is inside a locker: park the invisible representation and
     // re-place it at the network target once the owner is visible again.
     if (player_hiding::Hidden(characterAddress)) {
+        slot.hidingOwned.store(true, std::memory_order_release);
         if (slot.stopPending.load(std::memory_order_acquire)) {
             ReleaseSlot(slot);
             return;
@@ -2640,6 +2647,17 @@ void PumpSlotOnEngineThread(
         slot.preparedTargetRevision.store(0U, std::memory_order_release);
         return;
     }
+
+    // A hiding clip already placed and moved this existing actor. Returning
+    // to the follower is not a spawn: never teleport it to an in-flight exit
+    // sample. Let the owner's final post-animation transforms arrive first.
+    if (slot.hidingOwned.exchange(false, std::memory_order_acq_rel)) {
+        slot.initialPlacementPending.store(false, std::memory_order_release);
+        slot.idleConverged.store(false, std::memory_order_release);
+        slot.preparedTargetRevision.store(0U, std::memory_order_release);
+        slot.hidingResumeAt.store(GetTickCount64() + 200U, std::memory_order_release);
+    }
+    if (GetTickCount64() < slot.hidingResumeAt.load(std::memory_order_acquire)) return;
 
     float approachX{}, approachY{}, approachZ{};
     if (player_posture::ApproachTarget(characterAddress, approachX, approachY, approachZ)) {
@@ -3237,6 +3255,9 @@ bool Install(
     player_torch::Initialize(moduleBase);
     player_hiding::Initialize(moduleBase);
     player_hiding_presentation::Initialize(moduleBase, reinterpret_cast<std::uintptr_t>(gEnterIdleCycle));
+    std::string hidingAudioError;
+    if (hiding_presentation_audio::Initialize(moduleBase, hidingAudioError))
+        static_cast<void>(hiding_presentation_audio::InstallMetadataFilter(hooks, hidingAudioError));
     gInstalled.store(true, std::memory_order_release);
     return true;
 #endif

@@ -11,5 +11,7 @@ struct Snapshot final {
 };
 void PumpOnEngineThread() noexcept;
 Snapshot Read() noexcept;
+struct DiagnosticsSnapshot final { std::uint64_t entering{}, hidden{}, exiting{}, visible{}, unavailable{}; };
+DiagnosticsSnapshot Diagnostics() noexcept;
 void ForgetAll() noexcept;
 }

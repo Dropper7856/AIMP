@@ -84,6 +84,7 @@ set(AIMP_CORE_SOURCES
     src/PlayerTorchRuntime.cpp
     src/PlayerHidingRuntime.cpp
     src/PlayerHidingPresentationRuntime.cpp
+    src/HidingPresentationAudio.cpp
     src/PlayerHidingLocalCapture.cpp
     src/HidingDoorPresentation.cpp
     src/MissionSync.cpp
@@ -397,6 +398,12 @@ if(BUILD_TESTING)
     set_target_properties(AIMP.HidingDoorPresentationTests PROPERTIES
         VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
     add_test(NAME HidingDoorPresentation COMMAND AIMP.HidingDoorPresentationTests)
+    add_executable(AIMP.HidingPresentationAudioTests tests/HidingPresentationAudioTests.cpp)
+    target_link_libraries(AIMP.HidingPresentationAudioTests PRIVATE AIMP.Core)
+    target_compile_options(AIMP.HidingPresentationAudioTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.HidingPresentationAudioTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME HidingPresentationAudio COMMAND AIMP.HidingPresentationAudioTests)
     add_executable(AIMP.VoiceNativeAudioTests tests/VoiceNativeAudioTests.cpp)
     target_include_directories(AIMP.VoiceNativeAudioTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     target_compile_options(AIMP.VoiceNativeAudioTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)

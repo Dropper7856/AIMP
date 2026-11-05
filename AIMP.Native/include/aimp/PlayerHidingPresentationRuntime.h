@@ -10,6 +10,22 @@ namespace aimp::player_hiding_presentation {
 // These are the aliases bound by Hiding_logic_common's actual CMD_PlayAnimation
 // inputs, not clip-path hashes from ANIMATION.PAK.
 struct ClipSelection final { std::uint32_t phase{}, kind{}; };
+// A retail-accepted exact door edge certifies entry before PLAYER_HIDING.
+// First-person entry need not be the NPC scripted cycle sampled on Character.
+[[nodiscard]] inline std::uint32_t LocalPhase(std::uint32_t previous, bool sameDoor,
+    const State& door, std::uint32_t nativePhase, bool hidden, bool interactionActive) noexcept {
+    if (!sameDoor) {
+        if (door.phase == 1U && hidden) return 2U;
+        if (door.elapsedMilliseconds > 500U) return 0U;
+        return door.phase == 1U || door.phase == 3U ? door.phase : 0U;
+    }
+    if (previous == 3U) return hidden || nativePhase == 3U ? 3U : 0U;
+    if (door.phase == 3U) return 0U;
+    if (hidden) return 2U;
+    if (previous == 1U && door.elapsedMilliseconds <= 5000U &&
+        (door.elapsedMilliseconds <= 500U || interactionActive || nativePhase == 1U)) return 1U;
+    return 0U;
+}
 [[nodiscard]] constexpr ClipSelection ClassifyClip(std::uint32_t token) noexcept {
     switch (token) {
     case 0xCF2A9F36U: return {1U, 1U};
