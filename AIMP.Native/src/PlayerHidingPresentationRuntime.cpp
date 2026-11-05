@@ -421,6 +421,12 @@ bool Active(const std::uintptr_t character) noexcept {
     return slot != nullptr && (slot->desired.phase == 2U || slot->owned.address != 0U ||
         (slot->desired.phase != 0U && slot->desired.animate && slot->handled != slot->desired.transition));
 }
+bool HiddenExitHeading(const std::uintptr_t character, float& yaw) noexcept {
+    const std::lock_guard lock(gMutex); const auto* slot = Find(character);
+    if (slot == nullptr || slot->owned.address != 0U || slot->desired.phase != 2U) return false;
+    yaw = ExitYaw(slot->desired.yaw);
+    return true;
+}
 bool ClipPlaying(const std::uintptr_t character) noexcept {
     const std::lock_guard lock(gMutex); const auto* slot = Find(character);
     if (slot == nullptr || slot->owned.address == 0U) return false;

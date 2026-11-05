@@ -2594,6 +2594,7 @@ __declspec(naked) void NpcLocomotionPreTransformDetour() {
 
 std::atomic<std::uint64_t> gHidingFollowFrames{0U};
 std::atomic<std::uint64_t> gHidingFollowRejected{0U};
+std::atomic<std::uint64_t> gHidingExitHeadingFrames{0U};
 
 // The remote actor plays the first-person locker clip without its root motion,
 // so it never leaves the prop. During the entry and exit clips, carry it along
@@ -2652,6 +2653,13 @@ void PumpSlotOnEngineThread(
         if (phase == EnginePumpPhase::PostCharacterManager &&
             player_hiding_presentation::ClipPlaying(characterAddress))
             FollowHidingClipPath(slot, characterAddress);
+        // While invisible inside the prop, turn the body to face out so the
+        // exit clip starts facing the right way instead of turning afterwards.
+        float exitYaw{};
+        if (phase == EnginePumpPhase::PostCharacterManager &&
+            player_hiding_presentation::HiddenExitHeading(characterAddress, exitYaw) &&
+            WriteReplicatedYaw(characterAddress, exitYaw))
+            gHidingExitHeadingFrames.fetch_add(1U, std::memory_order_relaxed);
         return;
     }
 
@@ -3629,7 +3637,8 @@ bool ApplyReplicatedYaw(
 }
 HidingFollowStats HidingFollowSnapshot() noexcept {
     return {gHidingFollowFrames.load(std::memory_order_relaxed),
-        gHidingFollowRejected.load(std::memory_order_relaxed)};
+        gHidingFollowRejected.load(std::memory_order_relaxed),
+        gHidingExitHeadingFrames.load(std::memory_order_relaxed)};
 }
 
 bool ApplyAIRecoveryTransform(std::uintptr_t character,const float* position,float yaw) noexcept {

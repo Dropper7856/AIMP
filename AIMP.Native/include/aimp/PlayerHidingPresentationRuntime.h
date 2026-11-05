@@ -69,6 +69,10 @@ void DrainStreamsOnEngineThread() noexcept;
 [[nodiscard]] bool Active(std::uintptr_t character) noexcept;
 // Our entry/exit clip currently owns the actor (not a settled Hidden phase).
 [[nodiscard]] bool ClipPlaying(std::uintptr_t character) noexcept;
+// Settled Hidden (no clip): the heading the exit clip will use. A clip takes
+// the body's current orientation, and a yaw write only turns the body on the
+// next ticks, so the invisible body must already face out when exit starts.
+[[nodiscard]] bool HiddenExitHeading(std::uintptr_t character, float& yaw) noexcept;
 // Actual local player, engine thread only. true + State{} means visible;
 // false means a torn/unavailable sample or hiding without an exact door latch.
 // Parent validates its Character lifetime ticket before and after this call.
