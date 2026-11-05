@@ -63,6 +63,12 @@ constexpr float kFollowerMaximumLateralBlend = 0.55F;
 constexpr float kFollowerSettleDistance = 0.080F;
 constexpr float kHybridSettleResumeDistance = 0.160F;
 constexpr float kFollowerInitialPlacementTolerance = 0.05F;
+// After a hiding exit, the owner's network position must hold still this long
+// (within this distance) before the representation is re-placed; bounded so
+// an owner who walks straight off is still followed.
+constexpr std::uint64_t kHidingResumeSettleMs = 250U;
+constexpr std::uint64_t kHidingResumeMaximumMs = 1500U;
+constexpr float kHidingResumeSettleDistance = 0.02F;
 constexpr float kFollowerMaximumMagnitude = 8.0F;
 // v13 keeps retail locomotion for normal motion, but allows a lagging proxy to
 // recover network error materially faster than v12.8. The hard-resync below is
@@ -154,6 +160,10 @@ struct MovementSlot final {
     std::atomic<bool> initialPlacementPending{false};
     std::atomic<bool> hidingOwned{false};
     std::atomic<std::uint64_t> hidingResumeAt{0U};
+    std::atomic<std::uint64_t> hidingResumeDeadline{0U};
+    std::atomic<std::uint32_t> hidingSettleXBits{0U};
+    std::atomic<std::uint32_t> hidingSettleYBits{0U};
+    std::atomic<std::uint32_t> hidingSettleZBits{0U};
     std::atomic<bool> idleConverged{false};
     // A paired attack that aborted before retail's 4E destructor could clear
     // the victim's grapple bytes leaves the representation frozen.
@@ -673,6 +683,7 @@ void ResetPayload(MovementSlot& slot) noexcept {
     slot.initialPlacementPending.store(false, std::memory_order_release);
     slot.hidingOwned.store(false, std::memory_order_release);
     slot.hidingResumeAt.store(0U, std::memory_order_release);
+    slot.hidingResumeDeadline.store(0U, std::memory_order_release);
     slot.idleConverged.store(false, std::memory_order_release);
     slot.nextIdleValidationTickMs.store(0U, std::memory_order_release);
     slot.certifiedCycleAddress.store(0U, std::memory_order_release);
@@ -2648,16 +2659,46 @@ void PumpSlotOnEngineThread(
         return;
     }
 
-    // A hiding clip already placed and moved this existing actor. Returning
-    // to the follower is not a spawn: never teleport it to an in-flight exit
-    // sample. Let the owner's final post-animation transforms arrive first.
+    // Leaving a locker: the representation stays where its hiding clip left
+    // it (inside the prop), while the owner already stands in front of it. An
+    // idle follower never closes that gap, so re-place it exactly once at the
+    // owner's position. Teleporting to an in-flight exit sample misplaced the
+    // low locker by 30 cm: wait until the network target has stopped moving.
     if (slot.hidingOwned.exchange(false, std::memory_order_acq_rel)) {
-        slot.initialPlacementPending.store(false, std::memory_order_release);
+        const auto now = GetTickCount64();
+        slot.initialPlacementPending.store(true, std::memory_order_release);
         slot.idleConverged.store(false, std::memory_order_release);
         slot.preparedTargetRevision.store(0U, std::memory_order_release);
-        slot.hidingResumeAt.store(GetTickCount64() + 200U, std::memory_order_release);
+        slot.hidingResumeAt.store(now + kHidingResumeSettleMs, std::memory_order_release);
+        slot.hidingResumeDeadline.store(now + kHidingResumeMaximumMs, std::memory_order_release);
+        slot.hidingSettleXBits.store(0x7FC00000U, std::memory_order_release); // NaN: no sample yet
     }
-    if (GetTickCount64() < slot.hidingResumeAt.load(std::memory_order_acquire)) return;
+    if (const auto resumeAt = slot.hidingResumeAt.load(std::memory_order_acquire); resumeAt != 0U) {
+        const auto now = GetTickCount64();
+        float targetX{}, targetY{}, targetZ{};
+        if (LoadNetworkTarget(slot, targetX, targetY, targetZ)) {
+            const auto dx = targetX - LoadFloat(slot.hidingSettleXBits);
+            const auto dy = targetY - LoadFloat(slot.hidingSettleYBits);
+            const auto dz = targetZ - LoadFloat(slot.hidingSettleZBits);
+            const auto moved = std::sqrt(dx * dx + dy * dy + dz * dz);
+            // NaN (first sample) or a still-moving owner restarts the window.
+            if (!(moved <= kHidingResumeSettleDistance)) {
+                slot.hidingSettleXBits.store(std::bit_cast<std::uint32_t>(targetX), std::memory_order_release);
+                slot.hidingSettleYBits.store(std::bit_cast<std::uint32_t>(targetY), std::memory_order_release);
+                slot.hidingSettleZBits.store(std::bit_cast<std::uint32_t>(targetZ), std::memory_order_release);
+                slot.hidingResumeAt.store(now + kHidingResumeSettleMs, std::memory_order_release);
+                if (now < slot.hidingResumeDeadline.load(std::memory_order_acquire)) return;
+            } else if (now < resumeAt) {
+                return;
+            }
+        } else if (now < slot.hidingResumeDeadline.load(std::memory_order_acquire)) {
+            return;
+        }
+        // Settled (or bounded): the initial-placement path below teleports
+        // once to the owner's position, then the ordinary follower resumes.
+        slot.hidingResumeAt.store(0U, std::memory_order_release);
+        slot.hidingResumeDeadline.store(0U, std::memory_order_release);
+    }
 
     float approachX{}, approachY{}, approachZ{};
     if (player_posture::ApproachTarget(characterAddress, approachX, approachY, approachZ)) {
