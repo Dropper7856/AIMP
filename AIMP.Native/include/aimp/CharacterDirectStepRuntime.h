@@ -146,6 +146,9 @@ bool ReleaseAIIntentOwnership(std::uintptr_t characterAddress) noexcept;
 // AISync recovery only. Refresh physical registry + Character transform;
 // never selects/reinitializes a locomotion or paired animation cycle.
 bool ApplyAIRecoveryTransform(std::uintptr_t characterAddress,const float* position,float yaw) noexcept;
+// Hiding entry/exit clip path following (frames applied, network gaps rejected).
+struct HidingFollowStats final { std::uint64_t frames{}, rejected{}; };
+HidingFollowStats HidingFollowSnapshot() noexcept;
 
 // Called from CharacterManagerUpdate on the engine thread. PRE owns normal
 // follower preparation and native transitions. POST is a reconciliation pass

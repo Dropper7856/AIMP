@@ -313,8 +313,12 @@ void Advance(Slot& slot, const std::uint64_t now) noexcept {
     }
     // One placement at the phase boundary; repeated packets never overwrite
     // the native animation's root motion. This reuses certified placement ABI.
+    // The owner's Character keeps its entry heading while hidden (the turn is
+    // first-person only), but the exit clip is authored facing out of the prop
+    // and its root rotation is not applied to the remote actor: turn it 180.
+    const auto alignmentYaw = slot.desired.phase == 3U ? ExitYaw(slot.desired.yaw) : slot.desired.yaw;
     if (!character_direct_step_runtime::ApplyAIRecoveryTransform(slot.character,
-        slot.desired.position.data(), slot.desired.yaw)) { ++d.failed; d.stage = "alignment"; return; }
+        slot.desired.position.data(), alignmentYaw)) { ++d.failed; d.stage = "alignment"; return; }
     const auto before = current;
     if (!ReadCycle(slot.character, current) || !SameCycle(before, current) || !RemoteReady(slot.character)) {
         ++d.failed; d.stage = "actor-changed"; return;
@@ -416,6 +420,12 @@ bool Active(const std::uintptr_t character) noexcept {
     const std::lock_guard lock(gMutex); const auto* slot = Find(character);
     return slot != nullptr && (slot->desired.phase == 2U || slot->owned.address != 0U ||
         (slot->desired.phase != 0U && slot->desired.animate && slot->handled != slot->desired.transition));
+}
+bool ClipPlaying(const std::uintptr_t character) noexcept {
+    const std::lock_guard lock(gMutex); const auto* slot = Find(character);
+    if (slot == nullptr || slot->owned.address == 0U) return false;
+    const auto phase = ClassifyClip(slot->owned.animation).phase;
+    return phase == 1U || phase == 3U;
 }
 DiagnosticsSnapshot Snapshot(const std::uintptr_t character) noexcept {
     const std::lock_guard lock(gMutex); const auto* slot = Find(character);

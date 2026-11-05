@@ -2,6 +2,7 @@
 #include <Windows.h>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <vector>
@@ -57,6 +58,11 @@ int main() {
     Check(LocalPhase(3, true, state, 0, false, false) == 0U,
         "Completed exit clears once without replaying the retained door latch");
     state.phase = 1U;
+    Check(std::abs(ExitYaw(0.5F) - (0.5F - 3.14159265F)) < 0.0001F &&
+        std::abs(ExitYaw(-0.5F) - (3.14159265F - 0.5F)) < 0.0001F,
+        "Exit faces opposite the entry heading");
+    Check(std::abs(ExitYaw(3.1F)) <= 3.3F && std::abs(ExitYaw(-3.1F)) <= 3.3F && std::abs(ExitYaw(0.0F)) <= 3.3F,
+        "Exit heading stays inside the replicated yaw contract");
     aimp::ai_sync::native_intent::Payload intent{};
     for (std::uint32_t kind = 1U; kind <= 2U; ++kind) {
         for (std::uint32_t phase = 1U; phase <= 3U; ++phase) {

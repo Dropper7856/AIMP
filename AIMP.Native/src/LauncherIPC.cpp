@@ -3394,6 +3394,7 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
         const auto hidingPresentation = player_hiding_presentation::Snapshot(locomotion.characterAddress);
         const auto hidingDoor = hiding_door_presentation::Diagnostics();
         const auto hidingLocal = player_hiding_local::Diagnostics();
+        const auto hidingFollow = character_direct_step_runtime::HidingFollowSnapshot();
         const auto hidingAudio = hiding_presentation_audio::Snapshot(locomotion.characterAddress);
         diagnostics_->Log("info", "native_hiding_presentation_snapshot", "Remote hiding presentation state.",
             {{"audioStage", hidingAudio.stage, false},
@@ -3408,6 +3409,8 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
              {"localHidden", Diagnostics::Unsigned(hidingLocal.hidden), true},
              {"localExiting", Diagnostics::Unsigned(hidingLocal.exiting), true},
              {"localUnavailable", Diagnostics::Unsigned(hidingLocal.unavailable), true},
+             {"clipFollowFrames", Diagnostics::Unsigned(hidingFollow.frames), true},
+             {"clipFollowRejected", Diagnostics::Unsigned(hidingFollow.rejected), true},
              {"phase", Diagnostics::Unsigned(hidingPresentation.phase), true},
              {"transition", Diagnostics::Unsigned(hidingPresentation.transition), true},
              {"stage", hidingPresentation.stage, false},

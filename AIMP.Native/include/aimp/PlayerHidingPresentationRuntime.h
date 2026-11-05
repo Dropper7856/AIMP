@@ -26,6 +26,12 @@ struct ClipSelection final { std::uint32_t phase{}, kind{}; };
         (door.elapsedMilliseconds <= 500U || interactionActive || nativePhase == 1U)) return 1U;
     return 0U;
 }
+// Exit heading: the entry heading turned half a revolution, wrapped to
+// [-pi, pi] (the replicated yaw contract is |yaw| <= 3.3).
+[[nodiscard]] constexpr float ExitYaw(float entryYaw) noexcept {
+    constexpr float pi = 3.14159265358979F;
+    return entryYaw > 0.0F ? entryYaw - pi : entryYaw + pi;
+}
 [[nodiscard]] constexpr ClipSelection ClassifyClip(std::uint32_t token) noexcept {
     switch (token) {
     case 0xCF2A9F36U: return {1U, 1U};
@@ -61,6 +67,8 @@ void PumpAllOnEngineThread() noexcept;
 // If the engine cannot run again, the bounded pool remains inert until exit.
 void DrainStreamsOnEngineThread() noexcept;
 [[nodiscard]] bool Active(std::uintptr_t character) noexcept;
+// Our entry/exit clip currently owns the actor (not a settled Hidden phase).
+[[nodiscard]] bool ClipPlaying(std::uintptr_t character) noexcept;
 // Actual local player, engine thread only. true + State{} means visible;
 // false means a torn/unavailable sample or hiding without an exact door latch.
 // Parent validates its Character lifetime ticket before and after this call.

@@ -69,6 +69,11 @@ constexpr float kFollowerInitialPlacementTolerance = 0.05F;
 constexpr std::uint64_t kHidingResumeSettleMs = 250U;
 constexpr std::uint64_t kHidingResumeMaximumMs = 1500U;
 constexpr float kHidingResumeSettleDistance = 0.02F;
+// Smoothing of the entry/exit clip path: per-frame caps (~60 Hz) above a
+// walking pace, and a gap beyond which the network target is not this clip.
+constexpr float kHidingFollowDeadZone = 0.01F;
+constexpr float kHidingFollowMaximumStep = 0.08F;
+constexpr float kHidingFollowMaximumGap = 3.0F;
 constexpr float kFollowerMaximumMagnitude = 8.0F;
 // v13 keeps retail locomotion for normal motion, but allows a lagging proxy to
 // recover network error materially faster than v12.8. The hard-resync below is
@@ -2587,6 +2592,40 @@ __declspec(naked) void NpcLocomotionPreTransformDetour() {
 
 #endif
 
+std::atomic<std::uint64_t> gHidingFollowFrames{0U};
+std::atomic<std::uint64_t> gHidingFollowRejected{0U};
+
+// The remote actor plays the first-person locker clip without its root motion,
+// so it never leaves the prop. During the entry and exit clips, carry it along
+// the owner's own network path (the owner's Character really walks in/out),
+// smoothed per frame, while the clip keeps animating the body.
+void FollowHidingClipPath(MovementSlot& slot, const std::uintptr_t characterAddress) noexcept {
+    float targetX{}, targetY{}, targetZ{}, currentX{}, currentY{}, currentZ{};
+    if (!LoadNetworkTarget(slot, targetX, targetY, targetZ) ||
+        !ReadTransform(characterAddress, currentX, currentY, currentZ)) return;
+    const auto dx = targetX - currentX, dy = targetY - currentY, dz = targetZ - currentZ;
+    const auto distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (!std::isfinite(distance) || distance > kHidingFollowMaximumGap) {
+        gHidingFollowRejected.fetch_add(1U, std::memory_order_relaxed);
+        return;
+    }
+    if (distance > kHidingFollowDeadZone) {
+        const auto scale = distance > kHidingFollowMaximumStep ? kHidingFollowMaximumStep / distance : 1.0F;
+        const float position[3]{currentX + dx * scale, currentY + dy * scale, currentZ + dz * scale};
+        if (!TeleportCharacter(characterAddress, position[0], position[1], position[2]) ||
+            !GuardedWriteValue(characterAddress + kCharacterPositionOffset, position[0]) ||
+            !GuardedWriteValue(characterAddress + kCharacterPositionOffset + 4, position[1]) ||
+            !GuardedWriteValue(characterAddress + kCharacterPositionOffset + 8, position[2])) {
+            gHidingFollowRejected.fetch_add(1U, std::memory_order_relaxed);
+            return;
+        }
+    }
+    // Orientation stays the clip's own alignment: the owner's Character yaw
+    // keeps the entry heading while hidden, so following it would turn the
+    // actor back into the locker.
+    gHidingFollowFrames.fetch_add(1U, std::memory_order_relaxed);
+}
+
 void PumpSlotOnEngineThread(
     MovementSlot& slot,
     const EnginePumpPhase phase) noexcept {
@@ -2609,6 +2648,10 @@ void PumpSlotOnEngineThread(
         slot.driveRequested.store(false, std::memory_order_release);
         slot.certifiedCycleAddress.store(0U, std::memory_order_release);
         slot.preparedTargetRevision.store(0U, std::memory_order_release);
+        // After the retail tick, so the clip cannot pull the actor back.
+        if (phase == EnginePumpPhase::PostCharacterManager &&
+            player_hiding_presentation::ClipPlaying(characterAddress))
+            FollowHidingClipPath(slot, characterAddress);
         return;
     }
 
@@ -3584,6 +3627,11 @@ bool ApplyReplicatedYaw(
     error = "The replicated Character yaw field could not be written safely";
     return false;
 }
+HidingFollowStats HidingFollowSnapshot() noexcept {
+    return {gHidingFollowFrames.load(std::memory_order_relaxed),
+        gHidingFollowRejected.load(std::memory_order_relaxed)};
+}
+
 bool ApplyAIRecoveryTransform(std::uintptr_t character,const float* position,float yaw) noexcept {
     if(!GameplayLoaded()||!character||!position||!std::isfinite(yaw)||std::abs(yaw)>3.3F)return false;
     for(std::size_t i=0;i<3;++i)if(!std::isfinite(position[i])||std::abs(position[i])>100000.0F)return false;
