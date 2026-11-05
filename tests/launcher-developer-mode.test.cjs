@@ -7,7 +7,8 @@ const { test } = require('node:test');
 const root = path.resolve(__dirname, '..');
 
 test('Electron forwards only the explicit -dev argument to the API', () => {
-  const source = fs.readFileSync(process.env.AIMP_TEST_ELECTRON_MAIN || path.join(root, 'AIMP.Electron/main.js'), 'utf8');
+  const sourcePath = process.env.AIMP_TEST_ELECTRON_MAIN || path.join(root, 'AIMP.Electron/main.js');
+  const source = fs.readFileSync(sourcePath, 'utf8');
   for (const [args, expected] of [
     [[], []], [['-dev'], ['-dev']], [['-DEV'], ['-dev']],
     [['--dev', '-developer', '--debug'], []],
@@ -20,6 +21,7 @@ test('Electron forwards only the explicit -dev argument to the API', () => {
     const child = { stdout: { pipe() {} }, stderr: { pipe() {} }, once() {} };
     const context = {
       require(name) {
+        if (name.startsWith('./')) return require(path.resolve(path.dirname(sourcePath), name));
         if (name === 'electron') return { app, ipcMain: { on() {} } };
         if (name === 'node:child_process') return {
           spawn(executable, arguments_, options) { launch = { executable, arguments_, options }; return child; },

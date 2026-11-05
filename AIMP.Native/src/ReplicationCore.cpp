@@ -254,7 +254,7 @@ thread_local std::uint32_t gCausalTurnDepth{};
 thread_local std::vector<StagedRoot> gStagedRoots;
 std::atomic<std::uint64_t> gSegmentSerial{1U};
 std::mutex gOutboundSubmitMutex;
-std::atomic<std::uint64_t> gSequenceGaps{}, gSealedSegments{}, gAppliedSegments{}, gFailedSegments{};
+std::atomic<std::uint64_t> gSequenceGaps{}, gSealedSegments{}, gAppliedSegments{}, gFailedSegments{}, gSkippedSegments{};
 std::atomic<std::uint64_t> gOrderedCarrierTransactionCount{}, gOrderedCarrierMemberCount{},
     gOrderedCarrierCommitCount{}, gOrderedCarrierFailureCount{};
 thread_local bool gPumpingCausalSegment{};
@@ -1383,6 +1383,7 @@ RuntimeDiagnostics DiagnosticsSnapshot() noexcept {
     result.causalSegmentsSealed = gSealedSegments.load(std::memory_order_relaxed);
     result.causalSegmentsApplied = gAppliedSegments.load(std::memory_order_relaxed);
     result.causalSegmentsFailed = gFailedSegments.load(std::memory_order_relaxed);
+    result.causalSegmentsSkipped = gSkippedSegments.load(std::memory_order_relaxed);
     result.causalSequenceGaps = gSequenceGaps.load(std::memory_order_relaxed);
     {
         std::lock_guard lock(gOrderingMutex);
@@ -1727,16 +1728,12 @@ bool ReceiveAuthoritativeMutation(const WorldMutation& mutation) noexcept {
     command.kind = GameThreadCommandKind::WorldMutation;
     command.execute = [mutation, receivedAt] {
         const auto result = ExecuteMutationOnEngineThread(mutation, receivedAt);
-        if (result.code != WorldMutationResultCode::Accepted || !result.dispatched) {
-            if (result.code == WorldMutationResultCode::NativeFault) {
-                std::lock_guard lock(gOrderingMutex);
-                gCausalRecoveryRequired = true;
-                gDivergedAuthorityTransaction = mutation.sequence;
-            }
-            return;
-        }
         std::lock_guard lock(gOrderingMutex);
         gLastCommittedSequence = (std::max)(gLastCommittedSequence, mutation.sequence);
+        if (result.code != WorldMutationResultCode::Accepted || !result.dispatched) {
+            gSkippedSegments.fetch_add(1U, std::memory_order_relaxed);
+            return;
+        }
         if (mutation.kind == WorldMutationKind::State || mutation.kind == WorldMutationKind::Timeline)
             gStateRevisions[{mutation.entity, mutation.operation, mutation.kind}] = mutation.revision;
         gAcceptedMutationCount.fetch_add(1U, std::memory_order_acq_rel);
@@ -1843,22 +1840,27 @@ static std::size_t PumpOneDeferredRemoteTransaction(const std::size_t budget) no
             gDeferredRemoteApplies.pop_front();
         }
     }
-    // Several transactions can now be admitted ahead of their native result.
-    // A definitive failure of a complete transaction must fence its suffix in
-    // native immediately, before the launcher receives the failure callback.
-    // Requeued runtime waits release their in-flight ownership and do not fence.
-    struct CommitFence {
+    // An unsuccessful transaction is consumed once, without replaying effects
+    // which may already have run. Its original failure results remain visible
+    // to the Launcher, but the next transaction must not be fenced by the gap.
+    // A transient wait relinquishes in-flight ownership and is not settled.
+    struct SettlementFence {
         const std::vector<DeferredRemoteApply>& segment;
         const InFlightGuard& inFlight;
-        ~CommitFence() {
+        ~SettlementFence() {
             if (inFlight.count == 0U || segment.empty()) return;
             std::lock_guard lock(gOrderingMutex);
-            if (!gCausalRecoveryRequired && gLastCommittedSequence < segment.back().mutation.sequence) {
-                gCausalRecoveryRequired = true;
-                gDivergedAuthorityTransaction = segment.front().root.authorityTransaction;
+            if (!gCausalRecoveryRequired && gGenerations != nullptr &&
+                segment.front().mutation.levelGeneration == gGenerations->CurrentGeneration() &&
+                gLastCommittedSequence < segment.back().mutation.sequence) {
+                gLastCommittedSequence = segment.back().mutation.sequence;
+                for (const auto& member : segment)
+                    RememberPublicCauseLocked({member.mutation.sourcePeer, member.root.observationId});
+                gSkippedSegments.fetch_add(1U, std::memory_order_relaxed);
+                TouchVersion();
             }
         }
-    } commitFence{segment, inFlight};
+    } settlementFence{segment, inFlight};
     {
         std::lock_guard lock(gOrderingMutex);
         if (gCausalRecoveryRequired) {
@@ -1934,7 +1936,7 @@ static std::size_t PumpOneDeferredRemoteTransaction(const std::size_t budget) no
             return segment.size();
         };
 
-        const auto failStopFromMember = [&](const std::size_t index,
+        const auto skipFromMember = [&](const std::size_t index,
                                              const WorldMutationResultCode code) -> std::size_t {
             CountRejection(code);
             PushResult(Rejected(segment[index].mutation, code));
@@ -1942,21 +1944,19 @@ static std::size_t PumpOneDeferredRemoteTransaction(const std::size_t budget) no
                 CountRejection(WorldMutationResultCode::QueueRejected);
                 PushResult(Rejected(segment[j].mutation, WorldMutationResultCode::QueueRejected));
             }
-            MarkCausalRecoveryRequired(segment.front().root.authorityTransaction);
             gOrderedCarrierFailureCount.fetch_add(1U, std::memory_order_relaxed);
             gFailedSegments.fetch_add(1U, std::memory_order_relaxed);
             TouchVersion();
             return segment.size();
         };
 
-        const auto failStopAfterExecutedMember = [&](const std::size_t index) -> std::size_t {
+        const auto skipAfterExecutedMember = [&](const std::size_t index) -> std::size_t {
             // ExecuteMutationOnEngineThread already emitted the failing result
             // for `index`; only reject the not-yet-executed suffix here.
             for (std::size_t j = index + 1U; j < segment.size(); ++j) {
                 CountRejection(WorldMutationResultCode::QueueRejected);
                 PushResult(Rejected(segment[j].mutation, WorldMutationResultCode::QueueRejected));
             }
-            MarkCausalRecoveryRequired(segment.front().root.authorityTransaction);
             gOrderedCarrierFailureCount.fetch_add(1U, std::memory_order_relaxed);
             gFailedSegments.fetch_add(1U, std::memory_order_relaxed);
             TouchVersion();
@@ -2002,7 +2002,7 @@ static std::size_t PumpOneDeferredRemoteTransaction(const std::size_t budget) no
                     }
                     return requeueWholeBeforeRetail();
                 }
-                return failStopFromMember(i, WorldMutationResultCode::RuntimePending);
+                return skipFromMember(i, WorldMutationResultCode::RuntimePending);
             }
 
             WorldMutationResultCode semanticFailure = WorldMutationResultCode::EntityRejected;
@@ -2032,14 +2032,14 @@ static std::size_t PumpOneDeferredRemoteTransaction(const std::size_t budget) no
             if (semanticRejected) {
                 if (!crossedRetail)
                     return rejectWholeBeforeRetail(semanticFailure);
-                return failStopFromMember(i, semanticFailure);
+                return skipFromMember(i, semanticFailure);
             }
 
             // Re-check availability after earlier carriers have executed. The
             // transaction-wide preflight above prevents known pending roots;
             // this second check detects runtime invalidation CAUSED by an earlier
-            // member. Once retail has been crossed, such a change is fail-stop,
-            // never a transaction replay.
+            // member. Once retail has been crossed, discard the remaining members;
+            // never replay the transaction.
             const auto reason = PublicRootPendingReason(pending.mutation, pending.root);
             if (reason != 0U) {
                 if (!crossedRetail) {
@@ -2055,7 +2055,7 @@ static std::size_t PumpOneDeferredRemoteTransaction(const std::size_t budget) no
                     }
                     return requeueWholeBeforeRetail();
                 }
-                return failStopFromMember(i, WorldMutationResultCode::RuntimePending);
+                return skipFromMember(i, WorldMutationResultCode::RuntimePending);
             }
 
             std::shared_ptr<world_actions::PreparedPublicRoot> prepared;
@@ -2084,7 +2084,7 @@ static std::size_t PumpOneDeferredRemoteTransaction(const std::size_t budget) no
                 }
                 if (!crossedRetail)
                     return rejectWholeBeforeRetail(code);
-                return failStopFromMember(i, code);
+                return skipFromMember(i, code);
             }
 
             crossedRetail = true;
@@ -2092,7 +2092,7 @@ static std::size_t PumpOneDeferredRemoteTransaction(const std::size_t budget) no
                 pending.mutation, pending.receivedAt, prepared);
             gDeferredExecutedCount.fetch_add(1U, std::memory_order_relaxed);
             if (result.code != WorldMutationResultCode::Accepted || !result.dispatched)
-                return failStopAfterExecutedMember(i);
+                return skipAfterExecutedMember(i);
         }
 
         {
@@ -2155,9 +2155,8 @@ static std::size_t PumpOneDeferredRemoteTransaction(const std::size_t budget) no
 
     // A proved semantic mismatch is final for this transaction. No dependency
     // resolution, NativeContext reconstruction, Prepare or retail call occurs.
-    // Launcher fail-stop/rejoin semantics remain unchanged because the sequence
-    // cannot be committed when an authoritative occurrence is semantically
-    // unproven on this peer.
+    // The failed results remain visible, and SettlementFence consumes the
+    // skipped sequence range without applying or replaying an unproven effect.
     if (semanticReject) {
         for (const auto& member : segment) {
             CountRejection(semanticRejectCode);
@@ -2259,12 +2258,9 @@ static std::size_t PumpOneDeferredRemoteTransaction(const std::size_t budget) no
             return segment.size();
         }
     }
-    // No retry once any non-echo member crosses retail. A failure after this
-    // boundary is not rolled back and not replayed: the generation enters an
-    // explicit fail-stop state until a level/world reset establishes a fresh
-    // CATHODE instance.
+    // No retry once any member crosses retail. Preserve effects already run,
+    // discard the unsuccessful suffix, and consume this transaction once.
     bool failed = false;
-    bool crossedRetail = false;
     for (std::size_t i = 0; i < segment.size(); ++i) {
         const auto& pending = segment[i];
         if (failed) {
@@ -2289,16 +2285,10 @@ static std::size_t PumpOneDeferredRemoteTransaction(const std::size_t budget) no
                 true, true, pending.mutation.nativeDispatchId};
             PushResult(result);
         } else {
-            crossedRetail = true;
             result = ExecuteMutationOnEngineThread(pending.mutation, pending.receivedAt, prepared[i]);
             gDeferredExecutedCount.fetch_add(1U, std::memory_order_relaxed);
         }
         failed = result.code != WorldMutationResultCode::Accepted || !result.dispatched;
-        if (failed && crossedRetail) {
-            std::lock_guard lock(gOrderingMutex);
-            gCausalRecoveryRequired = true;
-            gDivergedAuthorityTransaction = segment.front().root.authorityTransaction;
-        }
     }
     if (!failed) {
         std::lock_guard lock(gOrderingMutex);

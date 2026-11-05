@@ -790,6 +790,7 @@ std::atomic<std::uint64_t> gExecutionCaptured{}, gExecutionTransitions{}, gExecu
 std::atomic<std::uint64_t> gRoleTaskCaptured{}, gRoleTaskTransitions{};
 std::atomic<std::uint64_t> gLifecycleCaptured{}, gLifecycleApplied{}, gLifecycleSnaps{}, gExecutionBarriers{};
 std::atomic<std::uint64_t> gImpactCaptured{}, gImpactQueued{}, gImpactApplied{}, gImpactRejected{};
+std::atomic<std::uint64_t> gImpactShooterRemaps{}, gImpactShooterUnresolved{};
 std::atomic<std::uint64_t> gWithdrawSamples{}, gWithdrawTransitions{}, gWithdrawApplied{};
 std::atomic<std::uint64_t> gBackstageCaptured{}, gBackstageTransitions{}, gBackstageApplied{}, gBackstageRejected{};
 std::atomic<std::uint64_t> gPlacementVerified{}, gPlacementRejected{}, gLifecycleRetries{};
@@ -7504,14 +7505,52 @@ bool ClientAIImpactVictim(void* receiver, std::uintptr_t& victim) noexcept {
         victim != 0U && Eligible(victim, type);
 }
 
+// Remote player Replicas are not inserted in the retail Character registry
+// (0x134EF40). On the Host, a Replica's shot therefore resolves its shooter to
+// null, and the zero-damage stimulus branch of 007CDCF0 dereferences it
+// (crash at 007CDE34). Map the missing registration to the published
+// participant with the same identity. Published bindings only: impact
+// dispatch may run on a worker.
+std::uintptr_t HostReplicaShooter(const std::uint32_t* identity) noexcept {
+    if (identity == nullptr || gRole.load(std::memory_order_acquire) != Role::Host ||
+        !PairGenerationStable()) return 0U;
+    const auto address = reinterpret_cast<std::uintptr_t>(identity);
+    std::uint32_t entityA{}, entityB{};
+    if (!Read(address, entityA) || !Read(address + 4U, entityB) ||
+        (entityA == 0U && entityB == 0U)) return 0U;
+    std::uintptr_t mapped{};
+    for (std::size_t i = 1U; i < gPairParticipants.size(); ++i) {
+        PairIdentity candidate{};
+        if (!LoadPairBinding(gPairParticipants[i], candidate) || candidate.peer == 0U ||
+            candidate.entityA != entityA || candidate.entityB != entityB ||
+            !RegisteredPlayerRepresentation(candidate.character) || !PairIdentityLive(candidate)) continue;
+        if (mapped != 0U && mapped != candidate.character) {
+            gParticipantSignalAmbiguous.fetch_add(1U, std::memory_order_relaxed);
+            return 0U;
+        }
+        mapped = candidate.character;
+    }
+    return mapped;
+}
+std::uintptr_t ResolveImpactShooter(void* resources, const std::uint32_t* identity) noexcept {
+    std::uintptr_t retail{};
+    __try {
+        retail = reinterpret_cast<SenseCharacterResolver>(gBase + kCharacterResolverRva)(resources, identity);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { retail = 0U; }
+    if (retail != 0U) return retail;
+    const auto mapped = HostReplicaShooter(identity);
+    if (mapped != 0U) gImpactShooterRemaps.fetch_add(1U, std::memory_order_relaxed);
+    return mapped;
+}
+std::uintptr_t __fastcall ImpactShooterResolverDetour(void* resources, void*,
+    const std::uint32_t* identity) noexcept {
+    return ResolveImpactShooter(resources, identity);
+}
 std::uintptr_t ResolveImpactSource(int* hit) noexcept {
     if (hit == nullptr || gBase == 0U) return 0U;
     std::uintptr_t resources{};
     if (!Read(gBase + kCharacterResolverRegistryRva, resources) || resources == 0U) return 0U;
-    __try {
-        return reinterpret_cast<SenseCharacterResolver>(gBase + kCharacterResolverRva)(
-            reinterpret_cast<void*>(resources), reinterpret_cast<const std::uint32_t*>(hit));
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0U; }
+    return ResolveImpactShooter(reinterpret_cast<void*>(resources), reinterpret_cast<const std::uint32_t*>(hit));
 }
 
 // Keep SEH in leaf functions that do not require C++ object unwinding. MSVC
@@ -7648,7 +7687,16 @@ void __fastcall CharacterImpactDetour(void* receiver, void*, int* hit) noexcept 
         static_cast<void>(PublishClientImpact(victim, hit, 1U));
         return;
     }
-    if (!HostReplicaImpactAlreadyOwned(receiver, hit, 1U)) original(receiver, hit);
+    if (HostReplicaImpactAlreadyOwned(receiver, hit, 1U)) return;
+    // Last resort only: the zero-damage branch unconditionally dereferences
+    // the shooter. Keep every resolvable or damaging impact retail.
+    std::int32_t damage{};
+    if (gRole.load(std::memory_order_acquire) == Role::Host && ResolveImpactSource(hit) == 0U &&
+        ResolveImpactDamageSafe(hit, damage) && damage == 0) {
+        gImpactShooterUnresolved.fetch_add(1U, std::memory_order_relaxed);
+        return;
+    }
+    original(receiver, hit);
 }
 void __fastcall CharacterImpactSecondaryDetour(void* receiver, void*, int* hit) noexcept {
     const auto original = reinterpret_cast<CharacterImpact>(
@@ -8887,6 +8935,21 @@ bool HookParticipantSenseSignals(HookManager& hooks, std::string& error) {
     return true;
 }
 
+bool HookImpactShooterIdentity(HookManager& hooks, std::string& error) {
+    // Every shooter resolver CALL in both certified Character impact
+    // receivers (007CDCF0, 007CE020); never the global resolver itself.
+    constexpr std::array<std::uintptr_t, 3U> calls{0x003CDD0CU, 0x003CDFF0U, 0x003CE03CU};
+    for (const auto rva : calls) {
+        CallRedirectRequest request;
+        request.name = "aisync_impact_shooter_identity_" + std::to_string(rva);
+        request.callSite = reinterpret_cast<void*>(gBase + rva);
+        request.expectedTarget = reinterpret_cast<void*>(gBase + kCharacterResolverRva);
+        request.detour = reinterpret_cast<void*>(&ImpactShooterResolverDetour);
+        if (!hooks.InstallCallRedirect(request, error)) return false;
+    }
+    return true;
+}
+
 bool HookParticipantPairedIdentity(HookManager& hooks, std::string& error) {
     // The shared initializer is used by both certified paired cycle families.
     // Complete prologue instructions have no relative or HIGHLOW operands.
@@ -9147,6 +9210,7 @@ bool Install(const std::uintptr_t base, HookManager& hooks, LevelGenerationTrack
         health::InstallDamageObserver(hooks, error) &&
         combat::Install(hooks, error) &&
         HookParticipantSenseSignals(hooks, error) &&
+        HookImpactShooterIdentity(hooks, error) &&
         HookParticipantPairedIdentity(hooks, error) &&
         HookPairedVictimGuards(hooks, error) &&
         HookPairedGraphTrace(hooks, error) &&
@@ -10146,6 +10210,8 @@ Counters DiagnosticsSnapshot() noexcept {
     value.lifecycleRetries = gLifecycleRetries.load();
     value.executionBarriers = gExecutionBarriers.load();
     value.impactCaptured = gImpactCaptured.load();
+    value.impactShooterRemaps = gImpactShooterRemaps.load();
+    value.impactShooterUnresolved = gImpactShooterUnresolved.load();
     value.impactQueued = gImpactQueued.load();
     value.impactApplied = gImpactApplied.load();
     value.impactRejected = gImpactRejected.load();
@@ -10880,6 +10946,8 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"impactQueued", Diagnostics::Unsigned(ai.impactQueued), true},
          {"impactApplied", Diagnostics::Unsigned(ai.impactApplied), true},
          {"impactRejected", Diagnostics::Unsigned(ai.impactRejected), true},
+         {"impactShooterRemaps", Diagnostics::Unsigned(ai.impactShooterRemaps), true},
+         {"impactShooterUnresolved", Diagnostics::Unsigned(ai.impactShooterUnresolved), true},
          {"withdrawSamples", Diagnostics::Unsigned(ai.withdrawSamples), true},
          {"withdrawTransitions", Diagnostics::Unsigned(ai.withdrawTransitions), true},
          {"withdrawApplied", Diagnostics::Unsigned(ai.withdrawApplied), true},

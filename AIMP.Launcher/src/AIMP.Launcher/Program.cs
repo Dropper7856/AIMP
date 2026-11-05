@@ -15,21 +15,30 @@ public static class Program
         }
 
         var hostArguments = LauncherStartupOptions.Parse(args, out var developerModeAvailable);
+        var accessPolicy = new LocalApiAccessPolicy(
+            Environment.GetEnvironmentVariable("AIMP_FRONTEND_ORIGIN"), Environment.GetEnvironmentVariable("AIMP_API_TOKEN"));
+        Environment.SetEnvironmentVariable("AIMP_API_TOKEN", null);
         var builder = WebApplication.CreateBuilder(hostArguments);
-        ConfigureServices(builder.Services, developerModeAvailable);
+        ConfigureServices(builder.Services, developerModeAvailable, accessPolicy);
 
         var app = builder.Build();
-        ConfigurePipeline(app);
+        ConfigurePipeline(app, accessPolicy);
         app.Run();
     }
 
-    private static void ConfigureServices(IServiceCollection services, bool developerModeAvailable)
+    internal static void ConfigureApiSecurityServices(IServiceCollection services, LocalApiAccessPolicy accessPolicy)
     {
-        services.AddProblemDetails();
         services.AddCors(options => options.AddDefaultPolicy(policy => policy
-            .SetIsOriginAllowed(IsLocalFrontendOrigin)
+            .SetIsOriginAllowed(accessPolicy.IsAllowedOrigin)
             .AllowAnyHeader()
             .AllowAnyMethod()));
+    }
+
+    private static void ConfigureServices(
+        IServiceCollection services, bool developerModeAvailable, LocalApiAccessPolicy accessPolicy)
+    {
+        services.AddProblemDetails();
+        ConfigureApiSecurityServices(services, accessPolicy);
         services.AddControllers().AddJsonOptions(options =>
             options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 
@@ -76,7 +85,7 @@ public static class Program
             provider.GetRequiredService<IHostApplicationLifetime>()));
     }
 
-    private static void ConfigurePipeline(WebApplication app)
+    internal static void ConfigurePipeline(WebApplication app, LocalApiAccessPolicy accessPolicy)
     {
         app.UseExceptionHandler(errorApp => errorApp.Run(async context =>
         {
@@ -101,24 +110,9 @@ public static class Program
                 .ExecuteAsync(context);
         }));
 
-        app.Use(async (context, next) =>
-        {
-            if (HttpMethods.IsOptions(context.Request.Method)
-                && string.Equals(
-                    context.Request.Headers["Access-Control-Request-Private-Network"],
-                    "true",
-                    StringComparison.OrdinalIgnoreCase)
-                && context.Request.Headers.Origin is { Count: > 0 } origins
-                && IsLocalFrontendOrigin(origins[0]!))
-            {
-                context.Response.OnStarting(() =>
-                {
-                    context.Response.Headers["Access-Control-Allow-Private-Network"] = "true";
-                    return Task.CompletedTask;
-                });
-            }
-            await next().ConfigureAwait(false);
-        });
+        // CORS only controls whether a browser can read a response. Reject
+        // untrusted requests before they can read files or execute actions.
+        app.Use(accessPolicy.EnforceAsync);
         app.UseCors();
         app.MapControllers();
         app.MapGet("/", () => Results.Ok(new
@@ -128,22 +122,5 @@ public static class Program
             apiBase = "/api/v1",
             localOnly = true
         }));
-    }
-
-    private static bool IsLocalFrontendOrigin(string origin)
-    {
-        if (string.Equals(origin, "null", StringComparison.OrdinalIgnoreCase)) return true;
-        if (!Uri.TryCreate(origin, UriKind.Absolute, out var uri)) return false;
-        if (uri.IsLoopback
-            || string.Equals(uri.Scheme, "file", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(uri.Scheme, "app", StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        var configuredOrigin = Environment.GetEnvironmentVariable("AIMP_FRONTEND_ORIGIN");
-        return !string.IsNullOrWhiteSpace(configuredOrigin)
-            && string.Equals(
-                origin.TrimEnd('/'),
-                configuredOrigin.Trim().TrimEnd('/'),
-                StringComparison.OrdinalIgnoreCase);
     }
 }

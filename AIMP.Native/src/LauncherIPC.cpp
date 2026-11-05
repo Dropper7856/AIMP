@@ -3913,6 +3913,7 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
              {"ws3SegmentsSealed", Diagnostics::Unsigned(replication.causalSegmentsSealed), true},
              {"ws3SegmentsApplied", Diagnostics::Unsigned(replication.causalSegmentsApplied), true},
              {"ws3SegmentsFailed", Diagnostics::Unsigned(replication.causalSegmentsFailed), true},
+             {"ws3SegmentsSkipped", Diagnostics::Unsigned(replication.causalSegmentsSkipped), true},
              {"ws3SequenceGaps", Diagnostics::Unsigned(replication.causalSequenceGaps), true},
              {"ws3LastCommittedSequence", Diagnostics::Unsigned(replication.causalLastCommittedSequence), true},
              {"ws3RecoveryRequired", Diagnostics::Boolean(replication.causalRecoveryRequired), true},
