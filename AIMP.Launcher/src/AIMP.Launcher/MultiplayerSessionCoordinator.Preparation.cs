@@ -140,6 +140,23 @@ internal sealed partial class MultiplayerSessionCoordinator
                     && !string.Equals(value.Level, snapshot.Level, StringComparison.OrdinalIgnoreCase));
                 if (mismatch is not null)
                     throw new InvalidOperationException($"Players selected different levels. Everyone must prepare {snapshot.Level} before starting.");
+                var hostPreparation = _lobby.Preparations?.FirstOrDefault(value => value.PeerId == host.HostPeerId
+                    && value.Ready && value.PreparationToken == snapshot.PreparationToken);
+                var different = hostPreparation is null ? null : _lobby.Preparations?.FirstOrDefault(value => value.Ready
+                    && value.PeerId != host.HostPeerId && value.PreparationToken == snapshot.PreparationToken
+                    && string.Equals(value.Level, snapshot.Level, StringComparison.OrdinalIgnoreCase)
+                    && !LobbyHost.SameWorldManifest(value, hostPreparation));
+                if (different is not null)
+                {
+                    var name = snapshot.Players.FirstOrDefault(player => player.PeerId == different.PeerId)?.DisplayName
+                        ?? "A player";
+                    _diagnostics.Log("Preparation",
+                        $"Start refused: {name}'s {snapshot.Level} WorldManifest would be rejected " +
+                        $"(host={hostPreparation!.Manifest}, peer={different.Manifest}).");
+                    throw new InvalidOperationException(
+                        $"{name}'s {snapshot.Level} level is too different from the host's: its WorldManifest would be rejected. " +
+                        "Every player needs the same level files: verify the game files in Steam, then try again.");
+                }
             }
             if (DateTimeOffset.UtcNow >= deadline) throw new InvalidOperationException("Waiting for all players to verify this level and become Ready. Try Start again when they are ready.");
             await Task.Delay(100, _lifetime.Token).ConfigureAwait(false);

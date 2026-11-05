@@ -47,7 +47,9 @@ internal static class PreparationTests
         await WaitUntilAsync(() => client.Snapshot?.Preparations?.Any(report =>
             report.PeerId == client.PeerId && report.Manifest == wrongMap.Manifest) == true)
             .ConfigureAwait(false);
-        AssertEx.True(host.CanStart, "The same level name must allow different compiled manifest identities.");
+        // In game, every world mutation of a different identity is ManifestRejected.
+        AssertEx.False(host.CanStart, "A different compiled manifest identity must block the start.");
+        await AssertStartRejectedAsync(host, timeout.Token).ConfigureAwait(false);
 
         await client.SendLobbyPreparationAsync(Report(host, client.PeerId, originalToken), timeout.Token)
             .ConfigureAwait(false);

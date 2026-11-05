@@ -20,6 +20,9 @@ internal static class LobbyReadiness
     private static string PreparationStatus(LobbySnapshotPayload lobby)
     {
         var reports = lobby.Preparations ?? Array.Empty<LobbyPreparationPayload>();
+        var hostPlayer = lobby.Players.FirstOrDefault(p => p.IsHost);
+        var hostReport = hostPlayer is null ? null : reports.FirstOrDefault(p => p.SessionId == lobby.SessionId
+            && p.PeerId == hostPlayer.PeerId && p.PreparationToken == lobby.PreparationToken && p.Ready);
         foreach (var player in lobby.Players)
         {
             var report = reports.FirstOrDefault(p => p.SessionId == lobby.SessionId && p.PeerId == player.PeerId
@@ -28,6 +31,8 @@ internal static class LobbyReadiness
             if (!report.Ready) return $"{player.DisplayName}: {report.Error}";
             if (!string.Equals(report.Level, lobby.Level, StringComparison.OrdinalIgnoreCase))
                 return $"Level mismatch: {player.DisplayName}";
+            if (hostReport is not null && !LobbyHost.SameWorldManifest(report, hostReport))
+                return $"Level files differ: {player.DisplayName}";
         }
         return string.Empty;
     }

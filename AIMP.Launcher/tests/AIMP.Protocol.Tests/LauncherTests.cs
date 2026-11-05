@@ -69,7 +69,19 @@ internal static class LauncherTests
         AssertEx.Equal("Ready to start", LobbyReadiness.Status(lobby with
             { Preparations = new[] { ready, peer with { ManifestSha256 = new string('b', 64) } } }));
         AssertEx.Equal("Ready to start", LobbyReadiness.Status(lobby with
-            { Preparations = new[] { ready, peer with { Level = "tech_comms", Manifest = identity with { MapContentId = new WorldEntityId(3,4) } } } }));
+            { Preparations = new[] { ready, peer with { Level = "tech_comms" } } }));
+        // A different identity would be ManifestRejected in game: refuse the start.
+        var rejected = peer with { Manifest = identity with { MapContentId = new WorldEntityId(3, 4) } };
+        AssertEx.Equal("Level files differ: Client", LobbyReadiness.Status(lobby with
+            { Preparations = new[] { ready, rejected } }));
+        AssertEx.True(LobbyHost.SameWorldManifest(peer with { ManifestSha256 = new string('b', 64) }, ready));
+        AssertEx.True(!LobbyHost.SameWorldManifest(rejected, ready));
+
+        // AI.exe ignores a COMMANDS.BIN beside COMMANDS.PAK; it must not change the map identity.
+        AssertEx.Equal(WorldManifestCompiler.ComputeStableMapContentId(@"C:\G\TECH_COMMS\WORLD", true, false),
+            WorldManifestCompiler.ComputeStableMapContentId(@"C:\G\TECH_COMMS\WORLD", true, true));
+        AssertEx.True(WorldManifestCompiler.ComputeStableMapContentId(@"C:\G\TECH_COMMS\WORLD", true, false)
+            != WorldManifestCompiler.ComputeStableMapContentId(@"C:\G\TECH_COMMS\WORLD", false, true));
         AssertEx.Equal("Level mismatch: Client", LobbyReadiness.Status(lobby with
             { Preparations = new[] { ready, peer with { Level = "TECH_HUB" } } }));
         AssertEx.Equal("Verifying Client's level", LobbyReadiness.Status(lobby with

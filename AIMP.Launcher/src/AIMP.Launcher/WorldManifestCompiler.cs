@@ -1966,7 +1966,10 @@ internal sealed class WorldManifestCompiler
         writer.Write("AIMP-WORLDMANIFEST-MAP-V3-LEVEL");
         writer.Write(WorldManifestConstants.FormatVersion);
         writer.Write(pakPresent);
-        writer.Write(binPresent);
+        // AI.exe only loads COMMANDS.PAK, and the manifest is built from it: a
+        // COMMANDS.BIN beside it (OpenCAGE output) must not change the identity.
+        // Levels without a BIN keep their previous identity.
+        writer.Write(binPresent && !pakPresent);
         writer.Write(name.ToUpperInvariant());
         writer.Flush();
         return Hash128(stream.ToArray());

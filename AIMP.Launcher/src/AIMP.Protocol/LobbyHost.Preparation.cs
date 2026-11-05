@@ -62,12 +62,16 @@ public sealed partial class LobbyHost
             _lobbyPreparations.TryGetValue(peerId, out var peer) && peer.Ready
             && peer.PreparationToken == _preparationToken
             && string.Equals(peer.Level, _level, StringComparison.OrdinalIgnoreCase)
-            // WorldManifest identity/hash equality check DISABLED: two untouched copies of the
-            // same level can legitimately produce different manifest hashes.
-            // && peer.Manifest == host.Manifest
-            // && string.Equals(peer.ManifestSha256, host.ManifestSha256, StringComparison.OrdinalIgnoreCase)
-            );
+            && SameWorldManifest(peer, host));
     }
+
+    // The native registry rejects every world mutation whose manifest identity
+    // (format, compiler, MapContentId) differs from the loaded one
+    // (ManifestRejected), so such a round cannot start. A different
+    // ManifestSha256 alone is accepted: two copies of a level may differ in
+    // details without breaking replication.
+    public static bool SameWorldManifest(LobbyPreparationPayload peer, LobbyPreparationPayload host) =>
+        peer.Manifest == host.Manifest;
 
     private bool AcceptLobbyPreparationLocked(LobbyPreparationPayload preparation)
     {
