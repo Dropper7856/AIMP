@@ -158,6 +158,12 @@ set_target_properties(AIMP.NetZ PROPERTIES
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(AIMP.WorldTransactionSkipTests tests/WorldTransactionSkipTests.cpp)
+    target_link_libraries(AIMP.WorldTransactionSkipTests PRIVATE AIMP.Core)
+    target_compile_options(AIMP.WorldTransactionSkipTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.WorldTransactionSkipTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME WorldTransactionSkipAndContinue COMMAND AIMP.WorldTransactionSkipTests)
     add_executable(AIMP.WorldManifestTests tests/WorldManifestRuntimeTests.cpp)
     target_link_libraries(AIMP.WorldManifestTests PRIVATE AIMP.Core)
     target_compile_options(AIMP.WorldManifestTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)

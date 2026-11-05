@@ -1,0 +1,72 @@
+{
+  "name": "aimp-launcher-desktop",
+  "version": "1.0.4",
+  "description": "AI-MP desktop launcher",
+  "author": "AI-MP",
+  "private": true,
+  "type": "commonjs",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win --x64"
+  },
+  "devDependencies": {
+    "electron": "^40.0.0",
+    "electron-builder": "^26.8.1"
+  },
+  "build": {
+    "appId": "com.aimp.launcher",
+    "productName": "AI-MP Launcher",
+    "asar": true,
+    "directories": {
+      "output": "../dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "api-security.js",
+      "startup-updater.js",
+      "update.html",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "staging/api",
+        "to": "api"
+      },
+      {
+        "from": "staging/launcher.config.json",
+        "to": "launcher.config.json"
+      }
+    ],
+    "win": {
+      "executableName": "AIMP.Launcher.Desktop",
+      "icon": "../ai-mp-icon.png",
+      "requestedExecutionLevel": "asInvoker",
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "artifactName": "AI-MP-Launcher-Setup-${version}-${arch}.${ext}"
+    },
+    "portable": {
+      "artifactName": "AI-MP-Launcher-Portable-${version}-${arch}.${ext}"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "Dropper7856",
+      "repo": "AIMP",
+      "releaseType": "release"
+    }
+  },
+  "dependencies": {
+    "electron-updater": "6.8.11"
+  }
+}

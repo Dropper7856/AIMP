@@ -4,7 +4,10 @@ internal static class Program
 {
     private static readonly TestCase[] Tests =
     {
+        new("Local API origin and loopback policy", LocalApiSecurityTests.AccessPolicyAsync),
+        new("Local API HTTP security boundary", LocalApiSecurityTests.HttpBoundaryAsync),
         new("WorldSync bounded dispatch pipeline", WorldDispatchWindowTests.CapacityAndOrderAsync),
+        new("WorldSync failed transaction skip and continuity", WorldTransactionSkipTests.SkipAndContinueAsync),
         new("MissionSync authored completion frontier", MissionFrontierTests.SelectionAsync),
         new("MissionSync survival objective frontiers", MissionFrontierTests.SurvivalAsync),
         new("MissionSync proxied composite milestone frontiers", MissionFrontierTests.ProxyAsync),

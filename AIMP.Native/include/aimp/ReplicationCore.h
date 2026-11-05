@@ -52,7 +52,7 @@ struct RuntimeDiagnostics final {
     std::uint64_t deferredExecutedCount{};
     std::uint64_t deferredExpiredCount{};
     std::uint64_t deferredOverflowCount{};
-    std::uint64_t causalSegmentsSealed{}, causalSegmentsApplied{}, causalSegmentsFailed{}, causalSequenceGaps{};
+    std::uint64_t causalSegmentsSealed{}, causalSegmentsApplied{}, causalSegmentsFailed{}, causalSegmentsSkipped{}, causalSequenceGaps{};
     std::uint64_t causalLastCommittedSequence{}, causalDivergedAuthorityTransaction{};
     bool causalRecoveryRequired{};
     // Patch 4.3 / Patch 5: certified EmittedOutput or high-level CompositeInput

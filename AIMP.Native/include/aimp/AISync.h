@@ -301,6 +301,7 @@ struct Counters final {
     std::uint64_t roleTaskCaptured{}, roleTaskTransitions{};
     std::uint64_t lifecycleCaptured{}, lifecycleApplied{}, lifecycleSnaps{}, executionBarriers{};
     std::uint64_t impactCaptured{}, impactQueued{}, impactApplied{}, impactRejected{};
+    std::uint64_t impactShooterRemaps{}, impactShooterUnresolved{};
     std::uint64_t backstageCaptured{}, backstageTransitions{}, backstageApplied{}, backstageRejected{};
     std::uint64_t placementVerified{}, placementRejected{}, lifecycleRetries{};
     std::uint64_t withdrawSamples{}, withdrawTransitions{}, withdrawApplied{};

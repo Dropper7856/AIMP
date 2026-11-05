@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
+  <title>AI-MP Launcher</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 34px;
+      background: #010a07; color: #a5ffd1; font: 14px Consolas, monospace; }
+    main { width: 100%; border-top: 2px solid #80f7b9; padding-top: 23px; }
+    .brand { color: #65a989; font-size: 12px; letter-spacing: .2em; }
+    h1 { font-size: 22px; font-weight: 400; letter-spacing: .06em; margin: 18px 0 12px; }
+    p { color: #8bbda2; line-height: 1.6; min-height: 44px; }
+    progress { width: 100%; height: 8px; accent-color: #80f7b9; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="brand">AI-MP // LAUNCHER UPDATE</div>
+    <h1 id="status">CHECKING FOR UPDATES</h1>
+    <p id="message">Checking for the latest AI-MP Launcher version.</p>
+    <progress id="progress" max="100" aria-label="Update progress"></progress>
+  </main>
+</body>
+</html>

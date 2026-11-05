@@ -163,6 +163,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         internal int ReceivedCount { get; set; }
         internal int ResultCount { get; set; }
         internal bool Failed { get; set; }
+        internal WorldMutationResultCode FailureCode { get; set; }
+        internal ulong FailureSequence { get; set; }
         internal HashSet<AwaitAuthorityCause> LocalAwaitCauses { get; } = new();
         internal TaskCompletionSource<bool> Completion { get; } = new(
             TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1382,24 +1384,14 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                             ? intent.SourcePeer
                             : _client?.PeerId ?? _host?.HostPeerId ?? 0;
                         if (sourcePeer != 0)
-                            _pendingAwaitAuthorityCauses.Add(
+                            _pendingAwaitAuthorityCauses.Remove(
                                 new AwaitAuthorityCause(sourcePeer, action.ObservationId));
                     }
-                    // An explicit Host rejection is conclusive. AwaitAuthority
-                    // has no local World effect to roll back; a non-Await ROOT
-                    // may already have executed optimistically. Neither case can
-                    // continue as if the authoritative transaction existed.
-                    _worldRecoveryRequired = true;
                 }
-                _diagnostics.Log("WorldSync", awaitAuthority
-                    ? $"WS3 cause {action.ObservationId:X16} was not accepted; its World effect has not executed. Rejoin/resynchronization is required; no delayed CATHODE replay is attempted."
-                    : $"WS3 cause {action.ObservationId:X16} was rejected after optimistic local execution may have occurred. Rejoin/resynchronization is required; no automatic replay or rollback is attempted.");
+                _diagnostics.Log("WorldSync",
+                    $"WS3 cause {action.ObservationId:X16} rejected by Host and skipped; " +
+                    $"awaitAuthority={awaitAuthority}. This element may be unsynchronized; WorldSync continues without replay.");
             }
-            // A conclusive authority rejection is terminal for this World bus
-            // generation. Close native capture immediately so one rejection
-            // cannot snowball into thousands of additional proposals while the
-            // Coordinator is already recovery-required.
-            await CloseNativeWorldBusAsync("host-intent-rejected").ConfigureAwait(false);
             await _controller.SendWorldIntentRejectedAsync(intent, _lifetime.Token)
                 .ConfigureAwait(false);
         }
@@ -1972,8 +1964,6 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         var transactionSucceeded = false;
         var transactionFailed = false;
         var retryIncompleteTransaction = false;
-        ulong firstFailedTransaction = 0;
-        WorldAuthorityContextIdentity? failedHostAuthorityContext = null;
 
         lock (_stateGate)
         {
@@ -1988,17 +1978,12 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 var resultFailed = result.Code != WorldMutationResultCode.Accepted || !result.Dispatched;
                 if (resultFailed)
                 {
-                    tracked.Failed = true;
-                    // Only the current transaction may enter fail-stop. Host
-                    // authority context was proven current above; Client state
-                    // retains the Step 4 behavior directly.
-                    if (tracked.ReceivedCount >= tracked.RootCount)
+                    if (!tracked.Failed)
                     {
-                        if (tracked.HostAuthorityContext is null)
-                            _worldRecoveryRequired = true;
-                        firstFailedTransaction = tracked.StartSequence;
-                        failedHostAuthorityContext = tracked.HostAuthorityContext;
+                        tracked.FailureCode = result.Code;
+                        tracked.FailureSequence = result.Sequence;
                     }
+                    tracked.Failed = true;
                 }
 
                 // If the authoritative transaction was never fully received, the
@@ -2019,8 +2004,10 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 else if (tracked.ResultCount == tracked.RootCount)
                 {
                     finishedTransaction = tracked;
-                    transactionSucceeded = !tracked.Failed
-                        && tracked.StartSequence == _lastCommittedWorldSequence + 1U
+                    // All members have a final disposition. A native failure
+                    // consumes this transaction as skipped, preserving its raw
+                    // result for diagnostics/ACKs and never replaying effects.
+                    transactionSucceeded = tracked.StartSequence == _lastCommittedWorldSequence + 1U
                         && (tracked.HostAuthorityContext is not null || !_worldRecoveryRequired);
                     if (transactionSucceeded && tracked.HostAuthorityContext is null)
                     {
@@ -2039,14 +2026,6 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                     }
                 }
             }
-        }
-
-        if (firstFailedTransaction != 0)
-        {
-            MarkWorldRecoveryRequired(
-                $"Transaction {firstFailedTransaction} produced a failing native result before full commit ({result.Code}, dispatched={result.Dispatched}).",
-                firstFailedTransaction,
-                failedHostAuthorityContext);
         }
 
         if (finishedTransaction is not null)
@@ -2111,13 +2090,18 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             finishedTransaction.Completion.TrySetResult(transactionSucceeded);
             if (transactionSucceeded)
             {
+                if (finishedTransaction.Failed)
+                    _diagnostics.Log("WorldSync",
+                        $"WS3 transaction {finishedTransaction.StartSequence}-{finishedTransaction.EndSequence} skipped: " +
+                        $"sequence={finishedTransaction.FailureSequence} code={finishedTransaction.FailureCode}; " +
+                        "this World effect may be unsynchronized. WorldSync and AISync remain active; no replay.");
                 var committedCount = Interlocked.Increment(ref _worldCommittedTransactionCount);
                 var now = Environment.TickCount64;
                 var lastLog = Interlocked.Read(ref _worldCommitLogTick);
                 if (now - lastLog >= 1_000 &&
                     Interlocked.CompareExchange(ref _worldCommitLogTick, now, lastLog) == lastLog)
                     _diagnostics.Log("WorldSync",
-                        $"WS3 transactions committed={committedCount}; committedThrough={_lastCommittedWorldSequence}.");
+                        $"WS3 transactions settled={committedCount}; settledThrough={_lastCommittedWorldSequence}.");
                 if (client is not null)
                     _ = TryOpenClientWorldBusAfterRecoveryAsync("recovery-suffix-committed");
             }
@@ -2161,7 +2145,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 _diagnostics.Log("WorldSync",
                     $"WorldMutation faults summarized: count={suppressed} lastCode={result.Code} " +
                     $"resolved={result.EntityResolved} dispatched={result.Dispatched}. " +
-                    "World state may require resynchronization from a common save; partially applied ROOTs are never retried.");
+                    "Failed transactions are logged and skipped; WorldSync continues without replaying partial effects.");
             }
         }
         completion?.TrySetResult(result);
