@@ -174,7 +174,7 @@ To **test the backend you just built** with an existing AI-MP installation, you 
 
 1. Close AI-MP and make sure its local API process is no longer running.
 2. Open the build output directory: `AIMP.Launcher/src/AIMP.Launcher/bin/x64/Release/net8.0-windows/` (or the corresponding `Debug` directory for a Debug build).
-3. Copy **the contents of that directory** into `<AI-MP mod folder>\\resources\\api\\`, **replacing the existing files** with the newly built ones.
+3. Copy **the contents of that directory** into `<AI-MP mod folder>\resources\api\`, **replacing the existing files** with the newly built ones.
 4. Launch AI-MP again to test the updated backend.
 
 If you also rebuilt the native module, make sure the launcher uses the **matching `AIMP.NetZ.dll`** from that same compatible revision, rather than an older DLL left in another directory.
