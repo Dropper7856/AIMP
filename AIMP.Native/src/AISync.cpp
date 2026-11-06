@@ -10263,7 +10263,7 @@ void ForgetPvPLease(const std::uintptr_t destroyedCharacter) noexcept {
     if (destroyedCharacter != 0U && gPvPLease.ticket.character != destroyedCharacter) return;
     if (alien_pvp_local::Drives(gPvPLease.ticket.character,gPvPLease.nativeGeneration))
         alien_pvp_local::Reset(destroyedCharacter!=0U && gGenerations!=nullptr &&
-            gGenerations->CurrentGeneration()==gPvPLease.nativeGeneration);
+            gGenerations->CurrentGeneration()==gPvPLease.nativeGeneration,false);
     gPvPLease={};
 }
 bool PvPLeaseLiveIdentity() noexcept {
@@ -10490,7 +10490,7 @@ bool ReleaseAlienPvPLease(AlienPvPLeaseStatus& status) noexcept {
     // The owner must stop locally before the exact native movement boundary
     // can certify safe release. Repeated RELEASE probes may wait for retirement.
     if (alien_pvp_local::Drives(actor->character,gPvPLease.nativeGeneration))
-        alien_pvp_local::Reset(true);
+        alien_pvp_local::Reset(true,true);
     // Native navigation may still retain worker Refs.
     if (!gPvPLease.owned) {
         status=PvPStatus(AlienPvPLeasePhase::Draining);return false;

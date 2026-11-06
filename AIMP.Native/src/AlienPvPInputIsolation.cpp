@@ -180,6 +180,7 @@ bool FindImports(std::uintptr_t base,std::array<ImportSlot,kSlotCount>& output) 
             if (!crash_guard::TryCopy(name.data(),reinterpret_cast<const void*>(
                 base+nameThunk.u1.AddressOfData+offsetof(IMAGE_IMPORT_BY_NAME,Name)),name.size()))
                 continue;
+            name.back()='\0';
             for (std::size_t n=0U;n<names.size();++n) {
                 if (std::strcmp(name.data(),names[n])!=0) continue;
                 auto* slotPointer=reinterpret_cast<void**>(base+slot);

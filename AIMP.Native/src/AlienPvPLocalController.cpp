@@ -230,12 +230,12 @@ bool Drives(const std::uintptr_t character,const std::uint32_t generation) noexc
         gLocal.generation==generation && gLocal.camera.bound &&
         alien_pvp_input::Installed();
 }
-void Reset(const bool clearCurrentWorld) noexcept {
+void Reset(const bool sameCameraWorld,const bool certifiedLivingCharacter) noexcept {
     // The controller does not release AISync's exclusive lease: only the lease
     // owner does that after the certified request boundary is idle.
     alien_pvp_input::SetActive(false);
-    RestoreLocalCamera(clearCurrentWorld);
-    if (clearCurrentWorld && gLocal.character!=0U)
+    RestoreLocalCamera(sameCameraWorld);
+    if (certifiedLivingCharacter && gLocal.character!=0U)
         static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(gLocal.character));
     gLocal={};
     alien_pvp_input::Uninstall();
@@ -247,13 +247,13 @@ void Pump(const Context& context) noexcept {
         context.ownerPeer==context.localPeer;
     if (!current) {
         if (gLocal.character!=0U)
-            Reset(context.nativeGeneration!=0U && gLocal.generation==context.nativeGeneration);
+            Reset(context.nativeGeneration!=0U && gLocal.generation==context.nativeGeneration,false);
         else alien_pvp_input::SetActive(false);
         return;
     }
     if (gLocal.character!=0U && (gLocal.character!=context.alien ||
         gLocal.generation!=context.nativeGeneration))
-        Reset(false);
+        Reset(false,false);
     if (gLocal.character==0U) {
         gLocal.character=context.alien;
         gLocal.generation=context.nativeGeneration;

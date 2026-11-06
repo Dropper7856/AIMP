@@ -18,7 +18,10 @@ struct Context {
 void Pump(const Context& context) noexcept;
 // clearCurrentWorld is false during teardown/physical generation rollover:
 // never dereference old Characters or resurrect a camera from the old world.
-void Reset(bool clearCurrentWorld) noexcept;
+// Only the AISync lease-release path may prove a living native identity and
+// permit a write to its movement slot. Ordinary teardown restores camera
+// targets but must never touch an incarnation which may have been recycled.
+void Reset(bool sameCameraWorld, bool certifiedLivingCharacter = false) noexcept;
 [[nodiscard]] bool Drives(std::uintptr_t character, std::uint32_t nativeGeneration) noexcept;
 
 } // namespace aimp::alien_pvp_local
