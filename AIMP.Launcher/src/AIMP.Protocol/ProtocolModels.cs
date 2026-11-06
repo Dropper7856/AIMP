@@ -175,7 +175,10 @@ public sealed record PlayerSpawnPositionPayload(
     ulong PeerId,
     float X,
     float Y,
-    float Z);
+    float Z,
+    // Crew representation (PlayerCharacterCatalog) assigned by the Host, so
+    // every peer shows this player as the same character. Null: E_RIPLEY.
+    string? Character = null);
 
 public sealed record SpawnPositionRequestPayload(
     Guid SessionId,
@@ -354,7 +357,8 @@ public sealed record LobbyPlayer(
     Guid LauncherPlayerId,
     string DisplayName,
     bool IsHost,
-    bool Ready);
+    bool Ready,
+    string? Character = null);
 
 public sealed record LobbySnapshotPayload(
     Guid SessionId,

@@ -3,6 +3,7 @@
 #include "aimp/WorldPublicActions.h"
 #include "aimp/PlayerTorchRuntime.h"
 #include "aimp/PlayerHidingRuntime.h"
+#include "aimp/PlayerCharacters.h"
 
 #include <algorithm>
 #include <array>
@@ -1127,8 +1128,17 @@ bool DecodeGameCommand(
         }
 
         if (command->stringValue == "SpawnCharacter") {
-            if (arguments->objectValue.size() != 3U) {
+            // x/y/z plus an optional crew "character" (default E_RIPLEY).
+            const auto* character = Field(*arguments, "character", JsonType::String);
+            if (character == nullptr && arguments->objectValue.contains("character")) return false;
+            if (arguments->objectValue.size() != (character != nullptr ? 4U : 3U)) {
                 return false;
+            }
+            if (character != nullptr) {
+                const auto* identity = player_characters::Find(character->stringValue);
+                if (identity == nullptr) return false;
+                output.spawnCharacter.characterHash = identity->nameHash;
+                output.spawnCharacter.displayModelGuid = identity->displayModelGuid;
             }
             const auto* x = Field(*arguments, "x", JsonType::String);
             const auto* y = Field(*arguments, "y", JsonType::String);

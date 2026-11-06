@@ -57,6 +57,9 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private bool _spawnPositionSending;
     private bool _spawnCommandCollecting;
     private SpawnRemotePlayersPayload? _pendingSpawnRequest;
+    // Host-assigned crew character per peer, from the last accepted roster: an
+    // independent respawn must show the same character as the first spawn.
+    private readonly Dictionary<ulong, string> _assignedCharacters = new();
     private bool _spawnRequestRunning;
     private bool _remoteSpawnConvergenceRunning;
     private long _remoteSpawnEpoch;
@@ -2622,6 +2625,10 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         lock (_stateGate)
         {
             _lobby = value;
+            _assignedCharacters.Clear();
+            foreach (var player in value.Players)
+                if (PlayerCharacterCatalog.IsKnown(player.Character))
+                    _assignedCharacters[player.PeerId] = player.Character!;
             var departed = RemoveDepartedRemotePlayers(value);
             var activePeers = value.Players.Select(player => player.PeerId).ToHashSet();
             _remoteGameplayReadyPeers.RemoveWhere(peerId => !activePeers.Contains(peerId));
@@ -3052,6 +3059,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             if (_processedSpawnRequests.Contains(value.RequestId)) return false;
             if (_pendingSpawnRequest is not null) return false;
             _pendingSpawnRequest = value;
+            foreach (var player in value.Players.Where(player => player.Character is not null))
+                _assignedCharacters[player.PeerId] = player.Character!;
             return true;
         }
     }
@@ -4282,6 +4291,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         out RemotePlayerSpawnTarget target)
     {
         target = default!;
+        if (!_assignedCharacters.TryGetValue(player.PeerId, out var character)) return false;
         if (!_remotePositions.TryGetValue(player.PeerId, out var track)) return false;
         var snapshot = track.Snapshot();
         if (snapshot is null) return false;
@@ -4296,7 +4306,10 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         // up if the peer moved after this snapshot.
         target = new RemotePlayerSpawnTarget(
             player,
-            RemoteSpawnPlanner.CreateNetworkPosition(latest));
+            RemoteSpawnPlanner.CreateNetworkPosition(latest) with
+            {
+                Character = character
+            });
         return true;
     }
 
@@ -5182,7 +5195,8 @@ internal static class RemoteSpawnPlanner
         {
             ["x"] = position.X.ToString("0.000", CultureInfo.InvariantCulture),
             ["y"] = position.Y.ToString("0.000", CultureInfo.InvariantCulture),
-            ["z"] = position.Z.ToString("0.000", CultureInfo.InvariantCulture)
+            ["z"] = position.Z.ToString("0.000", CultureInfo.InvariantCulture),
+            ["character"] = position.Character ?? PlayerCharacterCatalog.DefaultName
         };
 
     internal static IReadOnlyDictionary<string, string> CreateJoinMessage(

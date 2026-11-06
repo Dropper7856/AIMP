@@ -901,6 +901,10 @@ constexpr std::size_t kCharacterClassOffset = 0xA4U;
 constexpr std::size_t kExtendedSpawnKeyOffset = 0xF0U;
 constexpr std::size_t kExtendedModeOffset = 0xF4U;
 constexpr std::size_t kExtendedParameterOffset = 0xFCU;
+// Spawn130 character-name fields (FNV-1a 32 of the crew name).
+constexpr std::size_t kAnimSetOffset = 0x14U;
+constexpr std::size_t kReferenceSkeletonOffset = 0x20U;
+constexpr std::size_t kDisplayModelOffset = 0x24U;
 constexpr std::uintptr_t kSpawn130SinkOffset = 0x14U;
 constexpr std::size_t kParticipantRecordSize = 0x158U;
 constexpr std::size_t kParticipantTableSize = 0xAC0U;
@@ -1785,6 +1789,15 @@ bool GameCommandExecutor::PrepareDynamicSpawnPayload(
     WriteValue(payload, kPositionOffset + 4U, command.y);
     WriteValue(payload, kPositionOffset + 8U, command.z);
     WriteValue(payload, kExtendedSpawnKeyOffset, spawnKey);
+    // Crew identity: anim_set, reference_skeleton and display_model name hashes,
+    // plus the DisplayModel composite in the extended parameter (mode 0). A
+    // captured template may belong to another player's representation.
+    if (!player_characters::IsRepresentation(command.characterHash)) return false;
+    WriteValue(payload, kAnimSetOffset, command.characterHash);
+    WriteValue(payload, kReferenceSkeletonOffset, command.characterHash);
+    WriteValue(payload, kDisplayModelOffset, command.characterHash);
+    if (ReadValue<std::uint8_t>(payload, kExtendedModeOffset) == 0U)
+        WriteValue(payload, kExtendedParameterOffset, command.displayModelGuid);
     return ReadValue<std::uint32_t>(payload, kSpawnKeyOffset) == spawnKey &&
         ReadValue<std::uint32_t>(payload, kExtendedSpawnKeyOffset) == spawnKey;
 }

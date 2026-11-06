@@ -1,6 +1,7 @@
 #include "aimp/PlayerAnimationClipCapture.h"
 #include "aimp/HookManager.h"
 #include "aimp/Diagnostics.h"
+#include "aimp/PlayerCharacters.h"
 #include <Windows.h>
 #include <array>
 #include <atomic>
@@ -33,7 +34,7 @@ template<class T> bool Read(std::uintptr_t address, T& value) noexcept {
 void Record(void* database, const void* name, const void* contexts,
     const ClipResult* output, bool multiple) noexcept {
     std::uint32_t identity{};
-    if (!Read(reinterpret_cast<std::uintptr_t>(database) + 0x10U, identity) || identity != 569978346U) return;
+    if (!Read(reinterpret_cast<std::uintptr_t>(database) + 0x10U, identity) || !player_characters::IsRepresentation(identity)) return;
     Row entry{}; entry.multiple = multiple;
     if (!Read(reinterpret_cast<std::uintptr_t>(name) + 8U, entry.name)) return;
     const auto contextAddress = reinterpret_cast<std::uintptr_t>(contexts);
@@ -111,11 +112,11 @@ void Clear() noexcept { std::lock_guard lock(gMutex); gRows = {}; gReplaced = 0U
 void Export(Diagnostics& diagnostics) {
     decltype(gRows) rows{}; std::uint64_t replaced{};
     { std::lock_guard lock(gMutex); rows = gRows; replaced = gReplaced; }
-    diagnostics.Log("info", "remote_animation_clip_summary", "Actual retail clip-resolver returns for the E_RIPLEY database; no rendering claim.",
+    diagnostics.Log("info", "remote_animation_clip_summary", "Actual retail clip-resolver returns for the crew representation databases; no rendering claim.",
         {{"replacedRows", Diagnostics::Unsigned(replaced), true}});
     for (const auto& row : rows) {
         if (row.count == 0U) continue;
-        diagnostics.Log("info", "remote_animation_clip_resolution", "Passive retail clip-resource resolution; aggregated per E_RIPLEY database.",
+        diagnostics.Log("info", "remote_animation_clip_resolution", "Passive retail clip-resource resolution; aggregated across crew representation databases.",
             {{"name", Diagnostics::Unsigned(row.name), true},
              {"context", Diagnostics::Unsigned(row.context), true},
              {"path", Diagnostics::Unsigned(row.path), true},

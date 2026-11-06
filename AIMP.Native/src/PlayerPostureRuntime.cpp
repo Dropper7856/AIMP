@@ -1,5 +1,6 @@
 #include "aimp/PlayerPostureRuntime.h"
 #include "aimp/PlayerHidingPresentationRuntime.h"
+#include "aimp/PlayerCharacters.h"
 #include "aimp/CrashGuard.h"
 #include "aimp/PlayerAnimationClipCapture.h"
 #include "aimp/HookManager.h"
@@ -398,7 +399,7 @@ void SetupAim(void* controller, const AimSetup original) {
         Read(character + 0x64U, definition) && Read(definition + 0x1CU, player) &&
         Read(definition + 0x1FU, firstPerson) && !(player != 0U && firstPerson != 0U) &&
         Read(character + 0x720U, instance) && Read(instance + 0x10U, database) &&
-        Read(database + 0x10U, identity) && identity == HashName("E_RIPLEY") &&
+        Read(database + 0x10U, identity) && player_characters::IsRepresentation(identity) &&
         Read(character + 0x2AFU, crouched) && crouched != 0U &&
         Read(character + 0x2B4U, inVent) && inVent == 0U &&
         Read(character + 0x297U, grappled) && grappled == 0U &&
