@@ -33,6 +33,16 @@ void EndAdmission(std::uintptr_t navigation) noexcept;
 // Value-only recovery permission; caller must revalidate the local actor and
 // exclude native multi-actor actions before applying a Host transform.
 [[nodiscard]] bool HybridBinding(std::uintptr_t character,execution::NavigationBinding&) noexcept;
+// A newer installed HostRoute enters probation, not permanent recovery exit.
+// The caller must first release its hybrid motor lease, then report movement
+// sampled while CATHODE exclusively owns the Character. No synthetic route or
+// pose writes are authorized by these observations.
+[[nodiscard]] bool NativeHandoffCandidate(std::uintptr_t character) noexcept;
+[[nodiscard]] route::NativeHandoffResult ObserveNativeHandoff(std::uintptr_t character,
+    std::uint64_t now,bool valid,const std::array<float,3>& local,
+    const std::array<float,3>& host,bool hostMoving) noexcept;
+struct HandoffReport {std::uint64_t candidates{}, confirmed{}, stalled{};};
+[[nodiscard]] HandoffReport NativeHandoffDiagnostics() noexcept;
 // Called only after the engine accepted a new full execution scope. Old
 // recovery permissions must not be reused with new carriers in the same world.
 void BeginScope(const transactions::Scope&) noexcept;
