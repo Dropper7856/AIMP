@@ -633,6 +633,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _ = TryAdvanceGameplayAsync(runtime);
         _ = TryConvergeRemoteCharactersAsync(runtime, now);
         _ = TryAdvanceRemoteMovementAsync(runtime, now);
+        TryScheduleAlienPvPIdentityProbe(runtime, now);
         UpdateVoiceSession(runtime);
     }
 
