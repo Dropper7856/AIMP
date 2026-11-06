@@ -33,8 +33,18 @@ int main() {
     Check(teleport.Observe(1100,true,{4.0F,0.0F,0.0F},host,true)==NativeHandoffResult::Pending);
     Check(teleport.Observe(1900,false,origin,host,true)==NativeHandoffResult::Stalled);
     NativeHandoffProbe missing{};
+    // Samples taken while the hybrid motor still owns the Character are invalid
+    // even if that motor moved the Alien by several metres.
     Check(missing.Observe(1000,false,origin,host,true)==NativeHandoffResult::Pending);
+    Check(missing.Observe(1100,false,{0.9F,0.0F,0.0F},host,true)==NativeHandoffResult::Pending);
     Check(missing.Observe(1900,false,origin,host,true)==NativeHandoffResult::Stalled);
+    NativeHandoffProbe delayed{};
+    Check(delayed.Observe(1000,false,origin,host,true)==NativeHandoffResult::Pending);
+    Check(delayed.Observe(1060,true,origin,host,true)==NativeHandoffResult::Pending);
+    Check(delayed.Observe(1160,true,{0.20F,0.0F,0.0F},host,true)==NativeHandoffResult::Confirmed);
+    NativeHandoffProbe rewind{};
+    Check(rewind.Observe(2000,true,origin,host,true)==NativeHandoffResult::Pending);
+    Check(rewind.Observe(1999,true,origin,host,true)==NativeHandoffResult::Stalled);
         auto previous=std::make_unique<Graph>();auto next=std::make_unique<Graph>();
     previous->nodeCount=2;previous->resourceCount=2;
     previous->resources[1].state=7;previous->resources[1].immutableDigest[0]=123;
