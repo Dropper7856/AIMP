@@ -6,6 +6,46 @@ namespace AIMP.Protocol.Tests;
 
 internal static class AISyncHostBridgeTests
 {
+    internal static Task CurrentIntentRetryPriorityAsync()
+    {
+        var scope = new AISyncExecutionScope(Guid.NewGuid(), 1, 1, 1);
+        var submit = Record(scope, 2, AISyncTransactionOpcode.Submit)
+            with { NativeKind = 1, NativeAdmission = 1 };
+        var updates = Enumerable.Range(0, 10).Select(index =>
+            Record(scope, (ulong)(3 + index), AISyncTransactionOpcode.Update)
+                with { NativeKind = 1, CommandId = submit.CommandId,
+                    ParameterRevision = (uint)(index + 2) }).ToArray();
+        AssertEx.Equal(0UL, AISyncIntentRetryPriority.Select(Array.Empty<AISyncTransaction>()));
+        AssertEx.Equal(updates[^1].GlobalSequence, AISyncIntentRetryPriority.Select(updates),
+            "Older parameter revisions must not delay the latest Host goal.");
+        AssertEx.Equal(submit.GlobalSequence,
+            AISyncIntentRetryPriority.Select(new[] { submit, updates[^1] }),
+            "An Update cannot overtake its own unentered Submit.");
+
+        var stale = Record(scope, 13, AISyncTransactionOpcode.Submit)
+            with { NativeKind = 3, CommandId = submit.CommandId + 1, NativeAdmission = 1 };
+        var replacement = Record(scope, 14, AISyncTransactionOpcode.Submit)
+            with { NativeKind = 1, CommandId = stale.CommandId + 1, NativeAdmission = 0 };
+        AssertEx.Equal(replacement.GlobalSequence,
+            AISyncIntentRetryPriority.Select(new[] { submit, updates[0], stale, replacement }),
+            "An admission-0 replacement must retry before obsolete movement intents.");
+        AssertEx.Equal(submit.GlobalSequence,
+            AISyncIntentRetryPriority.Select(new[] { submit, replacement with { NativeAdmission = 1 } }),
+            "Append admission does not authorize preemption.");
+        foreach (var kind in new uint[] { 2, 5, 8, 0x100 })
+        {
+            var protectedWork = submit with { NativeKind = kind };
+            AssertEx.Equal(protectedWork.GlobalSequence,
+                AISyncIntentRetryPriority.Select(new[] { protectedWork, replacement }),
+                "Native marker, action, placement and constructor calls must keep their order.");
+        }
+        var cleanup = submit with { Opcode = AISyncTransactionOpcode.Release };
+        AssertEx.Equal(cleanup.GlobalSequence,
+            AISyncIntentRetryPriority.Select(new[] { cleanup, replacement }),
+            "Cleanup must not be skipped by a newer navigation goal.");
+        return Task.CompletedTask;
+    }
+
     internal static Task UpdateRejectedIsolationAsync() => RefusalIsolationAsync(AISyncExecutionStage.Rejected);
     internal static Task UnknownIsolationAsync() => RefusalIsolationAsync(AISyncExecutionStage.Unknown);
 
