@@ -1867,6 +1867,7 @@ public sealed partial class LobbyHost : IAsyncDisposable
         PlayerActionEventPayload payload,
         ulong expectedPeerId)
     {
+        RejectAlienTechnicalPlayerSync(expectedPeerId);
         ModelValidation.Validate(payload);
         if (payload.SessionId != SessionId || payload.PeerId != expectedPeerId)
             throw new InvalidOperationException("Player-action identity is invalid.");
@@ -1877,16 +1878,28 @@ public sealed partial class LobbyHost : IAsyncDisposable
         PlayerEquipmentSnapshotPayload payload,
         ulong expectedPeerId)
     {
+        RejectAlienTechnicalPlayerSync(expectedPeerId);
         ModelValidation.Validate(payload);
         if (payload.SessionId != SessionId || payload.PeerId != expectedPeerId)
             throw new InvalidOperationException("Player-equipment identity is invalid.");
         ValidateActiveGeneration(payload.LevelGeneration);
     }
 
+    // PvP inputs and native Alien outcomes travel on their own transport. No
+    // hidden Amanda position, torch, weapon or attack may be presented as the
+    // bound Alien to other participants.
+    private void RejectAlienTechnicalPlayerSync(ulong peerId)
+    {
+        lock (_stateLock)
+            if (_options.AlienVsSurvivors && _state == "Starting" && _alienPeerId == peerId)
+                throw new ProtocolException("Human PlayerSync from the Alien peer is forbidden.");
+    }
+
     private void ValidatePlayerPosition(
         PlayerPositionSnapshotPayload payload,
         ulong expectedPeerId)
     {
+        RejectAlienTechnicalPlayerSync(expectedPeerId);
         ModelValidation.Validate(payload);
         if (payload.SessionId != SessionId || payload.PeerId != expectedPeerId)
             throw new InvalidOperationException("Player-position identity is invalid.");

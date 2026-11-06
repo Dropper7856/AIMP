@@ -2926,6 +2926,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             if (_start is null || !_localGameplayReady) return;
             var peerId = LocalPeerId();
             if (peerId == 0 || (_host is null && _client is null)) return;
+            // The Alien's hidden THE_PLAYER is not a human proxy.
+            if (_start.AlienVsSurvivors && peerId == _start.AlienPeerId) return;
 
             _pendingLocalPlayerActions.Enqueue(new PlayerActionEventPayload(
                 _start.SessionId,
@@ -3089,6 +3091,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 return false;
             var peerId = LocalPeerId();
             if (peerId == 0 || (_host is null && _client is null)) return false;
+            if (_start.AlienVsSurvivors && peerId == _start.AlienPeerId) return false;
             var runtime=_controller.Snapshot;var connection=_controller.AISyncConnectionIdentity;
             var incarnation=_playerIncarnations.Observe(_start.SessionId,peerId,_start.LevelGeneration,runtime,connection);
             _aiSync.SetLocalIncarnation(_start.SessionId,peerId,incarnation,runtime,connection);
@@ -3180,6 +3183,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 || _localEquipmentState is not { Valid: true } state) return false;
             var peerId = LocalPeerId();
             if (peerId == 0 || (_host is null && _client is null)) return false;
+            if (_start.AlienVsSurvivors && peerId == _start.AlienPeerId) return false;
 
             var includeActions =
                 _performanceIsolation.IsEnabled(PerformanceIsolationModule.ActionSync);
