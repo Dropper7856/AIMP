@@ -81,6 +81,7 @@ internal static class Program
         new("AISync Host producer fanout and native readiness", AISyncHostBridgeTests.FanoutAsync),
         new("AISync Host producer recovery and incarnations", AISyncHostBridgeTests.RecoveryAndIncarnationAsync),
         new("AISync Host producer cancellation supersedes waiting retries", AISyncHostBridgeTests.CancelWaitingAsync),
+        new("AISync latest Host intent retry priority and native ordering", AISyncHostBridgeTests.CurrentIntentRetryPriorityAsync),
         new("AISync Host rejected operation isolation", AISyncHostBridgeTests.UpdateRejectedIsolationAsync),
         new("AISync Host unknown operation isolation", AISyncHostBridgeTests.UnknownIsolationAsync),
         new("AISync Host refusal exact receipt validation", AISyncHostBridgeTests.RefusalEchoValidationAsync),
