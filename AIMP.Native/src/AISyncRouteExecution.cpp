@@ -179,24 +179,28 @@ const Graph* Latest(const execution::NavigationBinding&) noexcept;
 Slot* ResumingCandidate(const execution::NavigationBinding& rejected,bool allowPending=false) noexcept {
     if(!gState)return nullptr;
     Slot* selected{};
+    std::uint64_t selectedCommand{};
+    std::uint32_t selectedRevision{};
     for(const auto& candidate:gState->slots)if(candidate&&
         !candidate->failed&&!candidate->retiring&&!candidate->retirementFault&&
         candidate->binding.command.scope==rejected.command.scope&&
         candidate->binding.command.owner==rejected.command.owner&&
-        candidate->binding.command.actor==rejected.command.actor&&
-        HybridResumeCurrent(rejected.command.command,rejected.command.revision,
-            candidate->binding.command.command,candidate->binding.command.revision)) {
+        candidate->binding.command.actor==rejected.command.actor) {
         execution::NavigationBinding current{};
-        if(!Current(*candidate,&current))continue;
+        if(!Current(*candidate,&current)||
+            !HybridResumeCurrent(rejected.command.command,rejected.command.revision,
+                current.command.command,current.command.revision))continue;
+        // An Update advances a retained B without changing the slot's initial
+        // identity. Compare the ACTUAL native revision, not the stale slot copy.
         // A prior hybrid owner can block Populate() before EndAdmission().
-        // Yield ONLY for a current native request with an actual Host graph,
-        // never for a speculative or locally synthesized navigation query.
         const bool pending=allowPending&&candidate->skipped&&candidate->result&&
             Latest(current)!=nullptr;
         if(!candidate->installed&&!pending)continue;
-        if(!selected || HybridResumeCurrent(selected->binding.command.command,
-            selected->binding.command.revision,candidate->binding.command.command,
-            candidate->binding.command.revision))selected=candidate.get();
+        if(!selected || HybridResumeCurrent(selectedCommand,selectedRevision,
+            current.command.command,current.command.revision)) {
+            selected=candidate.get();selectedCommand=current.command.command;
+            selectedRevision=current.command.revision;
+        }
     }
     return selected;
 }
