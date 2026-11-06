@@ -20,6 +20,20 @@ internal static class AlienPvPBehaviorInstaller
     private static string Resolve(string gameDirectory) =>
         Path.Combine(Path.GetFullPath(gameDirectory), "DATA", "BINARY_BEHAVIOR", "_DIRECTORY_CONTENTS.BML");
 
+    // Necessary file preflight only, NOT proof that the live engine loaded
+    // this BML. The native behavior-tree grant must be verified separately.
+    internal static void VerifyInstalled(string gameDirectory)
+    {
+        var path = Resolve(gameDirectory);
+        var backup = path + ".aimp-original";
+        if (!File.Exists(path) || Hash(File.ReadAllBytes(path)) != PvPSha256)
+            throw new InvalidDataException(
+                "Alien PvP needs its BML installed BEFORE AI.exe starts. " +
+                "Changing this file in a running lobby cannot reload the behavior tree.");
+        if (!File.Exists(backup) || Hash(File.ReadAllBytes(backup)) != RetailSha256)
+            throw new InvalidDataException("Alien PvP original BML backup is missing or incompatible.");
+    }
+
     internal static void Prepare(string gameDirectory)
     {
         var path = Resolve(gameDirectory);

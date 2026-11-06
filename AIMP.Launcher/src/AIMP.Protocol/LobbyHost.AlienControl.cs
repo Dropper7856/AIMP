@@ -4,6 +4,7 @@ public sealed partial class LobbyHost
 {
     private ulong _lastAlienControlSequence;
     private ulong _alienCommittedSequence;
+    private readonly SemaphoreSlim _alienControlDispatchGate = new(1, 1);
 
     // Validated on the Host, but the *source of decisions* remains AlienPeerId.
     public event EventHandler<AlienControlCommit>? AlienControlCommitted;
@@ -26,6 +27,10 @@ public sealed partial class LobbyHost
         CancellationToken cancellationToken)
     {
         AlienControlProtocol.Validate(intent);
+        // Admission and publication must preserve one ordered stream.
+        await _alienControlDispatchGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
         AlienControlCommit? committed = null;
         lock (_stateLock)
         {
@@ -50,5 +55,7 @@ public sealed partial class LobbyHost
         await BroadcastAsync(MessageType.AlienControlCommitted,
             JsonPayload.Serialize(committed), cancellationToken).ConfigureAwait(false);
         AlienControlCommitted?.Invoke(this, committed);
+        }
+        finally { _alienControlDispatchGate.Release(); }
     }
 }

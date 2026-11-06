@@ -159,15 +159,20 @@ public sealed class GamePreparationService
                 if (_status.State != "Ready" || !SameDirectory(game, _status.GameDirectory) || _receipt is null)
                     throw new InvalidOperationException("Prepare the game installation before selecting Alien vs Survivors.");
             }
-            lock (GamePreparationSynchronization.Gate)
+            // BML is loaded before the frontend lobby exists. Never mutate
+            // an installation while AI.exe is alive: that would leave the
+            // in-memory behavior tree unchanged and race file consumers.
+            if (enabled)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                if (enabled) AlienPvPBehaviorInstaller.Prepare(game);
-                else AlienPvPBehaviorInstaller.Restore(game);
+                AlienPvPBehaviorInstaller.VerifyInstalled(game);
+                _diagnostics.Log("AlienPvP",
+                    "PvP BML verified on disk; live tree and native possession still require a separate runtime grant.");
             }
-            _diagnostics.Log("AlienPvP", enabled
-                ? "Verified Alien behavior BML staged for the next level load."
-                : "Co-op lobby: original Alien behavior BML restored or unchanged.");
+            else
+            {
+                _diagnostics.Log("AlienPvP",
+                    "Co-op lobby selected: no BML files rewritten in a running game.");
+            }
         }, cancellationToken);
 
     // This path is intentionally read-only. No imports or cold compilation after launch.

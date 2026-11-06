@@ -3,6 +3,8 @@ namespace AIMP.Protocol;
 public sealed partial class LobbyClient
 {
     private ulong _lastAlienControlHostSequence;
+    private int _lastAlienControlGeneration;
+    private ulong _lastAlienControlPeer;
 
     public event EventHandler<AlienControlCommit>? AlienControlCommitted;
 
@@ -27,6 +29,13 @@ public sealed partial class LobbyClient
             current.AlienPeerId != value.Intent.AlienPeerId ||
             current.LevelGeneration != value.Intent.LevelGeneration)
             throw new ProtocolException("Alien control commit does not belong to the active PvP round.");
+        if (_lastAlienControlGeneration != current.LevelGeneration ||
+            _lastAlienControlPeer != current.AlienPeerId)
+        {
+            _lastAlienControlGeneration = current.LevelGeneration;
+            _lastAlienControlPeer = current.AlienPeerId;
+            _lastAlienControlHostSequence = 0;
+        }
         if (value.HostSequence <= _lastAlienControlHostSequence) return;
         _lastAlienControlHostSequence = value.HostSequence;
         AlienControlCommitted?.Invoke(this, value);
