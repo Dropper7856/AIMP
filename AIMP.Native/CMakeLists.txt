@@ -20,6 +20,7 @@ set(AIMP_CORE_SOURCES
     src/VoiceNativeAudio.cpp
     src/AISync.cpp
     src/AlienPvPLocalController.cpp
+    src/AlienPvPInputIsolation.cpp
     src/AISyncTransactions.cpp
     src/AISyncMarkerIdentity.cpp
     src/AISyncMovement.cpp

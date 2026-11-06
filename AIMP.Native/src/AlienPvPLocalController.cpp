@@ -1,4 +1,5 @@
 #include "aimp/AlienPvPLocalController.h"
+#include "aimp/AlienPvPInputIsolation.h"
 
 #include "aimp/CharacterDirectStepRuntime.h"
 #include "aimp/CrashGuard.h"
@@ -30,7 +31,7 @@ struct LocalState final {
     std::uintptr_t character{};
     std::uint32_t generation{};
     bool moving{}, viewKeyDown{};
-    std::uint64_t lastFrameMs{}, nextCameraAttemptMs{};
+    std::uint64_t lastFrameMs{}, nextCameraAttemptMs{}, nextInputAttemptMs{};
 };
 LocalState gLocal{}; // certified game thread only
 
@@ -114,9 +115,10 @@ void RestoreLocalCamera(const bool validWorld) noexcept {
         current.follow==camera.follow && current.head==camera.head &&
         Read(camera.manager+0x1D8U,active) &&
         (active==camera.follow || active==camera.head)) {
-        // Both retail cameras are returned to the local THE_PLAYER. CameraCall
-        // activates the chosen camera; a failed native call is not retried
-        // through a stale binding.
+        // Restore the original BoneAttached target before either retail
+        // camera can later be activated by the game.
+        static_cast<void>(AttachHeadBone(camera.head,camera.technical));
+        // Both retail cameras are returned to the local THE_PLAYER.
         static_cast<void>(CameraCall(gCameraBase,camera.manager,camera.head,camera.technical));
         static_cast<void>(CameraCall(gCameraBase,camera.manager,camera.follow,camera.technical));
         if (camera.previous==camera.head)
@@ -148,11 +150,28 @@ bool GameFocused() noexcept {
     return foreground!=nullptr && GetWindowThreadProcessId(foreground,&process)!=0U &&
         process==GetCurrentProcessId();
 }
+bool InputAllowed(const std::uintptr_t base) noexcept {
+    if (!GameFocused()) return false;
+    std::uintptr_t pauseManager{};
+    std::uint32_t pauseReasons{};
+    if (Read(base+0x012F194CU,pauseManager) && pauseManager &&
+        Read(pauseManager+4U,pauseReasons) &&
+        (pauseReasons&0x00012000U)!=0U) return false;
+    return true;
+}
+bool CameraStillOwned(const Context& context) noexcept {
+    CameraBinding current{};
+    std::uintptr_t active{};
+    return gLocal.camera.bound && CurrentCameraRoot(context.moduleBase,current) &&
+        current.root==gLocal.camera.root && current.manager==gLocal.camera.manager &&
+        Read(current.manager+0x1D8U,active) &&
+        (active==gLocal.camera.follow || active==gLocal.camera.head);
+}
 bool Down(const int key) noexcept { return (GetAsyncKeyState(key)&0x8000)!=0; }
 void TickInput(const Context& context,const std::uint64_t now) noexcept {
     if (now==gLocal.lastFrameMs) return;
     gLocal.lastFrameMs=now;
-    const bool focused=GameFocused();
+    const bool focused=InputAllowed(context.moduleBase);
     if (focused && gLocal.camera.bound) {
         const bool view=Down('V');
         if (view && !gLocal.viewKeyDown) {
@@ -202,15 +221,18 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
 
 bool Drives(const std::uintptr_t character,const std::uint32_t generation) noexcept {
     return character!=0U && gLocal.character==character &&
-        gLocal.generation==generation;
+        gLocal.generation==generation && gLocal.camera.bound &&
+        alien_pvp_input::Installed();
 }
 void Reset(const bool clearCurrentWorld) noexcept {
     // The controller does not release AISync's exclusive lease: only the lease
     // owner does that after the certified request boundary is idle.
+    alien_pvp_input::SetActive(false);
     RestoreLocalCamera(clearCurrentWorld);
     if (clearCurrentWorld && gLocal.character!=0U)
         static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(gLocal.character));
     gLocal={};
+    alien_pvp_input::Uninstall();
 }
 void Pump(const Context& context) noexcept {
     const bool current=context.exclusiveLease && context.moduleBase!=0U &&
@@ -218,7 +240,9 @@ void Pump(const Context& context) noexcept {
         context.nativeGeneration!=0U && context.localPeer!=0U &&
         context.ownerPeer==context.localPeer;
     if (!current) {
-        if (gLocal.character!=0U) Reset(false);
+        if (gLocal.character!=0U)
+            Reset(context.nativeGeneration!=0U && gLocal.generation==context.nativeGeneration);
+        else alien_pvp_input::SetActive(false);
         return;
     }
     if (gLocal.character!=0U && (gLocal.character!=context.alien ||
@@ -229,9 +253,21 @@ void Pump(const Context& context) noexcept {
         gLocal.generation=context.nativeGeneration;
     }
     const auto now=GetTickCount64();
+    if (!alien_pvp_input::Installed() && now>=gLocal.nextInputAttemptMs) {
+        gLocal.nextInputAttemptMs=now+3000U;
+        static_cast<void>(alien_pvp_input::EnsureInstalled(context.moduleBase));
+    }
+    if (!alien_pvp_input::Installed()) return; // Amanda input must be isolated first.
     if (gLocal.camera.bound && (gLocal.camera.alien!=context.alien ||
         gLocal.camera.technical!=context.technicalPlayer))
         RestoreLocalCamera(true);
-    if (BindCamera(context,now)) TickInput(context,now);
+    if (gLocal.camera.bound && !CameraStillOwned(context)) {
+        // The engine selected a cinematic or another camera; never hijack it.
+        alien_pvp_input::SetActive(false);
+        RestoreLocalCamera(false);
+    }
+    const bool attached=BindCamera(context,now);
+    alien_pvp_input::SetActive(attached && InputAllowed(context.moduleBase));
+    if (attached) TickInput(context,now);
 }
 } // namespace aimp::alien_pvp_local
