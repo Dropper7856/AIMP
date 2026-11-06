@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.412-hiding-presentation";
+    "0.11.4.414-crew-characters";
 
 } // namespace aimp

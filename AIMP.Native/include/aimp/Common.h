@@ -33,7 +33,7 @@ struct ModuleReport {
     std::string_view reason;
 };
 
-inline constexpr std::uint16_t kProtocolVersion = 31;
+inline constexpr std::uint16_t kProtocolVersion = 32;
 inline constexpr std::size_t kMaximumIpcPayload = 1024U * 1024U;
 inline constexpr std::size_t kMaximumTransportObservationPayload = 64U * 1024U;
 

@@ -1,3 +1,4 @@
+using AIMP.Protocol;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text.Json;
@@ -20,7 +21,11 @@ internal sealed record RipleyInstallResult(int LevelsImported, int AlreadyPresen
 internal static partial class RipleyCharacterInstaller
 {
     private const string SourceLevel = "PRODUCTION/DLC/BSPNOSTROMO_TWOTEAMS";
-    private static readonly string[] RootNames = ["E_RIPLEY", "DisplayModel:E_RIPLEY"];
+    // Every playable crew representation; each DisplayModel:<NAME> is a
+    // self-contained, level-local model composite in the Crew Expendable level.
+    private static readonly string[] DisplayModelNames = PlayerCharacterCatalog.All
+        .Select(c => "DisplayModel:" + c.Name).ToArray();
+    private static readonly string[] RootNames = DisplayModelNames.Prepend("E_RIPLEY").ToArray();
     private const string JournalName = "transaction.json";
 
     internal static string ResolveWorldDirectory(string levelDirectory)
@@ -63,8 +68,9 @@ internal static partial class RipleyCharacterInstaller
             new PAK2(Path.Combine(game, "DATA", "GLOBAL", "ANIMATION.PAK")));
         var source = new Assets(sourcePath, global);
         var roots = source.Commands.Entries.Where(c => RootNames.Contains(c.name, StringComparer.OrdinalIgnoreCase)).ToArray();
-        if (!roots.Any(c => string.Equals(c.name, "DisplayModel:E_RIPLEY", StringComparison.OrdinalIgnoreCase)))
-            throw new InvalidDataException("The source level does not contain DisplayModel:E_RIPLEY.");
+        foreach (var required in DisplayModelNames)
+            if (!roots.Any(c => string.Equals(c.name, required, StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidDataException($"The source level does not contain {required}.");
         var closure = DiscoverClosure(source.Commands, roots);
         ValidateClosure(source, closure);
 
@@ -84,7 +90,7 @@ internal static partial class RipleyCharacterInstaller
             cancellationToken.ThrowIfCancellationRequested();
             AssertGameStopped();
             var name = Path.GetRelativePath(env, levels[i]).Replace('\\', '/');
-            progress?.Report(new(name, i, levels.Length, "Checking E_RIPLEY character assets"));
+            progress?.Report(new(name, i, levels.Length, "Checking crew character assets"));
             if (string.Equals(Path.GetFullPath(levels[i]), Path.GetFullPath(sourcePath), StringComparison.OrdinalIgnoreCase))
             {
                 if (EnsureNpcWeaponScripts(source)) PublishScripts(game, levels[i], source, closure, cancellationToken);
@@ -92,7 +98,7 @@ internal static partial class RipleyCharacterInstaller
             }
             else if (PrepareLevel(game, levels[i], name, source, global, closure, cancellationToken)) present++;
             else imported++;
-            progress?.Report(new(name, i + 1, levels.Length, "E_RIPLEY character assets ready"));
+            progress?.Report(new(name, i + 1, levels.Length, "Crew character assets ready"));
         }
         return new(imported, present);
     }

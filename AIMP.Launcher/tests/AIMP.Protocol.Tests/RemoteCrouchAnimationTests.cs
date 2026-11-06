@@ -42,6 +42,11 @@ internal static class RemoteCrouchAnimationTests
         {
             dbPath, @"DATA\ANIM_SYS\ANIM_CLIP_DB.BIN", @"DATA\ANIM_SYS\SKELE\DEFS\569978346.BIN",
         };
+        foreach (var profile in RemoteCrouchAnimationInstaller.Profiles)
+        {
+            changed.Add(profile.ClipDbEntry);
+            changed.Add(profile.SkeletonDefEntry);
+        }
         var before = pak.Entries.ToDictionary(e => e.Filename, e => SHA256.HashData(e.Content));
         var original = AnimClipDatabase.Parse(pak.Entries.Single(e => e.Filename == dbPath).Content);
         var originalGlobalBytes = pak.Entries.Single(e => e.Filename == @"DATA\ANIM_SYS\ANIM_CLIP_DB.BIN").Content;
@@ -71,6 +76,16 @@ internal static class RemoteCrouchAnimationTests
         AssertEx.True(original.BlendSets.Keys.SequenceEqual(patched.BlendSets.Keys));
         AssertEx.True(original.BlendSets.Values.SequenceEqual(patched.BlendSets.Values));
         VerifyHiding(pak, original, originalGlobal, patched, global, characters);
+        foreach (var profile in RemoteCrouchAnimationInstaller.Profiles)
+        {
+            var crew = AnimClipDatabase.Parse(pak.Entries.Single(e => e.Filename == profile.ClipDbEntry).Content);
+            foreach (var (name, pathHash) in HidingClips)
+                AssertEx.Equal(pathHash, crew.Animations.Get(AnimClipDatabase.HashName(name))!.Value.Path,
+                    profile.Character + " hiding alias: " + name);
+            AssertEx.True(crew.Context("CROUCHED") is not null, profile.Character + " crouched context");
+            var skeleton = pak.Entries.Single(e => e.Filename == profile.SkeletonDefEntry).Content;
+            AssertEx.Equal(AnimClipDatabase.HashName(profile.LowRes), BitConverter.ToUInt32(skeleton, 4));
+        }
         foreach (var (alias, source) in new[] { ("locomotion_cycle_blend", @"HUMAN\LOCOMOTIONCYCLE"),
             ("aimed_locomotion_cycle_blend", @"HUMAN\AIMED_LOCOMOTION_CYCLE_BLEND") })
         {
@@ -158,7 +173,7 @@ internal static class RemoteCrouchAnimationTests
         AssertEx.True(expectedGroups.SetEquals(dependencies), "Load exactly the existing and required resident groups.");
         AssertEx.Equal(originalGlobal.Dependencies(character).Count + expectedGroups
             .Except(originalGlobal.Dependencies(character)).Count(), dependencies.Count, "Do not duplicate dependencies.");
-        foreach (var other in characters.Where(c => c != character))
+        foreach (var other in characters.Where(c => !PlayerCharacterCatalog.All.Any(p => p.NameHash == c)))
             AssertEx.True(originalGlobal.Dependencies(other).SequenceEqual(global.Dependencies(other)),
                 "Another character's dependencies changed: " + other);
         foreach (var (hash, slot) in original.Animations.Keys)
