@@ -122,7 +122,7 @@ internal static class AISyncExecutionTransportTests
         {
             entered.TrySetResult(true);
             await resume.Task.WaitAsync(ct).ConfigureAwait(false);
-            sent.Enqueue(bytes.Span[0]);
+            sent.Enqueue(bytes.ToArray()[0]);
         }, () => Interlocked.Increment(ref failures), token))
         {
             AssertEx.True(sender.Enqueue(MessageType.AISyncExecutionNetworkBatch, new byte[] { 1 }));
