@@ -41,7 +41,7 @@ void EndAdmission(std::uintptr_t navigation) noexcept;
 [[nodiscard]] bool NativeHandoffCandidate(std::uintptr_t character) noexcept;
 [[nodiscard]] route::NativeHandoffResult ObserveNativeHandoff(std::uintptr_t character,
     std::uint64_t now,bool valid,const std::array<float,3>& local,
-    const std::array<float,3>& host,bool hostMoving) noexcept;
+    const std::array<float,3>& host,bool hostMoving,bool suspended) noexcept;
 struct HandoffReport {std::uint64_t candidates{}, confirmed{}, stalled{};};
 [[nodiscard]] HandoffReport NativeHandoffDiagnostics() noexcept;
 // Called only after the engine accepted a new full execution scope. Old
