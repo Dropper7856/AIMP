@@ -70,6 +70,8 @@ struct Hybrid {
     bool used{};
     execution::NavigationBinding binding{};
     std::uint64_t observedInstallSerial{};
+    std::uintptr_t candidateBlock{};
+    ULONGLONG awaitingSince{};
     route::NativeHandoffProbe probe{};
 };
 struct State {
@@ -173,17 +175,25 @@ bool Guard(void* context,const Key& key,const LocalContext& local,
 // Installation is not locomotion. A delayed failure of an older HostRoute
 // may be ignored only once a current native route has demonstrably moved
 // (or settled at a stationary Host state) while hybrid control was released.
-Slot* ResumingCandidate(const execution::NavigationBinding& rejected) noexcept {
+const Graph* Latest(const execution::NavigationBinding&) noexcept;
+Slot* ResumingCandidate(const execution::NavigationBinding& rejected,bool allowPending=false) noexcept {
     if(!gState)return nullptr;
     Slot* selected{};
-    for(const auto& candidate:gState->slots)if(candidate&&candidate->installed&&
+    for(const auto& candidate:gState->slots)if(candidate&&
         !candidate->failed&&!candidate->retiring&&!candidate->retirementFault&&
         candidate->binding.command.scope==rejected.command.scope&&
         candidate->binding.command.owner==rejected.command.owner&&
         candidate->binding.command.actor==rejected.command.actor&&
         HybridResumeCurrent(rejected.command.command,rejected.command.revision,
-            candidate->binding.command.command,candidate->binding.command.revision)&&
-        Current(*candidate)) {
+            candidate->binding.command.command,candidate->binding.command.revision)) {
+        execution::NavigationBinding current{};
+        if(!Current(*candidate,&current))continue;
+        // A prior hybrid owner can block Populate() before EndAdmission().
+        // Yield ONLY for a current native request with an actual Host graph,
+        // never for a speculative or locally synthesized navigation query.
+        const bool pending=allowPending&&candidate->skipped&&candidate->result&&
+            Latest(current)!=nullptr;
+        if(!candidate->installed&&!pending)continue;
         if(!selected || HybridResumeCurrent(selected->binding.command.command,
             selected->binding.command.revision,candidate->binding.command.command,
             candidate->binding.command.revision))selected=candidate.get();
@@ -927,10 +937,13 @@ bool NativeHandoffCandidate(std::uintptr_t character) noexcept {
     if(!gState||!gEngine||!gEngine())return false;
     for(auto& entry:gState->hybrid)if(entry.used&&Qualified(entry.binding)&&
         entry.binding.command.actor.character==character) {
-        const auto* candidate=ResumingCandidate(entry.binding);
+        const auto* candidate=ResumingCandidate(entry.binding,true);
         if(!candidate)return false;
-        if(entry.observedInstallSerial!=candidate->installSerial) {
+        if(entry.candidateBlock!=candidate->local.block||
+            entry.observedInstallSerial!=candidate->installSerial||!entry.awaitingSince) {
+            entry.candidateBlock=candidate->local.block;
             entry.observedInstallSerial=candidate->installSerial;
+            entry.awaitingSince=GetTickCount64();
             entry.probe={};++gNativeHandoffCandidates;
         }
         return true;
@@ -943,11 +956,25 @@ route::NativeHandoffResult ObserveNativeHandoff(std::uintptr_t character,
     if(!gState||!gEngine||!gEngine())return route::NativeHandoffResult::Pending;
     for(auto& entry:gState->hybrid)if(entry.used&&Qualified(entry.binding)&&
         entry.binding.command.actor.character==character) {
-        auto* candidate=ResumingCandidate(entry.binding);
-        if(!candidate||!candidate->installSerial)return route::NativeHandoffResult::Pending;
-        if(entry.observedInstallSerial!=candidate->installSerial) {
-            entry.observedInstallSerial=candidate->installSerial;entry.probe={};
+        auto* candidate=ResumingCandidate(entry.binding,true);
+        if(!candidate)return route::NativeHandoffResult::Pending;
+        if(entry.candidateBlock!=candidate->local.block||
+            entry.observedInstallSerial!=candidate->installSerial||!entry.awaitingSince) {
+            entry.candidateBlock=candidate->local.block;
+            entry.observedInstallSerial=candidate->installSerial;
+            entry.awaitingSince=now;entry.probe={};
             ++gNativeHandoffCandidates;
+        }
+        if(!candidate->installed) {
+            // Give the native query time to populate, but do not leave the
+            // hybrid lease disabled forever when the imported route stalls.
+            if(now>=entry.awaitingSince&&now-entry.awaitingSince>=kRouteWaitMilliseconds) {
+                ++gNativeHandoffStalled;
+                Fail(*candidate,__LINE__,Result::Deferred);
+                entry.probe={};
+                return route::NativeHandoffResult::Stalled;
+            }
+            return route::NativeHandoffResult::Pending;
         }
         // The client hybrid lease must actually be gone. A positional change
         // sampled while it still owns the motor is NOT native route evidence.
