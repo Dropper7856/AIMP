@@ -82,6 +82,7 @@ internal static class Program
         new("AISync Host producer recovery and incarnations", AISyncHostBridgeTests.RecoveryAndIncarnationAsync),
         new("AISync Host producer cancellation supersedes waiting retries", AISyncHostBridgeTests.CancelWaitingAsync),
         new("AISync latest Host intent retry priority and native ordering", AISyncHostBridgeTests.CurrentIntentRetryPriorityAsync),
+        new("AISync retry congestion bounded actor fairness", AISyncHostBridgeTests.RetryCongestionPlannerAsync),
         new("AISync native repair classification, timeouts and bounded retries", AISyncHostBridgeTests.NativeRecoveryPolicyAsync),
         new("AISync Host rejected operation recovers through a fresh authority epoch", AISyncHostBridgeTests.UpdateRejectedIsolationAsync),
         new("AISync Host unknown native result triggers safe scope retirement", AISyncHostBridgeTests.UnknownIsolationAsync),
