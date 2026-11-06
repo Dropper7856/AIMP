@@ -110,6 +110,73 @@ a quiescent boundary; never pretend possession succeeded.
 The technical Alien player's normal human position/equipment/action
 transmissions remain disabled. The Host rejects those PlayerSync packets.
 
+## AVS-12 through AVS-18 — local Alien pilot (experimental)
+
+A local-pilot implementation is now wired to the milestone-1 lease, with
+**native retail-game proof still required**. This does not mean the PvP game
+mode is playable. The native Alien must first reach `ALIEN_PVP_OWNED`, then
+the local pilot must report `localOwner=1 localPilotReady=1` on a subsequent
+bind poll. `ALIEN_PVP_OWNED` alone only proves the ownership boundary.
+
+- **Owner only:** the native pilot runs only on the machine whose
+  AISync `localPeer` matches the Host-selected `AlienPeerId`. It uses the
+  same incarnation ticket and certified engine-thread/world scope as the lease.
+  It cannot drive a remote peer's Character.
+- **Input isolation:** the game executable's original USER32 IAT pointers
+  are checked before install; a conflicting hook, missing RawInput or
+  unexpected executable import fails closed. Only the game's input is filtered;
+  the AIMP DLL reads keys through its own import. The hooks are inactive
+  outside local PvP and are restored on normal release. ESC, Alt/Windows
+  system keys and screenshot shortcuts remain available; raw mouse movement
+  continues so the native look controller can turn. No outside-user32 global
+  detours or donor hook manager are installed.
+- **Camera:** only a live retail follow/head camera is reused, and only if
+  the current camera is not a cutscene. It follows the exact possessed Alien;
+  `V` toggles a native head-bone camera if BoneAttached can be verified. On
+  release, its pointers are retargeted to local THE_PLAYER without hijacking
+  a cinematic view; stale-generation cameras are never reactivated.
+- **Locomotion:** WASD directions are taken relative to the local look yaw.
+  CTRL is slow/sneak, SHIFT faster and SPACE run. Requests enter AIMP's
+  existing native NPC-locomotion carrier with a bounded 600ms lease; no
+  teleport, direct pose overwrite or global Alien AI toggle is used.
+  Releasing the keys requests native Idle rather than letting a stale move
+  continue. Alt-tab or the native pause menu stops the local pilot inputs.
+- **Coexistence:** the periodic ownership probe recognizes the local
+  controller's own movement slot, so it does not drain the player's active
+  movement as an old autonomous AI request. Native entity/generation proof
+  and resource pins are still required. Release first disables the pilot,
+  then attempts the existing safe native boundary check.
+
+**Unsolved / must be tested:**
+
+- THE_PLAYER remains a technically alive Character. Input and interaction
+  isolation were implemented for supported imported game APIs, but hiding its
+  local visual mesh or excluding every possible scripted/control path has
+  **not** yet been proven. No risky off-map player teleport is performed.
+- The camera entry points and import interception were adapted using the
+  provided Steam-build mod reference, not exercised in a running retail game.
+  Other retail builds, controller/gamepad bindings and custom remapped keys
+  are not certified.
+- The local Alien movement is intentionally **not network replicated yet**;
+  the client/host transport bridge belongs to milestone 3.
+- Local input is not an authorization to attack or complete an objective.
+  Attacks, vents and PvP consequences remain future milestones.
+- The pre-launch BML preparation limitation described above remains.
+
+### AVS milestone 2 in-game checklist
+
+- [ ] Validate `ALIEN_PVP_OWNED` then `localPilotReady=1` for Host Alien.
+- [ ] Repeat with a Client Alien; the Host must not receive local inputs.
+- [ ] WASD, diagonal motion, stopping, slow/fast/run use native animations and collisions.
+- [ ] Camera follows only the selected Alien; `V` switches head/follow safely.
+- [ ] Amanda cannot move, aim, attack or interact while serving as the technical owner.
+- [ ] ESC/pause and Alt-tab stop Alien motion and preserve normal UI behavior.
+- [ ] A cinematic temporarily owns the camera without being overwritten.
+- [ ] Losing an Alien during a vent transition does not dereference stale memory.
+- [ ] A lobby exit/restoration leaves the original camera and game controls working.
+- [ ] Two consecutive PvP rounds, then a regular Co-op match, work without reboot.
+- [ ] Recheck FPS, allocation churn and input behavior when PvP is inactive.
+
 ## Required patches to reach playable
 
 1. **Native Alien binding** (AVS-06/07/08 — implementation written, game test pending).
@@ -121,7 +188,7 @@ transmissions remain disabled. The Host rejects those PlayerSync packets.
    are fenced, prior movement/nav resources drain, and the release fails closed.
    Prove in-game that the lease reaches Owned, only one Alien is affected and
    return-to-lobby never wakes a half-drained brain.
-3. **Local input capture and native locomotion**. Adapt the original
+3. **Local input capture and native locomotion** (AVS-12–18 implementation written; game test pending). Adapt the original
    `control.cpp` / `input_block.cpp` findings to AIMP's x86 thread/hook
    certification and `CharacterDirectStepRuntime`; do not port the mod's
    global toggles, injector or hook manager. The Alien owner may be a client;

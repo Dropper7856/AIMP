@@ -9790,7 +9790,9 @@ void PumpOnEngineThread() noexcept {
     // Native Alien local pilot is deliberately outside the IPC mailbox lock.
     // Only the proven lease owner may issue physical requests on this process.
     const auto pvpPhysicalGeneration=gGenerations->CurrentGeneration();
-    const bool localLease=gPvPLease.owned && PvPLeaseScopeCurrent() &&
+    const auto currentRole=gRole.load(std::memory_order_acquire);
+    const bool localLease=(currentRole==Role::Host || currentRole==Role::Client) &&
+        gPvPLease.owned && PvPLeaseScopeCurrent() &&
         PvPLeaseLiveIdentity() && gCurrent.localPeer!=0U &&
         gPvPLease.ownerPeer==gCurrent.localPeer;
     alien_pvp_local::Pump({gBase,
@@ -10285,6 +10287,10 @@ AlienPvPLeaseStatus PvPStatus(const AlienPvPLeasePhase phase) noexcept {
     status.worldGeneration=gPvPLease.worldGeneration;
     status.boundaryOffset=gPvPLease.boundaryOffset;
     status.boundaryValue=gPvPLease.boundaryValue;
+    status.isLocalOwner=gPvPLease.ownerPeer!=0U &&
+        gPvPLease.ownerPeer==gCurrent.localPeer;
+    status.localPilotReady=status.isLocalOwner &&
+        alien_pvp_local::Drives(gPvPLease.ticket.character,gPvPLease.nativeGeneration);
     return status;
 }
 // The native movement scheduler can be idle while its N navigation cache

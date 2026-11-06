@@ -85,13 +85,24 @@ bool AttachHeadBone(const std::uintptr_t camera,const std::uintptr_t alien) noex
     }
     return false;
 }
-bool CameraCall(const std::uintptr_t base,const std::uintptr_t manager,
-    const std::uintptr_t camera,const std::uintptr_t character) noexcept {
-    if (!base || !manager || !camera || !LivingCameraTarget(character)) return false;
+bool RetargetCamera(const std::uintptr_t base,const std::uintptr_t camera,
+    const std::uintptr_t character) noexcept {
+    if (!base || !camera || !LivingCameraTarget(character)) return false;
 #if defined(_MSC_VER)
     __try {
         reinterpret_cast<void(__thiscall*)(void*,void*)>(base+kCameraSetEntityRva)(
             reinterpret_cast<void*>(camera),reinterpret_cast<void*>(character));
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+#else
+    return false;
+#endif
+}
+bool CameraCall(const std::uintptr_t base,const std::uintptr_t manager,
+    const std::uintptr_t camera,const std::uintptr_t character) noexcept {
+    if (!manager || !RetargetCamera(base,camera,character)) return false;
+#if defined(_MSC_VER)
+    __try {
         static_cast<void>(reinterpret_cast<unsigned(__thiscall*)(void*,void*)>(base+kCameraActivateRva)(
             reinterpret_cast<void*>(manager),reinterpret_cast<void*>(camera)));
         return true;
@@ -112,17 +123,16 @@ void RestoreLocalCamera(const bool validWorld) noexcept {
     std::uintptr_t active{};
     if (CurrentCameraRoot(gCameraBase,current) &&
         current.root==camera.root && current.manager==camera.manager &&
-        current.follow==camera.follow && current.head==camera.head &&
-        Read(camera.manager+0x1D8U,active) &&
-        (active==camera.follow || active==camera.head)) {
-        // Restore the original BoneAttached target before either retail
-        // camera can later be activated by the game.
+        current.follow==camera.follow && current.head==camera.head) {
+        // Retarget without activating: a cinematic may currently own the
+        // camera manager, and we must never steal its view on PvP exit.
         static_cast<void>(AttachHeadBone(camera.head,camera.technical));
-        // Both retail cameras are returned to the local THE_PLAYER.
-        static_cast<void>(CameraCall(gCameraBase,camera.manager,camera.head,camera.technical));
-        static_cast<void>(CameraCall(gCameraBase,camera.manager,camera.follow,camera.technical));
-        if (camera.previous==camera.head)
-            static_cast<void>(CameraCall(gCameraBase,camera.manager,camera.head,camera.technical));
+        static_cast<void>(RetargetCamera(gCameraBase,camera.head,camera.technical));
+        static_cast<void>(RetargetCamera(gCameraBase,camera.follow,camera.technical));
+        if (Read(camera.manager+0x1D8U,active) &&
+            (active==camera.follow || active==camera.head))
+            static_cast<void>(CameraCall(gCameraBase,camera.manager,
+                camera.previous==camera.head?camera.head:camera.follow,camera.technical));
     }
     gCameraBase=0U;
 }
@@ -264,7 +274,7 @@ void Pump(const Context& context) noexcept {
     if (gLocal.camera.bound && !CameraStillOwned(context)) {
         // The engine selected a cinematic or another camera; never hijack it.
         alien_pvp_input::SetActive(false);
-        RestoreLocalCamera(false);
+        RestoreLocalCamera(true);
     }
     const bool attached=BindCamera(context,now);
     alien_pvp_input::SetActive(attached && InputAllowed(context.moduleBase));

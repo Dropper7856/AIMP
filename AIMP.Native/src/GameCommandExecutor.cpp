@@ -4202,7 +4202,10 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteAlienPvPBind(const std::u
         " runtimeId="+std::to_string(status.runtimeId)+
         " boundaryOffset="+std::to_string(status.boundaryOffset)+
         " boundaryValue="+std::to_string(status.boundaryValue)+
-        ". Exclusive native lease only; player inputs/camera are not installed."};
+        " localOwner="+std::to_string(status.isLocalOwner?1:0)+
+        " localPilotReady="+std::to_string(status.localPilotReady?1:0)+
+        ". Owned means exclusive NPC authority, not verified local camera or locomotion. "+
+        "The local pilot requires an isolated input path and a live camera target."};
 }
 GameCommandExecutionResult GameCommandExecutor::ExecuteAlienPvPRelease() const {
     ai_sync::AlienPvPLeaseStatus status{};
