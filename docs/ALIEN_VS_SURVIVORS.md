@@ -132,9 +132,18 @@ bind poll. `ALIEN_PVP_OWNED` alone only proves the ownership boundary.
   detours or donor hook manager are installed.
 - **Camera:** only a live retail follow/head camera is reused, and only if
   the current camera is not a cutscene. It follows the exact possessed Alien;
-  `V` toggles a native head-bone camera if BoneAttached can be verified. On
-  release, its pointers are retargeted to local THE_PLAYER without hijacking
+  `V` toggles a native head-bone camera if BoneAttached can be verified.
+  The Alien skull/shell submodels are temporarily hidden in head view and
+  restored in follow view when the same live Character is certified. On
+  release, camera targets return to local THE_PLAYER without hijacking
   a cinematic view; stale-generation cameras are never reactivated.
+- **Technical Amanda visibility:** local THE_PLAYER stays alive, but the
+  native submodel visibility bytes for its exact model are hidden while piloting.
+  Every frame locates current submodels by native name; original visibility
+  flags are retained by name, never by an old reused flags pointer. The
+  original flags are restored only when the technical Character runtime ID,
+  skeleton and level generation still match. Unexpected native models fail
+  closed and disable Alien inputs rather than risk altering another NPC.
 - **Locomotion:** WASD directions are taken relative to the local look yaw.
   CTRL is slow/sneak, SHIFT faster and SPACE run. Requests enter AIMP's
   existing native NPC-locomotion carrier with a bounded 600ms lease; no
@@ -149,10 +158,12 @@ bind poll. `ALIEN_PVP_OWNED` alone only proves the ownership boundary.
 
 **Unsolved / must be tested:**
 
-- THE_PLAYER remains a technically alive Character. Input and interaction
-  isolation were implemented for supported imported game APIs, but hiding its
-  local visual mesh or excluding every possible scripted/control path has
-  **not** yet been proven. No risky off-map player teleport is performed.
+- THE_PLAYER remains a technically alive Character. An Alien-owner-only,
+  native submodel visibility controller is implemented, but has **not** been
+  validated against live retail meshes. Direct keyboard/RawInput paths are
+  blocked when possession and camera proofs hold; possible scripted inputs,
+  other providers and gamepads still require a dedicated game test. No
+  risky off-map player teleport is performed.
 - The camera entry points and import interception were adapted using the
   provided Steam-build mod reference, not exercised in a running retail game.
   Other retail builds, controller/gamepad bindings and custom remapped keys
@@ -168,7 +179,10 @@ bind poll. `ALIEN_PVP_OWNED` alone only proves the ownership boundary.
 - [ ] Validate `ALIEN_PVP_OWNED` then `localPilotReady=1` for Host Alien.
 - [ ] Repeat with a Client Alien; the Host must not receive local inputs.
 - [ ] WASD, diagonal motion, stopping, slow/fast/run use native animations and collisions.
-- [ ] Camera follows only the selected Alien; `V` switches head/follow safely.
+- [ ] Camera follows only the selected Alien; `V` switches head/follow safely
+  and hides/restores the Alien's skull/shell parts when entering/leaving head view.
+- [ ] Amanda's arms, head and clothing submodels are hidden on the Alien
+  owner's view and restored in the next normal Co-op match.
 - [ ] Amanda cannot move, aim, attack or interact while serving as the technical owner.
 - [ ] ESC/pause and Alt-tab stop Alien motion and preserve normal UI behavior.
 - [ ] A cinematic temporarily owns the camera without being overwritten.
@@ -176,6 +190,9 @@ bind poll. `ALIEN_PVP_OWNED` alone only proves the ownership boundary.
 - [ ] A lobby exit/restoration leaves the original camera and game controls working.
 - [ ] Two consecutive PvP rounds, then a regular Co-op match, work without reboot.
 - [ ] Recheck FPS, allocation churn and input behavior when PvP is inactive.
+- [ ] The Windows CI native movement-vector test succeeds and native x86
+  release compilation remains green. This is a prerequisite, **not**
+  proof that model/camera hooks work in the live game.
 
 ## Required patches to reach playable
 

@@ -10291,6 +10291,13 @@ AlienPvPLeaseStatus PvPStatus(const AlienPvPLeasePhase phase) noexcept {
         gPvPLease.ownerPeer==gCurrent.localPeer;
     status.localPilotReady=status.isLocalOwner &&
         alien_pvp_local::Drives(gPvPLease.ticket.character,gPvPLease.nativeGeneration);
+    if (status.isLocalOwner) {
+        const auto pilot=alien_pvp_local::Snapshot();
+        status.pilotInputIsolated=pilot.inputIsolated;
+        status.pilotCameraBound=pilot.cameraBound;
+        status.pilotTechnicalHidden=pilot.technicalHidden;
+        status.pilotMoving=pilot.moving;
+    }
     return status;
 }
 // The native movement scheduler can be idle while its N navigation cache

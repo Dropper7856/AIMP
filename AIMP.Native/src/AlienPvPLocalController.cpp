@@ -248,6 +248,10 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
 }
 } // namespace
 
+Readiness Snapshot() noexcept {
+    return {alien_pvp_input::Installed(),gLocal.camera.bound,
+        gLocal.visualReady,gLocal.moving};
+}
 bool Drives(const std::uintptr_t character,const std::uint32_t generation) noexcept {
     return character!=0U && gLocal.character==character &&
         gLocal.generation==generation && gLocal.camera.bound &&

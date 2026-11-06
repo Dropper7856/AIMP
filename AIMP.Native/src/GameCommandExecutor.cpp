@@ -4204,6 +4204,10 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteAlienPvPBind(const std::u
         " boundaryValue="+std::to_string(status.boundaryValue)+
         " localOwner="+std::to_string(status.isLocalOwner?1:0)+
         " localPilotReady="+std::to_string(status.localPilotReady?1:0)+
+        " pilotInputIsolated="+std::to_string(status.pilotInputIsolated?1:0)+
+        " pilotCameraBound="+std::to_string(status.pilotCameraBound?1:0)+
+        " pilotTechnicalHidden="+std::to_string(status.pilotTechnicalHidden?1:0)+
+        " pilotMoving="+std::to_string(status.pilotMoving?1:0)+
         ". Owned means exclusive NPC authority, not verified local camera or locomotion. "+
         "The local pilot requires an isolated input path and a live camera target."};
 }

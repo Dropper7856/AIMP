@@ -15,6 +15,10 @@ struct Context {
     bool exclusiveLease{};
 };
 
+struct Readiness final {
+    bool inputIsolated{}, cameraBound{}, technicalHidden{}, moving{};
+};
+[[nodiscard]] Readiness Snapshot() noexcept;
 void Pump(const Context& context) noexcept;
 // clearCurrentWorld is false during teardown/physical generation rollover:
 // never dereference old Characters or resurrect a camera from the old world.

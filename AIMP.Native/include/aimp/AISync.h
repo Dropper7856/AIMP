@@ -392,6 +392,7 @@ struct AlienPvPLeaseStatus final {
     std::uint32_t entityA{}, entityB{}, runtimeId{}, nativeGeneration{}, worldGeneration{};
     std::uint32_t boundaryOffset{}, boundaryValue{};
     bool isLocalOwner{}, localPilotReady{};
+    bool pilotInputIsolated{}, pilotCameraBound{}, pilotTechnicalHidden{}, pilotMoving{};
 };
 bool AcquireAlienPvPLease(std::uint64_t ownerPeer, AlienPvPLeaseStatus& status) noexcept;
 bool ReleaseAlienPvPLease(AlienPvPLeaseStatus& status) noexcept;
