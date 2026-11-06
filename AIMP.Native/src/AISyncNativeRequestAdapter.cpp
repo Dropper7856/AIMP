@@ -277,6 +277,9 @@ Readiness NativeRequestAdapter::Check(const Record& r) noexcept {
         return r.opcode==Op::Submit?Readiness::Ready:Readiness::Rejected;
     if ((r.nativeKind == 1 || r.nativeKind == 2 || r.nativeKind == 3)) return CheckMovement(r,actor);
     if (auto* lease = Find(r)) {
+        // A later accepted Host replacement revoked this request's ability to
+        // change motion. Keep exact Cancel/Release available for native cleanup.
+        if (lease->preempted && r.opcode == Op::Update) return Readiness::Rejected;
         if (lease->unknown || lease->kind != r.nativeKind || lease->admission!=r.admission || !Live(*lease, actor)) return Readiness::Rejected;
         if (r.opcode == Op::Release && !lease->cancelled) {
             std::uint32_t status{};
