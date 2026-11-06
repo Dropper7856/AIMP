@@ -70,30 +70,57 @@ enter/exit vent and roar. No client can choose a different Alien by editing the
 intent payload. Messages currently terminate at transport events; **there is
 not yet a game-engine input producer or native command executor**.
 
-### Native candidate probe (read-only)
+### Native possession lease (AVS-06 — AVS-11)
 
-A new engine-thread command `ALIEN_PVP_PROBE` enumerates live Characters,
-accepts only the native Alien template class (1), excludes PlayerSync proxies,
-and returns a non-pointer identity only if exactly one Alien exists.
-The launcher polls this probe every five seconds during active PvP rounds,
-including after a vent despawn/respawn. A changed or lost candidate invalidates
-its previous evidence. This is **not** possession, a camera binding or a native
-movement write. The command also rejects all caller arguments. The technical
-Alien player's normal human position/equipment/action transmissions are
-disabled, and the Host rejects those human PlayerSync packets.
+The read-only `ALIEN_PVP_PROBE` still exists as a safe diagnostic. It enumerates
+only real retail Alien Characters (template class 1), excludes PlayerSync
+representations, and now verifies the live Character's behaviour-tree owner
+and its AI manager's owner. No user-provided pointer can select an Alien.
+
+During an Alien vs Survivors round, the Launcher issues `ALIEN_PVP_BIND` with
+the Host-selected portable `ownerPeer`, every two seconds while pending and
+every five seconds after success. The native engine thread finds exactly one
+retail Alien and binds an incarnation ticket, Character identity, AI tree,
+session cookie and native/world generations. It does **not** spawn an Alien.
+No Alien, multiple Aliens, a changed Character, or an active different owner
+is rejected or deferred, never resolved by an arbitrary choice.
+
+Only the selected Character's behaviour-manager decisions, CATHODE prepass,
+coordinator and AISync host/client carriers are fenced. The existing retail
+manager housekeeping remains active; ordinary NPCs and Coop remain untouched.
+The lease first retires that actor's legacy BT, task executor, AIMP movement
+slot and known navigation resources using certified retail cleanup paths.
+It is marked **Owned** only when the native movement ownership boundary proves
+quiescence with the exact incarnation and a pinned movement resource. The
+boundary is re-verified for the life of the round.
+
+`ALIEN_PVP_RELEASE` is issued before network authority unbind. It refuses to
+release a living native Character if any paired or movement request still holds
+its resources. If release cannot be proven before disconnection, its fence
+survives the lobby configuration change until native destruction/world
+generation advancement or a later safe release. The Character is never
+recreated to clear a stale lease. Vent respawn is handled through a fresh
+incarnation, not address reuse.
+
+**Limitation:** This is native *ownership isolation*, not yet usable Alien
+control. No input source, camera attachment, attack or vent-driving command has
+been connected. The lease remains pending if the native world cannot prove
+a quiescent boundary; never pretend possession succeeded.
+
+The technical Alien player's normal human position/equipment/action
+transmissions remain disabled. The Host rejects those PlayerSync packets.
 
 ## Required patches to reach playable
 
-1. **Native Alien binding**. On the certified engine thread, identify one
-   genuine retail Alien (NPC class 1) from a level-authored spawn. Bind to
-   Character lifetime/generation, not a global NPC type or untrusted pointer.
-   Do not use `NativeCharacterSpawner` until its research gate has been cleared.
-   Fail closed if the map has no suitable Alien.
-2. **Ownership arbitration with AISync**. For exactly the bound Alien, drain
-   outstanding AI Move/attack native requests, verify exclusive ownership, and
-   suppress retail AI decisions for the duration of possession. Other NPCs,
-   including any non-selected Alien, continue using existing AISync. Preserve
-   the normal host-brain implementation for regular Co-op.
+1. **Native Alien binding** (AVS-06/07/08 — implementation written, game test pending).
+   The engine thread identifies a retail Alien and binds an exact incarnation.
+   Ambiguous/absent characters fail closed. `NativeCharacterSpawner` remains
+   prohibited until its research gate is cleared.
+2. **Ownership arbitration with AISync** (AVS-09/10/11 — implementation written,
+   game test pending). The selected Alien's native AI decisions and replication
+   are fenced, prior movement/nav resources drain, and the release fails closed.
+   Prove in-game that the lease reaches Owned, only one Alien is affected and
+   return-to-lobby never wakes a half-drained brain.
 3. **Local input capture and native locomotion**. Adapt the original
    `control.cpp` / `input_block.cpp` findings to AIMP's x86 thread/hook
    certification and `CharacterDirectStepRuntime`; do not port the mod's
@@ -133,11 +160,27 @@ Protocol/lobby tests added in `AlienPvPTests.cs`. They exercise host-controlled
 roles, payload constraints, a local two-peer lobby, proposal/commit relay,
 native probe argument rejection, victory conditions and control ordering after
 a second round.
-**They have not been executed in this environment** (Windows .NET runtime,
-GFX compiler and retail game engine are unavailable here).
+Windows CI executes the .NET tests and compiles the x86 native DLL. The retail
+game engine and compiled GFX are **not** available in CI, so successful builds
+cannot certify in-game AI possession or safety.
 
 Manual proof: on a clean supported game, compile GFX, host a PvP survival lobby,
 verify the exact BML hash and backup, select each possible Alien owner, check
 client snapshots and Host-only controls, then confirm the current branch blocks
 duplicate *human* remote spawns. Do not use this as a playable PvP release
 until native possession, camera and attacks are delivered and tested.
+
+### AVS milestone 1 manual proof checklist
+
+- [ ] Build ActionScript into GFX externally and run a clean supported retail game.
+- [ ] Co-op baseline: normal Alien AISync still operates without any PvP binding.
+- [ ] PvP Host-as-Alien: exactly one retail Alien is found, its native lease reaches `ALIEN_PVP_OWNED`.
+- [ ] PvP Client-as-Alien: owner ID is the Host-selected client, not automatically the Host.
+- [ ] The selected Alien no longer issues autonomous decisions; all other Characters continue normally.
+- [ ] Alien absent/multiple: no native possession or arbitrary actor choice.
+- [ ] Vent despawn/respawn: original incarnation is retired and a new one bound.
+- [ ] Disconnect/return to lobby: verified `ALIEN_PVP_RELEASED` or a retained fence; no competing AI wakeup.
+- [ ] Two consecutive rounds and a level reload do not reuse stale native ownership.
+- [ ] A deliberately busy navigation or native paired attack leaves lease pending instead of forcing a takeover.
+
+Only after all checks pass should AVS-06 through AVS-11 be called **validated in game**.

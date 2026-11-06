@@ -15,6 +15,43 @@ internal static class AlienPvPTests
             Guid.NewGuid(), GameCommandNames.AlienPvPProbe,
             new Dictionary<string, string>());
         ModelValidation.Validate(nativeProbe);
+        // Possession controls are local launcher->DLL commands only. No peer
+        // can smuggle a raw Character pointer or a second Alien owner.
+        var nativeBind = nativeProbe with
+        {
+            Command = GameCommandNames.AlienPvPBind,
+            Arguments = new Dictionary<string, string> { ["ownerPeer"] = "42" }
+        };
+        ModelValidation.Validate(nativeBind);
+        ModelValidation.Validate(nativeBind with
+        {
+            Arguments = new Dictionary<string, string> { ["ownerPeer"] = ulong.MaxValue.ToString() }
+        });
+        foreach (var invalid in new[] { "", "0", "-1", "+1", "1.0", "0x2A", "18446744073709551616" })
+        {
+            AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(nativeBind with
+            {
+                Arguments = new Dictionary<string, string> { ["ownerPeer"] = invalid }
+            }));
+        }
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(nativeBind with
+        {
+            Arguments = new Dictionary<string, string> { ["ownerPeer"] = "42", ["character"] = "1234" }
+        }));
+        ModelValidation.Validate(nativeProbe with
+        {
+            Command = GameCommandNames.AlienPvPRelease
+        });
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(nativeProbe with
+        {
+            Command = GameCommandNames.AlienPvPRelease,
+            Arguments = new Dictionary<string, string> { ["force"] = "1" }
+        }));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(nativeBind with
+        {
+            LevelGeneration = 0
+        }));
+
         AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(nativeProbe with
         {
             Arguments = new Dictionary<string, string> { ["alienPointer"] = "1234" }
