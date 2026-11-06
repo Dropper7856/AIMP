@@ -9952,6 +9952,37 @@ void PumpOnEngineThread() noexcept {
             static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
             actor.recoveryNativeArmed=false;
         };
+        // A newly installed HostRoute enters native probation instead of
+        // immediately revoking the hybrid recovery ticket. Yield the hybrid
+        // locomotion lease FIRST: displacement observed under our own motor
+        // would falsely certify CATHODE, and can block native route pumps.
+        if(route_execution::NativeHandoffCandidate(actor.character)) {
+            releaseNative();
+            const auto& host=actor.recoveryPose;
+            const bool fresh=actor.recoveryPoseAt&&now>=actor.recoveryPoseAt&&now-actor.recoveryPoseAt<=600U&&
+                host.sessionCookie==gCurrent.sessionCookie&&host.worldGeneration==gCurrent.worldGeneration&&
+                (host.stateFlags&PoseValid)!=0U&&!ProxyWithdrawn(host)&&!health::Terminal(host.health)&&
+                (host.executionFlags&ExecutionPaired)==0U&&(host.motionFlags&6U)==0U&&
+                !PairReservedCharacter(actor.character)&&!PairSourceBusy(actor.character);
+            float current[3]{};
+            const bool sample=fresh&&ReadCharacterPosition(actor.character,current)&&
+                !execution::MovementExecutionOwned(actor.character);
+            const std::array<float,3> local{current[0],current[1],current[2]};
+            const std::array<float,3> expected{host.position[0],host.position[1],host.position[2]};
+            const bool hostMoving=(host.stateFlags&Moving)!=0U&&
+                (host.motionFlags&1U)!=0U&&std::isfinite(host.motionVelocity[0])&&
+                std::isfinite(host.motionVelocity[2])&&
+                std::hypot(host.motionVelocity[0],host.motionVelocity[2])>0.15F;
+            const auto handoff=route_execution::ObserveNativeHandoff(
+                actor.character,now,sample,local,expected,hostMoving);
+            if(handoff==route::NativeHandoffResult::Confirmed) {
+                if(actor.recoveryFollowing){actor.recoveryFollowing=false;++gHybridResumes;}
+                actor.recoveryLastTick=actor.recoveryLastHardSnap=0;
+            } else if(handoff==route::NativeHandoffResult::Stalled) {
+                actor.recoveryLastTick=0;++gHybridFailures;
+            }
+            continue;
+        }
         execution::NavigationBinding binding{};
         const bool needed=route_execution::HybridBinding(actor.character,binding);
         if(!needed) {
