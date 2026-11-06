@@ -154,7 +154,7 @@ internal static class AISyncHostBridgeTests
             if (c.Kind == AISyncExecutionControlKind.Offer) client.AcceptAISyncExecution(c.Scope);
         };
         client.AISyncExecutionBatchReceived += (_, b) => batches.Enqueue(b);
-        using var bridge = new AISyncHostBridge(() => binding, (_, _, _, bytes, _) =>
+        using var bridge = new AISyncHostBridge(() => Volatile.Read(ref binding), (_, _, _, bytes, _) =>
         {
             controls.Enqueue(AISyncExecutionControlCodec.Decode(bytes.Span));
             return Task.CompletedTask;
@@ -189,6 +189,15 @@ internal static class AISyncHostBridgeTests
             AssertEx.Equal(AISyncNativeRecoveryPolicy.MaxAutomaticRepairs + 1,
                 controls.Count(c => c.Kind == AISyncExecutionControlKind.Offer),
                 "A repeatedly failing native binding entered an unbounded restart loop.");
+            // A genuinely new native connection/world binding is a new repair
+            // opportunity, not a replay of the old failed operation or scope.
+            Volatile.Write(ref binding, binding with { ConnectionIdentity = Guid.NewGuid(), Epoch = 2 });
+            await Wait(() => controls.Count(c => c.Kind == AISyncExecutionControlKind.Offer) ==
+                AISyncNativeRecoveryPolicy.MaxAutomaticRepairs + 2, token);
+            var afterRebind = controls.Last(c => c.Kind == AISyncExecutionControlKind.Offer);
+            AssertEx.True(afterRebind.Scope.AuthorityEpoch >
+                controls.First(c => c.Kind == AISyncExecutionControlKind.Offer).Scope.AuthorityEpoch);
+            AssertEx.Equal(1, bridge.NativeRepairLimitHits);
         }
         finally { bridge.Dispose(); await bridge.Completion.WaitAsync(token); }
     }
