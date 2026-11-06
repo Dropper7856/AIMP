@@ -378,6 +378,7 @@ NativeOutcome NativeRequestAdapter::InvokePinned(const Record& r, const LocalAct
             if (!Resolve(r, after) || !Live(*lease, after)) return NativeOutcome::Unknown;
             *reinterpret_cast<std::uint8_t*>(lease->ref.object+0x18)=static_cast<std::uint8_t>((r.scalarRetention>>1)&1);
             lease->admitted = accepted != 0; lease->unknown = false;
+            if(accepted)FenceSupersededMovements(r,actor);
             return accepted != 0 ? NativeOutcome::Admitted : NativeOutcome::Rejected;
         }
         if (lease == nullptr || lease->unknown || !Live(*lease, actor)) return NativeOutcome::Rejected;
