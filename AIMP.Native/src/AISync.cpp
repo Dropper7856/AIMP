@@ -9973,8 +9973,11 @@ void PumpOnEngineThread() noexcept {
                 (host.motionFlags&1U)!=0U&&std::isfinite(host.motionVelocity[0])&&
                 std::isfinite(host.motionVelocity[2])&&
                 std::hypot(host.motionVelocity[0],host.motionVelocity[2])>0.15F;
+            const bool suspended=(host.executionFlags&ExecutionPaired)!=0U||
+                (host.motionFlags&6U)!=0U||PairReservedCharacter(actor.character)||
+                PairSourceBusy(actor.character);
             const auto handoff=route_execution::ObserveNativeHandoff(
-                actor.character,now,sample,local,expected,hostMoving);
+                actor.character,now,sample,local,expected,hostMoving,suspended);
             if(handoff==route::NativeHandoffResult::Confirmed) {
                 if(actor.recoveryFollowing){actor.recoveryFollowing=false;++gHybridResumes;}
                 actor.recoveryLastTick=actor.recoveryLastHardSnap=0;
