@@ -590,6 +590,20 @@ std::array<ULONGLONG, kActors> gIncomingAt{};
 std::array<ULONGLONG, kActors> gNextIdentityProbe{};
 Configuration gCurrent{}; // engine thread only
 std::atomic<Role> gRole{Role::Retail};
+// Engine-thread-only PvP scope; pointers are never persisted beyond a qualified
+// Character incarnation. This does not grant locomotion/camera control.
+struct AlienPvPNativeLease final {
+    character_incarnations::Ticket ticket{};
+    std::uintptr_t tree{};
+    std::uint64_t sessionCookie{}, ownerPeer{};
+    std::uint32_t nativeGeneration{}, worldGeneration{}, entityA{}, entityB{}, runtimeId{};
+    std::uint32_t boundaryOffset{}, boundaryValue{};
+    bool fenced{}, drained{}, owned{};
+};
+AlienPvPNativeLease gPvPLease{};
+bool PvPCharacterFenced(std::uintptr_t character) noexcept;
+void ForgetPvPLease(std::uintptr_t destroyedCharacter = 0U) noexcept;
+
 std::atomic<bool> gAlienSuppressed{};
 std::atomic<bool> gInstalled{}, gStopping{};
 std::atomic<void*> gUpdateOriginal{}, gCoordinatorOriginal{}, gInteractionOriginal{};
@@ -7361,6 +7375,21 @@ void __fastcall UpdateDetour(void* manager, void*, std::uint32_t previousTime, f
         return;
     }
 
+    // A single selected retail Alien must never run its autonomous decision
+    // branch while the PvP native lease is fencing or owned. Preserve the
+    // manager's retail housekeeping exactly as we do for PlayerSync proxies.
+    if (PvPCharacterFenced(c)) {
+        Actor pvpProxy{};
+        pvpProxy.character = c;
+        pvpProxy.blocked = true;
+        auto* previous = gUpdating;
+        gUpdating = &pvpProxy;
+        gSuspended.fetch_add(1U, std::memory_order_relaxed);
+        callOriginal();
+        gUpdating = previous;
+        return;
+    }
+
     if (!OwnsAI()) { callOriginal(); return; }
     if (!Client() && !Stable()) { callOriginal(); return; }
     gManagerUpdates.fetch_add(1U, std::memory_order_relaxed);
@@ -7434,12 +7463,15 @@ void __fastcall UpdateDetour(void* manager, void*, std::uint32_t previousTime, f
             actor->lastSend = 0U;
         }
         actor->lastManagerUpdate = now;
-        SampleParticipantPerception(*actor, reinterpret_cast<std::uintptr_t>(manager), now);
-        Publish(*actor);
+        if (!PvPCharacterFenced(c)) {
+            SampleParticipantPerception(*actor, reinterpret_cast<std::uintptr_t>(manager), now);
+            Publish(*actor);
+        }
     } else if (Client() && Stable() && !actor->faulted && !actor->duplicate) {
         const auto now=GetTickCount64();
         SamplePresentation(*actor,now);
-        static_cast<void>(ApplyCommandAction(*actor,now)); // records its own holds
+        if (!PvPCharacterFenced(c))
+            static_cast<void>(ApplyCommandAction(*actor,now)); // records its own holds
     }
 }
 void __fastcall PrepassDetour(void* context, void*) noexcept {
@@ -7453,6 +7485,7 @@ void __fastcall PrepassDetour(void* context, void*) noexcept {
         Read(manager + 0x128U, owner)) {
         if (PairSourceBusy(owner)) return;
         if (PlayerRepresentation(owner)) return;
+        if (EngineThread() && PvPCharacterFenced(owner)) return;
         if (Client() && Eligible(owner, type)) return;
     }
     const auto original = reinterpret_cast<void(__thiscall*)(void*)>(gPrepassOriginal.load());
@@ -7479,6 +7512,7 @@ void __fastcall CoordinatorDetour(void* tree, void*, std::uint32_t execute) noex
     if (Read(reinterpret_cast<std::uintptr_t>(tree) + 0xCU, owner)) {
         if (PairSourceBusy(owner)) return;
         if (PlayerRepresentation(owner)) return;
+        if (EngineThread() && PvPCharacterFenced(owner)) return;
         if (Client() && Eligible(owner, type)) return;
     }
     if (original == nullptr) return;
@@ -10067,6 +10101,7 @@ void BeforeCharacterDestruction(const std::uintptr_t c) noexcept {
     execution_runtime::BeforeActorDestruction({c,runtime,static_cast<std::uint32_t>(gGeneration),ticket.serial});
 }
 void ForgetCharacter(const std::uintptr_t c) noexcept {
+    if (EngineThread()) ForgetPvPLease(c);
     InvalidatePairTransactions(c);
     InvalidatePairCharacter(c);
     const bool playerRepresentation = RegisteredPlayerRepresentation(c);
@@ -10099,6 +10134,7 @@ void ForgetCharacter(const std::uintptr_t c) noexcept {
 }
 void ForgetSpawnKey(const std::uint32_t id) noexcept {
     if (id == 0U) return;
+    if (EngineThread() && gPvPLease.runtimeId == id) ForgetPvPLease();
     // The manager's key-based destroy wrapper runs BEFORE FullDestroy. Drain
     // while its actor/ownership mapping is still live, rather than revoking it
     // here and making the later FullDestroy preflight unable to find it.
@@ -10182,6 +10218,155 @@ std::uintptr_t ResolveLivingParticipant(const std::uint64_t peer,
     if (!EngineThread() || !Stable() || gCurrent.nativeGeneration != nativeGeneration) return 0U;
     const auto character = ParticipantForPeer(peer);
     return LivingCharacter(character) ? character : 0U;
+}
+
+// No native Character is dereferenced by this helper; the local incarnation
+// registry is our lifetime authority. Every call occurs on the certified
+// engine thread, including ManagerUpdate/BT detours.
+bool PvPLeaseScopeCurrent() noexcept {
+    return gPvPLease.fenced && Installed() && EngineThread() && Stable() &&
+        gPvPLease.sessionCookie != 0U && gPvPLease.sessionCookie == gCurrent.sessionCookie &&
+        gPvPLease.nativeGeneration == gCurrent.nativeGeneration &&
+        gPvPLease.worldGeneration == gCurrent.worldGeneration &&
+        gGenerations != nullptr && gGenerations->CurrentGeneration() == gPvPLease.nativeGeneration &&
+        character_incarnations::NativeRegistry().Current(gPvPLease.ticket);
+}
+bool PvPCharacterFenced(const std::uintptr_t character) noexcept {
+    return character != 0U && gPvPLease.ticket.character == character && PvPLeaseScopeCurrent();
+}
+void ForgetPvPLease(const std::uintptr_t destroyedCharacter) noexcept {
+    if (destroyedCharacter == 0U || gPvPLease.ticket.character == destroyedCharacter) gPvPLease = {};
+}
+bool PvPLeaseLiveIdentity() noexcept {
+    if (!PvPLeaseScopeCurrent()) return false;
+    std::uint32_t a{}, b{}, type{}, runtime{};
+    std::uintptr_t tree{}, owner{};
+    return CharacterIdentity(gPvPLease.ticket.character,a,b,type) && type == 1U &&
+        a == gPvPLease.entityA && b == gPvPLease.entityB &&
+        Read(gPvPLease.ticket.character+0x50U,runtime) && runtime == gPvPLease.runtimeId &&
+        Read(gPvPLease.ticket.character+0x34D8U,tree) && tree == gPvPLease.tree &&
+        Read(tree+0xCU,owner) && owner == gPvPLease.ticket.character;
+}
+AlienPvPLeaseStatus PvPStatus(const AlienPvPLeasePhase phase) noexcept {
+    AlienPvPLeaseStatus status{};
+    status.phase=phase;
+    status.ownerPeer=gPvPLease.ownerPeer;
+    status.entityA=gPvPLease.entityA;
+    status.entityB=gPvPLease.entityB;
+    status.runtimeId=gPvPLease.runtimeId;
+    status.nativeGeneration=gPvPLease.nativeGeneration;
+    status.worldGeneration=gPvPLease.worldGeneration;
+    status.boundaryOffset=gPvPLease.boundaryOffset;
+    status.boundaryValue=gPvPLease.boundaryValue;
+    return status;
+}
+bool PvPTryDrain(AlienPvPLeaseStatus& status) noexcept {
+    using Check=execution::OwnershipCheck;
+    if (!PvPLeaseLiveIdentity()) { ForgetPvPLease(); status=PvPStatus(AlienPvPLeasePhase::Stale); return false; }
+    auto* actor=Find(gPvPLease.ticket.character);
+    if (!actor || actor->duplicate || actor->faulted || actor->runtimeId != gPvPLease.runtimeId ||
+        PairSourceBusy(actor->character) || !UnownedCleanupAllowed(*actor)) {
+        status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement); return false;
+    }
+    if (!gPvPLease.drained) {
+        // All per-actor BT decisions are already fenced, and the exact native
+        // owner has no transaction/paired lease. Use retail destructors, not
+        // a memcpy/zero of movement requests or the shared Alien controller.
+        if (!QuiesceProxyExecution(*actor)) {
+            status=PvPStatus(AlienPvPLeasePhase::Draining); return false;
+        }
+        if (!character_direct_step_runtime::ReleaseAIIntentOwnership(actor->character)) {
+            status=PvPStatus(AlienPvPLeasePhase::Draining); return false;
+        }
+        gPvPLease.drained=true;
+    }
+    const character_direct_step_runtime::MovementResourceLease resources(actor->character);
+    if (!resources) { status=PvPStatus(AlienPvPLeasePhase::Draining); return false; }
+    const execution::OwnershipMemory memory{gBase,nullptr,
+        [](void*,std::uintptr_t at,void* out,std::size_t size) noexcept {
+            return crash_guard::TryCopy(out,reinterpret_cast<const void*>(at),size);
+        }};
+    const execution::ActorLifetime lifetime{actor->character,actor->runtimeId,
+        gPvPLease.nativeGeneration,gPvPLease.ticket.serial};
+    execution::OwnershipBoundaryFailure failure{};
+    const auto check=execution::InspectMovementBoundary(memory,lifetime,true,&failure);
+    gPvPLease.boundaryOffset=failure.offset;gPvPLease.boundaryValue=failure.value;
+    if (check != Check::Ready) { status=PvPStatus(AlienPvPLeasePhase::Draining); return false; }
+    gPvPLease.owned=true;
+    status=PvPStatus(AlienPvPLeasePhase::Owned);
+    return true;
+}
+bool AcquireAlienPvPLease(const std::uint64_t ownerPeer, AlienPvPLeaseStatus& status) noexcept {
+    status={};
+    if (!ownerPeer || !Installed() || !EngineThread() || !Stable() ||
+        gCurrent.role == Role::Retail || gCurrent.role == Role::FrozenClient ||
+        !gCurrent.sessionCookie || !gCurrent.nativeGeneration || !gCurrent.worldGeneration ||
+        !gGenerations || gGenerations->CurrentGeneration() != gCurrent.nativeGeneration) return false;
+    AlienPvPProbe candidate{};
+    if (!ProbeAlienPvPCandidate(candidate)) return false;
+    if (!candidate.unique) {
+        if (gPvPLease.fenced) ForgetPvPLease();
+        status.phase=candidate.candidates==0U?AlienPvPLeasePhase::WaitingForAlien:AlienPvPLeasePhase::Ambiguous;
+        return false;
+    }
+    if (gPvPLease.fenced) {
+        if (gPvPLease.ownerPeer != ownerPeer) {
+            status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement);
+            return false;
+        }
+        if (candidate.runtimeId != gPvPLease.runtimeId ||
+            candidate.entityA != gPvPLease.entityA || candidate.entityB != gPvPLease.entityB ||
+            !PvPLeaseLiveIdentity()) ForgetPvPLease();
+        else return gPvPLease.owned ? (status=PvPStatus(AlienPvPLeasePhase::Owned),true) :
+            PvPTryDrain(status);
+    }
+    const auto character=FindCharacterByIdentity(candidate.entityA,candidate.entityB);
+    if (!character) { status.phase=AlienPvPLeasePhase::WaitingForAlien; return false; }
+    auto* actor=Admit(character);
+    if (!actor || actor->duplicate || actor->faulted ||
+        actor->runtimeId!=candidate.runtimeId || actor->characterClass!=1U ||
+        !UnownedCleanupAllowed(*actor) || PairSourceBusy(character)) {
+        status.phase=AlienPvPLeasePhase::AwaitingRetirement;return false;
+    }
+    character_incarnations::Ticket ticket{};
+    auto& registry=character_incarnations::NativeRegistry();
+    auto found=registry.Find(gCurrent.nativeGeneration,character,ticket);
+    if (found==character_incarnations::Result::Missing || found==character_incarnations::Result::WrongGeneration)
+        found=registry.BindExisting(gCurrent.nativeGeneration,character,candidate.runtimeId,ticket);
+    if ((found!=character_incarnations::Result::Ok && found!=character_incarnations::Result::Duplicate) ||
+        ticket.runtimeId!=candidate.runtimeId || !ticket.serial || !registry.Current(ticket)) {
+        status.phase=AlienPvPLeasePhase::AwaitingRetirement;return false;
+    }
+    gPvPLease.ticket=ticket;
+    gPvPLease.tree=actor->tree;
+    gPvPLease.ownerPeer=ownerPeer;
+    gPvPLease.sessionCookie=gCurrent.sessionCookie;
+    gPvPLease.nativeGeneration=gCurrent.nativeGeneration;
+    gPvPLease.worldGeneration=gCurrent.worldGeneration;
+    gPvPLease.entityA=candidate.entityA;
+    gPvPLease.entityB=candidate.entityB;
+    gPvPLease.runtimeId=candidate.runtimeId;
+    gPvPLease.fenced=true;
+    return PvPTryDrain(status);
+}
+bool ReleaseAlienPvPLease(AlienPvPLeaseStatus& status) noexcept {
+    status={};
+    if (!EngineThread()) return false;
+    if (!gPvPLease.fenced) { status.phase=AlienPvPLeasePhase::Released; return true; }
+    if (PvPLeaseLiveIdentity()) {
+        auto* actor=Find(gPvPLease.ticket.character);
+        if (actor && (PairSourceBusy(actor->character) || !UnownedCleanupAllowed(*actor))) {
+            status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement);return false;
+        }
+        // AVS-12+ must first retire any player-written input slots before
+        // asking for release. No locomotion writer is installed by this patch.
+        if (!character_direct_step_runtime::ReleaseAIIntentOwnership(gPvPLease.ticket.character)) {
+            status=PvPStatus(AlienPvPLeasePhase::Draining);return false;
+        }
+    }
+    ForgetPvPLease();
+    status.phase=AlienPvPLeasePhase::Released;
+    return true;
 }
 
 bool ProbeAlienPvPCandidate(AlienPvPProbe& result) noexcept {
