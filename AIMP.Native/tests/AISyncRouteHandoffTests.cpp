@@ -11,7 +11,31 @@ int main() {
     Check(!HybridResumeCurrent(8,4,8,3));
     Check(HybridResumeCurrent(8,4,8,4));
     Check(HybridResumeCurrent(8,4,9,1));
-    auto previous=std::make_unique<Graph>();auto next=std::make_unique<Graph>();
+    // Native installation alone cannot clear a hybrid recovery ticket.
+    // Probe starts only after AISync relinquishes its own motor lease.
+    NativeHandoffProbe moving{};
+    const std::array<float,3> origin{0.0F,0.0F,0.0F}, host{3.0F,0.0F,0.0F};
+    Check(moving.Observe(1000,true,origin,host,true)==NativeHandoffResult::Pending);
+    Check(moving.Observe(1050,true,{0.04F,0.0F,0.0F},host,true)==NativeHandoffResult::Pending);
+    Check(moving.Observe(1120,true,{0.18F,0.0F,0.0F},host,true)==NativeHandoffResult::Confirmed);
+    NativeHandoffProbe blocked{};
+    Check(blocked.Observe(1000,true,origin,host,true)==NativeHandoffResult::Pending);
+    Check(blocked.Observe(1450,true,origin,host,true)==NativeHandoffResult::Pending);
+    Check(blocked.Observe(1900,true,origin,host,true)==NativeHandoffResult::Stalled);
+    NativeHandoffProbe settled{};
+    Check(settled.Observe(1000,true,origin,origin,false)==NativeHandoffResult::Pending);
+    Check(settled.Observe(1100,true,origin,origin,false)==NativeHandoffResult::Confirmed);
+    NativeHandoffProbe distantIdle{};
+    Check(distantIdle.Observe(1000,true,origin,host,false)==NativeHandoffResult::Pending);
+    Check(distantIdle.Observe(1900,true,origin,host,false)==NativeHandoffResult::Stalled);
+    NativeHandoffProbe teleport{};
+    Check(teleport.Observe(1000,true,origin,host,true)==NativeHandoffResult::Pending);
+    Check(teleport.Observe(1100,true,{4.0F,0.0F,0.0F},host,true)==NativeHandoffResult::Pending);
+    Check(teleport.Observe(1900,false,origin,host,true)==NativeHandoffResult::Stalled);
+    NativeHandoffProbe missing{};
+    Check(missing.Observe(1000,false,origin,host,true)==NativeHandoffResult::Pending);
+    Check(missing.Observe(1900,false,origin,host,true)==NativeHandoffResult::Stalled);
+        auto previous=std::make_unique<Graph>();auto next=std::make_unique<Graph>();
     previous->nodeCount=2;previous->resourceCount=2;
     previous->resources[1].state=7;previous->resources[1].immutableDigest[0]=123;
     auto& tail=previous->nodes[1];tail.resourceIndex=1;tail.type=2;tail.ordinal=15;
