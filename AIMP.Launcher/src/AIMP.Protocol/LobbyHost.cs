@@ -17,7 +17,8 @@ public sealed record LobbyHostOptions(
     CompatibilityInfo Compatibility,
     bool OpaqueRelayEnabled = false,
     bool RequireWorldPreparation = false,
-    bool AlienEnabled = true);
+    bool AlienEnabled = true,
+    bool AlienVsSurvivors = false);
 
 public readonly record struct WorldHostAcceptedMutation(
     WorldNetworkMutation Mutation,
@@ -69,6 +70,7 @@ public sealed partial class LobbyHost : IAsyncDisposable
     private Task? _worldMutationBroadcastLoop;
     private string _level;
     private string _state = "Lobby";
+    private ulong _alienPeerId; // Host-owned lobby role, never assigned by a client packet.
     private int _levelGeneration;
     // Participants whose THE_PLAYER died during _levelGeneration. Guarded by
     // _stateLock and cleared whenever a generation starts or a round ends.
@@ -138,8 +140,32 @@ public sealed partial class LobbyHost : IAsyncDisposable
                 return string.Equals(_state, "Lobby", StringComparison.Ordinal)
                     && _clients.Count >= 1
                     && _clients.Values.All(client => client.IsReady)
+                    && (!_options.AlienVsSurvivors || (_alienPeerId != 0 &&
+                        (_alienPeerId == HostPeerId || _clients.ContainsKey(_alienPeerId))))
                     && (!_options.RequireWorldPreparation || AllLobbyPreparationsMatchLocked());
         }
+    }
+
+    // Only the local host API may choose the unique Alien. There is deliberately no
+    // corresponding client-to-host message, preventing role spoofing.
+    public async Task SetAlienPlayerAsync(ulong peerId, CancellationToken cancellationToken = default)
+    {
+        if (!_options.AlienVsSurvivors)
+            throw new InvalidOperationException("The lobby is not an Alien vs Survivors game.");
+        await _admissionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            lock (_stateLock)
+            {
+                if (_state != "Lobby") throw new InvalidOperationException("Roles are locked after start.");
+                if (peerId != 0 && peerId != HostPeerId && !_clients.ContainsKey(peerId))
+                    throw new InvalidOperationException("Selected Alien is not in the lobby.");
+                _alienPeerId = peerId;
+            }
+        }
+        finally { _admissionGate.Release(); }
+        PublishSnapshot();
+        await BroadcastSnapshotAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public event EventHandler<LobbySnapshotPayload>? SnapshotChanged;
@@ -258,6 +284,9 @@ public sealed partial class LobbyHost : IAsyncDisposable
                         "At least one connected client is required and every client must be ready.");
                 }
 
+                if (_options.AlienVsSurvivors && (_alienPeerId == 0 ||
+                    (_alienPeerId != HostPeerId && !_clients.ContainsKey(_alienPeerId))))
+                    throw new InvalidOperationException("The host must assign exactly one Alien before launch.");
                 if (_options.RequireWorldPreparation && !AllLobbyPreparationsMatchLocked())
                     throw new InvalidOperationException(
                         "Every participant must prepare the selected level with the same WorldManifest before launch.");
@@ -274,7 +303,9 @@ public sealed partial class LobbyHost : IAsyncDisposable
                     startAtUtc.ToUnixTimeMilliseconds(),
                     _level,
                     _levelGeneration,
-                    _options.AlienEnabled);
+                    _options.AlienEnabled,
+                    _options.AlienVsSurvivors,
+                    _alienPeerId);
             }
         }
         finally
@@ -1187,6 +1218,7 @@ public sealed partial class LobbyHost : IAsyncDisposable
                 await RemoveShadowPeerAsync(state.PeerId).ConfigureAwait(false);
                 await RemoveExecutionPeerAsync(state.PeerId).ConfigureAwait(false);
                 lock (_stateLock) {
+                    if (_alienPeerId == state.PeerId) _alienPeerId = 0;
                     _lobbyPreparations.Remove(state.PeerId);
                     _sessionPreparedPeers.Remove(state.PeerId);
                 }
@@ -1942,7 +1974,9 @@ public sealed partial class LobbyHost : IAsyncDisposable
             preparationToken,
             preparations,
             _options.RequireWorldPreparation,
-            _options.AlienEnabled);
+            _options.AlienEnabled,
+            _options.AlienVsSurvivors,
+            _alienPeerId);
         ModelValidation.Validate(snapshot);
         return snapshot;
     }
