@@ -353,6 +353,47 @@ void NativeIntentEvidenceAndOrdering() {
     }
 }
 
+void CurrentIntentPreemption() {
+    const auto next=[](Record r,Op opcode) {++r.globalSeq;++r.ownerSeq;r.opcode=opcode;return r;};
+    auto begin=Base();begin.nativeKind=1;begin.admission=1;
+    Ledger ledger({},true);
+    CHECK(ledger.SetScope(begin.scope)==Result::Ok&&ledger.Apply(begin)==Result::Ok);
+    auto submit=next(begin,Op::Submit);
+    CHECK(ledger.Apply(submit)==Result::Ok);
+    std::array<Record,10> updates{};
+    auto latest=submit;
+    for(std::size_t i=0;i<updates.size();++i) {
+        latest=next(latest,Op::Update);++latest.parameterRevision;
+        latest.goalX=static_cast<float>(i+2);
+        CHECK(ledger.Apply(latest)==Result::Ok);
+        updates[i]=latest;
+    }
+    for(std::size_t i=0;i+1<updates.size();++i) {
+        CHECK(ledger.Superseded(updates[i].globalSeq));
+        CHECK(ledger.NativeReadiness(updates[i])==Result::Duplicate);
+    }
+    // The newest goal still needs its command's Submit, not nine old goals.
+    CHECK(ledger.NativeReadiness(latest)==Result::OwnerBusy);
+    CHECK(ledger.EnterNative(submit)==Result::Ok);
+    CHECK(ledger.FinishNative(submit,NativeOutcome::Admitted)==Result::Ok);
+    CHECK(ledger.NativeReadiness(latest)==Result::Ok);
+    CHECK(ledger.EnterNative(latest)==Result::Ok);
+    CHECK(ledger.FinishNative(latest,NativeOutcome::Admitted)==Result::Ok);
+
+    // Host admission=0 supersedes a different unentered movement command.
+    auto older=next(latest,Op::Begin);
+    ++older.commandId;older.parentCommandId=begin.commandId;older.parameterRevision=1;
+    CHECK(ledger.Apply(older)==Result::Ok);
+    auto pending=next(older,Op::Submit);CHECK(ledger.Apply(pending)==Result::Ok);
+    auto newCommand=next(pending,Op::Begin);
+    ++newCommand.commandId;newCommand.parentCommandId=older.commandId;
+    newCommand.parameterRevision=1;newCommand.admission=0;
+    CHECK(ledger.Apply(newCommand)==Result::Ok);
+    auto replacing=next(newCommand,Op::Submit);CHECK(ledger.Apply(replacing)==Result::Ok);
+    CHECK(ledger.Superseded(pending.globalSeq));
+    CHECK(ledger.NativeReadiness(pending)==Result::Duplicate);
+    CHECK(ledger.NativeReadiness(replacing)==Result::Ok);
+}
 void SchedulerControlOrdering() {
     const auto next=[](Record r,Op op) {++r.globalSeq;++r.ownerSeq;r.opcode=op;return r;};
     for(auto kind:{6U,8U,11U}) for(auto terminal:{Op::Complete,Op::Cancel,Op::Stop}) {
@@ -540,6 +581,7 @@ int main(int argc, char** argv) {
     FencesAndEntry();
     OwnerQuarantineAndReentrance();
     NativeIntentEvidenceAndOrdering();
+    CurrentIntentPreemption();
     SchedulerControlOrdering();
     GeneratedTraces();
     std::cout << "AISync transaction canonical codec, journal, caps and native entry checks passed\n";
