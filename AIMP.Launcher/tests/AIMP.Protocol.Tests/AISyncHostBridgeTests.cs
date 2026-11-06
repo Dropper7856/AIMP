@@ -6,6 +6,59 @@ namespace AIMP.Protocol.Tests;
 
 internal static class AISyncHostBridgeTests
 {
+    internal static Task RetryCongestionPlannerAsync()
+    {
+        var scope = new AISyncExecutionScope(Guid.NewGuid(), 1, 1, 1);
+        AssertEx.Equal(8, AISyncRetryPlanner.MaxHostPerTick);
+        AssertEx.Equal(8, AISyncRetryPlanner.MaxLocalPerTick);
+        AssertEx.True(AISyncRetryPlanner.HostRetryIntervalMs > AISyncRetryPlanner.LocalRetryIntervalMs);
+        var cursor = 0;
+        var latest = new List<(ulong Peer, AISyncTransaction Operation)>();
+        for (uint actor = 1; actor <= 12; ++actor)
+        {
+            for (uint revision = 1; revision <= 10; ++revision)
+            {
+                var op = Record(scope, 2, AISyncTransactionOpcode.Update) with
+                {
+                    EntityA = actor, EntityB = 2, Birth = 1, CharacterClass = 1,
+                    NativeKind = 1, CommandId = actor,
+                    ParameterRevision = revision,
+                    GlobalSequence = (ulong)(actor * 10 + revision),
+                    OwnerSequence = revision
+                };
+                latest.Add((0UL, op));
+            }
+        }
+        var first = AISyncRetryPlanner.ChooseCycle(latest, 8, ref cursor);
+        var second = AISyncRetryPlanner.ChooseCycle(latest, 8, ref cursor);
+        AssertEx.Equal(8, first.Length);
+        AssertEx.Equal(8, second.Length);
+        AssertEx.Equal(8, first.Select(x => x.Sequence).Distinct().Count());
+        AssertEx.True(first.All(x => x.Sequence % 10 == 0 || x.Sequence % 10 == 1),
+            "No stale revision should be chosen before a newer revision of the same command.");
+        AssertEx.True(latest.Any(x => x.Operation.GlobalSequence == second[^1].Sequence));
+        AssertEx.True(first.Concat(second).Select(x => x.Sequence).Distinct().Count() == 12,
+            "More than eight actors must receive a fair retry window within two ticks.");
+        var selectOne = AISyncRetryPlanner.ChooseCycle(latest, 1, ref cursor);
+        AssertEx.Equal(1, selectOne.Length);
+        AssertEx.Equal(0, AISyncRetryPlanner.ChooseCycle(latest, 0, ref cursor).Length);
+        AssertEx.Equal(0, AISyncRetryPlanner.ChooseCycle(
+            Array.Empty<(ulong Peer, AISyncTransaction Operation)>(), 8, ref cursor).Length);
+
+        var firstActor = latest.Where(p => p.Operation.EntityA == 1).ToArray();
+        var sameActorTwoPeers = firstActor.Concat(firstActor.Select(p => (1UL, p.Operation)));
+        AssertEx.Equal(2, AISyncRetryPlanner.ChooseCycle(sameActorTwoPeers, 8, ref cursor).Length,
+            "Different consumers must never share retry identity.");
+        var protectedFirst = firstActor[0].Operation with {
+            Opcode = AISyncTransactionOpcode.Release, GlobalSequence = 1
+        };
+        var protectedCandidates = firstActor.Append((0UL, protectedFirst));
+        var choice = AISyncRetryPlanner.ChooseCycle(protectedCandidates, 8, ref cursor);
+        AssertEx.Equal(1UL, choice.Single().Sequence,
+            "An irreversible Release must not be bypassed by a more recent move.");
+        return Task.CompletedTask;
+    }
+
     internal static Task CurrentIntentRetryPriorityAsync()
     {
         var scope = new AISyncExecutionScope(Guid.NewGuid(), 1, 1, 1);
