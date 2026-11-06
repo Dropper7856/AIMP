@@ -10184,6 +10184,40 @@ std::uintptr_t ResolveLivingParticipant(const std::uint64_t peer,
     return LivingCharacter(character) ? character : 0U;
 }
 
+bool ProbeAlienPvPCandidate(AlienPvPProbe& result) noexcept {
+    result = {};
+    if (!Installed() || !EngineThread() || !Stable() ||
+        gCurrent.nativeGeneration == 0U || gCurrent.worldGeneration == 0U ||
+        gRole.load(std::memory_order_acquire) == Role::Retail)
+        return false;
+
+    result.nativeGeneration = gCurrent.nativeGeneration;
+    result.worldGeneration = gCurrent.worldGeneration;
+    // Enumerate the native Character registry, including currently active
+    // characters that have not yet been admitted into AISync's actor cache.
+    const bool scanned = ForEachCharacter([&](const std::uintptr_t character) noexcept {
+        std::uint32_t entityA{}, entityB{}, type{}, runtimeId{};
+        if (CharacterIdentity(character, entityA, entityB, type) &&
+            type == 1U && Eligible(character, type) &&
+            Read(character + 0x50U, runtimeId) && runtimeId != 0U) {
+            ++result.candidates;
+            if (result.candidates == 1U) {
+                result.entityA = entityA;
+                result.entityB = entityB;
+                result.runtimeId = runtimeId;
+            }
+        }
+        return true;
+    });
+    if (!scanned) { result = {}; return false; }
+    result.unique = result.candidates == 1U;
+    if (!result.unique) {
+        // No ambiguous or stale identity may be retained as a controller.
+        result.entityA = result.entityB = result.runtimeId = 0U;
+    }
+    return true;
+}
+
 Counters DiagnosticsSnapshot() noexcept {
     Counters value{gObserved.load(), gApplied.load(), gDropped.load(), gRefused.load(),
         gSuspended.load(), gFaults.load(), gMissing.load()};

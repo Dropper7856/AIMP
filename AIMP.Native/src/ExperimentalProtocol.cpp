@@ -918,6 +918,7 @@ bool DecodeGameCommand(
             command->stringValue == "WORLD_STATE_DISCOVERY_BASELINE" ||
             command->stringValue == "WORLD_STATE_DISCOVERY_AFTER" ||
             command->stringValue == "WORLD_STATE_DISCOVERY_STATUS" ||
+            command->stringValue == "ALIEN_PVP_PROBE" ||
             command->stringValue == "RETURN_TO_FRONTEND") {
             if (!arguments->objectValue.empty()) return false;
             output.command = command->stringValue;

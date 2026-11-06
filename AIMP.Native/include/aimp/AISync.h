@@ -369,6 +369,15 @@ struct Counters final {
     bool stable{};
 };
 Counters DiagnosticsSnapshot() noexcept;
+
+// Read-only identity probe. It never grants possession, creates a Character,
+// modifies CATHODE state or exports process-local Character pointers.
+struct AlienPvPProbe final {
+    std::uint32_t nativeGeneration{}, worldGeneration{}, candidates{};
+    std::uint32_t entityA{}, entityB{}, runtimeId{};
+    bool unique{};
+};
+bool ProbeAlienPvPCandidate(AlienPvPProbe& result) noexcept;
 // Engine-thread participant identity for source-attributed native subsystems.
 // Uses the same native generation/lifetime proof as perception; never chooses a
 // target. The launcher's world generation is AISync-private and not compared.

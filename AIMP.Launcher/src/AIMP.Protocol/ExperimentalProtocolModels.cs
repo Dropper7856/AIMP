@@ -167,6 +167,8 @@ public static class GameCommandNames
     // Internal round lifecycle: revokes the previous level incarnation at a lobby start.
     public const string SessionRoundBoundary = "SESSION_ROUND_BOUNDARY";
     public const string ReturnToFrontend = "RETURN_TO_FRONTEND";
+    // Local engine-thread probe only. No remote player can choose a native pointer.
+    public const string AlienPvPProbe = "ALIEN_PVP_PROBE";
     // Internal ItemSync: remove a pickup another participant collected, absent from the UI catalogue.
     public const string ItemSyncApply = "ITEM_SYNC_APPLY";
     // Internal ItemSync: spawn a Host-decided GCIP pickup or a remote player drop.
@@ -196,6 +198,7 @@ public static class GameCommandNames
             WorldStateDiscoveryAfter,
             WorldStateDiscoveryStatus,
             ReturnToFrontend,
+            AlienPvPProbe,
             SessionLoadingHold,
             SessionRoundBoundary,
             ItemSyncApply,

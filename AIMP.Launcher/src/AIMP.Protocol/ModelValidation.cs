@@ -901,6 +901,10 @@ public static class ModelValidation
                 StringComparison.Ordinal)
             || string.Equals(
                 value.Command,
+                GameCommandNames.AlienPvPProbe,
+                StringComparison.Ordinal)
+            || string.Equals(
+                value.Command,
                 GameCommandNames.ReturnToFrontend,
                 StringComparison.Ordinal))
         {

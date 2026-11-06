@@ -3190,6 +3190,9 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
                 pending->request.command == "WORLD_STATE_DISCOVERY_STATUS") {
                 result = gameCommands_->ExecuteWorldStateDiscoveryStatus();
             } else if (
+                pending->request.command == "ALIEN_PVP_PROBE") {
+                result = gameCommands_->ExecuteAlienPvPProbe();
+            } else if (
                 pending->request.command == "RETURN_TO_FRONTEND") {
                 result = gameCommands_->ExecuteReturnToFrontend();
             } else if (
@@ -3226,7 +3229,8 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
                 !result.executed &&
                 ((pending->request.command == "WORLD_MANIFEST_LOAD" &&
                   nativeStatusCode == "WORLD_MANIFEST_PREPARING") ||
-                 nativeStatusCode.rfind("ITEM_SYNC_", 0U) == 0U);
+                 nativeStatusCode.rfind("ITEM_SYNC_", 0U) == 0U ||
+                 nativeStatusCode.rfind("ALIEN_PVP_", 0U) == 0U);
             if (remoteEquipmentRetry || remoteEquipmentTerminal || preservedStatus) {
                 // Preserve the native equipment provisioning stage/status so
                 // the Launcher can distinguish convergence from terminal

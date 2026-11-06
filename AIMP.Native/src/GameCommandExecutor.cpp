@@ -1,4 +1,5 @@
 #include "aimp/GameCommandExecutor.h"
+#include "aimp/AISync.h"
 #include "aimp/ReplicationCore.h"
 #include "aimp/PlayerTorchRuntime.h"
 #include "aimp/PlayerHidingRuntime.h"
@@ -1540,6 +1541,9 @@ bool GameCommandExecutor::CanExecute(const std::string_view command) const noexc
     }
     if (command == "REMOTE_EQUIPMENT_PROVISION") {
         return RemoteEquipmentProvisionAvailable();
+    }
+    if (command == "ALIEN_PVP_PROBE") {
+        return ai_sync::Installed();
     }
     if (command == "RETURN_TO_FRONTEND") {
         return ReturnToFrontendAvailable();
@@ -4157,6 +4161,24 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteMissionSync(
         result.executed = mission_sync::Apply(signal, result.statusCode, result.message);
     }
     return result;
+}
+
+GameCommandExecutionResult GameCommandExecutor::ExecuteAlienPvPProbe() const {
+    ai_sync::AlienPvPProbe probe{};
+    if (!ai_sync::ProbeAlienPvPCandidate(probe))
+        return {false, "ALIEN_PVP_NOT_READY",
+            "Engine thread, AISync generation or Character registry is not ready."};
+    if (!probe.unique)
+        return {false, probe.candidates == 0U ? "ALIEN_PVP_NO_ALIEN" : "ALIEN_PVP_MULTIPLE_ALIENS",
+            "Found " + std::to_string(probe.candidates) +
+            " native Alien candidates; require exactly one before granting control."};
+    return {true, "ALIEN_PVP_PROBE_READY",
+        "Native Alien candidate verified: entityA=" + std::to_string(probe.entityA) +
+        ", entityB=" + std::to_string(probe.entityB) +
+        ", runtimeId=" + std::to_string(probe.runtimeId) +
+        ", nativeGeneration=" + std::to_string(probe.nativeGeneration) +
+        ", worldGeneration=" + std::to_string(probe.worldGeneration) +
+        ". Read-only: no native control lease has been granted."};
 }
 
 GameCommandExecutionResult GameCommandExecutor::ExecuteItemSyncApply(
