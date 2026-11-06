@@ -1,5 +1,6 @@
 #include <intrin.h>
 #include "aimp/AISync.h"
+#include "aimp/AlienPvPLocalController.h"
 #include "aimp/AISyncProfiling.h"
 #include "aimp/AISyncExecutionPolicy.h"
 #include "aimp/AISyncNavigation.h"
@@ -602,6 +603,8 @@ struct AlienPvPNativeLease final {
 };
 AlienPvPNativeLease gPvPLease{};
 bool PvPCharacterFenced(std::uintptr_t character) noexcept;
+bool PvPLeaseScopeCurrent() noexcept;
+bool PvPLeaseLiveIdentity() noexcept;
 void ForgetPvPLease(std::uintptr_t destroyedCharacter = 0U) noexcept;
 
 std::atomic<bool> gAlienSuppressed{};
@@ -9784,6 +9787,17 @@ void PumpOnEngineThread() noexcept {
     // Own native path-query references independently of Characters. Maintain
     // them before taking the IPC mailbox mutex; cleanup can invoke native code.
     PumpHostNavigationContext();
+    // Native Alien local pilot is deliberately outside the IPC mailbox lock.
+    // Only the proven lease owner may issue physical requests on this process.
+    const auto pvpPhysicalGeneration=gGenerations->CurrentGeneration();
+    const bool localLease=gPvPLease.owned && PvPLeaseScopeCurrent() &&
+        PvPLeaseLiveIdentity() && gCurrent.localPeer!=0U &&
+        gPvPLease.ownerPeer==gCurrent.localPeer;
+    alien_pvp_local::Pump({gBase,
+        localLease?gPvPLease.ticket.character:0U,
+        localLease?LocalPlayer():0U,
+        static_cast<std::uint32_t>(pvpPhysicalGeneration),
+        gPvPLease.ownerPeer,gCurrent.localPeer,localLease});
     std::unique_lock lock(gMailboxMutex, std::try_to_lock);
     if (!lock.owns_lock()) return; // never wait for IPC on the engine thread
     if (gConfigurationPending) {
@@ -10244,7 +10258,11 @@ bool PvPCharacterFenced(const std::uintptr_t character) noexcept {
         PvPLeaseLifetimeCurrent();
 }
 void ForgetPvPLease(const std::uintptr_t destroyedCharacter) noexcept {
-    if (destroyedCharacter == 0U || gPvPLease.ticket.character == destroyedCharacter) gPvPLease = {};
+    if (destroyedCharacter != 0U && gPvPLease.ticket.character != destroyedCharacter) return;
+    if (alien_pvp_local::Drives(gPvPLease.ticket.character,gPvPLease.nativeGeneration))
+        alien_pvp_local::Reset(destroyedCharacter!=0U && gGenerations!=nullptr &&
+            gGenerations->CurrentGeneration()==gPvPLease.nativeGeneration);
+    gPvPLease={};
 }
 bool PvPLeaseLiveIdentity() noexcept {
     if (!PvPLeaseLifetimeCurrent()) return false;
@@ -10327,6 +10345,19 @@ bool PvPTryDrain(AlienPvPLeaseStatus& status) noexcept {
         PairSourceBusy(actor->character) || !UnownedCleanupAllowed(*actor)) {
         gPvPLease.owned=false;
         status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement); return false;
+    }
+    if (gPvPLease.owned &&
+        alien_pvp_local::Drives(actor->character,gPvPLease.nativeGeneration)) {
+        // A live local pilot now owns an AIMP locomotion slot. Its legitimate
+        // movement must never be mistaken for a leftover retail AI request
+        // and drained by the periodic bind recheck. The incarnation and native
+        // resource pins are still verified on every renewal.
+        const character_direct_step_runtime::MovementResourceLease resources(actor->character);
+        if (!resources) {
+            status=PvPStatus(AlienPvPLeasePhase::Draining);return false;
+        }
+        status=PvPStatus(AlienPvPLeasePhase::Owned);
+        return true;
     }
     if (!gPvPLease.drained) {
         // All per-actor BT decisions are already fenced, and the exact native
@@ -10450,8 +10481,11 @@ bool ReleaseAlienPvPLease(AlienPvPLeaseStatus& status) noexcept {
         !UnownedCleanupAllowed(*actor)) {
         status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement);return false;
     }
-    // Do not release a half-drained lease. No player-sourced movement is
-    // installed yet, but native navigation can still retain worker Refs.
+    // The owner must stop locally before the exact native movement boundary
+    // can certify safe release. Repeated RELEASE probes may wait for retirement.
+    if (alien_pvp_local::Drives(actor->character,gPvPLease.nativeGeneration))
+        alien_pvp_local::Reset(true);
+    // Native navigation may still retain worker Refs.
     if (!gPvPLease.owned) {
         status=PvPStatus(AlienPvPLeasePhase::Draining);return false;
     }
