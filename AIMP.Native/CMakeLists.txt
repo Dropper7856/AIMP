@@ -165,6 +165,10 @@ set_target_properties(AIMP.NetZ PROPERTIES
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(AIMP.AlienPvPMovementTests tests/AlienPvPMovementTests.cpp)
+    target_include_directories(AIMP.AlienPvPMovementTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_options(AIMP.AlienPvPMovementTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    add_test(NAME AlienPvPMovement COMMAND AIMP.AlienPvPMovementTests)
     add_executable(AIMP.WorldTransactionSkipTests tests/WorldTransactionSkipTests.cpp)
     target_link_libraries(AIMP.WorldTransactionSkipTests PRIVATE AIMP.Core)
     target_compile_options(AIMP.WorldTransactionSkipTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)

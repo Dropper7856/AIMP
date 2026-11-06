@@ -1,5 +1,6 @@
 #include "aimp/AlienPvPLocalController.h"
 #include "aimp/AlienPvPInputIsolation.h"
+#include "aimp/AlienPvPMovementMath.h"
 
 #include "aimp/CharacterDirectStepRuntime.h"
 #include "aimp/CrashGuard.h"
@@ -217,15 +218,10 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
     float yaw{};
     if (!Read(context.technicalPlayer+0x174U,yaw) || !std::isfinite(yaw))
         if (!Read(context.alien+0x174U,yaw) || !std::isfinite(yaw)) return;
-    const float magnitude=std::hypot(static_cast<float>(forward),static_cast<float>(side));
-    if (magnitude<0.1F) return;
-    const float f=static_cast<float>(forward)/magnitude;
-    const float s=static_cast<float>(side)/magnitude;
-    const float dx=std::sin(yaw)*f+std::cos(yaw)*s;
-    const float dz=std::cos(yaw)*f-std::sin(yaw)*s;
-    const float intensity=gait==3U?2.2F:(gait==2U?1.6F:(gait==0U?0.6F:1.1F));
+    alien_pvp_movement::Plan plan{};
+    if (!alien_pvp_movement::TryPlan(forward,side,yaw,gait,plan)) return;
     gLocal.moving=character_direct_step_runtime::ArmAIIntentReplication(
-        context.alien,dx,dz,intensity,gait,error);
+        context.alien,plan.worldX,plan.worldZ,plan.intensity,plan.gait,error);
 }
 } // namespace
 

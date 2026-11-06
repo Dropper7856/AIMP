@@ -38,7 +38,12 @@ jobs:
         run: dotnet run --project AIMP.Launcher/tests/AIMP.Protocol.Tests/AIMP.Protocol.Tests.csproj -c Release --no-build -- --filter "Alien PvP"
       - name: Configure native x86 engine module
         shell: pwsh
-        run: cmake -S AIMP.Native -B AIMP.Native/build-ci -G "Visual Studio 17 2022" -A Win32 -DBUILD_TESTING=OFF
+        run: cmake -S AIMP.Native -B AIMP.Native/build-ci -G "Visual Studio 17 2022" -A Win32 -DBUILD_TESTING=ON
       - name: Build native AISync and probe
         shell: pwsh
         run: cmake --build AIMP.Native/build-ci --config Release --target AIMP.NetZ --parallel 2
+      - name: Build and run native Alien movement math tests
+        shell: pwsh
+        run: |
+          cmake --build AIMP.Native/build-ci --config Release --target AIMP.AlienPvPMovementTests --parallel 2
+          ctest --test-dir AIMP.Native/build-ci -C Release -R "^AlienPvPMovement$" --output-on-failure
