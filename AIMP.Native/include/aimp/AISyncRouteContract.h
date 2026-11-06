@@ -8,6 +8,42 @@ namespace aimp::ai_sync::route {
     std::uint64_t installedCommand,std::uint32_t installedRevision) noexcept {
     return installedCommand>rejectedCommand||(installedCommand==rejectedCommand&&installedRevision>=rejectedRevision);
 }
+// A route installer proves only an installed corridor, not locomotion.
+// After the hybrid motor is released, this observer requires physical native
+// progress or a settled Host pose before handing off permanently. No writes
+// to Character, pathfinding or network protocol are performed here.
+enum class NativeHandoffResult : std::uint8_t { Pending, Confirmed, Stalled };
+struct NativeHandoffProbe {
+    static constexpr std::uint64_t kTimeoutMs = 900U;
+    static constexpr std::uint64_t kMinimumObservationMs = 80U;
+    static constexpr float kMinTravelSquared = 0.0144F; // 12 cm
+    static constexpr float kMaxStepSquared = 4.0F;      // Reject teleport-like steps (>2 m)
+    static constexpr float kSettledSquared = 0.36F;     // 60 cm when Host stationary
+    bool started{}, baseline{};
+    std::uint64_t startMs{}, sampleMs{};
+    std::array<float,3> origin{}, previous{};
+    [[nodiscard]] NativeHandoffResult Observe(std::uint64_t now, bool valid,
+        const std::array<float,3>& local, const std::array<float,3>& host, bool hostMoving) noexcept {
+        if(!started) {started=true;startMs=now;}
+        if(now<startMs)return NativeHandoffResult::Stalled; // Clock/epoch changed
+        if(!valid) return now-startMs>=kTimeoutMs?NativeHandoffResult::Stalled:NativeHandoffResult::Pending;
+        for(std::size_t i=0;i<3;++i)if(!std::isfinite(local[i])||!std::isfinite(host[i]))
+            return now-startMs>=kTimeoutMs?NativeHandoffResult::Stalled:NativeHandoffResult::Pending;
+        if(!baseline) {baseline=true;origin=previous=local;sampleMs=now;return NativeHandoffResult::Pending;}
+        if(now<sampleMs)return NativeHandoffResult::Stalled;
+        const auto elapsed=now-startMs;
+        float step{},travel{},gap{};
+        for(std::size_t i=0;i<3;++i) {
+            const float d=local[i]-previous[i], total=local[i]-origin[i], error=local[i]-host[i];
+            step+=d*d;travel+=total*total;gap+=error*error;
+        }
+        previous=local;sampleMs=now;
+        if(elapsed>=kMinimumObservationMs && step<=kMaxStepSquared &&
+            (travel>=kMinTravelSquared || (!hostMoving && gap<=kSettledSquared)))
+            return NativeHandoffResult::Confirmed;
+        return elapsed>=kTimeoutMs?NativeHandoffResult::Stalled:NativeHandoffResult::Pending;
+    }
+};
 // Local-only contract checks. No new wire fields or inferred bridge nodes.
 [[nodiscard]] inline bool SameRouteCommand(const Key& a,const Key& b) noexcept {
     return a.scope==b.scope&&a.owner==b.owner&&a.commandId==b.commandId&&a.part==b.part;
