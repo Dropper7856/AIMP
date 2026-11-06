@@ -1,5 +1,6 @@
 #include "aimp/AlienPvPLocalController.h"
 #include "aimp/AlienPvPInputIsolation.h"
+#include "aimp/AlienPvPVisualIsolation.h"
 #include "aimp/AlienPvPMovementMath.h"
 
 #include "aimp/CharacterDirectStepRuntime.h"
@@ -23,15 +24,15 @@ constexpr std::uintptr_t kCameraActivateRva=0x00032E10U;
 constexpr std::uintptr_t kCharacterSkeletonOffset=0x718U;
 
 struct CameraBinding final {
-    std::uintptr_t root{}, manager{}, follow{}, head{}, previous{}, technical{}, alien{};
-    std::uint32_t generation{};
+    std::uintptr_t root{}, manager{}, follow{}, head{}, previous{}, technical{}, alien{}, technicalSkeleton{};
+    std::uint32_t generation{}, technicalRuntime{};
     bool bound{}, firstPerson{};
 };
 struct LocalState final {
     CameraBinding camera{};
     std::uintptr_t character{};
     std::uint32_t generation{};
-    bool moving{}, viewKeyDown{};
+    bool moving{}, viewKeyDown{}, visualReady{};
     std::uint64_t lastFrameMs{}, nextCameraAttemptMs{}, nextInputAttemptMs{};
 };
 LocalState gLocal{}; // certified game thread only
@@ -146,14 +147,25 @@ bool BindCamera(const Context& context,const std::uint64_t now) noexcept {
     if (!CurrentCameraRoot(context.moduleBase,camera)) return false;
     // A cinematic, loading camera or a third-party view is never hijacked.
     if (camera.previous!=camera.follow && camera.previous!=camera.head) return false;
-    if (!CameraCall(context.moduleBase,camera.manager,camera.follow,context.alien)) return false;
     camera.technical=context.technicalPlayer;
     camera.alien=context.alien;
+    if (!Read(camera.technical+0x50U,camera.technicalRuntime) ||
+        !Read(camera.technical+kCharacterSkeletonOffset,camera.technicalSkeleton) ||
+        !camera.technicalRuntime || !camera.technicalSkeleton) return false;
+    if (!CameraCall(context.moduleBase,camera.manager,camera.follow,context.alien)) return false;
     camera.generation=context.nativeGeneration;
     camera.bound=true;
     gLocal.camera=camera;
     gCameraBase=context.moduleBase;
     return true;
+}
+bool TechnicalIdentityCurrent(const CameraBinding& camera) noexcept {
+    std::uintptr_t skeleton{};
+    std::uint32_t runtime{};
+    return camera.technical!=0U && camera.technicalRuntime!=0U &&
+        Read(camera.technical+0x50U,runtime) && runtime==camera.technicalRuntime &&
+        Read(camera.technical+kCharacterSkeletonOffset,skeleton) &&
+        skeleton==camera.technicalSkeleton;
 }
 bool GameFocused() noexcept {
     DWORD process{};
@@ -188,9 +200,20 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
         if (view && !gLocal.viewKeyDown) {
             auto& camera=gLocal.camera;
             const auto wanted=camera.firstPerson?camera.follow:camera.head;
-            if ((camera.firstPerson || AttachHeadBone(camera.head,context.alien)) &&
-                CameraCall(context.moduleBase,camera.manager,wanted,context.alien))
-                camera.firstPerson=!camera.firstPerson;
+            const bool wantHead=!camera.firstPerson;
+            const bool headPrepared=!wantHead ||
+                alien_pvp_visual::HideAlienHead(context.alien,context.nativeGeneration);
+            if (headPrepared &&
+                (!wantHead || AttachHeadBone(camera.head,context.alien)) &&
+                CameraCall(context.moduleBase,camera.manager,wanted,context.alien)) {
+                camera.firstPerson=wantHead;
+                if (!wantHead)
+                    alien_pvp_visual::RestoreAlienHead(
+                        context.alien,context.nativeGeneration,true);
+            } else if (wantHead) {
+                alien_pvp_visual::RestoreAlienHead(
+                    context.alien,context.nativeGeneration,true);
+            }
         }
         gLocal.viewKeyDown=view;
     } else {
@@ -228,12 +251,17 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
 bool Drives(const std::uintptr_t character,const std::uint32_t generation) noexcept {
     return character!=0U && gLocal.character==character &&
         gLocal.generation==generation && gLocal.camera.bound &&
-        alien_pvp_input::Installed();
+        gLocal.visualReady && alien_pvp_input::Installed();
 }
 void Reset(const bool sameCameraWorld,const bool certifiedLivingCharacter) noexcept {
     // The controller does not release AISync's exclusive lease: only the lease
     // owner does that after the certified request boundary is idle.
     alien_pvp_input::SetActive(false);
+    const auto camera=gLocal.camera;
+    alien_pvp_visual::RestoreAlienHead(gLocal.character,gLocal.generation,
+        certifiedLivingCharacter && sameCameraWorld);
+    alien_pvp_visual::RestoreTechnical(camera.technical,camera.generation,
+        sameCameraWorld && TechnicalIdentityCurrent(camera));
     RestoreLocalCamera(sameCameraWorld);
     if (certifiedLivingCharacter && gLocal.character!=0U)
         static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(gLocal.character));
@@ -273,7 +301,12 @@ void Pump(const Context& context) noexcept {
         RestoreLocalCamera(true);
     }
     const bool attached=BindCamera(context,now);
-    alien_pvp_input::SetActive(attached && InputAllowed(context.moduleBase));
-    if (attached) TickInput(context,now);
+    gLocal.visualReady=attached && TechnicalIdentityCurrent(gLocal.camera) &&
+        alien_pvp_visual::HideTechnical(context.technicalPlayer,context.nativeGeneration);
+    if (!gLocal.visualReady && attached)
+        alien_pvp_visual::RestoreTechnical(context.technicalPlayer,context.nativeGeneration,
+            TechnicalIdentityCurrent(gLocal.camera));
+    alien_pvp_input::SetActive(gLocal.visualReady && InputAllowed(context.moduleBase));
+    if (gLocal.visualReady) TickInput(context,now);
 }
 } // namespace aimp::alien_pvp_local

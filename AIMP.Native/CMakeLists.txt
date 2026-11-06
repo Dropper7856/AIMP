@@ -21,6 +21,7 @@ set(AIMP_CORE_SOURCES
     src/AISync.cpp
     src/AlienPvPLocalController.cpp
     src/AlienPvPInputIsolation.cpp
+    src/AlienPvPVisualIsolation.cpp
     src/AISyncTransactions.cpp
     src/AISyncMarkerIdentity.cpp
     src/AISyncMovement.cpp
