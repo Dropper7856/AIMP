@@ -10319,11 +10319,13 @@ bool PvPTryClearDrainedNavigation(Actor& actor,
 bool PvPTryDrain(AlienPvPLeaseStatus& status) noexcept {
     using Check=execution::OwnershipCheck;
     if (!PvPLeaseScopeCurrent() || !PvPLeaseLiveIdentity()) {
+        gPvPLease.owned=false;
         status=PvPStatus(AlienPvPLeasePhase::Stale); return false;
     }
     auto* actor=Find(gPvPLease.ticket.character);
     if (!actor || actor->duplicate || actor->faulted || actor->runtimeId != gPvPLease.runtimeId ||
         PairSourceBusy(actor->character) || !UnownedCleanupAllowed(*actor)) {
+        gPvPLease.owned=false;
         status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement); return false;
     }
     if (!gPvPLease.drained) {
@@ -10353,7 +10355,11 @@ bool PvPTryDrain(AlienPvPLeaseStatus& status) noexcept {
         check=execution::InspectMovementBoundary(memory,lifetime,true,&failure);
     }
     gPvPLease.boundaryOffset=failure.offset;gPvPLease.boundaryValue=failure.value;
-    if (check != Check::Ready) { status=PvPStatus(AlienPvPLeasePhase::Draining); return false; }
+    if (check != Check::Ready) {
+        gPvPLease.owned=false;
+        status=PvPStatus(AlienPvPLeasePhase::Draining);
+        return false;
+    }
     gPvPLease.owned=true;
     status=PvPStatus(AlienPvPLeasePhase::Owned);
     return true;
@@ -10391,8 +10397,9 @@ bool AcquireAlienPvPLease(const std::uint64_t ownerPeer, AlienPvPLeaseStatus& st
             status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement);
             return false;
         }
-        return gPvPLease.owned ? (status=PvPStatus(AlienPvPLeasePhase::Owned),true) :
-            PvPTryDrain(status);
+        // A previous success is not permanent proof. Re-inspect scheduler
+        // and navigation ownership even during a quiet long-lived round.
+        return PvPTryDrain(status);
     }
     const auto character=FindCharacterByIdentity(candidate.entityA,candidate.entityB);
     if (!character) { status.phase=AlienPvPLeasePhase::WaitingForAlien; return false; }
