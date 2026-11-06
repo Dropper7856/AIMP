@@ -72,6 +72,7 @@ internal static class Program
         new("AISync checkpoint waits for every native consumer", AISyncCheckpointTests.HostBridgeAsync),
         new("AISync Host bounded ingress loss fences source", AISyncHostBridgeTests.IngressOverflowAsync),
         new("AISync execution transport delivery and retry", AISyncExecutionTransportTests.DeliveryAsync),
+        new("AISync FIFO congestion telemetry preserves packet order", AISyncExecutionTransportTests.SenderQueueTelemetryAsync),
         new("AISync execution transport peer isolation", AISyncExecutionTransportTests.IsolationAsync),
         new("AISync execution transport direction authority", AISyncExecutionTransportTests.DirectionAsync),
         new("AISync execution transport pending writer shutdown", AISyncExecutionTransportTests.PendingWriterShutdownAsync),
