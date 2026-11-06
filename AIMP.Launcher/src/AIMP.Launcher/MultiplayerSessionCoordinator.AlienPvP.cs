@@ -10,6 +10,7 @@ internal sealed partial class MultiplayerSessionCoordinator
     private DateTimeOffset _nextAlienPvPProbeUtc = DateTimeOffset.MinValue;
     private (Guid Session, int StartGeneration, int NativeGeneration, int ProcessId)?
         _alienPvPProvenScope;
+    private string _alienPvPProbeLastResult = string.Empty;
 
     private void TryScheduleAlienPvPIdentityProbe(NativeRuntimeSnapshot runtime, DateTimeOffset now)
     {
@@ -29,11 +30,8 @@ internal sealed partial class MultiplayerSessionCoordinator
                 return;
             }
             scope = (start.SessionId, start.LevelGeneration, runtime.LevelGeneration, runtime.ProcessId);
-            if (_alienPvPProvenScope == scope)
-            {
-                Interlocked.Exchange(ref _alienPvPProbeRunning, 0);
-                return;
-            }
+            // Keep checking after success. A retail Alien may be despawned into
+            // a vent and replaced without changing the level generation.
             _nextAlienPvPProbeUtc = now.AddSeconds(5);
         }
         _ = ProbeNativeAlienCandidateAsync(scope);
@@ -50,6 +48,9 @@ internal sealed partial class MultiplayerSessionCoordinator
                 _lifetime.Token,
                 waitForExecution: true,
                 expectedLevelGeneration: scope.NativeGeneration).ConfigureAwait(false);
+            var changed = false;
+            var message = (response.Executed ? "Read-only candidate verified: " : "Native candidate not ready: ") +
+                response.Message;
             lock (_stateGate)
             {
                 if (_start?.SessionId != scope.Session ||
@@ -57,12 +58,14 @@ internal sealed partial class MultiplayerSessionCoordinator
                     _controller.Snapshot.LevelGeneration != scope.NativeGeneration ||
                     _controller.Snapshot.ProcessId != scope.ProcessId)
                     return;
-                if (response.Executed) _alienPvPProvenScope = scope;
+                // Revocation is as important as the initial identity proof.
+                _alienPvPProvenScope = response.Executed ? scope : null;
+                changed = !string.Equals(_alienPvPProbeLastResult, message, StringComparison.Ordinal);
+                _alienPvPProbeLastResult = message;
             }
-            _diagnostics.Log("AlienPvP",
-                (response.Executed ? "Read-only candidate verified: " : "Native candidate not ready: ") +
-                response.Message +
-                " Possession remains disabled until its exclusive native lease is implemented.");
+            if (changed)
+                _diagnostics.Log("AlienPvP", message +
+                    " Possession remains disabled until its exclusive native lease is implemented.");
         }
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
         catch (Exception error)
