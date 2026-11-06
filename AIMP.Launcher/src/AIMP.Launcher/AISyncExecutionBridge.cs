@@ -145,19 +145,27 @@ internal sealed class AISyncExecutionBridge : IDisposable
         var now = Environment.TickCount64; var sent = 0;
         var actors = _localWaiting.Values
             .Where(w => w.Receipt.Scope == _scope)
-            .GroupBy(w => (w.Receipt.Operation.EntityA, w.Receipt.Operation.EntityB, w.Receipt.Operation.Birth))
+            .GroupBy(w => (w.Receipt.Operation.EntityA, w.Receipt.Operation.EntityB, w.Receipt.Operation.Birth,
+                w.Receipt.Operation.CharacterClass, w.Receipt.Operation.Capability, w.Receipt.Operation.OwnerEpoch))
             .ToArray();
         foreach (var actor in actors)
-            foreach (var waiting in actor.OrderBy(w => w.Receipt.Operation.GlobalSequence).Take(8))
+        {
+            var preferred = AISyncIntentRetryPriority.Select(actor.Select(w => w.Receipt.Operation));
+            foreach (var waiting in actor
+                .OrderBy(w => w.Receipt.Operation.GlobalSequence == preferred ? 0 : 1)
+                .ThenBy(w => w.Receipt.Operation.GlobalSequence).Take(8))
             {
-                // Native answers each retry with a fresh receipt; leave it a tick.
-                if (sent >= 64 || now - waiting.Tick < 15) break;
+                // Prioritize the latest replaceable intent, without dropping
+                // obsolete receipts: they must still settle as Superseded.
+                if (sent >= 64) return;
+                if (now - waiting.Tick < 15) continue;
                 var receipt = waiting.Receipt;
                 _localWaiting[receipt.Operation.GlobalSequence] = (receipt, now);
                 var bytes = AISyncExecutionCodec.EncodeBatch(new(receipt.Scope, receipt.BatchId, new[] { receipt.Operation }));
                 await SendAsync(MessageType.AISyncExecutionRetry, binding, bytes, _shutdown.Token).ConfigureAwait(false);
                 ++sent; ++_localRetries;
             }
+        }
     }
     private async Task ProcessAsync(Work work)
     {
