@@ -10197,9 +10197,17 @@ bool ProbeAlienPvPCandidate(AlienPvPProbe& result) noexcept {
     // characters that have not yet been admitted into AISync's actor cache.
     const bool scanned = ForEachCharacter([&](const std::uintptr_t character) noexcept {
         std::uint32_t entityA{}, entityB{}, type{}, runtimeId{};
+        // A template-class match alone is insufficient: the retail Alien
+        // must own a live behaviour manager/tree. The registry may enumerate
+        // half-constructed or retiring Characters during vent transitions.
+        std::uintptr_t manager{}, tree{}, treeOwner{}, managerOwner{};
         if (CharacterIdentity(character, entityA, entityB, type) &&
             type == 1U && Eligible(character, type) &&
-            Read(character + 0x50U, runtimeId) && runtimeId != 0U) {
+            Read(character + 0x50U, runtimeId) && runtimeId != 0U &&
+            Read(character + 0x34D8U, tree) && tree != 0U &&
+            Read(tree + 0xCU, treeOwner) && treeOwner == character &&
+            Read(character + 0x34ACU, manager) && manager != 0U &&
+            Read(manager + 0x128U, managerOwner) && managerOwner == character) {
             ++result.candidates;
             if (result.candidates == 1U) {
                 result.entityA = entityA;
