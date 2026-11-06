@@ -4270,6 +4270,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         var localPeerId = LocalPeerId();
         foreach (var player in _lobby.Players
                      .Where(player => player.PeerId != localPeerId)
+                     // Alien is a real native NPC, never a second human Character.
+                     .Where(player => !_start.AlienVsSurvivors || player.PeerId != _start.AlienPeerId)
                      .OrderBy(player => player.PeerId))
         {
             if (_remoteCharacters.ContainsKey(player.PeerId)) continue;
@@ -4295,6 +4297,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 || _remoteCharacters.ContainsKey(peerId)
                 || !_remoteGameplayReadyPeers.Contains(peerId))
                 return false;
+            if (_start.AlienVsSurvivors && _start.AlienPeerId == peerId) return false;
             var player = _lobby.Players.SingleOrDefault(value => value.PeerId == peerId);
             return player is not null && TryCreateSpawnTarget(player, out target);
         }
@@ -4305,6 +4308,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         out RemotePlayerSpawnTarget target)
     {
         target = default!;
+        if (_start?.AlienVsSurvivors == true && player.PeerId == _start.AlienPeerId) return false;
         if (!_assignedCharacters.TryGetValue(player.PeerId, out var character)) return false;
         if (!_remotePositions.TryGetValue(player.PeerId, out var track)) return false;
         var snapshot = track.Snapshot();
@@ -5193,6 +5197,7 @@ internal static class RemoteSpawnPlanner
             .ToDictionary(value => value.PeerId);
         return (lobby?.Players ?? Array.Empty<LobbyPlayer>())
             .Where(player => player.PeerId != localPeerId)
+            .Where(player => lobby?.AlienVsSurvivors != true || player.PeerId != lobby.AlienPeerId)
             .Where(player => !existing.ContainsKey(player.PeerId))
             .Where(player => byPeer.ContainsKey(player.PeerId))
             .OrderBy(player => player.PeerId)
