@@ -1,5 +1,6 @@
 #pragma once
 #include "aimp/AISyncNativeRoute.h"
+#include "aimp/AISyncRouteContract.h"
 #include "aimp/AISyncOwnership.h"
 #include <string>
 namespace aimp { class HookManager; }
