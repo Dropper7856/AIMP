@@ -37,8 +37,15 @@ struct NativeHandoffProbe {
             const float d=local[i]-previous[i], total=local[i]-origin[i], error=local[i]-host[i];
             step+=d*d;travel+=total*total;gap+=error*error;
         }
+        // A teleport or external repositioning is not evidence of native
+        // locomotion. Discard the previous baseline rather than accepting its
+        // large accumulated displacement on the next stationary sample.
+        if(step>kMaxStepSquared) {
+            baseline=false;
+            return elapsed>=kTimeoutMs?NativeHandoffResult::Stalled:NativeHandoffResult::Pending;
+        }
         previous=local;sampleMs=now;
-        if(elapsed>=kMinimumObservationMs && step<=kMaxStepSquared &&
+        if(elapsed>=kMinimumObservationMs &&
             (travel>=kMinTravelSquared || (!hostMoving && gap<=kSettledSquared)))
             return NativeHandoffResult::Confirmed;
         return elapsed>=kTimeoutMs?NativeHandoffResult::Stalled:NativeHandoffResult::Pending;
