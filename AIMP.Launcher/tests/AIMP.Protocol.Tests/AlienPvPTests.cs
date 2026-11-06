@@ -74,6 +74,32 @@ internal static class AlienPvPTests
         var start = await host.StartGameAsync(DateTimeOffset.UtcNow, token);
         AssertEx.True(start.AlienVsSurvivors);
         AssertEx.Equal(client.PeerId, start.AlienPeerId);
+        var delivered = new TaskCompletionSource<AlienControlCommit>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        client.AlienControlCommitted += (_, update) => delivered.TrySetResult(update);
+        var firstIntent = new AlienControlIntent(host.SessionId, client.PeerId,
+            start.LevelGeneration, 1, 1F, 0F, 90F, 0F, true, false, AlienAction.None);
+        await client.SendAlienControlAsync(firstIntent, token);
+        var committed = await delivered.Task.WaitAsync(token);
+        AssertEx.Equal(client.PeerId, committed.Intent.AlienPeerId);
+        AssertEx.Equal(1UL, committed.HostSequence);
+        AssertEx.Throws<ProtocolException>(() => AlienControlProtocol.Validate(firstIntent with
+        {
+            Forward = 2F
+        }));
+        AssertEx.Throws<ProtocolException>(() => AlienControlProtocol.Validate(firstIntent with
+        {
+            Action = (AlienAction)255
+        }));
+        AssertEx.Throws<ProtocolException>(() => AlienControlProtocol.Validate(firstIntent with
+        {
+            Sprint = true, Sneak = true
+        }));
+        await AssertEx.ThrowsAsync<ProtocolException>(() =>
+            host.SubmitHostAlienControlAsync(firstIntent with
+            {
+                AlienPeerId = host.HostPeerId, Sequence = 2
+            }, token));
         AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(start with
         {
             AlienPeerId = 0
