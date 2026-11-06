@@ -305,6 +305,16 @@ void Pump(const Context& context) noexcept {
         RestoreLocalCamera(true);
     }
     const bool attached=BindCamera(context,now);
+    // Retail can re-enable a submodel after a camera/animation transition.
+    // Reassert head visibility only while we own the exact current Alien.
+    if (attached && gLocal.camera.firstPerson &&
+        !alien_pvp_visual::HideAlienHead(context.alien,context.nativeGeneration)) {
+        const auto camera=gLocal.camera;
+        if (CameraCall(context.moduleBase,camera.manager,camera.follow,context.alien)) {
+            gLocal.camera.firstPerson=false;
+            alien_pvp_visual::RestoreAlienHead(context.alien,context.nativeGeneration,true);
+        }
+    }
     gLocal.visualReady=attached && TechnicalIdentityCurrent(gLocal.camera) &&
         alien_pvp_visual::HideTechnical(context.technicalPlayer,context.nativeGeneration);
     if (!gLocal.visualReady && attached)
