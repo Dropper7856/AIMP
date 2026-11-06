@@ -166,7 +166,7 @@ private:
         std::uint32_t kind{}, revision{}, admission{};
         bool used{}, admitted{}, cancelled{}, unknown{}, secondary{};
         bool refCertified{}, releaseEntered{}, actorDestroyed{};
-        bool routeRejected{};
+        bool routeRejected{}, preempted{}; // A newer accepted Host admission=0 owns movement; retain Ref until exact cleanup.
         movement::Bundle movement{};
         native_intent::Payload markerPayload{};
         transactions::Record* markerRecord{}; // Borrows this slot's retained operation below.
@@ -195,6 +195,7 @@ private:
     [[nodiscard]] bool NavigationRevalidate(const Lease&) noexcept;
     [[nodiscard]] bool RestartMovement(Lease&, const transactions::Record&, const LocalActorBinding&) noexcept;
     void MovementUnknown(const transactions::Record&) noexcept;
+    void FenceSupersededMovements(const transactions::Record&, const LocalActorBinding&) noexcept;
     [[nodiscard]] bool CheckImage() const noexcept;
     [[nodiscard]] bool EndRetirement(const transactions::Scope&) noexcept;
     [[nodiscard]] RetirementProgress RetirementState() const noexcept;
