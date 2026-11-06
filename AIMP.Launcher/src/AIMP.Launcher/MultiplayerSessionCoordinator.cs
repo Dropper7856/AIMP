@@ -633,7 +633,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _ = TryAdvanceGameplayAsync(runtime);
         _ = TryConvergeRemoteCharactersAsync(runtime, now);
         _ = TryAdvanceRemoteMovementAsync(runtime, now);
-        TryScheduleAlienPvPIdentityProbe(runtime, now);
+        TryScheduleAlienPvPBinding(runtime, now);
         UpdateVoiceSession(runtime);
     }
 
@@ -4913,6 +4913,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         DetachNetwork(stopState.Host, stopState.Client);
         try
         {
+            await ReleaseNativeAlienPvPLeaseBestEffortAsync().ConfigureAwait(false);
             await UnbindNativeWorldSyncAuthorityAsync($"network-stop:{reason}").ConfigureAwait(false);
             await StopRemoteCharactersBestEffortAsync(stopState.RemoteCharacters).ConfigureAwait(false);
         }
