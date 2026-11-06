@@ -102,6 +102,8 @@ public enum MessageType : ushort
     AISyncCausalStateNetwork = 146, // Host -> Client events in the execution sender.
     PlayerMissionComplete = 147, // Client -> Host only; the sender reached a retail level exit.
     RoundProgress = 148, // Host -> Clients only; finished/dead participants of the round.
+    AlienControlProposal = 149, // The selected Alien player -> Host only.
+    AlienControlCommitted = 150, // Host -> Clients: validated player's intent, not Host-generated AI.
 
     TestModeConfigure = 200,
     CapabilityQuery = 201,

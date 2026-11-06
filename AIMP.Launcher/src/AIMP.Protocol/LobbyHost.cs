@@ -161,6 +161,8 @@ public sealed partial class LobbyHost : IAsyncDisposable
                 if (peerId != 0 && peerId != HostPeerId && !_clients.ContainsKey(peerId))
                     throw new InvalidOperationException("Selected Alien is not in the lobby.");
                 _alienPeerId = peerId;
+                _lastAlienControlSequence = 0;
+                _alienCommittedSequence = 0;
             }
         }
         finally { _admissionGate.Release(); }
@@ -292,6 +294,8 @@ public sealed partial class LobbyHost : IAsyncDisposable
                         "Every participant must prepare the selected level with the same WorldManifest before launch.");
                 _state = "Starting";
                 _levelGeneration++;
+                _lastAlienControlSequence = 0;
+                _alienCommittedSequence = 0;
                 _sessionPreparedPeers.Clear();
                 _sessionReleasedGeneration = 0;
                 _deadPeers.Clear();
@@ -1363,6 +1367,14 @@ public sealed partial class LobbyHost : IAsyncDisposable
                     await HandlePlayerEquipmentAsync(state, frame.Payload, cancellationToken)
                         .ConfigureAwait(false);
                     break;
+
+                case MessageType.AlienControlProposal:
+                    await HandleAlienControlProposalAsync(state, frame.Payload, cancellationToken)
+                        .ConfigureAwait(false);
+                    break;
+
+                case MessageType.AlienControlCommitted:
+                    throw new ProtocolException("Only the Host may commit Alien control intents.");
 
                 case MessageType.PlayerActionEvent:
                     await HandlePlayerActionAsync(state, frame.Payload, cancellationToken)
