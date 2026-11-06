@@ -43,8 +43,10 @@ internal sealed class AISyncExecutionBridge : IDisposable
     // order, instead of waiting one Host network round trip per operation:
     // that round trip drained a backlog at ~55 ms per operation and made the
     // Client Alien start/stop moves far behind the Host.
-    private readonly Dictionary<ulong, (AISyncExecutionReceipt Receipt, long Tick)> _localWaiting = new();
-    private ulong _localRetries;
+    private readonly Dictionary<ulong, (AISyncExecutionReceipt Receipt, long Tick, long FirstTick)> _localWaiting = new();
+    private int _localRetryCursor;
+    private ulong _localRetries, _localRetryCooling;
+    private long _maxLocalWaitingAge;
     private long _openedAt, _lossEpoch = long.MinValue;
     private int _disposed;
     internal Task Completion { get; }
@@ -141,30 +143,30 @@ internal sealed class AISyncExecutionBridge : IDisposable
     private async Task RetryLocalAsync()
     {
         var binding = _nativeBinding;
-        if (binding is null || _scope is null || _waitingReady || _localWaiting.Count == 0 || !BindingCurrent(binding)) return;
-        var now = Environment.TickCount64; var sent = 0;
-        var actors = _localWaiting.Values
+        if (binding is null || _scope is null || _waitingReady || _localWaiting.Count == 0 ||
+            !BindingCurrent(binding)) return;
+        var now = Environment.TickCount64;
+        // One native retry per actor, at most eight per tick. The ledger will
+        // still receive all original ordered records; stale retry receipts
+        // settle naturally as Superseded without consuming the whole IPC budget.
+        var chosen = AISyncRetryPlanner.ChooseCycle(_localWaiting.Values
             .Where(w => w.Receipt.Scope == _scope)
-            .GroupBy(w => (w.Receipt.Operation.EntityA, w.Receipt.Operation.EntityB, w.Receipt.Operation.Birth,
-                w.Receipt.Operation.CharacterClass, w.Receipt.Operation.Capability, w.Receipt.Operation.OwnerEpoch))
-            .ToArray();
-        foreach (var actor in actors)
+            .Select(w => (Peer: 0UL, Operation: w.Receipt.Operation)),
+            AISyncRetryPlanner.MaxLocalPerTick, ref _localRetryCursor);
+        foreach (var (_, sequence) in chosen)
         {
-            var preferred = AISyncIntentRetryPriority.Select(actor.Select(w => w.Receipt.Operation));
-            foreach (var waiting in actor
-                .OrderBy(w => w.Receipt.Operation.GlobalSequence == preferred ? 0 : 1)
-                .ThenBy(w => w.Receipt.Operation.GlobalSequence).Take(8))
-            {
-                // Prioritize the latest replaceable intent, without dropping
-                // obsolete receipts: they must still settle as Superseded.
-                if (sent >= 64) return;
-                if (now - waiting.Tick < 15) continue;
-                var receipt = waiting.Receipt;
-                _localWaiting[receipt.Operation.GlobalSequence] = (receipt, now);
-                var bytes = AISyncExecutionCodec.EncodeBatch(new(receipt.Scope, receipt.BatchId, new[] { receipt.Operation }));
-                await SendAsync(MessageType.AISyncExecutionRetry, binding, bytes, _shutdown.Token).ConfigureAwait(false);
-                ++sent; ++_localRetries;
-            }
+            if (!_localWaiting.TryGetValue(sequence, out var waiting)) continue;
+            _maxLocalWaitingAge = Math.Max(_maxLocalWaitingAge,
+                Math.Max(0, now - waiting.FirstTick));
+            if (now - waiting.Tick < AISyncRetryPlanner.LocalRetryIntervalMs)
+            { ++_localRetryCooling; continue; }
+            var receipt = waiting.Receipt;
+            _localWaiting[sequence] = waiting with { Tick = now };
+            var bytes = AISyncExecutionCodec.EncodeBatch(new(receipt.Scope, receipt.BatchId,
+                new[] { receipt.Operation }));
+            await SendAsync(MessageType.AISyncExecutionRetry, binding, bytes, _shutdown.Token)
+                .ConfigureAwait(false);
+            ++_localRetries;
         }
     }
     private async Task ProcessAsync(Work work)
@@ -243,7 +245,8 @@ internal sealed class AISyncExecutionBridge : IDisposable
             return;
         }
         if (_scope is not null) await RetireAsync(AISyncExecutionRecovery.RestartRequired).ConfigureAwait(false);
-        _scope = control.Scope; _profiles = control.Value; _nativeBinding = work.Binding; _localWaiting.Clear();
+        _scope = control.Scope; _profiles = control.Value; _nativeBinding = work.Binding;
+        _localWaiting.Clear(); _localRetryCursor = 0;
         _waitingReady = true; _openedAt = Environment.TickCount64;
         await SendAsync(MessageType.AISyncExecutionBinding, work.Binding, work.Bytes, _shutdown.Token).ConfigureAwait(false);
     }
@@ -310,7 +313,11 @@ internal sealed class AISyncExecutionBridge : IDisposable
             }
             if (receipt.Stage == AISyncExecutionStage.Waiting) {
                 ++_diagnosticWaiting;
-                _localWaiting[receipt.Operation.GlobalSequence] = (receipt, Environment.TickCount64);
+                var now = Environment.TickCount64;
+                if (_localWaiting.TryGetValue(receipt.Operation.GlobalSequence, out var previous))
+                    _localWaiting[receipt.Operation.GlobalSequence] = previous with { Receipt = receipt };
+                else _localWaiting[receipt.Operation.GlobalSequence] = (receipt,
+                    now - AISyncRetryPlanner.LocalRetryIntervalMs, now);
             }
             else _localWaiting.Remove(receipt.Operation.GlobalSequence);
             if (receipt.Stage == AISyncExecutionStage.Admitted) ++_diagnosticAdmitted;
@@ -358,7 +365,8 @@ internal sealed class AISyncExecutionBridge : IDisposable
     {
         var scope = _scope; var binding = _nativeBinding;
         _scope = null; _nativeBinding = null; _waitingReady = false;
-        _diagnosticSent.Clear(); _localWaiting.Clear();
+        _diagnosticSent.Clear(); _localWaiting.Clear(); _localRetryCursor = 0;
+        _localRetryCooling = 0; _maxLocalWaitingAge = 0;
         // The Host reopens with a new authority epoch; an old overflow must
         // not refuse that fresh offer for the rest of the round.
         Interlocked.Exchange(ref _lossEpoch, long.MinValue);
@@ -375,7 +383,9 @@ internal sealed class AISyncExecutionBridge : IDisposable
         _diagnosticTick = now;
         var oldest = _diagnosticSent.Count == 0 ? 0 : now - _diagnosticSent.Values.Min();
         _log($"Execution timing: work={_diagnosticWork}, maxQueueMs={_maxQueueAge}, maxIpcSendMs={_maxIpcSend}, "
-            + $"maxReceiptAgeMs={_maxReceiptAge}, waitingReceipts={_diagnosticWaiting}, admittedReceipts={_diagnosticAdmitted}, localRetries={_localRetries}, localWaiting={_localWaiting.Count}, "
+            + $"maxReceiptAgeMs={_maxReceiptAge}, waitingReceipts={_diagnosticWaiting}, admittedReceipts={_diagnosticAdmitted}, " +
+            $"localRetries={_localRetries}, localRetryCooling={_localRetryCooling}, localWaiting={_localWaiting.Count}, " +
+            $"maxLocalWaitingAgeMs={_maxLocalWaitingAge}, localRetryCap={AISyncRetryPlanner.MaxLocalPerTick}, "
             + $"pendingSamples={_diagnosticSent.Count}, oldestPendingMs={oldest}, droppedSamples={_diagnosticDropped}; "
             + "receipt age includes native/IPC/bridge waiting; cumulative timings, not network RTT.");
     }
