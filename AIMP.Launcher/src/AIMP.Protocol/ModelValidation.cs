@@ -905,11 +905,26 @@ public static class ModelValidation
                 StringComparison.Ordinal)
             || string.Equals(
                 value.Command,
+                GameCommandNames.AlienPvPRelease,
+                StringComparison.Ordinal)
+            || string.Equals(
+                value.Command,
                 GameCommandNames.ReturnToFrontend,
                 StringComparison.Ordinal))
         {
             if (value.Arguments.Count != 0)
                 throw new ProtocolException($"{value.Command} parameters are invalid.");
+            return;
+        }
+
+        if (string.Equals(value.Command, GameCommandNames.AlienPvPBind,
+                StringComparison.Ordinal))
+        {
+            if (value.LevelGeneration < 1 || value.Arguments.Count != 1 ||
+                !value.Arguments.TryGetValue("ownerPeer", out var peerText) ||
+                !ulong.TryParse(peerText, NumberStyles.None, CultureInfo.InvariantCulture,
+                    out var ownerPeer) || ownerPeer == 0UL)
+                throw new ProtocolException("ALIEN_PVP_BIND parameters are invalid.");
             return;
         }
 

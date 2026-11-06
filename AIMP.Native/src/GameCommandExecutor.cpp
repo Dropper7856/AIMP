@@ -1542,7 +1542,8 @@ bool GameCommandExecutor::CanExecute(const std::string_view command) const noexc
     if (command == "REMOTE_EQUIPMENT_PROVISION") {
         return RemoteEquipmentProvisionAvailable();
     }
-    if (command == "ALIEN_PVP_PROBE") {
+    if (command == "ALIEN_PVP_PROBE" || command == "ALIEN_PVP_BIND" ||
+        command == "ALIEN_PVP_RELEASE") {
         return ai_sync::Installed();
     }
     if (command == "RETURN_TO_FRONTEND") {
@@ -4179,6 +4180,36 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteAlienPvPProbe() const {
         ", nativeGeneration=" + std::to_string(probe.nativeGeneration) +
         ", worldGeneration=" + std::to_string(probe.worldGeneration) +
         ". Read-only: no native control lease has been granted."};
+}
+
+GameCommandExecutionResult GameCommandExecutor::ExecuteAlienPvPBind(const std::uint64_t ownerPeer) const {
+    ai_sync::AlienPvPLeaseStatus status{};
+    const auto owned=ai_sync::AcquireAlienPvPLease(ownerPeer,status);
+    std::string code;
+    switch (status.phase) {
+        case ai_sync::AlienPvPLeasePhase::Owned: code="ALIEN_PVP_OWNED";break;
+        case ai_sync::AlienPvPLeasePhase::WaitingForAlien: code="ALIEN_PVP_WAITING_FOR_SPAWN";break;
+        case ai_sync::AlienPvPLeasePhase::Ambiguous: code="ALIEN_PVP_MULTIPLE_ALIENS";break;
+        case ai_sync::AlienPvPLeasePhase::AwaitingRetirement: code="ALIEN_PVP_OWNER_BUSY";break;
+        case ai_sync::AlienPvPLeasePhase::Draining: code="ALIEN_PVP_DRAINING";break;
+        case ai_sync::AlienPvPLeasePhase::Stale: code="ALIEN_PVP_STALE";break;
+        default: code="ALIEN_PVP_NOT_READY";break;
+    }
+    return {owned,code,
+        "Alien PvP native lease: ownerPeer="+std::to_string(status.ownerPeer)+
+        " entityA="+std::to_string(status.entityA)+
+        " entityB="+std::to_string(status.entityB)+
+        " runtimeId="+std::to_string(status.runtimeId)+
+        " boundaryOffset="+std::to_string(status.boundaryOffset)+
+        " boundaryValue="+std::to_string(status.boundaryValue)+
+        ". Exclusive native lease only; player inputs/camera are not installed."};
+}
+GameCommandExecutionResult GameCommandExecutor::ExecuteAlienPvPRelease() const {
+    ai_sync::AlienPvPLeaseStatus status{};
+    const bool released=ai_sync::ReleaseAlienPvPLease(status);
+    return {released,released?"ALIEN_PVP_RELEASED":"ALIEN_PVP_RELEASE_PENDING",
+        released?"Alien PvP native lease released safely.":
+            "Alien PvP release deferred while native requests are in flight."};
 }
 
 GameCommandExecutionResult GameCommandExecutor::ExecuteItemSyncApply(

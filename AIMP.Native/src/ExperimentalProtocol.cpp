@@ -919,9 +919,24 @@ bool DecodeGameCommand(
             command->stringValue == "WORLD_STATE_DISCOVERY_AFTER" ||
             command->stringValue == "WORLD_STATE_DISCOVERY_STATUS" ||
             command->stringValue == "ALIEN_PVP_PROBE" ||
+            command->stringValue == "ALIEN_PVP_RELEASE" ||
             command->stringValue == "RETURN_TO_FRONTEND") {
             if (!arguments->objectValue.empty()) return false;
             output.command = command->stringValue;
+            return true;
+        }
+
+        if (command->stringValue == "ALIEN_PVP_BIND") {
+            if (arguments->objectValue.size() != 1U) return false;
+            const auto* peer = Field(*arguments, "ownerPeer", JsonType::String);
+            if (!peer || peer->stringValue.empty() || peer->stringValue.size() > 20U) return false;
+            std::uint64_t parsed{};
+            const auto* first = peer->stringValue.data();
+            const auto* last = first + peer->stringValue.size();
+            const auto conversion = std::from_chars(first,last,parsed,10);
+            if (conversion.ec != std::errc{} || conversion.ptr != last || parsed == 0U) return false;
+            output.command = command->stringValue;
+            output.alienPvPOwnerPeer = parsed;
             return true;
         }
 

@@ -3193,6 +3193,12 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
                 pending->request.command == "ALIEN_PVP_PROBE") {
                 result = gameCommands_->ExecuteAlienPvPProbe();
             } else if (
+                pending->request.command == "ALIEN_PVP_BIND") {
+                result = gameCommands_->ExecuteAlienPvPBind(pending->request.alienPvPOwnerPeer);
+            } else if (
+                pending->request.command == "ALIEN_PVP_RELEASE") {
+                result = gameCommands_->ExecuteAlienPvPRelease();
+            } else if (
                 pending->request.command == "RETURN_TO_FRONTEND") {
                 result = gameCommands_->ExecuteReturnToFrontend();
             } else if (

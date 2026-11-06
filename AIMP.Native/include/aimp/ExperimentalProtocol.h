@@ -49,6 +49,7 @@ struct DiagnosticSnapshotRequest : RequestEnvelope {
 
 struct GameCommandRequest : RequestEnvelope {
     std::string command;
+    std::uint64_t alienPvPOwnerPeer{};
     bool worldSync3EmptyCallbackEnabled{};
     std::string performanceIsolationModule;
     bool performanceIsolationEnabled{};
