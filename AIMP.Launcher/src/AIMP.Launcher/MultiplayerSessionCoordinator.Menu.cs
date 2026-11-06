@@ -4,6 +4,9 @@ namespace AIMP.Launcher;
 
 internal sealed partial class MultiplayerSessionCoordinator
 {
+    private static bool ReadLobbyAlienVsSurvivors(ScaleformBridgeMessage message) =>
+        message.Get("alienVsSurvivors", "0") == "1";
+
     private static bool ReadLobbyAlienEnabled(ScaleformBridgeMessage message) =>
         message.Get("alienEnabled", "1") switch
         {

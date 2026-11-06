@@ -785,6 +785,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             "CREATE_LOBBY" => CreateLobbyAsync(message),
             "JOIN_DIRECT_IP" => JoinDirectAsync(),
             "READY" => SetReadyAsync(message.Get("ready", "0") == "1"),
+            "SET_ALIEN_ROLE" => SetAlienRoleAsync(message),
             "START_GAME" => StartGameAsync(message),
             "START_GAME_ACK" => LogOnlyAsync("Start-game UI acknowledgement received."),
             "CHARACTER_SELECTED" => LogCharacterSelectionAsync(message),
@@ -882,7 +883,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         ResolveLevel(message),
         LobbyCompatibility.Create(settings),
         RequireWorldPreparation: true,
-        AlienEnabled: ReadLobbyAlienEnabled(message));
+        AlienEnabled: ReadLobbyAlienEnabled(message),
+        AlienVsSurvivors: ReadLobbyAlienVsSurvivors(message));
 
     private static string ResolveServerName(
         LauncherSettings settings,
@@ -944,6 +946,18 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             "Join a lobby before changing ready state.");
         await client.SetReadyAsync(ready).ConfigureAwait(false);
         _diagnostics.Log("Multiplayer", $"Client lobby ready state: {ready}.");
+    }
+
+    private async Task SetAlienRoleAsync(ScaleformBridgeMessage message)
+    {
+        LobbyHost? host;
+        lock (_stateGate) host = _host;
+        if (host is null) throw new InvalidOperationException("Only the host can select the Alien.");
+        if (!ulong.TryParse(message.Get("peerId"), NumberStyles.None,
+            CultureInfo.InvariantCulture, out var peerId) || peerId == 0)
+            throw new InvalidOperationException("The selected lobby participant is invalid.");
+        await host.SetAlienPlayerAsync(peerId).ConfigureAwait(false);
+        _diagnostics.Log("Multiplayer", $"Host assigned Alien control to PeerId={peerId}.");
     }
 
     private async Task StartGameAsync(ScaleformBridgeMessage message)
@@ -5021,21 +5035,31 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             ["mode"] = LevelGameMode(snapshot.Level),
             ["mapId"] = snapshot.Level,
             ["mapName"] = snapshot.Level,
-            ["p1"] = FormatPlayer(players, 0, 1),
-            ["p2"] = FormatPlayer(players, 1, 2),
-            ["p3"] = FormatPlayer(players, 2, 3),
-            ["p4"] = FormatPlayer(players, 3, 4)
+            ["p1"] = FormatPlayer(players, 0, 1, snapshot.AlienVsSurvivors, snapshot.AlienPeerId),
+            ["p2"] = FormatPlayer(players, 1, 2, snapshot.AlienVsSurvivors, snapshot.AlienPeerId),
+            ["p3"] = FormatPlayer(players, 2, 3, snapshot.AlienVsSurvivors, snapshot.AlienPeerId),
+            ["p4"] = FormatPlayer(players, 3, 4, snapshot.AlienVsSurvivors, snapshot.AlienPeerId),
+            ["alienVsSurvivors"] = snapshot.AlienVsSurvivors ? "1" : "0",
+            ["alienPeerId"] = snapshot.AlienPeerId.ToString(CultureInfo.InvariantCulture),
+            ["peer1"] = players.Length > 0 ? players[0].PeerId.ToString(CultureInfo.InvariantCulture) : "",
+            ["peer2"] = players.Length > 1 ? players[1].PeerId.ToString(CultureInfo.InvariantCulture) : "",
+            ["peer3"] = players.Length > 2 ? players[2].PeerId.ToString(CultureInfo.InvariantCulture) : "",
+            ["peer4"] = players.Length > 3 ? players[3].PeerId.ToString(CultureInfo.InvariantCulture) : ""
         });
     }
 
     private static string FormatPlayer(
         IReadOnlyList<LobbyPlayer> players,
         int index,
-        int slot)
+        int slot,
+        bool alienVsSurvivors,
+        ulong alienPeerId)
     {
         if (index >= players.Count) return $"{slot}  Empty";
         var player = players[index];
-        var role = player.IsHost ? "Owner" : "Player";
+        var role = alienVsSurvivors
+            ? player.PeerId == alienPeerId ? "Alien" : "Survivor"
+            : player.IsHost ? "Owner" : "Player";
         var ready = player.Ready ? "Ready" : "Waiting";
         return $"{slot}  {role}  {player.DisplayName}  {ready}";
     }
@@ -5049,6 +5073,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             ["lobbyId"] = start.SessionId.ToString("N"),
             ["syncProtocol"] = ProtocolConstants.Version.ToString(CultureInfo.InvariantCulture),
             ["mode"] = LevelGameMode(start.Level),
+            ["alienVsSurvivors"] = start.AlienVsSurvivors ? "1" : "0",
+            ["alienPeerId"] = start.AlienPeerId.ToString(CultureInfo.InvariantCulture),
             ["mapId"] = start.Level,
             ["mapName"] = start.Level,
             ["engineLevelPath"] = @"Production\" + start.Level,
