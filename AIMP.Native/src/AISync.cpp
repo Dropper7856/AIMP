@@ -10688,8 +10688,12 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"placementContractReady",Diagnostics::Boolean(execution::PlacementDedupReady()),true},
          {"placementChildrenDerived",Diagnostics::Unsigned(gPlacementChildrenDerived.load()),true},
          {"placementFallbacksSuppressed",Diagnostics::Unsigned(gPlacementFallbacksSuppressed.load()),true}});
+    const auto nativeHandoff=route_execution::NativeHandoffDiagnostics();
     diagnostics.Log("info","aisync_native_motion","Host commands and routes drive native Client locomotion and rotation.",
         {{"worldResets",Diagnostics::Unsigned(gWorldResetCount.load()),true},
+         {"nativeHandoffCandidates",Diagnostics::Unsigned(nativeHandoff.candidates),true},
+         {"nativeHandoffConfirmed",Diagnostics::Unsigned(nativeHandoff.confirmed),true},
+         {"nativeHandoffStalled",Diagnostics::Unsigned(nativeHandoff.stalled),true},
          {"hybridFollowerEnabled",Diagnostics::Boolean(true),true},
          {"clientRoutePlanningEnabled",Diagnostics::Boolean(false),true},
          {"correctionTeleportsEnabled",Diagnostics::Boolean(true),true},
