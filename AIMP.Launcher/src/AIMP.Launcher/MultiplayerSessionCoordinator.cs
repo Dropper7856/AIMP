@@ -741,6 +741,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         StopNetworkAsync("Launcher closed").GetAwaiter().GetResult();
         Task.WhenAll(_missionReportTask, _missionApplyTask).GetAwaiter().GetResult();
         _commandGate.Dispose();
+        _alienPvPOperationGate.Dispose();
         _spawnGate.Dispose();
         _remoteEquipmentProvisionGate.Dispose();
         _remotePlayerSyncGate.Dispose();
