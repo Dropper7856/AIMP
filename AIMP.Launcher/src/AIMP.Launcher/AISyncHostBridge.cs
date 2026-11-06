@@ -62,8 +62,8 @@ internal static class AISyncNativeRecoveryPolicy
         stage is AISyncExecutionStage.Rejected or AISyncExecutionStage.Unknown;
 
     internal static bool MovementTimedOut(AISyncTransaction operation, long ageMilliseconds) =>
-        ageMilliseconds >= MovementWaitingTimeoutMs && operation.NativeKind is 1 or 3 &&
-        operation.Opcode is AISyncTransactionOpcode.Submit or AISyncTransactionOpcode.Update;
+        ageMilliseconds >= MovementWaitingTimeoutMs && (operation.NativeKind is 1 or 3) &&
+        (operation.Opcode is AISyncTransactionOpcode.Submit or AISyncTransactionOpcode.Update);
 
     internal static bool MayRepair(int completedRepairs) =>
         completedRepairs >= 0 && completedRepairs < MaxAutomaticRepairs;
