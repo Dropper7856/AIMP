@@ -8,6 +8,48 @@ internal sealed record AISyncHostBinding(LobbyHost? Host, Guid Session, int Worl
 
 // The producer owns the decision stream. Fan-out changes only consumerEpoch;
 // it never derives a command from a pose, shadow observation or Client packet.
+// Native command admission stays in the ledger. This selects only which already
+// Waiting receipt to retry first; it never skips wire records or fabricates
+// admission. Irreversible calls and cleanup remain causally ordered.
+internal static class AISyncIntentRetryPriority
+{
+    internal static ulong Select(IEnumerable<AISyncTransaction> pending)
+    {
+        var ordered = pending.OrderBy(operation => operation.GlobalSequence).ToArray();
+        if (ordered.Length == 0) return 0;
+        var latest = ordered[^1];
+        var prior = ordered.AsSpan(0, ordered.Length - 1);
+        if (latest.Opcode == AISyncTransactionOpcode.Submit && latest.NativeAdmission == 0
+            && Replaceable(latest.NativeKind))
+        {
+            var canPreempt = true;
+            foreach (var operation in prior)
+                if (!Replaceable(operation.NativeKind)
+                    || operation.Opcode is not (AISyncTransactionOpcode.Submit or AISyncTransactionOpcode.Update))
+                { canPreempt = false; break; }
+            if (canPreempt) return latest.GlobalSequence;
+        }
+        if (latest.Opcode == AISyncTransactionOpcode.Update && Replaceable(latest.NativeKind))
+        {
+            var canCoalesce = true;
+            foreach (var operation in prior)
+                if (operation.Opcode != AISyncTransactionOpcode.Update
+                    || operation.CommandId != latest.CommandId
+                    || operation.NativeKind != latest.NativeKind
+                    || operation.ParameterRevision >= latest.ParameterRevision)
+                { canCoalesce = false; break; }
+            if (canCoalesce) return latest.GlobalSequence;
+        }
+        return ordered[0].GlobalSequence;
+    }
+
+    // Exact native kinds whose unentered scalar work the C++ ledger already
+    // supersedes for admission=0 and for same-command parameter revisions.
+    // Kind 2 (marker), 5 (action), 8 (placement), scheduler controls and native
+    // constructors must never be reordered by this retry optimization.
+    private static bool Replaceable(uint nativeKind) => nativeKind is 1 or 3 or 4 or 7 or 9;
+}
+
 internal sealed partial class AISyncHostBridge : IDisposable
 {
     private sealed record Work(AISyncHostBinding Binding, NativeAISyncExecution? Native,
@@ -197,7 +239,14 @@ internal sealed partial class AISyncHostBridge : IDisposable
     }
     private KeyValuePair<(ulong Peer, ulong Sequence), Waiting>[] RetryHeads() => _waiting
         .GroupBy(p => (p.Key.Peer, Actor: Identity(p.Value.Operation) with { Command = 0 }))
-        .Select(group => group.MinBy(p => p.Key.Sequence)).ToArray();
+        .Select(group =>
+        {
+            // A replacing Submit can overtake obsolete unentered movements;
+            // same-command Updates can skip obsolete revisions. The native
+            // ledger still decides whether the selected retry may execute.
+            var selected = AISyncIntentRetryPriority.Select(group.Select(p => p.Value.Operation));
+            return group.First(p => p.Key.Sequence == selected);
+        }).ToArray();
     private void ResolveRetryRace((ulong Peer, ulong Sequence) key)
     {
         if (_binding!.Host!.TryGetAISyncExecutionReceipt(key.Peer, _peers[key.Peer], key.Sequence, out var receipt)
