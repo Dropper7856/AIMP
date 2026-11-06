@@ -194,7 +194,7 @@ Slot* ResumingCandidate(const execution::NavigationBinding& rejected,bool allowP
         // identity. Compare the ACTUAL native revision, not the stale slot copy.
         // A prior hybrid owner can block Populate() before EndAdmission().
         const bool pending=allowPending&&candidate->skipped&&candidate->result&&
-            Latest(current)!=nullptr;
+            (Latest(current)!=nullptr||candidate->planned!=nullptr);
         if(!candidate->installed&&!pending)continue;
         if(!selected || HybridResumeCurrent(selectedCommand,selectedRevision,
             current.command.command,current.command.revision)) {
