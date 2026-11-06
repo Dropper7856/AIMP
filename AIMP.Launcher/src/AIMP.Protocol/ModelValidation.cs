@@ -469,7 +469,7 @@ public static class ModelValidation
             hostCount += player.IsHost ? 1 : 0;
         }
 
-        if (value.AlienPeerId != 0 && !peerIds.Contains(value.AlienPeerId))
+        if (value.AlienPeerId != 0 && !peerIds.Contains(value.AlienPeerId) && value.State == "Lobby")
             throw new ProtocolException("Alien player is not a lobby participant.");
         if (value.AlienVsSurvivors && value.State == "Starting" && value.AlienPeerId == 0)
             throw new ProtocolException("PvP round cannot start without an assigned Alien.");

@@ -32,6 +32,7 @@ public sealed partial class LobbyHost
             if (!string.Equals(_state, "Starting", StringComparison.Ordinal)
                 || payload.LevelGeneration != _levelGeneration
                 || _deadPeers.Contains(payload.PeerId)
+                || (_options.AlienVsSurvivors && payload.PeerId == _alienPeerId)
                 || !_finishedPeers.Add(payload.PeerId)) return;
             progress = CreateRoundProgressLocked();
             ended = TryEndRoundLocked();

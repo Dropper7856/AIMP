@@ -366,6 +366,8 @@ public sealed partial class LobbyHost : IAsyncDisposable
             if (!string.Equals(_state, "Starting", StringComparison.Ordinal)
                 || payload.LevelGeneration != _levelGeneration
                 || _finishedPeers.Contains(payload.PeerId)
+                // The Alien's hidden technical THE_PLAYER is not the Alien NPC.
+                || (_options.AlienVsSurvivors && payload.PeerId == _alienPeerId)
                 || !_deadPeers.Add(payload.PeerId)) return;
             progress = CreateRoundProgressLocked();
             ended = TryEndRoundLocked();
@@ -397,9 +399,26 @@ public sealed partial class LobbyHost : IAsyncDisposable
     // connected client of the active generation is terminal: dead or finished.
     private RoundEndedPayload? TryEndRoundLocked()
     {
-        if (!RoundTerminalLocked(HostPeerId)
-            || _clients.Keys.Any(peerId => !RoundTerminalLocked(peerId))) return null;
-        var reason = RoundEndReasonLocked();
+        string reason;
+        if (_options.AlienVsSurvivors)
+        {
+            // In PvP the Alien's hidden retail player is not a survivor.
+            // All survivor deaths -> Alien victory. Any survivor escape ->
+            // survivor victory. A departed client Alien forfeits the round.
+            var survivors = _clients.Keys.Append(HostPeerId)
+                .Where(peer => peer != _alienPeerId).ToArray();
+            var alienLeft = _alienPeerId != 0 && _alienPeerId != HostPeerId && !_clients.ContainsKey(_alienPeerId);
+            var survivorsEscape = survivors.Any(_finishedPeers.Contains);
+            var survivorsAllDead = survivors.Length > 0 && survivors.All(_deadPeers.Contains);
+            if (!alienLeft && !survivorsEscape && !survivorsAllDead) return null;
+            reason = survivorsEscape || alienLeft ? "SurvivorsWin" : "AlienWin";
+        }
+        else
+        {
+            if (!RoundTerminalLocked(HostPeerId)
+                || _clients.Keys.Any(peerId => !RoundTerminalLocked(peerId))) return null;
+            reason = RoundEndReasonLocked();
+        }
         _state = "Lobby";
         _sessionPreparedPeers.Clear();
         _sessionReleasedGeneration = 0;
@@ -407,6 +426,8 @@ public sealed partial class LobbyHost : IAsyncDisposable
         _finishedPeers.Clear();
         _collectedItems.Clear();
         ClearSpawnDecisionsLocked();
+        if (_options.AlienVsSurvivors && _alienPeerId != HostPeerId && !_clients.ContainsKey(_alienPeerId))
+            _alienPeerId = 0;
         var payload = new RoundEndedPayload(SessionId, _levelGeneration,
             reason, RoundReturnDelayMilliseconds);
         ModelValidation.Validate(payload);
@@ -1222,7 +1243,9 @@ public sealed partial class LobbyHost : IAsyncDisposable
                 await RemoveShadowPeerAsync(state.PeerId).ConfigureAwait(false);
                 await RemoveExecutionPeerAsync(state.PeerId).ConfigureAwait(false);
                 lock (_stateLock) {
-                    if (_alienPeerId == state.PeerId) _alienPeerId = 0;
+                    // Preserve the departed Alien identity until PvP round logic
+                    // can declare a survivor victory. Clear it for a lobby exit.
+                    if (_alienPeerId == state.PeerId && _state == "Lobby") _alienPeerId = 0;
                     _lobbyPreparations.Remove(state.PeerId);
                     _sessionPreparedPeers.Remove(state.PeerId);
                 }
