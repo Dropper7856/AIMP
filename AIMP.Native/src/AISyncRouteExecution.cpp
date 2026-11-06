@@ -969,6 +969,14 @@ route::NativeHandoffResult ObserveNativeHandoff(std::uintptr_t character,
             entry.awaitingSince=now;entry.probe={};
             ++gNativeHandoffCandidates;
         }
+        // An authored vent transition or paired capture may hold locomotion
+        // legitimately. Suspend probation instead of declaring the Host route
+        // stuck while native action ownership is intentionally unavailable.
+        if(suspended) {
+            entry.awaitingSince=now;
+            entry.probe={};
+            return route::NativeHandoffResult::Pending;
+        }
         if(!candidate->installed) {
             // Give the native query time to populate, but do not leave the
             // hybrid lease disabled forever when the imported route stalls.
