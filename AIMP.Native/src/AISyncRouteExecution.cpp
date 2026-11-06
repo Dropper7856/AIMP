@@ -956,7 +956,7 @@ bool NativeHandoffCandidate(std::uintptr_t character) noexcept {
 }
 route::NativeHandoffResult ObserveNativeHandoff(std::uintptr_t character,
     std::uint64_t now,bool valid,const std::array<float,3>& local,
-    const std::array<float,3>& host,bool hostMoving) noexcept {
+    const std::array<float,3>& host,bool hostMoving,bool suspended) noexcept {
     if(!gState||!gEngine||!gEngine())return route::NativeHandoffResult::Pending;
     for(auto& entry:gState->hybrid)if(entry.used&&Qualified(entry.binding)&&
         entry.binding.command.actor.character==character) {
