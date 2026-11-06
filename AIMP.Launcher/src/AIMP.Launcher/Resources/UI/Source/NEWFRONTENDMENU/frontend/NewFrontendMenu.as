@@ -541,10 +541,10 @@ package frontend
          this._serverSurvivalItem.data = "";
          this._serverSurvivalItem.enabled = false;
          this._hostLobbyStatusItem = new MenuItem("Status: Waiting for players");
-         this._hostLobbyPlayer1Item = new MenuItem("1  Owner    You    Ready");
-         this._hostLobbyPlayer2Item = new MenuItem("2  Empty");
-         this._hostLobbyPlayer3Item = new MenuItem("3  Empty");
-         this._hostLobbyPlayer4Item = new MenuItem("4  Empty");
+         this._hostLobbyPlayer1Item = new MenuItem("1  Owner    You    Ready",this.mpAssignAlienHandler);
+         this._hostLobbyPlayer2Item = new MenuItem("2  Empty",this.mpAssignAlienHandler);
+         this._hostLobbyPlayer3Item = new MenuItem("3  Empty",this.mpAssignAlienHandler);
+         this._hostLobbyPlayer4Item = new MenuItem("4  Empty",this.mpAssignAlienHandler);
          this._hostLobbyKick2Item = new MenuItem("Kick Player 2",this.kickLobbyPlayerHandler);
          this._hostLobbyKick2Item.data = "slot2";
          this._hostLobbyKick3Item = new MenuItem("Kick Player 3",this.kickLobbyPlayerHandler);
