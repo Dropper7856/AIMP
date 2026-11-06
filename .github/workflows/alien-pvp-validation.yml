@@ -16,7 +16,9 @@ permissions:
 
 jobs:
   protocol-and-native:
-    runs-on: windows-latest
+    # Pin VS 2022: windows-latest now ships VS 2026, which cannot
+    # satisfy the certified x86 VS 2022 generator used by AIMP.Native.
+    runs-on: windows-2022
     timeout-minutes: 30
     steps:
       - name: Check out sources
