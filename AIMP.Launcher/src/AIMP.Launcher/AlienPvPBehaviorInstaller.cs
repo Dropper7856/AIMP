@@ -104,14 +104,14 @@ internal static class AlienPvPBehaviorInstaller
                     throw new InvalidDataException("Truncated Alien PvP copy range.");
                 var length = BinaryPrimitives.ReadUInt32LittleEndian(delta[pos..]);
                 pos += 4;
-                if (offsetOrLength > retail.Length || length > retail.Length - offsetOrLength
+                if (offsetOrLength > (uint)retail.Length || length > (uint)retail.Length - offsetOrLength
                     || output.Length + length > MaximumBmlBytes)
                     throw new InvalidDataException("Alien PvP copy range exceeds the verified retail source.");
                 output.Write(retail.Slice((int)offsetOrLength, (int)length));
             }
             else if (kind == 1)
             {
-                if (offsetOrLength > delta.Length - pos || output.Length + offsetOrLength > MaximumBmlBytes)
+                if (offsetOrLength > (uint)(delta.Length - pos) || output.Length + offsetOrLength > MaximumBmlBytes)
                     throw new InvalidDataException("Alien PvP insert exceeds the delta bounds.");
                 output.Write(delta.Slice(pos, (int)offsetOrLength));
                 pos += (int)offsetOrLength;
