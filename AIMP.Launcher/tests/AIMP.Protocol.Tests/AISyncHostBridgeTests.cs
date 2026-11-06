@@ -139,6 +139,60 @@ internal static class AISyncHostBridgeTests
         finally { bridge.Dispose(); await bridge.Completion.WaitAsync(token); }
     }
 
+    internal static async Task NativeRepairBudgetAsync()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(35)); var token = timeout.Token;
+        await using var host = Host(); await using var client = await Client(host, "Dallas", token);
+        var round = await Start(host, new[] { client }, token);
+        var binding = new AISyncHostBinding(host, host.SessionId, round.LevelGeneration,
+            7, 123, Guid.NewGuid(), 1, true);
+        var controls = new ConcurrentQueue<AISyncExecutionControl>();
+        var batches = new ConcurrentQueue<AISyncExecutionBatch>();
+        var logs = new ConcurrentQueue<string>();
+        client.AISyncExecutionControlReceived += (_, c) =>
+        {
+            if (c.Kind == AISyncExecutionControlKind.Offer) client.AcceptAISyncExecution(c.Scope);
+        };
+        client.AISyncExecutionBatchReceived += (_, b) => batches.Enqueue(b);
+        using var bridge = new AISyncHostBridge(() => binding, (_, _, _, bytes, _) =>
+        {
+            controls.Enqueue(AISyncExecutionControlCodec.Decode(bytes.Span));
+            return Task.CompletedTask;
+        }, logs.Enqueue);
+        try
+        {
+            bridge.BindHost(host);
+            for (var i = 0; i <= AISyncNativeRecoveryPolicy.MaxAutomaticRepairs; i++)
+            {
+                var ordinal = i + 1;
+                await Wait(() => controls.Count(c => c.Kind == AISyncExecutionControlKind.Offer) >= ordinal, token);
+                var offer = controls.Where(c => c.Kind == AISyncExecutionControlKind.Offer).ElementAt(i);
+                bridge.ObserveNative(new(binding.ConnectionIdentity, binding.ProcessId, MessageType.AISyncHostControl,
+                    AISyncExecutionControlCodec.Encode(offer with { Kind = AISyncExecutionControlKind.Ready })));
+                bridge.ObserveNative(new(binding.ConnectionIdentity, binding.ProcessId, MessageType.AISyncHostBatch,
+                    AISyncExecutionCodec.EncodeBatch(new(offer.Scope, 1,
+                        new[] { Record(offer.Scope),
+                            Record(offer.Scope, 2, AISyncTransactionOpcode.Submit) }))));
+                await Wait(() => batches.Any(b => b.Scope == offer.Scope), token);
+                var batch = batches.Single(b => b.Scope == offer.Scope);
+                var stage = i % 2 == 0 ? AISyncExecutionStage.Rejected : AISyncExecutionStage.Unknown;
+                AssertEx.True(client.SendAISyncExecutionReceipt(new(batch.Scope, batch.BatchId,
+                    batch.Records[1], stage, stage == AISyncExecutionStage.Unknown
+                        ? AISyncExecutionResult.OutcomeUnknown : AISyncExecutionResult.Ok)));
+                await Wait(() => controls.Any(c => c.Kind == AISyncExecutionControlKind.Close &&
+                    c.Scope == offer.Scope), token);
+            }
+            AssertEx.Equal(AISyncNativeRecoveryPolicy.MaxAutomaticRepairs, bridge.NativeFaultRecoveries);
+            AssertEx.Equal(1, bridge.NativeRepairLimitHits);
+            AssertEx.True(logs.Any(l => l.Contains("AISync native recovery exhausted:", StringComparison.Ordinal)));
+            await Task.Delay(TimeSpan.FromMilliseconds(2600), token);
+            AssertEx.Equal(AISyncNativeRecoveryPolicy.MaxAutomaticRepairs + 1,
+                controls.Count(c => c.Kind == AISyncExecutionControlKind.Offer),
+                "A repeatedly failing native binding entered an unbounded restart loop.");
+        }
+        finally { bridge.Dispose(); await bridge.Completion.WaitAsync(token); }
+    }
+
     internal static Task RefusalEchoValidationAsync()
     {
         var scope = new AISyncExecutionScope(Guid.NewGuid(), 1, 1, 1);
