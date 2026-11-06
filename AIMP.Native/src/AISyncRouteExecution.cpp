@@ -27,6 +27,8 @@ std::atomic<std::uint32_t> gFailureSite{},gFailureResult{},gImportStage{},gConte
 std::atomic<std::uint64_t> gAppendPublished{},gContinuationPublished{},gCompoundRequests{};
 std::atomic<std::uint64_t> gOrphanQuarantined{},gOrphanQuarantineRejected{};
 std::atomic<std::uint64_t> gCorridorJoins{};
+std::atomic<std::uint64_t> gNativeHandoffCandidates{},gNativeHandoffConfirmed{},gNativeHandoffStalled{};
+std::uint64_t gInstallSerial{};
 std::atomic<std::uint32_t> gLastAdmissionMode{},gLastIncomingCount{},gLastCompoundParts{};
 bool gPumping{};
 template<class T> bool Read(std::uintptr_t at,T& value) noexcept {
@@ -60,9 +62,16 @@ struct Slot {
     std::array<std::uint32_t,43> queryOptions{};
     std::uint32_t startCheck{};
     ULONGLONG waitingSince{};
+    std::uint64_t installSerial{};
+    bool physicalProgressVerified{};
 };
 struct Cached {std::unique_ptr<Graph> graph;};
-struct Hybrid {bool used{};execution::NavigationBinding binding{};};
+struct Hybrid {
+    bool used{};
+    execution::NavigationBinding binding{};
+    std::uint64_t observedInstallSerial{};
+    route::NativeHandoffProbe probe{};
+};
 struct State {
     std::array<std::unique_ptr<Slot>,kCapacity> slots;
     // Confirmed dead-world requests can retain native M/R/mesh refs after the
@@ -161,10 +170,12 @@ bool Guard(void* context,const Key& key,const LocalContext& local,
     return local==slot.local||(phase==GuardPhase::Read&&slot.installed&&
         local.navigation==slot.local.navigation&&local.block==slot.local.block&&!local.result&&!local.resultControl);
 }
-// A delayed failure from an old request must not seize movement back from a
-// newer Host route which CATHODE has actually installed and still owns.
-bool NativeRouteResumed(const execution::NavigationBinding& rejected) noexcept {
-    if(!gState)return false;
+// Installation is not locomotion. A delayed failure of an older HostRoute
+// may be ignored only once a current native route has demonstrably moved
+// (or settled at a stationary Host state) while hybrid control was released.
+Slot* ResumingCandidate(const execution::NavigationBinding& rejected) noexcept {
+    if(!gState)return nullptr;
+    Slot* selected{};
     for(const auto& candidate:gState->slots)if(candidate&&candidate->installed&&
         !candidate->failed&&!candidate->retiring&&!candidate->retirementFault&&
         candidate->binding.command.scope==rejected.command.scope&&
@@ -172,8 +183,16 @@ bool NativeRouteResumed(const execution::NavigationBinding& rejected) noexcept {
         candidate->binding.command.actor==rejected.command.actor&&
         HybridResumeCurrent(rejected.command.command,rejected.command.revision,
             candidate->binding.command.command,candidate->binding.command.revision)&&
-        Current(*candidate))return true;
-    return false;
+        Current(*candidate)) {
+        if(!selected || HybridResumeCurrent(selected->binding.command.command,
+            selected->binding.command.revision,candidate->binding.command.command,
+            candidate->binding.command.revision))selected=candidate.get();
+    }
+    return selected;
+}
+bool NativeRouteResumed(const execution::NavigationBinding& rejected) noexcept {
+    const auto* candidate=ResumingCandidate(rejected);
+    return candidate&&candidate->physicalProgressVerified;
 }
 bool Reject(const execution::NavigationBinding& binding) noexcept {
     // A route may fail after native cancellation already invalidated its
@@ -691,13 +710,10 @@ void EndAdmission(std::uintptr_t n) noexcept {
     if(Current(*slot)&&Read(n+0x5C,pending)&&!pending&&Read(slot->local.block+0x40,phase)&&phase==3) {
         if(slot->replacementRequested){++gReplacementCommits;++gReplacements;gReplacementReason=0U;}
         slot->installed=true;slot->waitingSince=0;slot->replacementRequested=false;
-        // Only an ACTUALLY installed current/newer native route hands motion
-        // back. A received graph or a Submit receipt is insufficient.
-        for(auto& entry:gState->hybrid)if(entry.used&&
-            entry.binding.command.scope==slot->binding.command.scope&&entry.binding.command.owner==slot->binding.command.owner&&
-            entry.binding.command.actor==slot->binding.command.actor&&
-            HybridResumeCurrent(entry.binding.command.command,entry.binding.command.revision,
-                slot->binding.command.command,slot->binding.command.revision))entry={};
+        slot->physicalProgressVerified=false;slot->installSerial=++gInstallSerial;
+        // Keep the hybrid recovery ticket until CATHODE has proven physical
+        // progression. NativeHandoffCandidate temporarily yields the hybrid
+        // motor so the next frame can observe genuine native movement.
         slot->planned.reset();slot->continuation=false;
         // The native installer no longer references the old R. Route/history
         // nodes retain their own Refs and the slot retains the backing mesh.
@@ -906,6 +922,56 @@ bool HybridBinding(std::uintptr_t character,execution::NavigationBinding& output
         if(entry.binding.command.actor.character==character){output=entry.binding;return true;}
     }
     return false;
+}
+bool NativeHandoffCandidate(std::uintptr_t character) noexcept {
+    if(!gState||!gEngine||!gEngine())return false;
+    for(auto& entry:gState->hybrid)if(entry.used&&Qualified(entry.binding)&&
+        entry.binding.command.actor.character==character) {
+        const auto* candidate=ResumingCandidate(entry.binding);
+        if(!candidate)return false;
+        if(entry.observedInstallSerial!=candidate->installSerial) {
+            entry.observedInstallSerial=candidate->installSerial;
+            entry.probe={};++gNativeHandoffCandidates;
+        }
+        return true;
+    }
+    return false;
+}
+route::NativeHandoffResult ObserveNativeHandoff(std::uintptr_t character,
+    std::uint64_t now,bool valid,const std::array<float,3>& local,
+    const std::array<float,3>& host,bool hostMoving) noexcept {
+    if(!gState||!gEngine||!gEngine())return route::NativeHandoffResult::Pending;
+    for(auto& entry:gState->hybrid)if(entry.used&&Qualified(entry.binding)&&
+        entry.binding.command.actor.character==character) {
+        auto* candidate=ResumingCandidate(entry.binding);
+        if(!candidate||!candidate->installSerial)return route::NativeHandoffResult::Pending;
+        if(entry.observedInstallSerial!=candidate->installSerial) {
+            entry.observedInstallSerial=candidate->installSerial;entry.probe={};
+            ++gNativeHandoffCandidates;
+        }
+        // The client hybrid lease must actually be gone. A positional change
+        // sampled while it still owns the motor is NOT native route evidence.
+        const bool nativeSample=valid&&!execution::MovementExecutionOwned(character);
+        const auto result=entry.probe.Observe(now,nativeSample,local,host,hostMoving);
+        if(result==route::NativeHandoffResult::Confirmed) {
+            if(!Current(*candidate))return route::NativeHandoffResult::Pending;
+            candidate->physicalProgressVerified=true;++gNativeHandoffConfirmed;
+            entry={};
+        } else if(result==route::NativeHandoffResult::Stalled) {
+            ++gNativeHandoffStalled;
+            // Native refusal already publishes the fallback ticket before
+            // cancelling the request. A stalled native route cannot silently
+            // extinguish a previously valid Host-authorized recovery.
+            Fail(*candidate,__LINE__,Result::Deferred);
+            entry.probe={};
+        }
+        return result;
+    }
+    return route::NativeHandoffResult::Pending;
+}
+HandoffReport NativeHandoffDiagnostics() noexcept {
+    return {gNativeHandoffCandidates.load(),gNativeHandoffConfirmed.load(),
+        gNativeHandoffStalled.load()};
 }
 void BeginScope(const transactions::Scope& scope) noexcept {
     if(!gState||!gEngine||!gEngine())return;
