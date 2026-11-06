@@ -11,6 +11,7 @@ internal sealed class AISyncExecutionSender : IAsyncDisposable
     private readonly Func<MessageType, ReadOnlyMemory<byte>, CancellationToken, Task> _send;
     private readonly Action _failure;
     private int _bytes, _inFlight;
+    private long _maxQueuedMs, _maxSendMs;
     private bool _terminal;
     private int _disposed;
     internal Task Completion { get; }
@@ -41,6 +42,18 @@ internal sealed class AISyncExecutionSender : IAsyncDisposable
             _queue.Enqueue(new(MessageType.AISyncExecutionControl, bytes, Environment.TickCount64, true)); Signal();
         }
     }
+    // Observation only. The Sender always publishes EXACT FIFO packets; it
+    // never coalesces AIEX batches/retries or reorders native actions.
+    internal (int PendingPackets, int PendingBytes, long OldestPendingMs,
+        long MaxQueuedMs, long MaxSendMs) Snapshot()
+    {
+        lock (_gate)
+        {
+            var oldest = _queue.Count == 0 ? 0 :
+                Math.Max(0L, Environment.TickCount64 - _queue.Peek().Tick);
+            return (_queue.Count, _bytes + _inFlight, oldest, _maxQueuedMs, _maxSendMs);
+        }
+    }
     private void Signal() { if (_signal.CurrentCount == 0) _signal.Release(); }
     private async Task RunAsync()
     {
@@ -53,14 +66,23 @@ internal sealed class AISyncExecutionSender : IAsyncDisposable
                 lock (_gate)
                 {
                     value = _queue.Count == 0 ? null : _queue.Dequeue();
-                    if (value is not null) { _bytes -= value.Bytes.Length; _inFlight = value.Bytes.Length; }
+                    if (value is not null) {
+                        _bytes -= value.Bytes.Length; _inFlight = value.Bytes.Length;
+                        _maxQueuedMs = Math.Max(_maxQueuedMs,
+                            Math.Max(0L, Environment.TickCount64 - value.Tick));
+                    }
                 }
                 if (value is null) continue;
                 if (Environment.TickCount64 - value.Tick > 2000) throw new IOException("AISync execution queue expired.");
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
                 timeout.CancelAfter(TimeSpan.FromSeconds(2));
+                var sentAt = Environment.TickCount64;
                 await _send(value.Type, value.Bytes, timeout.Token).ConfigureAwait(false);
-                lock (_gate) { _inFlight = 0; if (_queue.Count != 0) Signal(); }
+                lock (_gate) {
+                    _maxSendMs = Math.Max(_maxSendMs,
+                        Math.Max(0L, Environment.TickCount64 - sentAt));
+                    _inFlight = 0; if (_queue.Count != 0) Signal();
+                }
                 if (value.Terminal) return;
             }
         }
