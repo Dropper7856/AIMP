@@ -76,8 +76,14 @@ internal sealed partial class MultiplayerSessionCoordinator
         {
             await SendStatusAsync("Verifying level preparation...").ConfigureAwait(false);
             if (_gamePreparation is null) throw new InvalidOperationException("Game preparation is unavailable. Complete launcher setup first.");
+            if (lobby.AlienVsSurvivors && LevelGameMode(lobby.Level) != "Survival")
+                throw new InvalidOperationException("Alien vs Survivors currently supports survival maps only.");
             prepared = await _gamePreparation.PrepareLevelAsync(lobby.Level, token,
                 allowCampaign: LevelGameMode(lobby.Level) == "Campaign").ConfigureAwait(false);
+            // Every peer stages/validates the same behavior bytes in its own lobby.
+            // The normal level manifest remains read-only and does not depend on this BML.
+            await _gamePreparation.PrepareAlienVsSurvivorsAsync(lobby.AlienVsSurvivors, token)
+                .ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { return null; }
         catch (Exception exception) when (exception is not OutOfMemoryException)

@@ -147,6 +147,29 @@ public sealed class GamePreparationService
             throw new InvalidOperationException(string.IsNullOrEmpty(state.Error) ? "Game preparation is not ready." : state.Error);
     }
 
+    // PvP behaviour files are a distinct, on-demand lobby preparation step.
+    // No level manifests or character archives are recompiled while the game runs.
+    internal Task PrepareAlienVsSurvivorsAsync(bool enabled, CancellationToken cancellationToken) =>
+        Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var game = _settings.Load().GameDirectory;
+            lock (_sync)
+            {
+                if (_status.State != "Ready" || !SameDirectory(game, _status.GameDirectory) || _receipt is null)
+                    throw new InvalidOperationException("Prepare the game installation before selecting Alien vs Survivors.");
+            }
+            lock (GamePreparationSynchronization.Gate)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (enabled) AlienPvPBehaviorInstaller.Prepare(game);
+                else AlienPvPBehaviorInstaller.Restore(game);
+            }
+            _diagnostics.Log("AlienPvP", enabled
+                ? "Verified Alien behavior BML staged for the next level load."
+                : "Co-op lobby: original Alien behavior BML restored or unchanged.");
+        }, cancellationToken);
+
     // This path is intentionally read-only. No imports or cold compilation after launch.
     internal Task<PreparedWorldManifest> PrepareLevelAsync(string level, CancellationToken cancellationToken, bool allowCampaign = false) =>
         Task.Run(() =>
