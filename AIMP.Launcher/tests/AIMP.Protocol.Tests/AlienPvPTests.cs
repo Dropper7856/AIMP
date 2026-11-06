@@ -10,6 +10,15 @@ internal static class AlienPvPTests
         var normal = new LobbyStartPayload(session, 1, "ChallengeMap16", 1);
         ModelValidation.Validate(normal);
         AssertEx.False(normal.AlienVsSurvivors);
+        var nativeProbe = new GameCommandExecutePayload(
+            ProtocolConstants.ExperimentalSchemaVersion, Guid.NewGuid(), 1,
+            Guid.NewGuid(), GameCommandNames.AlienPvPProbe,
+            new Dictionary<string, string>());
+        ModelValidation.Validate(nativeProbe);
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(nativeProbe with
+        {
+            Arguments = new Dictionary<string, string> { ["alienPointer"] = "1234" }
+        }));
         AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(normal with
         {
             AlienPeerId = 42
@@ -104,6 +113,35 @@ internal static class AlienPvPTests
         {
             AlienPeerId = 0
         }));
+
+        // Win/lose and repeated-round protocol must not depend on the Alien's
+        // hidden technical THE_PLAYER reaching the usual solo end state.
+        var roundEnded = new TaskCompletionSource<RoundEndedPayload>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        host.RoundEnded += (_, ended) => roundEnded.TrySetResult(ended);
+        await host.ReportHostPlayerDeathAsync(start.LevelGeneration, token);
+        AssertEx.Equal("AlienWin", (await roundEnded.Task.WaitAsync(token)).Reason);
+        await WaitUntilAsync(() => host.CanStart && client.Snapshot?.State == "Lobby", token);
+
+        // The Host resets its command sequence on a new round. Client must
+        // reset its accepted Host sequence or it will drop the first input.
+        var nextCommitted = new TaskCompletionSource<AlienControlCommit>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        client.AlienControlCommitted += (_, next) =>
+        {
+            if (next.Intent.LevelGeneration > start.LevelGeneration)
+                nextCommitted.TrySetResult(next);
+        };
+        var nextRound = await host.StartGameAsync(DateTimeOffset.UtcNow, token);
+        await WaitUntilAsync(() => client.Snapshot?.LevelGeneration ==
+            nextRound.LevelGeneration, token);
+        await client.SendAlienControlAsync(firstIntent with
+        {
+            LevelGeneration = nextRound.LevelGeneration, Sequence = 1
+        }, token);
+        var firstAfterRestart = await nextCommitted.Task.WaitAsync(token);
+        AssertEx.Equal(1UL, firstAfterRestart.HostSequence);
+        AssertEx.Equal(nextRound.LevelGeneration, firstAfterRestart.Intent.LevelGeneration);
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition, CancellationToken token)
