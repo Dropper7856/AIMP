@@ -138,6 +138,9 @@ internal static class AISyncExecutionTransportTests
             await Wait(() => sent.Count == 3, token);
             AssertEx.SequenceEqual(new byte[] { 1, 2, 3 }, sent.ToArray(),
                 "Congestion telemetry must not change FIFO causal delivery order.");
+            // The last send callback can complete just before its worker has
+            // published the timing snapshot; wait for that handoff as well.
+            await Wait(() => sender.Snapshot().PendingBytes == 0, token);
             var after = sender.Snapshot();
             AssertEx.Equal(0, after.PendingPackets);
             AssertEx.True(after.MaxQueuedMs >= 20);
