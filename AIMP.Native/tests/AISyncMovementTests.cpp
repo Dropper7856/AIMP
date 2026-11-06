@@ -280,6 +280,27 @@ void NativePreemption() {
     const auto firstNavigation=reinterpret_cast<std::uintptr_t>(rejected.resource.data())+0xC4U;
     const auto firstBlock=reinterpret_cast<std::uintptr_t>(rejected.requests[0].data())+0x28U;
     CHECK(rejected.adapter.IdentifyNavigation(firstNavigation,firstBlock,binding)==NavigationOwnership::Ready);
+
+    // A replacing Move also supersedes a prior scalar stance, whose retained
+    // Ref must remain releasable but whose old Update must never regain control.
+    NativeHarness scalar;
+    auto stance=old;stance.commandId=200;stance.nativeKind=7;stance.movement={};
+    stance.mode=2;stance.scalarRetention=2;stance.admission=1;
+    scalar.current=stance;
+    CHECK(scalar.adapter.Check(stance)==Readiness::Ready
+        &&scalar.adapter.Invoke(stance)==NativeOutcome::Admitted);
+    auto newer=old;newer.commandId=201;newer.admission=0;
+    scalar.current=newer;
+    CHECK(scalar.adapter.Invoke(newer)==NativeOutcome::Admitted);
+    auto oldStanceUpdate=stance;oldStanceUpdate.opcode=Op::Update;++oldStanceUpdate.parameterRevision;
+    CHECK(scalar.adapter.Check(oldStanceUpdate)==Readiness::Rejected);
+    auto stanceRelease=stance;stanceRelease.opcode=Op::Release;
+    stanceRelease.mode=0;stanceRelease.scalarRetention=3;
+    CHECK(scalar.adapter.Invoke(stanceRelease)==NativeOutcome::Admitted
+        &&scalar.adapter.ActiveCount()==1);
+    auto newRelease=newer;newRelease.opcode=Op::Release;newRelease.movement={};
+    CHECK(scalar.adapter.Invoke(newRelease)==NativeOutcome::Admitted
+        &&scalar.adapter.ActiveCount()==0);
 }
 void Native() {
     NativeHarness h;h.reenter=true;CHECK(h.Submit()==NativeOutcome::Admitted&&h.adapter.ActiveCount()==2);
