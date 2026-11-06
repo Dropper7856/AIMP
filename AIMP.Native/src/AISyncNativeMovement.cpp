@@ -164,7 +164,11 @@ NavigationOwnership NativeRequestAdapter::IdentifyNavigation(std::uintptr_t navi
             (invokingRecord_->opcode==Op::Submit||invokingRecord_->opcode==Op::Update);
         const bool admitting=invoking||lease.markerInitializing;
         if(invoking){value.command.revision=invokingRecord_->parameterRevision;output=value;}
-        if (lease.routeRejected || lease.cancelled || (lease.unknown&&!admitting)) return NavigationOwnership::Rejected;
+        // The Host has already admitted a replacing native request. Retained
+        // old B/Ref values still belong to their owner for later Cancel/Release,
+        // but a delayed worker callback must never regain route authority.
+        if (lease.preempted || lease.routeRejected || lease.cancelled || (lease.unknown&&!admitting))
+            return NavigationOwnership::Rejected;
         if(busy_&&!admitting)return NavigationOwnership::Waiting;
         LocalActorBinding actor{};
         const auto resolver=invoking?resolve_:(lifecycleResolver_?lifecycleResolver_:resolve_);
@@ -301,6 +305,17 @@ void NativeRequestAdapter::MovementUnknown(const Record& r) noexcept {
     for(auto& lease:leases_)if(lease.used&&lease.scope==r.scope&&lease.owner==r.owner&&lease.command==r.commandId)
         lease.unknown=true;
 }
+void NativeRequestAdapter::FenceSupersededMovements(const Record& current,const LocalActorBinding& actor) noexcept {
+    // The retail scheduler's admission=0 performs the actual replacement.
+    // Only AFTER it has returned accepted may old local route callbacks lose
+    // authority. Do not Cancel or RefRelease here: the Host's exact terminal
+    // records still own native cleanup, including any retained worker Ref.
+    if(current.admission!=0 || PreserveNativeOperations(current.nativeKind))return;
+    for(auto& lease:leases_)
+        if(lease.used&&lease.scope==current.scope&&lease.owner==current.owner&&lease.actor==actor&&
+            lease.command!=current.commandId&&!PreserveNativeOperations(lease.kind))
+            lease.preempted=true;
+}
 Readiness NativeRequestAdapter::CheckMovement(const Record& r,const LocalActorBinding& actor) noexcept {
     auto* primary=Find(r);
     if(r.nativeKind==2&&(r.opcode==Op::Submit||r.opcode==Op::Update)) {
@@ -326,6 +341,7 @@ Readiness NativeRequestAdapter::CheckMovement(const Record& r,const LocalActorBi
         if(kCapacity-ActiveCount()<r.movement.parts)return Readiness::Rejected;
 
     } else {
+        if(primary->preempted&&r.opcode==Op::Update)return Readiness::Rejected;
         if(primary->routeRejected&&r.opcode==Op::Update&&r.nativeKind==1&&r.movement.parts==1&&
             primary->cancelled&&!primary->unknown&&primary->kind==r.nativeKind&&
             primary->admission==r.admission&&Live(*primary,actor)&&r.parameterRevision>primary->revision&&
@@ -446,6 +462,7 @@ NativeOutcome NativeRequestAdapter::InvokeMovement(const Record& r,const LocalAc
             // stays immutable in the lease until the native callback runs.
             if(!MarkerFields(*primary,true))return NativeOutcome::Unknown;
             primary->admitted=accepted;primary->unknown=false;
+            if(accepted)FenceSupersededMovements(r,actor);
             return accepted?NativeOutcome::Admitted:NativeOutcome::Rejected;
         }
         // 0070A940 sets M+194 before constructing/admitting the Move. Native
@@ -464,6 +481,10 @@ NativeOutcome NativeRequestAdapter::InvokeMovement(const Record& r,const LocalAc
             !MovementRevalidate(r,*primary))return NativeOutcome::Unknown;
         primary->admitted=accepted;
         if(!accepted){primary->unknown=false;return NativeOutcome::Rejected;}
+        // Admission=0 has replaced previous scheduler requests NOW. Fence
+        // their late route callbacks before subsequent native callbacks can
+        // observe the new owner; their strong Refs are released by Host cleanup.
+        FenceSupersededMovements(r,actor);
         if(!MovementParameters(*primary,r.movement.after,false)||
             (r.nativeKind==1&&!MovementStop(*primary,r.movement.after.stopDistance,static_cast<std::uint8_t>((r.movement.after.flags91>>5)&1)))||
             !MovementRevalidate(r,*primary))return NativeOutcome::Unknown;
