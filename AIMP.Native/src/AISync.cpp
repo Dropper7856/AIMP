@@ -598,7 +598,7 @@ struct AlienPvPNativeLease final {
     std::uint64_t sessionCookie{}, ownerPeer{};
     std::uint32_t nativeGeneration{}, worldGeneration{}, entityA{}, entityB{}, runtimeId{};
     std::uint32_t boundaryOffset{}, boundaryValue{};
-    bool fenced{}, drained{}, owned{};
+    bool fenced{}, drained{}, owned{}, navigationDrainEntered{};
 };
 AlienPvPNativeLease gPvPLease{};
 bool PvPCharacterFenced(std::uintptr_t character) noexcept;
@@ -10269,6 +10269,53 @@ AlienPvPLeaseStatus PvPStatus(const AlienPvPLeasePhase phase) noexcept {
     status.boundaryValue=gPvPLease.boundaryValue;
     return status;
 }
+// The native movement scheduler can be idle while its N navigation cache
+// still owns list Refs. Copy the already-certified transactional drain gates
+// instead of pretending empty scheduler counts imply a safe possession.
+bool PvPTryClearDrainedNavigation(Actor& actor,
+    const execution::OwnershipBoundaryFailure failure) noexcept {
+    if (failure.offset != 0x10004U && failure.offset != 0x10014U &&
+        failure.offset != 0x10044U) return false;
+    if (gPvPLease.navigationDrainEntered || !PvPLeaseScopeCurrent() ||
+        !PvPLeaseLiveIdentity() || PairSourceBusy(actor.character) ||
+        !UnownedCleanupAllowed(actor)) return false;
+    std::uintptr_t movement{}, control{};
+    if (!Read(actor.character + 0x42A8U,movement) || movement == 0U ||
+        !Read(actor.character + 0x42ACU,control) || control == 0U) return false;
+    const auto navigation=movement+0xC4U;
+    std::uintptr_t owner{};
+    if (!Read(navigation+0x64U,owner) || owner!=movement) return false;
+    for(const auto offset:{0x2CD8U,0x2CE4U}) {
+        std::uint32_t active{};
+        if (!Read(actor.character+offset,active) || active) return false;
+    }
+    for(const auto offset:{0x24U,0x2CU,0x38U,0x40U,0x5CU,0x60U}) {
+        std::uint32_t active{};
+        if (!Read(navigation+offset,active) || active) return false;
+    }
+    // Validate both retail-owned list sentinels before calling their
+    // destructors. Never overwrite N+44 or fabricate a cleared native Ref.
+    for(const auto offset:{0x28U,0x34U}) {
+        std::uintptr_t sentinel{}, next{}, previous{};
+        if (!Read(navigation+offset,sentinel) || !sentinel ||
+            !Read(sentinel,next) || !Read(sentinel+4U,previous) ||
+            next!=sentinel || previous!=sentinel) return false;
+    }
+    const auto current=[&]() noexcept {
+        std::uintptr_t m{}, c{};
+        return PvPLeaseScopeCurrent() && PvPLeaseLiveIdentity() &&
+            !PairSourceBusy(actor.character) && UnownedCleanupAllowed(actor) &&
+            Read(actor.character+0x42A8U,m) && m==movement &&
+            Read(actor.character+0x42ACU,c) && c==control;
+    };
+    if (!current()) return false;
+    gPvPLease.navigationDrainEntered=true;
+    if (!ResetDrainedNavigation(navigation) || !current()) return false;
+    if (!ClearDrainedNavigation(navigation,false) || !current()) return false;
+    if (!ClearDrainedNavigation(navigation,true) || !current()) return false;
+    return true;
+}
+
 bool PvPTryDrain(AlienPvPLeaseStatus& status) noexcept {
     using Check=execution::OwnershipCheck;
     if (!PvPLeaseScopeCurrent() || !PvPLeaseLiveIdentity()) {
@@ -10300,7 +10347,11 @@ bool PvPTryDrain(AlienPvPLeaseStatus& status) noexcept {
     const execution::ActorLifetime lifetime{actor->character,actor->runtimeId,
         gPvPLease.nativeGeneration,gPvPLease.ticket.serial};
     execution::OwnershipBoundaryFailure failure{};
-    const auto check=execution::InspectMovementBoundary(memory,lifetime,true,&failure);
+    auto check=execution::InspectMovementBoundary(memory,lifetime,true,&failure);
+    if (check == Check::Waiting && PvPTryClearDrainedNavigation(*actor,failure)) {
+        failure={};
+        check=execution::InspectMovementBoundary(memory,lifetime,true,&failure);
+    }
     gPvPLease.boundaryOffset=failure.offset;gPvPLease.boundaryValue=failure.value;
     if (check != Check::Ready) { status=PvPStatus(AlienPvPLeasePhase::Draining); return false; }
     gPvPLease.owned=true;
