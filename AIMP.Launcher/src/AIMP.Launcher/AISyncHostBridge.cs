@@ -375,10 +375,18 @@ internal sealed partial class AISyncHostBridge : IDisposable
         var now = Environment.TickCount64;
         if (_scope is null || now - _lastHostRetryLog < 5000) return;
         _lastHostRetryLog = now;
+        var transport = _binding?.Host?.GetAISyncExecutionTransportTimings()
+            ?? Array.Empty<AISyncExecutionTransportTiming>();
+        var oldestQueued = transport.Length == 0 ? 0 : transport.Max(p => p.OldestPendingMs);
+        var maxQueued = transport.Length == 0 ? 0 : transport.Max(p => p.MaxQueuedMs);
+        var maxSend = transport.Length == 0 ? 0 : transport.Max(p => p.MaxSendMs);
         _log($"Host AISync retry timing: waiting={_waiting.Count}, " +
             $"retryAttempts={_hostRetriesAttempted}, coolingSkips={_hostRetryCooling}, " +
-            $"oldestSelectedWaitMs={_maxHostWaitingAge}, perTickCap={AISyncRetryPlanner.MaxHostPerTick}; " +
-            "transport and native admission remain separate.");
+            $"oldestSelectedWaitMs={_maxHostWaitingAge}, perTickCap={AISyncRetryPlanner.MaxHostPerTick}, " +
+            $"networkPending={transport.Sum(p => p.PendingPackets)}, " +
+            $"networkQueuedBytes={transport.Sum(p => p.PendingBytes)}, " +
+            $"networkOldestQueuedMs={oldestQueued}, networkMaxQueuedMs={maxQueued}, networkMaxSendMs={maxSend}; " +
+            "socket send time is not network RTT or native admission.");
     }
     private void ResolveRetryRace((ulong Peer, ulong Sequence) key)
     {
