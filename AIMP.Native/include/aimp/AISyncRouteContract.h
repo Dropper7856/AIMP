@@ -34,8 +34,12 @@ struct NativeHandoffProbe {
         const auto elapsed=now-startMs;
         float step{},travel{},gap{};
         for(std::size_t i=0;i<3;++i) {
-            const float d=local[i]-previous[i], total=local[i]-origin[i], error=local[i]-host[i];
-            step+=d*d;travel+=total*total;gap+=error*error;
+            const float error=local[i]-host[i];gap+=error*error;
+            // Vertical transport/vent motion is not evidence that a ground
+            // navigation route has resumed its locomotion motor.
+            if(i==1)continue;
+            const float d=local[i]-previous[i], total=local[i]-origin[i];
+            step+=d*d;travel+=total*total;
         }
         // A teleport or external repositioning is not evidence of native
         // locomotion. Discard the previous baseline rather than accepting its
