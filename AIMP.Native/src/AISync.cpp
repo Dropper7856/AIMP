@@ -10223,6 +10223,7 @@ std::uintptr_t ResolveLivingParticipant(const std::uint64_t peer,
 // No native Character is dereferenced by this helper; the local incarnation
 // registry is our lifetime authority. Every call occurs on the certified
 // engine thread, including ManagerUpdate/BT detours.
+namespace {
 bool PvPLeaseScopeCurrent() noexcept {
     return gPvPLease.fenced && Installed() && EngineThread() && Stable() &&
         gPvPLease.sessionCookie != 0U && gPvPLease.sessionCookie == gCurrent.sessionCookie &&
@@ -10296,6 +10297,8 @@ bool PvPTryDrain(AlienPvPLeaseStatus& status) noexcept {
     status=PvPStatus(AlienPvPLeasePhase::Owned);
     return true;
 }
+} // namespace
+
 bool AcquireAlienPvPLease(const std::uint64_t ownerPeer, AlienPvPLeaseStatus& status) noexcept {
     status={};
     if (!ownerPeer || !Installed() || !EngineThread() || !Stable() ||
