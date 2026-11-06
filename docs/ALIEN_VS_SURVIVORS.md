@@ -32,21 +32,29 @@ modified `_DIRECTORY_CONTENTS.BML`.
 - Binary format `APB1`, a bounded series of copy-from-retail and inserted-byte
   commands. It reconstructs the modded asset only when the **exact original**
   user's installed BML SHA-256 matches.
-- `AlienPvPBehaviorInstaller` embeds that delta and verifies the exact
-  reconstructed SHA-256, maintains `.aimp-original`, publishes the replacement
-  using a temporary file, and restores the original for normal Co-op lobbies.
-- This is prepared **inside lobby world preflight**, not at launcher startup.
-  Every participant must complete preflight. Existing `WorldManifest` matching
-  still runs for the level.
+- `AlienPvPBehaviorInstaller` embeds that delta, verifies the exact
+  reconstructed SHA-256 and supports explicit **offline** installation and
+  restoration using a verified `.aimp-original` backup.
+- **IMPORTANT:** Files cannot be modified safely after `AI.exe` has loaded the
+  behavior graph. A running lobby now performs a **read-only** hash/backup
+  preflight, and fails with an actionable error if the BML was not installed
+  before game launch. Regular Co-op never rewrites it at runtime.
+- The automatic, backward-compatible pre-launch preparation flow has not been
+  integrated yet. Merely verifying the file on disk does not prove the live
+  engine is using it. It must not be claimed that lobby-time BML installation
+  is solved. The long-term approach is a neutral boot-time extension enabled
+  only by the runtime PvP flag, or a fully native implementation without BML.
+- Every participant completes the same lobby preflight. Existing
+  `WorldManifest` matching still runs for the level.
 - Original BML SHA-256: `334CB41B70468A1DCC6C7054F391C7715C06FA7F287AB5468D24D0BEDE30D46D`.
 - Modified BML SHA-256: `0307A8346C242BFB0F7253D0E4DE6B5BF73426A3B73891408BAF5530AA0671E5`.
 
-**Important research gaps:** the provided modified BML also includes behavior
-branches originally intended for facehuggers/Androids. AI-MP does **not**
-implement or expose control of either. A further Alien-only semantic rewrite is
-desirable, as is proving whether a game process already in the lobby reads the
-updated behavior asset on the next level load. No in-game validation has yet
-established the answer. This branch does not import the photo mode.
+**Important research gaps:** the provided modified BML includes behavior
+branches for facehuggers and Androids. AI-MP does **not** expose their control,
+but the current asset delta is not yet an Alien-only semantic rewrite.
+These inactive branches must be stripped or proved harmless before release.
+A game process already in the lobby must never be assumed to reload BML.
+This branch does not import the photo mode.
 
 ## Alien control network
 
@@ -61,6 +69,18 @@ Current wire actions: movement axes, look yaw/pitch, sprint/sneak, attack,
 enter/exit vent and roar. No client can choose a different Alien by editing the
 intent payload. Messages currently terminate at transport events; **there is
 not yet a game-engine input producer or native command executor**.
+
+### Native candidate probe (read-only)
+
+A new engine-thread command `ALIEN_PVP_PROBE` enumerates live Characters,
+accepts only the native Alien template class (1), excludes PlayerSync proxies,
+and returns a non-pointer identity only if exactly one Alien exists.
+The launcher polls this probe every five seconds during active PvP rounds,
+including after a vent despawn/respawn. A changed or lost candidate invalidates
+its previous evidence. This is **not** possession, a camera binding or a native
+movement write. The command also rejects all caller arguments. The technical
+Alien player's normal human position/equipment/action transmissions are
+disabled, and the Host rejects those human PlayerSync packets.
 
 ## Required patches to reach playable
 
@@ -110,7 +130,9 @@ not yet a game-engine input producer or native command executor**.
 ## Validation
 
 Protocol/lobby tests added in `AlienPvPTests.cs`. They exercise host-controlled
-roles, payload constraints, a local two-peer lobby, and proposal/commit relay.
+roles, payload constraints, a local two-peer lobby, proposal/commit relay,
+native probe argument rejection, victory conditions and control ordering after
+a second round.
 **They have not been executed in this environment** (Windows .NET runtime,
 GFX compiler and retail game engine are unavailable here).
 

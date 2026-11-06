@@ -59,8 +59,10 @@ internal sealed partial class MultiplayerSessionCoordinator
                     _controller.Snapshot.ProcessId != scope.ProcessId)
                     return;
                 // Revocation is as important as the initial identity proof.
+                var previousProof = _alienPvPProvenScope;
                 _alienPvPProvenScope = response.Executed ? scope : null;
-                changed = !string.Equals(_alienPvPProbeLastResult, message, StringComparison.Ordinal);
+                changed = previousProof != _alienPvPProvenScope ||
+                    !string.Equals(_alienPvPProbeLastResult, message, StringComparison.Ordinal);
                 _alienPvPProbeLastResult = message;
             }
             if (changed)
