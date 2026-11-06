@@ -19,6 +19,8 @@ internal static class Program
         new("MissionSync ordered Host commits", MissionSyncTests.LobbyAsync),
         new("Protocol frames", ProtocolTests.FrameRoundTripAndValidationAsync),
         new("Protocol models", ProtocolTests.ModelValidationAsync),
+        new("Alien PvP host-only role and start contract", AlienPvPTests.LobbyAsync),
+        new("Alien PvP invalid role contract", AlienPvPTests.ValidationAsync),
         new("PlayerSync posture wire and revisions", PlayerPostureTests.WireAsync),
         new("PlayerSync posture stationary and edges", PlayerPostureTests.MovementAsync),
         new("PlayerSync posture coherent memory capture", PlayerPostureTests.CaptureAsync),
