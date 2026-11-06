@@ -25,6 +25,9 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
+      - name: Restore 32-bit injector dependency
+        shell: pwsh
+        run: dotnet restore AIMP.Launcher/src/AIMP.Injector32/AIMP.Injector32.csproj
       - name: Build .NET launcher and protocol test runner
         shell: pwsh
         run: dotnet build AIMP.Launcher/tests/AIMP.Protocol.Tests/AIMP.Protocol.Tests.csproj -c Release
