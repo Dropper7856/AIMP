@@ -335,7 +335,7 @@ bool VentRead(std::uintptr_t at,void* out,std::size_t size) noexcept {
 bool UpdateVentInterface(const Context& context,alien_pvp::vents::Table& table) noexcept {
     const bool backstage=IsBackstage(context.alien);
     if(backstage && !gLocal.wasBackstage)gLocal.ventMapOpen=true;
-    if(!backstage)gLocal.ventMapOpen=false;
+    if(!backstage && !alien_pvp::VentPending())gLocal.ventMapOpen=false;
     gLocal.wasBackstage=backstage;gLocal.nearbyVent=-1;
     if(!alien_pvp::vents::ReadTable(context.alien,&VentRead,table))return false;
     alien_pvp::vents::Point body{};float best=100000.0F,nearest=100000.0F;int closest=-1;
@@ -396,7 +396,7 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
     const bool interact=focused && Down('E'),exit=focused && Down('Q');
     if((interact && !gLocal.enterDown) || (exit && !gLocal.exitDown)) {
         if(gLocal.wasBackstage)gLocal.ventMapOpen=!gLocal.ventMapOpen;
-        else if(interact && gLocal.nearbyVent>=0) {
+        else if(interact && gLocal.nearbyVent>=0 && !alien_pvp::VentPending()) {
             input.action=alien_pvp::Action::EnterVent;alien_pvp::CaptureLocal(input);
         }
     }
@@ -409,12 +409,14 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
             alien_pvp::vents::Point point{};
             if(alien_pvp::vents::ReadPoint(vents,static_cast<std::uint32_t>(gLocal.selectedVent),&VentRead,point))break;
         }
-        if(confirm && !gLocal.ventConfirm && gLocal.selectedVent>=0) {
+        const bool pending=alien_pvp::VentPending();
+        if(confirm && !gLocal.ventConfirm && gLocal.selectedVent>=0 && !pending) {
             alien_pvp::vents::Point point{};
             if(alien_pvp::vents::ReadPoint(vents,static_cast<std::uint32_t>(gLocal.selectedVent),&VentRead,point)) {
                 input.forward=input.strafe=0;input.action=alien_pvp::Action::ExitVent;input.selectedVent=true;
                 input.ventX=point[0];input.ventY=point[1];input.ventZ=point[2];alien_pvp::CaptureLocal(input);
-                gLocal.ventMapOpen=false;
+                // Stay on the selector until the native exit really reaches
+                // frontstage. A queued/refused request is not a camera mode.
             }
         }
     }

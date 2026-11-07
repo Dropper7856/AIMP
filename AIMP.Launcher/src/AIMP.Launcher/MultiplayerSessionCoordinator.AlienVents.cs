@@ -65,6 +65,9 @@ internal sealed partial class MultiplayerSessionCoordinator
                 ["selected"]=root.GetProperty("selected").GetInt32().ToString(CultureInfo.InvariantCulture),
                 ["open"]=root.GetProperty("open").GetBoolean()?"1":"0",
                 ["backstage"]=root.GetProperty("backstage").GetBoolean()?"1":"0",
+                ["action"]=root.GetProperty("action").GetInt32().ToString(CultureInfo.InvariantCulture),
+                ["phase"]=root.GetProperty("phase").GetInt32().ToString(CultureInfo.InvariantCulture),
+                ["pending"]=root.GetProperty("pending").GetBoolean()?"1":"0",
                 ["x"]=Number(root.GetProperty("x")),["y"]=Number(root.GetProperty("y")),["z"]=Number(root.GetProperty("z")),
                 ["points"]=string.Join(';',points)
             },_lifetime.Token).ConfigureAwait(false);

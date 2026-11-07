@@ -1,0 +1,58 @@
+AIMP 438 / protocol 37
+Branch: feature/alien-vs-survivors-main
+
+Evidence
+- The two 15:29/13:29 diagnostics both load build437 and exchange Alien inputs,
+  commits and poses successfully. Client entry367 completes locally after5s;
+  the Host times out the same entry at30s. Exit606/835 is refused NativeBusy;
+  exit966 is refused WrongStage after the Host entry times out. No exit was
+  actually accepted, despite the UI immediately closing on Enter.
+- The supplied screenshot shows spokes from the graphics origin to vent
+  markers. The marker drawing shares the grid's stroked graphics context.
+- Available source/dumps and offline Capstone disassembly of supplied AI.exe
+  show entry node vtable+40C =0040F6B0, which reads THE_PLAYER+70 and authors
+  exclusion geometry in0070A940. The retail exit node's same callback is
+  00D931C0 (xor al,al; ret14), supplying no exclusion geometry.
+  In the donor, the technical Amanda is hidden under the map. On a multiplayer
+  Host THE_PLAYER is a real survivor, so retaining this exclusion geometry
+  can obstruct the selected entry. This is a code-based explanation, not an
+  observed Host pathfinding trace. Remote full native logs were unavailable.
+- Native node Shutdown0040FBC0 releases the Move and vent-manager lock. The
+  previous polling code retained both while waiting for the stage change.
+- Owner recovery used current local distance from an older Host pose, and
+  could take control away from fresh local input above4m. Peer input/commit
+  counters do not establish measured input latency.
+
+Changes
+- Entry uses a private stable copy of the retail method table; only+40C uses
+  the certified retail exit callback. All Start/Update/Shutdown and traversal
+  methods remain native. Other actors and ordinary Coop are unaffected.
+- On Move completion, shut down and release the node immediately. Independently
+  confirm the actual stationary target stage before publishing completion.
+  Neither stage flags nor raw coordinates are fabricated. Finished-node
+  cancellation cannot retain stationary backstage77 as a live passage forever.
+- Keep the vent selector open after Travel until the native exit finishes.
+  Show pending/unavailable status from authenticated Host results plus local
+  native work; prevent repeated requests during entry/exit. A rejected request
+  no longer hides the map and exposes backstage as apparent free camera.
+- Each marker is a separate fill-only sprite, independent from the grid pen.
+  Centre the point map within its available area and use an opaque background.
+- Fresh owner movement preempts recovery after native resource retirement.
+  Idle owner recovery uses acknowledged prediction error, rather than distance
+  to a delayed Host pose. Observer recovery remains available.
+
+Validation and delivery
+- Native targeted tests:4/4 passed; .NET targeted protocol/Alien tests:5/5 passed.
+- Win32 Release /W4 /WX and .NET Release publish succeeded. Both API packages
+  updated successfully. SHA-256 equality verified for Launcher/Protocol/NetZ
+  and both UI GFX files. No Electron rebuild or destination-only deletion.
+- Targeted native checks include immediate steering despite a distant delayed
+  Host pose, pending vent state, initial placement and native ownership.
+- Production installation test checks the private method table against a
+  relocated executable image, verifying that only the intended method changes.
+- AS3 compiled and final GFX re-exported. Marker/status methods are present;
+  original visual tags and opaque Scaleform tail remain byte-identical.
+- Logs: artifacts/alien-438/. Delivery receipt:
+  artifacts/avs-v417-port/delivery.json.
+- Runtime two-PC latency, vent pathfinding and animation outcomes require a
+  fresh in-game match. No claim of completed in-game verification.

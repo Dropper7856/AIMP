@@ -23,6 +23,7 @@ using Reason=ap::ActionReason;
 using Action=ap::Action;
 struct VentSlot final {
     std::array<std::uint32_t,4> node{};
+    ap::vent_node::Methods entryMethods{};
     std::uintptr_t frame{},manager{};
     ap::Scope scope{};std::uintptr_t character{};
     bool used{},started{},quarantined{},cancelling{};
@@ -193,6 +194,13 @@ bool StartVent(const ap::Context& c,ap::Frame& result,VentSlot& slot) noexcept {
         using Dispatch=void(__thiscall*)(void*,std::uintptr_t,std::uintptr_t,std::uint32_t,std::uint32_t,std::uint32_t);
         const auto ctor=result.action==Action::EnterVent?0x0000F680U:0x0000FC50U;
         Native<Constructor>(ctor)(slot.node.data());
+        if(result.action==Action::EnterVent) {
+            if(!ap::vent_node::PilotEntryMethods(gBase,nullptr,
+                [](void*,std::uintptr_t at,void* out,std::size_t n) noexcept {
+                    return crash_guard::TryCopy(out,reinterpret_cast<const void*>(at),n);
+                },slot.entryMethods)){slot={};return false;}
+            slot.node[0]=static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(slot.entryMethods.data()));
+        }
         slot.frame=Native<Create>(0x002F15C0U)(slot.node.data(),1U,gPvPLease.tree);
         if(!slot.frame){slot.used=false;return false;}
         // Dispatch invokes the real Start method: frame+3C flags and the
@@ -475,6 +483,11 @@ void Cancel(const ap::Context& c,bool living) noexcept {
         if(done)Clear();
         return;
     }
+    if(active.moveArrived && (active.receipt.action==Action::EnterVent || active.receipt.action==Action::ExitVent)) {
+        // The native node was already shut down and released. Stationary
+        // backstage77 is not an outstanding traversal resource to retain.
+        Clear();return;
+    }
     // A registered pair belongs to the existing native retirement path. Never
     // force Idle/zero a cycle or mark a death complete on cancellation.
     if(!active.entrySubmitted && !active.entered && AttackQueryRetired(active.chooser))Clear();
@@ -620,7 +633,7 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
         }
         return false;
     }
-    if(!active.vent)return false;
+    if(!active.vent && !active.moveArrived)return false;
     if(active.lastStep && now-active.lastStep<33U)return false;
     active.lastStep=now;
     int nativeResult=active.moveArrived?1:0;
@@ -628,14 +641,22 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
         active.vent->quarantined=true;Terminal(result,Phase::Failed,Reason::Fault);Clear();return true;
     }
     if(nativeResult==1)active.moveArrived=true;
-    // Completion releases the Move's native request. Do not resubmit it while
-    // waiting for the animation to finish changing the backstage state.
+    // Retail shuts down a finished node immediately, releasing its request
+    // and vent-manager lock. Waiting for the stage change while retaining
+    // that lock can stall the transition. Stage confirmation remains separate.
+    if(active.moveArrived && active.vent) {
+        bool done{};
+        if(!FinishVent(c,*active.vent,false,done) || !done) {
+            active.vent->quarantined=true;Terminal(result,Phase::Failed,Reason::Fault);Clear();return true;
+        }
+        active.vent=nullptr;
+        if(!Cycle(c.character,state,backstage))return false;
+    }
     if(state==18U || state==75U || state==77U)active.entered=true;
-    const bool expected=active.receipt.action==Action::EnterVent?backstage:!backstage;
-    if(nativeResult==1 && expected && state!=18U) {
-        bool done{};const bool finished=FinishVent(c,*active.vent,false,done) && done;
-        Terminal(result,finished?Phase::Completed:Phase::Failed,finished?Reason::None:Reason::Fault);
-        if(!finished)active.vent->quarantined=true;
+    const bool expected=active.receipt.action==Action::EnterVent?
+        backstage && (Ordinary(state) || state==77U):!backstage && Ordinary(state);
+    if(nativeResult==1 && expected) {
+        Terminal(result,Phase::Completed,Reason::None);
         Clear();return true;
     }
     if(nativeResult==2 || now-active.began>policy::kActionTimeoutMs) {

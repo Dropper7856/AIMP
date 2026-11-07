@@ -28,6 +28,16 @@ package
          return field;
       }
 
+      private function aimp_vent_marker(x:Number, y:Number, color:uint, radius:Number) : void
+      {
+         var marker:Sprite = new Sprite();
+         marker.x = x;marker.y = y;
+         marker.graphics.beginFill(color,1);
+         marker.graphics.drawCircle(0,0,radius);
+         marker.graphics.endFill();
+         this.aimp_vent_layer.addChild(marker);
+      }
+
       private function aimp_update_vents(line:String) : void
       {
          var scope:String = this.aimp_get_bridge_value(line,"scope");
@@ -56,6 +66,11 @@ package
          var floorY:Number = Number(this.aimp_get_bridge_value(line,"y"));
          var loaded:int = 0;
          var color:uint;
+         var phase:int = int(this.aimp_get_bridge_value(line,"phase"));
+         var pending:Boolean = this.aimp_get_bridge_value(line,"pending") == "1";
+         var originX:Number;
+         var originY:Number;
+         var status:String = "Left / Right: select exit     Enter: travel     E: close";
          this.aimp_hide_vents();
          this.aimp_vent_at = getTimer();
          if(this.aimp_get_bridge_value(line,"active") != "1" || scope == "" || count < 0 || count > 4096)
@@ -94,7 +109,7 @@ package
                'Press "E" to enter ventilation',22,width * 0.2,height * 0.82 + 10,width * 0.6));
             return;
          }
-         this.aimp_vent_layer.graphics.beginFill(0x061116,0.96);
+         this.aimp_vent_layer.graphics.beginFill(0x061116,1);
          this.aimp_vent_layer.graphics.drawRect(0,0,width,height);
          this.aimp_vent_layer.graphics.endFill();
          if(this.aimp_vent_points[String(selected)] != null)
@@ -107,6 +122,8 @@ package
             loaded++;
          }
          scale = Math.min((width - 120) / (maxX - minX),(height - 230) / (maxZ - minZ));
+         originX = 60 + (width - 120 - (maxX - minX) * scale) * 0.5;
+         originY = height - 120 - (height - 230 - (maxZ - minZ) * scale) * 0.5;
          this.aimp_vent_layer.graphics.lineStyle(1,0x19353D,0.6);
          for(px = 60;px < width - 60;px += 40)
          {this.aimp_vent_layer.graphics.moveTo(px,110);this.aimp_vent_layer.graphics.lineTo(px,height - 120);}
@@ -115,24 +132,22 @@ package
          for(key in this.aimp_vent_points)
          {
             point = this.aimp_vent_points[key];id = int(point[0]);
-            px = 60 + (Number(point[1]) - minX) * scale;
-            py = height - 120 - (Number(point[3]) - minZ) * scale;
+            px = originX + (Number(point[1]) - minX) * scale;
+            py = originY - (Number(point[3]) - minZ) * scale;
             color = id == selected ? 0xF3C96A : Math.abs(Number(point[2]) - floorY) <= 2.5 ? 0x79E9DF : 0x455E68;
-            this.aimp_vent_layer.graphics.lineStyle(2,color,1);
-            this.aimp_vent_layer.graphics.beginFill(color,id == selected ? 1 : 0.8);
-            this.aimp_vent_layer.graphics.drawCircle(px,py,id == selected ? 8 : 4);
-            this.aimp_vent_layer.graphics.endFill();
+            this.aimp_vent_marker(px,py,color,id == selected ? 8 : 4);
             if(id == selected || Math.abs(Number(point[2]) - floorY) <= 2.5)
                this.aimp_vent_layer.addChild(this.aimp_vent_text(String(id + 1),14,px - 18,py + 8,36));
          }
-         px = 60 + (bodyX - minX) * scale;py = height - 120 - (bodyZ - minZ) * scale;
-         this.aimp_vent_layer.graphics.lineStyle(2,0xFFFFFF,1);
-         this.aimp_vent_layer.graphics.drawCircle(px,py,7);
+         px = originX + (bodyX - minX) * scale;py = originY - (bodyZ - minZ) * scale;
+         this.aimp_vent_marker(px,py,0xFFFFFF,7);
          this.aimp_vent_layer.addChild(this.aimp_vent_text("YOU",14,px - 25,py - 26,50));
          this.aimp_vent_layer.addChild(this.aimp_vent_text("VENTILATION MAP",32,40,28,width - 80));
          this.aimp_vent_layer.addChild(this.aimp_vent_text(selected >= 0 ?
             "Vent " + String(selected + 1) + "  |  Elevation " + floorY.toFixed(1) + " m" : "Loading ventilation exits...",20,40,72,width - 80));
-         this.aimp_vent_layer.addChild(this.aimp_vent_text("Left / Right: select exit     Enter: travel     E: close",21,40,height - 82,width - 80));
+         if(pending) status = "Travel in progress. Please wait...";
+         else if(phase == 3 || phase == 4 || phase == 5) status = "Travel unavailable. Select an exit and press Enter to retry.";
+         this.aimp_vent_layer.addChild(this.aimp_vent_text(status,21,40,height - 82,width - 80));
          this.aimp_vent_layer.addChild(this.aimp_vent_text(String(loaded) + " ventilation openings mapped  |  Dim markers: other elevations",16,40,height - 48,width - 80));
       }
        

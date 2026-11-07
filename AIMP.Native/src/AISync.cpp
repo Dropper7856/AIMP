@@ -4,6 +4,7 @@
 #include "aimp/AlienPvPControlRuntime.h"
 #include "aimp/AlienPvPControlPolicy.h"
 #include "aimp/AlienPvPVents.h"
+#include "aimp/AlienPvPVentNode.h"
 #include "aimp/AlienPvPActionPolicy.h"
 #include "aimp/AlienPvPNativeActionAbi.h"
 #include "aimp/PlayerHidingRuntime.h"
@@ -10827,13 +10828,17 @@ bool SnapshotAlienVents(std::uint32_t page,std::string& json) {
     if(!alien_pvp::vents::ReadTable(gPvPLease.ticket.character,reader,table) ||
         !Read(gPvPLease.ticket.character+0x70U,body))return false;
     const auto ui=alien_pvp_local::VentSnapshot();
+    const auto authority=alien_pvp::VentAuthority();
     json="AVSVENTS:{\"scope\":\""+std::to_string(gPvPLease.sessionCookie)+":"+
         std::to_string(gPvPLease.ownerPeer)+":"+std::to_string(gPvPLease.nativeGeneration)+":"+
         std::to_string(gPvPLease.worldGeneration)+":"+std::to_string(gPvPLease.ticket.serial)+"\",\"page\":"+
         std::to_string(page)+",\"count\":"+std::to_string(table.count)+",\"nearby\":"+std::to_string(ui.nearby)+
         ",\"selected\":"+std::to_string(ui.selected)+",\"open\":"+(ui.open?"true":"false")+
         ",\"backstage\":"+(ui.backstage?"true":"false")+",\"x\":"+std::to_string(body[0])+
-        ",\"y\":"+std::to_string(body[1])+",\"z\":"+std::to_string(body[2])+",\"vents\":[";
+        ",\"y\":"+std::to_string(body[1])+",\"z\":"+std::to_string(body[2])+
+        ",\"action\":"+std::to_string(static_cast<unsigned>(authority.action))+
+        ",\"phase\":"+std::to_string(static_cast<unsigned>(authority.phase))+
+        ",\"pending\":"+(alien_pvp::VentPending()?"true":"false")+",\"vents\":[";
     bool comma{};
     for(auto i=page*64U;i<std::min(table.count,(page+1U)*64U);++i) {
         alien_pvp::vents::Point point{};

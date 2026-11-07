@@ -1,6 +1,7 @@
 #include "aimp/AISyncAnimation.h"
 #include "aimp/AISync.h"
 #include "aimp/AlienPvPNativeActionAbi.h"
+#include "aimp/AlienPvPVentNode.h"
 #include "aimp/CharacterDirectStepRuntime.h"
 #include "aimp/GameThreadDispatcher.h"
 #include "aimp/LevelGenerationTracker.h"
@@ -200,6 +201,16 @@ void TestProductionInstallation(DataImage& image) {
     std::uintptr_t inactiveRoot{};
     std::string error;
     const auto base = image.Base();
+    aimp::alien_pvp::vent_node::Methods pilotMethods{},retailMethods{};
+    const auto readMethods=+[](void*,std::uintptr_t at,void* out,std::size_t size) noexcept {
+        std::memcpy(out,reinterpret_cast<const void*>(at),size);return true;
+    };
+    Require(aimp::alien_pvp::vent_node::PilotEntryMethods(base,nullptr,readMethods,pilotMethods),
+        "Pilot entry callback contract rejected the ASLR-rebased executable");
+    std::memcpy(retailMethods.data(),reinterpret_cast<const void*>(base+0xDBC498U),sizeof(retailMethods));
+    for(std::size_t i=0;i<pilotMethods.size();++i)
+        Require(pilotMethods[i]==(i==0x40CU/4U?base+0x9931C0U:retailMethods[i]),
+            "Pilot entry changed a native method beyond THE_PLAYER exclusion geometry");
     constexpr std::array<std::uintptr_t, 6> sites{0x2579F0U, 0x2556F0U, 0x33433EU,0x287396U,0x2873CAU,0x24A930U};
     std::array<std::array<std::byte, 16>, sites.size()> original{};
     for (std::size_t i = 0; i < sites.size(); ++i)

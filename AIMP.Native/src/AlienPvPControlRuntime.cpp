@@ -25,7 +25,7 @@ struct State final {
     std::array<LocalInput,8> actions{};std::size_t actionRead{},actionCount{};
     std::uint64_t inputSequence{},poseSequence{},lastInputSent{},lastStatus{},lastPose{},lastTick{},lastAckAt{},lastRoar{};
     std::uint64_t appliedInput{},appliedHost{},correctionAt{};
-    Frame correction{},lastObserved{};
+    Frame correction{},lastObserved{},ventAuthority{};
     bool moving{},hadPose{},ownsSlot{},expired{},recovering{},hasDeferredAction{},aligned{};
     Frame deferredAction{};std::uint64_t deferredActionAt{};
     float correctionX{},correctionZ{};bool predictionCorrection{};
@@ -106,6 +106,7 @@ void ReleaseCarrier() noexcept {
     g.moving=false;
 }
 void PublishAction(Frame result,std::uint64_t now) noexcept {
+    if(g.context.host && (result.action==Action::EnterVent || result.action==Action::ExitVent))g.ventAuthority=result;
     result.scope=g.context.scope;result.flags=Flags(now);
     result.kind=g.context.host && result.action!=Action::Roar?Kind::Resolution:Kind::ActionResult;
     if(result.phase==ActionPhase::Started || result.phase==ActionPhase::Completed)result.flags|=ActionApplied;
@@ -153,6 +154,7 @@ void ApplyAction(const Frame& command,std::uint64_t now) noexcept {
 }
 void ApplyResolution(const Frame& plan,std::uint64_t now) noexcept {
     if(g.context.host)return;
+    if(plan.action==Action::EnterVent || plan.action==Action::ExitVent)g.ventAuthority=plan;
     if((!StopDonorMovement() || !CancelRecovery()) && (plan.phase==ActionPhase::Preparing || plan.phase==ActionPhase::Started)) {
         if(!g.hasDeferredAction || g.deferredAction.hostSequence==plan.hostSequence) {
             if(!g.hasDeferredAction)g.deferredActionAt=now;
@@ -309,15 +311,27 @@ void ApplyMovement(std::uint64_t now,float dt) noexcept {
     Frame body{};
     if(!ReadPose(body)){StopMovement();return;}
     if(g.context.actions && g.context.actions->recover) {
-        const bool ready=!g.context.host && input.focused && g.correctionAt && Fresh(now,g.correctionAt,250U) &&
+        const bool ownerIdle=!g.context.localOwner || (input.forward==0.0F && input.strafe==0.0F);
+        const bool ready=!g.context.host && ownerIdle && input.focused && g.correctionAt && Fresh(now,g.correctionAt,250U) &&
             (g.correction.flags&PoseValid)!=0U && (g.correction.flags&(NativeBusy|Backstage))==0U;
-        const bool substantial=ready && (std::hypot(g.correction.x-body.x,g.correction.z-body.z)>4.0F ||
+        const float errorX=g.context.localOwner?g.correctionX:g.correction.x-body.x;
+        const float errorZ=g.context.localOwner?g.correctionZ:g.correction.z-body.z;
+        const bool substantial=ready && (!g.context.localOwner || g.predictionCorrection) && (std::hypot(errorX,errorZ)>4.0F ||
             std::abs(g.correction.y-body.y)>1.0F);
         if(substantial || g.recovering) {
-            if(!StopDonorMovement()){ReleaseCarrier();return;}
-            ReleaseCarrier();
-            g.recovering=g.context.actions->recover(g.context,ready?&g.correction:nullptr);
-            if(g.recovering){g.moving=true;return;}
+            if(!ownerIdle) {
+                // Fresh local steering takes priority over a path towards an
+                // older Host pose. Retire recovery before resuming the donor.
+                g.recovering=!CancelRecovery();
+                if(g.recovering)return;
+            } else {
+                if(!StopDonorMovement()){ReleaseCarrier();return;}
+                ReleaseCarrier();
+                auto goal=g.correction;
+                if(g.context.localOwner){goal.x=body.x+errorX;goal.z=body.z+errorZ;}
+                g.recovering=g.context.actions->recover(g.context,ready?&goal:nullptr);
+                if(g.recovering){g.moving=true;return;}
+            }
         }
     }
     alien_pvp_movement::Plan plan{};
@@ -419,6 +433,9 @@ void PublishInput(std::uint64_t now) noexcept {
         frame.flags|=VentSelected;frame.x=queued.ventX;frame.y=queued.ventY;frame.z=queued.ventZ;
     }
     Publish(frame,now);gInputs.fetch_add(1U,std::memory_order_relaxed);g.lastInputSent=now;
+    if(frame.action==Action::EnterVent || frame.action==Action::ExitVent) {
+        g.ventAuthority=frame;g.ventAuthority.phase=ActionPhase::Preparing;
+    }
 }
 } // namespace
 
@@ -430,6 +447,11 @@ void CaptureLocal(const LocalInput& input) noexcept {
         } else gDropped.fetch_add(1U,std::memory_order_relaxed);
     }
     g.local.action=Action::None;
+}
+Frame VentAuthority() noexcept {return g.ventAuthority;}
+bool VentPending() noexcept {
+    return ActionBusy() || g.hasDeferredAction || g.ventAuthority.phase==ActionPhase::Preparing ||
+        g.ventAuthority.phase==ActionPhase::Started;
 }
 void Reset(bool certifiedLivingCharacter) noexcept {
     if(g.context.actions && g.context.actions->cancel)g.context.actions->cancel(g.context,certifiedLivingCharacter);

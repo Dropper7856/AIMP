@@ -8,7 +8,7 @@
 #include <cstdlib>
 
 namespace {
-int genericCalls{},driveCalls{},stopCalls{},beginCalls{},placements{};
+int genericCalls{},driveCalls{},stopCalls{},beginCalls{},placements{},recoveryCalls{};
 bool stopReady=true,nativeBusy=false;
 aimp::alien_pvp::Frame lastIntent{};
 void Check(bool pass,const char* message) {
@@ -24,6 +24,7 @@ bool Begin(const aimp::alien_pvp::Context&,const aimp::alien_pvp::Frame& frame,a
     nativeBusy=true;return true;
 }
 bool Busy(const aimp::alien_pvp::Context&) noexcept {return nativeBusy;}
+bool Recover(const aimp::alien_pvp::Context&,const aimp::alien_pvp::Frame*) noexcept {++recoveryCalls;return true;}
 void Cancel(const aimp::alien_pvp::Context& c,bool) noexcept {static_cast<void>(Drive(c,nullptr));nativeBusy=false;}
 void Queue(aimp::alien_pvp::Frame frame) {
     std::array<std::uint8_t,aimp::alien_pvp::kWireBytes> bytes{};
@@ -70,6 +71,7 @@ int main() {
     Check(beginCalls==0,"vent started before movement retirement");
     stopReady=true;Pump(context);
     Check(beginCalls==1,"deferred vent did not start after retirement");
+    Check(VentAuthority().phase==ActionPhase::Started,"Host vent progress was not exposed to the selector");
     const auto duringAction=driveCalls;Pump(context);
     Check(driveCalls==duringAction,"movement replaced a native vent action");
     Frame stop=activate;stop.kind=Kind::Stop;Queue(stop);Pump(context);
@@ -86,6 +88,11 @@ int main() {
     Check(placements==1 && driveCalls>beforePlacement,"first Host pose did not align the client Alien");
     correction.sequence=2;correction.x=-31;Queue(correction);Pump(context);
     Check(placements==1,"ordinary pose correction teleported the Alien again");
+    hooks.recover=&Recover;
+    const auto immediateDrive=driveCalls;
+    correction.sequence=3;correction.x=-300;Queue(correction);CaptureLocal(movement);Pump(context);
+    Check(recoveryCalls==0 && driveCalls>immediateDrive,"a delayed Host pose stole the owner's fresh steering");
+    hooks.recover=nullptr;
     auto selected=movement;selected.action=Action::ExitVent;selected.selectedVent=true;
     selected.ventX=10;selected.ventY=22;selected.ventZ=40;
     CaptureLocal(selected);CaptureLocal(movement);Pump(context);
@@ -97,6 +104,7 @@ int main() {
         }
     }
     Check(selectedObserved,"selected vent coordinates were lost between input capture and publication");
+    Check(VentAuthority().phase==ActionPhase::Preparing,"queued travel was shown as completed");
     Check(vents::WithinReach({0,0,0},{0,3,0}),"overhead vent was not interactable");
     Check(!vents::WithinReach({0,0,0},{0,8,0}),"vent on another floor was interactable");
     Check(!vents::WithinReach({0,0,0},{8,0,0}),"distant vent was interactable");
