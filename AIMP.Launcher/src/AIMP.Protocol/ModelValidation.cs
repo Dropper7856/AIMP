@@ -917,6 +917,13 @@ public static class ModelValidation
             return;
         }
 
+        if(value.Command==GameCommandNames.AlienPvPVents) {
+            if(value.LevelGeneration<1 || value.Arguments.Count!=1 ||
+                !value.Arguments.TryGetValue("page",out var pageText) ||
+                !uint.TryParse(pageText,NumberStyles.None,CultureInfo.InvariantCulture,out var page) || page>=64)
+                throw new ProtocolException("Invalid Alien vent catalogue page.");
+            return;
+        }
         if (string.Equals(value.Command, GameCommandNames.AlienPvPBind,
                 StringComparison.Ordinal))
         {
@@ -1482,7 +1489,7 @@ public static class ModelValidation
         if (value is null
             || !GameCommandNames.All.Contains(value.Command)
             || !Identifier(value.StatusCode)
-            || !Bounded(value.Message, 1, ProtocolConstants.MaximumExperimentalTextLength))
+            || !Bounded(value.Message, 1, value.Command==GameCommandNames.AlienPvPVents?16384:ProtocolConstants.MaximumExperimentalTextLength))
         {
             throw new ProtocolException("The game command result is invalid.");
         }

@@ -335,6 +335,23 @@ internal sealed class NativeRuntimeController : IDisposable
         var request = CreateCommandRequest(command, arguments);
         if (expectedLevelGeneration is { } generation)
             request = request with { LevelGeneration = generation };
+        if(command==GameCommandNames.AlienPvPVents)
+        {
+            // HUD polling is state publication, not a user command/status.
+            var completion=new TaskCompletionSource<GameCommandResultPayload>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _commandExecutionWaiters.TryAdd(request.RequestId,completion);
+            _quietCommandIds.TryAdd(request.RequestId,0);
+            try
+            {
+                var response=await session.ExecuteGameCommandAsync(request,TimeSpan.FromSeconds(5),cancellationToken).ConfigureAwait(false);
+                return IsQueuedResult(response)?await completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false):response;
+            }
+            finally
+            {
+                _commandExecutionWaiters.TryRemove(request.RequestId,out _);
+                _quietCommandIds.TryRemove(request.RequestId,out _);
+            }
+        }
         TaskCompletionSource<GameCommandResultPayload>? execution = null;
         var manifestLoad = command == GameCommandNames.WorldManifestLoad;
         if (waitForExecution || manifestLoad)
@@ -942,7 +959,7 @@ internal sealed class NativeRuntimeController : IDisposable
         if (!IsQueuedResult(value)
             && _commandExecutionWaiters.TryGetValue(value.RequestId, out var execution))
             execution.TrySetResult(value);
-        if (_quietCommandIds.TryRemove(value.RequestId, out _)) return;
+        if (_quietCommandIds.TryRemove(value.RequestId, out _) || value.Command==GameCommandNames.AlienPvPVents) return;
         lock (_commandResultGate)
         {
             if (_awaitingCommandAcks.ContainsKey(value.RequestId))

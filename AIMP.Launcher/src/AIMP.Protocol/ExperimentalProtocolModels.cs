@@ -171,6 +171,7 @@ public static class GameCommandNames
     public const string AlienPvPProbe = "ALIEN_PVP_PROBE";
     public const string AlienPvPBind = "ALIEN_PVP_BIND";
     public const string AlienPvPRelease = "ALIEN_PVP_RELEASE";
+    public const string AlienPvPVents = "ALIEN_PVP_VENTS";
     // Internal ItemSync: remove a pickup another participant collected, absent from the UI catalogue.
     public const string ItemSyncApply = "ITEM_SYNC_APPLY";
     // Internal ItemSync: spawn a Host-decided GCIP pickup or a remote player drop.
@@ -203,6 +204,7 @@ public static class GameCommandNames
             AlienPvPProbe,
             AlienPvPBind,
             AlienPvPRelease,
+            AlienPvPVents,
             SessionLoadingHold,
             SessionRoundBoundary,
             ItemSyncApply,

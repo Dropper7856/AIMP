@@ -135,9 +135,15 @@ bool SelectPortal(const ap::Context& c,const ap::Frame& request,ap::Frame& resul
         if(!Read(entries+static_cast<std::uintptr_t>(i)*0x30U+0x28U,descriptor) || !descriptor ||
             !Read(descriptor,vent.entrance) || !policy::Finite(vent.entrance) || !ExitPoint(descriptor,vent.exit))continue;
         if(c.host) {
+            if(!enter && (request.flags&ap::VentSelected)!=0U) {
+                constexpr float tolerance=policy::kVentMatchTolerance*policy::kVentMatchTolerance;
+                if(policy::DistanceSquared(vent.entrance,{request.x,request.y,request.z})>tolerance)continue;
+                if(found){result.reason=Reason::AmbiguousVent;return false;}
+                best=vent;found=true;continue;
+            }
             const auto p=enter?vent.entrance:vent.exit;const auto d=policy::DistanceSquared(body,p);
             if(enter) {
-                if(d>policy::kVentEnterReach*policy::kVentEnterReach || std::abs(body.y-p.y)>3.5F)continue;
+                if(!ap::vents::WithinReach({body.x,body.y,body.z},{p.x,p.y,p.z}))continue;
                 if(!found || d<bestDistance){best=vent;found=true;bestDistance=d;}
             } else {
                 // Donor vent.cpp::NearestUntried: nearest real opening to

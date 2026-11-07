@@ -10,7 +10,7 @@ public enum AlienPvPNativeFlags : uint
 {
     None=0, Bound=1, LocalOwner=2, PilotReady=4, Focused=8, Host=16,
     Moving=32, NativeBusy=64, Active=128, Expired=256,
-    UnsupportedAction=512, PoseValid=1024, ActionApplied=2048, Backstage=4096
+    UnsupportedAction=512, PoseValid=1024, ActionApplied=2048, Backstage=4096, VentSelected=8192
 }
 public readonly record struct AlienPvPNativeScope(uint NativeGeneration,uint WorldGeneration,
     ulong Cookie,ulong OwnerPeer,ulong Incarnation,uint EntityA,uint EntityB);
@@ -56,7 +56,7 @@ public static class AlienPvPNativeCodec
         var s=f.Scope;
         if(s.NativeGeneration==0 || s.WorldGeneration==0 || s.Cookie==0 || s.OwnerPeer==0 ||
             s.Incarnation==0 || (s.EntityA==0 && s.EntityB==0) ||
-            (ushort)f.Kind is <1 or >10 || ((uint)f.Flags & ~8191U)!=0 ||
+            (ushort)f.Kind is <1 or >10 || ((uint)f.Flags & ~16383U)!=0 ||
             f.Gait>3 || (byte)f.Action>4 || (uint)f.Phase>6 || (uint)f.Reason>13)
             throw new ProtocolException("Invalid native PvP identity or kind.");
         foreach(var v in new[]{f.Forward,f.Strafe,f.Yaw,f.Pitch,f.X,f.Y,f.Z,f.VelocityX,f.VelocityZ,f.ResolvedX,f.ResolvedY,f.ResolvedZ})
@@ -72,6 +72,9 @@ public static class AlienPvPNativeCodec
             (f.Kind is not (AlienPvPNativeKind.Input or AlienPvPNativeKind.Commit or AlienPvPNativeKind.ActionResult or AlienPvPNativeKind.Resolution)
                 && f.Action!=AlienAction.None))
             throw new ProtocolException("Invalid native PvP value or ordering identity.");
+        if(f.Flags.HasFlag(AlienPvPNativeFlags.VentSelected) &&
+            (f.Kind is not (AlienPvPNativeKind.Input or AlienPvPNativeKind.Commit) || f.Action!=AlienAction.ExitVent))
+            throw new ProtocolException("Invalid native selected vent action.");
         if(f.Kind==AlienPvPNativeKind.Acknowledge &&
             (f.DeliveryId==0 || f.Sequence!=0 || f.HostSequence!=0 || f.Flags!=0))
             throw new ProtocolException("Invalid native delivery acknowledgement.");

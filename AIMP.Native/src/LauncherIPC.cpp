@@ -3215,6 +3215,8 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
             } else if (
                 pending->request.command == "ALIEN_PVP_RELEASE") {
                 result = gameCommands_->ExecuteAlienPvPRelease();
+            } else if(pending->request.command=="ALIEN_PVP_VENTS") {
+                result=gameCommands_->ExecuteAlienPvPVents(pending->request.alienPvPVentPage);
             } else if (
                 pending->request.command == "RETURN_TO_FRONTEND") {
                 result = gameCommands_->ExecuteReturnToFrontend();
@@ -3282,7 +3284,7 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
                     pending->requestPayload,
                     payload);
             }
-            if (pending->request.command != "CHARACTER_DIRECT_MOVE" ||
+            if ((pending->request.command != "CHARACTER_DIRECT_MOVE" && pending->request.command!="ALIEN_PVP_VENTS") ||
                 !result.executed) {
                 diagnostics_->Log(
                     result.executed ? "info" : "warning",

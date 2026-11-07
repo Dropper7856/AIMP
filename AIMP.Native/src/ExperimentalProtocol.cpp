@@ -562,11 +562,11 @@ std::string Escape(const std::string_view value) {
     return output.str();
 }
 
-std::string BoundedGameCommandMessage(const std::string_view value) {
+std::string BoundedGameCommandMessage(const std::string_view value,const std::size_t maximumBytes=1000U) {
     // Launcher ModelValidation caps GameCommandResult.Message at 1024 UTF-16 code units.
     // Capping the UTF-8 payload to 1000 bytes is stricter and leaves headroom while
     // guaranteeing that diagnostics can never invalidate the IPC frame.
-    constexpr std::size_t kMaximumBytes = 1000U;
+    const auto kMaximumBytes=maximumBytes;
     constexpr std::string_view kSuffix = "...[truncated]";
     if (value.size() <= kMaximumBytes) {
         return std::string(value);
@@ -926,6 +926,15 @@ bool DecodeGameCommand(
             return true;
         }
 
+        if(command->stringValue=="ALIEN_PVP_VENTS") {
+            if(arguments->objectValue.size()!=1U)return false;
+            const auto* page=Field(*arguments,"page",JsonType::String);
+            if(!page || page->stringValue.empty() || page->stringValue.size()>2U)return false;
+            std::uint32_t parsed{};const auto* first=page->stringValue.data();const auto* last=first+page->stringValue.size();
+            const auto conversion=std::from_chars(first,last,parsed,10);
+            if(conversion.ec!=std::errc{} || conversion.ptr!=last || parsed>=64U)return false;
+            output.command=command->stringValue;output.alienPvPVentPage=parsed;return true;
+        }
         if (command->stringValue == "ALIEN_PVP_BIND") {
             if (arguments->objectValue.size() != 1U) return false;
             const auto* peer = Field(*arguments, "ownerPeer", JsonType::String);
@@ -1944,7 +1953,7 @@ std::vector<std::byte> EncodeGameCommandResult(
     const GameCommandExecutionResult& result) {
     std::ostringstream json;
     Prefix(json, request);
-    const auto boundedMessage = BoundedGameCommandMessage(result.message);
+    const auto boundedMessage = BoundedGameCommandMessage(result.message,command=="ALIEN_PVP_VENTS"?16000U:1000U);
     json << ",\"command\":" << Escape(command)
          << ",\"statusCode\":" << Escape(result.statusCode)
          << ",\"message\":" << Escape(boundedMessage)

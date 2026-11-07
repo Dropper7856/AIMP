@@ -38,3 +38,10 @@ AI.exe with Capstone. The offline hook-installation tests verify compatibility.
 
 In-game validation remains required for camera rendering, collision, native
 gait transitions, vent connectivity and two-PC interaction animation timing.
+
+AIMP build 436:
+Native action preflight now accounts for ASLR and the already-installed Move
+hook. The first authenticated Host pose aligns the independent Client spawn
+before driving it. The V toggle is removed. AIMP's PickupOverlay HUD displays
+nearby vent interaction and a map of real portal coordinates. Selected exits
+are authenticated intents resolved against the Host's native portal catalogue.

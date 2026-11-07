@@ -200,6 +200,9 @@ public:
     [[nodiscard]] virtual GameCommandExecutionResult ExecuteAlienPvPRelease() const {
         return {false, "ALIEN_PVP_NOT_READY", "Native Alien possession is not installed."};
     }
+    [[nodiscard]] virtual GameCommandExecutionResult ExecuteAlienPvPVents(std::uint32_t) const {
+        return {false,"ALIEN_PVP_NOT_READY","Alien ventilation is unavailable."};
+    }
     // Default rejection keeps other executor implementations source-compatible.
     [[nodiscard]] virtual GameCommandExecutionResult ExecuteReturnToFrontend() const {
         return {false, "RETURN_TO_FRONTEND_UNAVAILABLE", "Return to frontend is not supported by this executor."};
@@ -261,6 +264,7 @@ public:
     [[nodiscard]] GameCommandExecutionResult ExecuteAlienPvPProbe() const override;
     [[nodiscard]] GameCommandExecutionResult ExecuteAlienPvPBind(std::uint64_t ownerPeer) const override;
     [[nodiscard]] GameCommandExecutionResult ExecuteAlienPvPRelease() const override;
+    [[nodiscard]] GameCommandExecutionResult ExecuteAlienPvPVents(std::uint32_t page) const override;
     [[nodiscard]] GameCommandExecutionResult ExecuteReturnToFrontend() const override;
     [[nodiscard]] GameCommandExecutionResult ExecuteItemSyncApply(
         const ItemSyncApplyCommand& command) const override;

@@ -2,7 +2,7 @@
 param(
     [string]$CMakeExe = '',
     [string]$Generator = 'Visual Studio 18 2026',
-    [string]$OutputDirectory = 'artifacts/alien-api-435',
+    [string]$OutputDirectory = 'artifacts/alien-api-436',
     [string]$SecondPcApi = '\\DESKTOP-2JNROA0\Users\Public\Documents\win-unpacked\resources\api',
     [switch]$DeliveryOnly
 )
@@ -26,7 +26,7 @@ function Copy-Api([string]$Destination) {
     # /E preserves files that exist only at the destination. Never use /MIR.
     & robocopy $api $Destination /E /COPY:DAT /DCOPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS | Out-Host
     if ($LASTEXITCODE -ge 8) { throw "API delivery failed: $Destination (robocopy $LASTEXITCODE)." }
-    foreach ($name in @('AIMP.Launcher.dll', 'AIMP.Protocol.dll', 'AIMP.NetZ.dll', 'UIBridge/NEWFRONTENDMENU.GFX')) {
+    foreach ($name in @('AIMP.Launcher.dll', 'AIMP.Protocol.dll', 'AIMP.NetZ.dll', 'UIBridge/NEWFRONTENDMENU.GFX','UIBridge/PICKUPOVERLAY.GFX')) {
         $expected = (Get-FileHash -LiteralPath (Join-Path $api $name) -Algorithm SHA256).Hash
         $actual = (Get-FileHash -LiteralPath (Join-Path $Destination $name) -Algorithm SHA256).Hash
         if ($expected -ne $actual) { throw "SHA-256 mismatch: $Destination/$name" }
@@ -55,11 +55,11 @@ try {
       Run 'dotnet' @('publish','AIMP.Launcher/src/AIMP.Injector32/AIMP.Injector32.csproj','-c','Release','-r','win-x86','--self-contained','true','--artifacts-path',(Join-Path $output 'dotnet'),'-o',(Join-Path $api 'Injector32'))
       Copy-Item -LiteralPath (Join-Path $native 'bin/Release/AIMP.NetZ.dll') -Destination (Join-Path $api 'AIMP.NetZ.dll') -Force
     }
-    foreach ($required in @('AIMP.Launcher.dll','AIMP.Protocol.dll','AIMP.NetZ.dll','UIBridge/NEWFRONTENDMENU.GFX','Injector32/AIMP.Injector32.exe')) {
+    foreach ($required in @('AIMP.Launcher.dll','AIMP.Protocol.dll','AIMP.NetZ.dll','UIBridge/NEWFRONTENDMENU.GFX','UIBridge/PICKUPOVERLAY.GFX','Injector32/AIMP.Injector32.exe')) {
         if (!(Test-Path -LiteralPath (Join-Path $api $required) -PathType Leaf)) { throw "Incomplete build artifacts: $required" }
     }
 
-    $delivery = [ordered]@{ builtAtUtc=[DateTime]::UtcNow.ToString('o'); apiVersion='0.8.4.435'; protocol=36; unitTestsRun=$false; localDelivered=$false; secondPcDelivered=$false; hashes=@(); failures=@() }
+    $delivery = [ordered]@{ builtAtUtc=[DateTime]::UtcNow.ToString('o'); apiVersion='0.8.4.436'; protocol=37; unitTestsRun=$false; localDelivered=$false; secondPcDelivered=$false; hashes=@(); failures=@() }
     foreach ($target in @($localApi,$SecondPcApi)) {
         try {
             $delivery.hashes += @(Copy-Api $target)

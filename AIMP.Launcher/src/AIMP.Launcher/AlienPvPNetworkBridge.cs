@@ -297,7 +297,8 @@ internal sealed class AlienPvPNetworkBridge : IDisposable
             var intent=new AlienControlIntent(b.Session,b.OwnerPeer,b.RoundGeneration,f.Sequence,
                 f.Forward,f.Strafe,Math.Clamp(f.Yaw*180F/MathF.PI,-180F,180F),
                 Math.Clamp(f.Pitch*180F/MathF.PI,-90F,90F),f.Gait>=2,f.Gait==0,f.Action,f.Epoch,f.Gait,
-                f.Flags.HasFlag(AlienPvPNativeFlags.Focused));
+                f.Flags.HasFlag(AlienPvPNativeFlags.Focused),
+                f.Flags.HasFlag(AlienPvPNativeFlags.VentSelected)?new(f.X,f.Y,f.Z):null);
             if(b.Host is not null)await b.Host.SubmitHostAlienControlAsync(intent,token).ConfigureAwait(false);
             else if(b.Client is not null)await b.Client.SendAlienControlAsync(intent,token).ConfigureAwait(false);
             ++_inputs;
@@ -345,7 +346,9 @@ internal sealed class AlienPvPNetworkBridge : IDisposable
             i.SessionId!=b.Session || i.LevelGeneration!=b.RoundGeneration || i.AlienPeerId!=b.OwnerPeer)return;
         await SendNativeAsync(new(){Kind=AlienPvPNativeKind.Commit,Scope=_native!.Frame.Scope,
             Epoch=i.Epoch,Sequence=i.Sequence,HostSequence=commit.HostSequence,
-            Flags=i.Focused?AlienPvPNativeFlags.Focused:AlienPvPNativeFlags.None,
+            Flags=(i.Focused?AlienPvPNativeFlags.Focused:AlienPvPNativeFlags.None)|
+                (i.Vent is not null?AlienPvPNativeFlags.VentSelected:AlienPvPNativeFlags.None),
+            X=i.Vent?.X??0,Y=i.Vent?.Y??0,Z=i.Vent?.Z??0,
             Forward=i.Forward,Strafe=i.Strafe,Yaw=i.Yaw*MathF.PI/180F,Pitch=i.Pitch*MathF.PI/180F,
             Gait=i.Gait,Action=i.Action},token).ConfigureAwait(false);
         ++_commits;

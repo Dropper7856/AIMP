@@ -1,5 +1,6 @@
 #include "aimp/AlienPvPControlRuntime.h"
 #include "aimp/CharacterDirectStepRuntime.h"
+#include "aimp/AlienPvPVents.h"
 #include <Windows.h>
 #include <array>
 #include <cstring>
@@ -7,7 +8,7 @@
 #include <cstdlib>
 
 namespace {
-int genericCalls{},driveCalls{},stopCalls{},beginCalls{};
+int genericCalls{},driveCalls{},stopCalls{},beginCalls{},placements{};
 bool stopReady=true,nativeBusy=false;
 aimp::alien_pvp::Frame lastIntent{};
 void Check(bool pass,const char* message) {
@@ -37,7 +38,10 @@ bool ArmAIIntentReplication(std::uintptr_t,float,float,float,std::uint32_t,std::
 bool HoldAIIntentIdle(std::uintptr_t,std::uint32_t,std::string&) noexcept {++genericCalls;return false;}
 bool ArmAIHybridReplication(std::uintptr_t,float,float,float,float,float,float,float,std::uint32_t,std::string&,std::uint64_t) noexcept {++genericCalls;return false;}
 bool ReleaseAIIntentOwnership(std::uintptr_t) noexcept {return true;}
-bool ApplyAIRecoveryTransform(std::uintptr_t,const float*,float) noexcept {return false;}
+bool ApplyAIRecoveryTransform(std::uintptr_t character,const float* position,float yaw) noexcept {
+    ++placements;std::memcpy(reinterpret_cast<void*>(character+0x70U),position,sizeof(float)*3U);
+    std::memcpy(reinterpret_cast<void*>(character+0x174U),&yaw,sizeof(yaw));return true;
+}
 bool ApplyReplicatedYaw(std::uintptr_t,float,std::string&) noexcept {++genericCalls;return false;}
 }
 int main() {
@@ -72,5 +76,30 @@ int main() {
     Check(!MovingNow() && stopCalls>0,"revocation left donor movement running");
     Check(genericCalls==0,"stop or action rearmed the generic carrier");
     Reset(true);
-    std::cout<<"Donor movement routing, gait, action retirement and revocation passed.\n";
+    context.host=false;context.localOwner=true;
+    Pump(context);Queue(activate);
+    LocalInput movement{1,0,0,0,3,Action::None,true};CaptureLocal(movement);
+    const auto beforePlacement=driveCalls;Pump(context);
+    Check(driveCalls==beforePlacement,"client predicted from an unaligned local spawn");
+    Frame correction=activate;correction.kind=Kind::Correction;correction.sequence=1;correction.flags=PoseValid;
+    correction.x=-32;correction.y=19;correction.z=-10;Queue(correction);Pump(context);
+    Check(placements==1 && driveCalls>beforePlacement,"first Host pose did not align the client Alien");
+    correction.sequence=2;correction.x=-31;Queue(correction);Pump(context);
+    Check(placements==1,"ordinary pose correction teleported the Alien again");
+    auto selected=movement;selected.action=Action::ExitVent;selected.selectedVent=true;
+    selected.ventX=10;selected.ventY=22;selected.ventZ=40;
+    CaptureLocal(selected);CaptureLocal(movement);Pump(context);
+    std::array<std::uint8_t,kWireBytes> bytes{};bool selectedObserved{};
+    while(TryPopObservation(bytes)) {
+        Frame frame{};Check(Decode(bytes,frame),"invalid observation");
+        if(frame.kind==Kind::Input && frame.action==Action::ExitVent) {
+            selectedObserved=(frame.flags&VentSelected)!=0U && frame.x==10 && frame.y==22 && frame.z==40;
+        }
+    }
+    Check(selectedObserved,"selected vent coordinates were lost between input capture and publication");
+    Check(vents::WithinReach({0,0,0},{0,3,0}),"overhead vent was not interactable");
+    Check(!vents::WithinReach({0,0,0},{0,8,0}),"vent on another floor was interactable");
+    Check(!vents::WithinReach({0,0,0},{8,0,0}),"distant vent was interactable");
+    Reset(true);
+    std::cout<<"Donor control, Host placement, selected vent transport and interaction reach passed.\n";
 }

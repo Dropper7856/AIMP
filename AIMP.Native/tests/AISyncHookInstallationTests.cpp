@@ -1,5 +1,6 @@
 #include "aimp/AISyncAnimation.h"
 #include "aimp/AISync.h"
+#include "aimp/AlienPvPNativeActionAbi.h"
 #include "aimp/CharacterDirectStepRuntime.h"
 #include "aimp/GameThreadDispatcher.h"
 #include "aimp/LevelGenerationTracker.h"
@@ -209,6 +210,16 @@ void TestProductionInstallation(DataImage& image) {
     Require(characterHooks != 0U, "Production Character hooks missing");
     const bool installed = aimp::ai_sync::Install(base, hooks, generations, dispatcher, error);
     Require(installed, "Production AISync installation: " + error);
+    for(const auto& signature:aimp::alien_pvp::action_abi::kSignatures) {
+        std::array<std::uint8_t,8> actual{};
+        std::memcpy(actual.data(),reinterpret_cast<const void*>(base+signature.rva),actual.size());
+        if(actual!=aimp::alien_pvp::action_abi::Expected(signature,base))
+            std::cerr<<"Alien ABI mismatch RVA "<<std::hex<<signature.rva<<std::dec<<'\n';
+    }
+    Require(aimp::alien_pvp::action_abi::Matches(base,nullptr,
+        [](void*,std::uintptr_t at,void* out,std::size_t size) noexcept {
+            std::memcpy(out,reinterpret_cast<const void*>(at),size);return true;
+        }),"Alien native action ABI rejected the ASLR-rebased installed executable");
     Require(aimp::ai_sync::Installed() && hooks.InstalledCount() > characterHooks,
         "Production AISync did not publish readiness");
     for (const auto site : sites)

@@ -13,6 +13,7 @@ public enum AlienAction : byte
     Roar = 4,
 }
 
+public sealed record AlienVentDestination(float X,float Y,float Z);
 public sealed record AlienControlIntent(
     Guid SessionId,
     ulong AlienPeerId,
@@ -27,7 +28,8 @@ public sealed record AlienControlIntent(
     AlienAction Action,
     ulong Epoch = 0,
     uint Gait = 1,
-    bool Focused = true);
+    bool Focused = true,
+    AlienVentDestination? Vent = null);
 
 public sealed record AlienControlCommit(
     ulong HostSequence,
@@ -48,6 +50,10 @@ public static class AlienControlProtocol
             (value.Sprint && value.Sneak) ||
             (!value.Focused && (value.Forward!=0 || value.Strafe!=0 || value.Action!=AlienAction.None)))
             throw new ProtocolException("Alien control contains an invalid actor identity or input.");
+        if(value.Vent is { } vent && (value.Action!=AlienAction.ExitVent || !value.Focused ||
+            !float.IsFinite(vent.X) || !float.IsFinite(vent.Y) || !float.IsFinite(vent.Z) ||
+            Math.Abs(vent.X)>100000 || Math.Abs(vent.Y)>100000 || Math.Abs(vent.Z)>100000))
+            throw new ProtocolException("Alien vent selection requires a finite exit location.");
     }
 
     public static void Validate(AlienControlCommit? value)

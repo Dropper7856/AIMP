@@ -17,6 +17,8 @@ struct LocalInput final {
     std::uint32_t gait{1U};
     Action action{Action::None};
     bool focused{};
+    bool selectedVent{};
+    float ventX{},ventY{},ventZ{};
 };
 // Engine-thread calls. No camera/input/character pointer crosses IPC.
 void CaptureLocal(const LocalInput& input) noexcept;

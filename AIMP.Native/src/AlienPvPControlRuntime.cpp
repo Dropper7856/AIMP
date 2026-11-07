@@ -22,11 +22,11 @@ struct State final {
     Context context{};InputWindow window{};PredictionHistory history{};
     DeliveryInbox inbox{};DeliveryOutbox<> outbox{};bool deliveryFault{};std::uint64_t deliveryGeneration{};
     LocalInput local{};std::uint64_t capturedAt{};
-    std::array<Action,8> actions{};std::size_t actionRead{},actionCount{};
+    std::array<LocalInput,8> actions{};std::size_t actionRead{},actionCount{};
     std::uint64_t inputSequence{},poseSequence{},lastInputSent{},lastStatus{},lastPose{},lastTick{},lastAckAt{},lastRoar{};
     std::uint64_t appliedInput{},appliedHost{},correctionAt{};
     Frame correction{},lastObserved{};
-    bool moving{},hadPose{},ownsSlot{},expired{},recovering{},hasDeferredAction{};
+    bool moving{},hadPose{},ownsSlot{},expired{},recovering{},hasDeferredAction{},aligned{};
     Frame deferredAction{};std::uint64_t deferredActionAt{};
     float correctionX{},correctionZ{};bool predictionCorrection{};
 };
@@ -226,6 +226,15 @@ void Drain(std::uint64_t now) noexcept {
         } else if(f.kind==Kind::Resolution) {
             ApplyResolution(f,now);
         } else if(f.kind==Kind::Correction && !g.context.host) {
+            if(!g.aligned && (f.flags&(PoseValid|Backstage|NativeBusy))==PoseValid &&
+                !ActionBusy() && OrdinaryCycle(g.context.character)) {
+                // AIMP fences ordinary spawn/lifecycle replay for the possessed
+                // Alien. Apply the Host's first authenticated placement once,
+                // before predicting any movement from a different local spawn.
+                const float position[]{f.x,f.y,f.z};
+                g.aligned=character_direct_step_runtime::ApplyAIRecoveryTransform(g.context.character,position,f.yaw);
+                if(g.aligned){g.history.Clear();g.hadPose=false;g.predictionCorrection=false;}
+            }
             g.correction=f;g.correctionAt=value.at;g.predictionCorrection=false;
             if(g.context.localOwner)
                 g.predictionCorrection=g.history.Error(f.acknowledgedInput,f.x,f.y,f.z,g.correctionX,g.correctionZ);
@@ -245,6 +254,7 @@ void StopMovement() noexcept {
     g.moving=false;
 }
 void ApplyMovement(std::uint64_t now,float dt) noexcept {
+    if(!g.context.host && !g.aligned){static_cast<void>(StopDonorMovement());ReleaseCarrier();return;}
     const bool active=g.window.ActiveAt(now) && !g.deliveryFault;
     const bool fresh=g.context.localOwner ?
         active && g.context.pilotReady && Fresh(now,g.capturedAt,150U) &&
@@ -390,13 +400,18 @@ void PublishInput(std::uint64_t now) noexcept {
         frame.forward=frame.strafe=0.0F;frame.flags&=~Focused;
         g.actionRead=g.actionCount=0U;
     }
+    LocalInput queued{};
     if(g.actionCount) {
-        frame.action=g.actions[g.actionRead];g.actionRead=(g.actionRead+1U)%g.actions.size();--g.actionCount;
+        queued=g.actions[g.actionRead];frame.action=queued.action;
+        g.actionRead=(g.actionRead+1U)%g.actions.size();--g.actionCount;
     }
     Frame body{};
     if(ReadPose(body)) {
         frame.x=body.x;frame.y=body.y;frame.z=body.z;frame.flags|=PoseValid;
         g.history.Record(frame.sequence,body.x,body.y,body.z);
+    }
+    if(queued.selectedVent && queued.action==Action::ExitVent) {
+        frame.flags|=VentSelected;frame.x=queued.ventX;frame.y=queued.ventY;frame.z=queued.ventZ;
     }
     Publish(frame,now);gInputs.fetch_add(1U,std::memory_order_relaxed);g.lastInputSent=now;
 }
@@ -406,7 +421,7 @@ void CaptureLocal(const LocalInput& input) noexcept {
     g.local=input;g.capturedAt=GetTickCount64();
     if(input.action!=Action::None && g.window.Granted()) {
         if(g.actionCount<g.actions.size()) {
-            g.actions[(g.actionRead+g.actionCount)%g.actions.size()]=input.action;++g.actionCount;
+            g.actions[(g.actionRead+g.actionCount)%g.actions.size()]=input;++g.actionCount;
         } else gDropped.fetch_add(1U,std::memory_order_relaxed);
     }
     g.local.action=Action::None;

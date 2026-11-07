@@ -9,6 +9,132 @@ package
    
    public class PickupOverlay extends MovieClip
    {
+      private var aimp_vent_layer:Sprite;
+      private var aimp_vent_scope:String = "";
+      private var aimp_vent_points:Object = {};
+      private var aimp_vent_at:int = 0;
+
+      private function aimp_hide_vents() : void
+      {
+         if(this.aimp_vent_layer != null && this.aimp_vent_layer.parent != null)
+            this.aimp_vent_layer.parent.removeChild(this.aimp_vent_layer);
+         this.aimp_vent_layer = null;
+      }
+
+      private function aimp_vent_text(text:String, size:int, x:Number, y:Number, width:Number) : TextField
+      {
+         var field:TextField = this.aimp_create_round_end_text(text,size,width,y);
+         field.x = x;
+         return field;
+      }
+
+      private function aimp_update_vents(line:String) : void
+      {
+         var scope:String = this.aimp_get_bridge_value(line,"scope");
+         var rows:Array;
+         var values:Array;
+         var row:String;
+         var point:Array;
+         var key:String;
+         var id:int;
+         var count:int = int(this.aimp_get_bridge_value(line,"count"));
+         var selected:int = int(this.aimp_get_bridge_value(line,"selected"));
+         var nearby:int = int(this.aimp_get_bridge_value(line,"nearby"));
+         var open:Boolean = this.aimp_get_bridge_value(line,"open") == "1";
+         var backstage:Boolean = this.aimp_get_bridge_value(line,"backstage") == "1";
+         var width:Number = stage != null ? stage.stageWidth : 1280;
+         var height:Number = stage != null ? stage.stageHeight : 720;
+         var bodyX:Number = Number(this.aimp_get_bridge_value(line,"x"));
+         var bodyZ:Number = Number(this.aimp_get_bridge_value(line,"z"));
+         var minX:Number = bodyX - 5;
+         var maxX:Number = bodyX + 5;
+         var minZ:Number = bodyZ - 5;
+         var maxZ:Number = bodyZ + 5;
+         var scale:Number;
+         var px:Number;
+         var py:Number;
+         var floorY:Number = Number(this.aimp_get_bridge_value(line,"y"));
+         var loaded:int = 0;
+         var color:uint;
+         this.aimp_hide_vents();
+         this.aimp_vent_at = getTimer();
+         if(this.aimp_get_bridge_value(line,"active") != "1" || scope == "" || count < 0 || count > 4096)
+         {
+            this.aimp_vent_scope = "";
+            this.aimp_vent_points = {};
+            return;
+         }
+         if(scope != this.aimp_vent_scope)
+         {
+            this.aimp_vent_scope = scope;
+            this.aimp_vent_points = {};
+         }
+         rows = this.aimp_get_bridge_value(line,"points").split(";");
+         for each(row in rows)
+         {
+            values = row.split(",");
+            if(values.length != 4) continue;
+            id = int(values[0]);
+            if(id < 0 || id >= count || !isFinite(Number(values[1])) ||
+               !isFinite(Number(values[2])) || !isFinite(Number(values[3]))) continue;
+            this.aimp_vent_points[String(id)] = [id,Number(values[1]),Number(values[2]),Number(values[3])];
+         }
+         if(this.aimp_loading_layer != null || this.aimp_round_end_layer != null) return;
+         if(!open && nearby < 0 && !backstage) return;
+         this.aimp_vent_layer = new Sprite();
+         this.aimp_vent_layer.mouseEnabled = false;
+         this.aimp_vent_layer.mouseChildren = false;
+         addChild(this.aimp_vent_layer);
+         if(!open)
+         {
+            this.aimp_vent_layer.graphics.beginFill(0,0.8);
+            this.aimp_vent_layer.graphics.drawRect(width * 0.2,height * 0.82,width * 0.6,52);
+            this.aimp_vent_layer.graphics.endFill();
+            this.aimp_vent_layer.addChild(this.aimp_vent_text(backstage ? 'Press "E" to choose a ventilation exit' :
+               'Press "E" to enter ventilation',22,width * 0.2,height * 0.82 + 10,width * 0.6));
+            return;
+         }
+         this.aimp_vent_layer.graphics.beginFill(0x061116,0.96);
+         this.aimp_vent_layer.graphics.drawRect(0,0,width,height);
+         this.aimp_vent_layer.graphics.endFill();
+         if(this.aimp_vent_points[String(selected)] != null)
+            floorY = Number(this.aimp_vent_points[String(selected)][2]);
+         for(key in this.aimp_vent_points)
+         {
+            point = this.aimp_vent_points[key];
+            minX = Math.min(minX,Number(point[1]) - 3);maxX = Math.max(maxX,Number(point[1]) + 3);
+            minZ = Math.min(minZ,Number(point[3]) - 3);maxZ = Math.max(maxZ,Number(point[3]) + 3);
+            loaded++;
+         }
+         scale = Math.min((width - 120) / (maxX - minX),(height - 230) / (maxZ - minZ));
+         this.aimp_vent_layer.graphics.lineStyle(1,0x19353D,0.6);
+         for(px = 60;px < width - 60;px += 40)
+         {this.aimp_vent_layer.graphics.moveTo(px,110);this.aimp_vent_layer.graphics.lineTo(px,height - 120);}
+         for(py = 110;py < height - 120;py += 40)
+         {this.aimp_vent_layer.graphics.moveTo(60,py);this.aimp_vent_layer.graphics.lineTo(width - 60,py);}
+         for(key in this.aimp_vent_points)
+         {
+            point = this.aimp_vent_points[key];id = int(point[0]);
+            px = 60 + (Number(point[1]) - minX) * scale;
+            py = height - 120 - (Number(point[3]) - minZ) * scale;
+            color = id == selected ? 0xF3C96A : Math.abs(Number(point[2]) - floorY) <= 2.5 ? 0x79E9DF : 0x455E68;
+            this.aimp_vent_layer.graphics.lineStyle(2,color,1);
+            this.aimp_vent_layer.graphics.beginFill(color,id == selected ? 1 : 0.8);
+            this.aimp_vent_layer.graphics.drawCircle(px,py,id == selected ? 8 : 4);
+            this.aimp_vent_layer.graphics.endFill();
+            if(id == selected || Math.abs(Number(point[2]) - floorY) <= 2.5)
+               this.aimp_vent_layer.addChild(this.aimp_vent_text(String(id + 1),14,px - 18,py + 8,36));
+         }
+         px = 60 + (bodyX - minX) * scale;py = height - 120 - (bodyZ - minZ) * scale;
+         this.aimp_vent_layer.graphics.lineStyle(2,0xFFFFFF,1);
+         this.aimp_vent_layer.graphics.drawCircle(px,py,7);
+         this.aimp_vent_layer.addChild(this.aimp_vent_text("YOU",14,px - 25,py - 26,50));
+         this.aimp_vent_layer.addChild(this.aimp_vent_text("VENTILATION MAP",32,40,28,width - 80));
+         this.aimp_vent_layer.addChild(this.aimp_vent_text(selected >= 0 ?
+            "Vent " + String(selected + 1) + "  |  Elevation " + floorY.toFixed(1) + " m" : "Loading ventilation exits...",20,40,72,width - 80));
+         this.aimp_vent_layer.addChild(this.aimp_vent_text("Left / Right: select exit     Enter: travel     E: close",21,40,height - 82,width - 80));
+         this.aimp_vent_layer.addChild(this.aimp_vent_text(String(loaded) + " ventilation openings mapped  |  Dim markers: other elevations",16,40,height - 48,width - 80));
+      }
        
       
       public var pickup_cursor_mc:MovieClip;
@@ -668,6 +794,7 @@ package
       // and the round deadline are consumed in order on the movie's frame.
       private function aimp_on_bridge_frame(param1:Event) : void
       {
+         if(this.aimp_vent_layer != null && getTimer() - this.aimp_vent_at > 2000) this.aimp_hide_vents();
          var lineEnd:int = 0;
          var line:String = null;
          var count:int = 0;
@@ -775,6 +902,11 @@ package
          param1 = param1.split("\r").join("");
          if(param1.length == 0)
          {
+            return;
+         }
+         if(param1.indexOf("ALIEN_VENTS|") == 0)
+         {
+            this.aimp_update_vents(param1);
             return;
          }
          if(param1.indexOf("SESSION_LOADING|") == 0)

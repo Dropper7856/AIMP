@@ -1,0 +1,60 @@
+AIMP 436 / protocol 37
+Branch: feature/alien-vs-survivors-main
+
+Evidence from the two 2026-11-07 diagnostics
+- Both replicas bind the same map entity B360341C:4C41EDAF, with different
+  local runtime IDs as expected. Host receives and commits the owner's input.
+- The Alien positions differ around initial possession: the Host is near
+  (-32,19,-10), while the Client still observes its Alien near (-9,19,-17).
+  The manual lease fences ordinary Coop lifecycle placement. Prediction was
+  starting from the independent local spawn before receiving a Host placement.
+- Every recorded attack is rejected NativeUnavailable, before a victim is
+  selected. The action ABI preflight compares relocated absolute operands
+  against preferred-base bytes and also compares the already-hooked Move entry
+  against its original bytes. Both conditions reject a supported installation.
+
+Changes
+- Apply the first current-scope Host placement once on Client replicas before
+  enabling local native movement. Subsequent corrections retain the existing
+  native movement/path handling; ordinary poses do not cause repeated teleports.
+- Normalize the certified HIGHLOW operands for ASLR. Move's mandatory hook
+  validates its original bytes before installation; its rewritten entry is
+  deliberately excluded from the later action preflight.
+- Remove the V view toggle. Keep the existing third-person camera and zoom.
+- At an accessible opening, the HUD displays:
+  Press "E" to enter ventilation
+- Once backstage, show a ventilation map using the real native portal positions.
+  Left / Right selects an opening; Enter requests travel; E closes/reopens it.
+  Numbered markers show real openings; dim markers are at other elevations.
+  This is a map of ventilation locations, not the retail map's wall/floor artwork.
+- The catalogue is read on the engine thread in bounded pages of 64 entries,
+  supporting all 4096 native entries. The owner HUD receives scoped updates;
+  inactive/retired/loading state hides it, with a two-second freshness timeout.
+- A selected exit carries a portable location in the authenticated Alien intent.
+  The Host must match it to an existing real opening; native indices/pointers
+  never cross the peer network. Duplicate/missing portal matches are rejected.
+- Query responses have a dedicated bounded IPC limit. HUD polling does not
+  replace user-command status in the launcher. The query task is joined at close.
+- PICKUPOVERLAY.GFX was compiled with FFDec/Java21 and re-exported to verify
+  the new methods and English text. Only DoABC is transplanted; original visual
+  tags and the opaque Scaleform tail are verified byte-identical.
+
+Validation
+- Native: AlienPvPDonorControl, AISyncHookInstallation,
+  AISyncProductionInstallation: 3/3 passed. The production test verifies the
+  action ABI against the ASLR-rebased executable AFTER mandatory hooks install.
+- .NET: Protocol frames; Alien configuration, payload defaults, lobby/restart;
+  selected vent wire/catalogue validation: 5/5 passed.
+- The broader existing "Protocol models" test fails on the untouched WorldSync
+  fixture in ProtocolTests.AssertWorldPublicAction: it expects root version6,
+  while the unchanged WorldPublicActionCodec accepts versions12/13.
+  No claim that the complete repository test suite passes.
+- Native Win32 Release /W4 /WX and .NET Release publish succeeded.
+- Game rendering, native attack outcomes and two-PC timing need an in-game test.
+
+Delivery
+API only, no Electron rebuild. Local package and second test PC are updated
+without removing destination-only files. SHA-256 equality covers Launcher,
+Protocol, NetZ, NEWFRONTENDMENU.GFX and PICKUPOVERLAY.GFX.
+Detailed receipt: artifacts/avs-v417-port/delivery.json.
+Logs: artifacts/alien-436/.

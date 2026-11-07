@@ -1543,7 +1543,7 @@ bool GameCommandExecutor::CanExecute(const std::string_view command) const noexc
         return RemoteEquipmentProvisionAvailable();
     }
     if (command == "ALIEN_PVP_PROBE" || command == "ALIEN_PVP_BIND" ||
-        command == "ALIEN_PVP_RELEASE") {
+        command == "ALIEN_PVP_RELEASE" || command=="ALIEN_PVP_VENTS") {
         return ai_sync::Installed();
     }
     if (command == "RETURN_TO_FRONTEND") {
@@ -4218,6 +4218,11 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteAlienPvPRelease() const {
     return {released,released?"ALIEN_PVP_RELEASED":"ALIEN_PVP_RELEASE_PENDING",
         released?"Alien PvP native lease released safely.":
             "Alien PvP release deferred while native requests are in flight."};
+}
+GameCommandExecutionResult GameCommandExecutor::ExecuteAlienPvPVents(std::uint32_t page) const {
+    std::string json;
+    const bool ready=ai_sync::SnapshotAlienVents(page,json);
+    return {ready,ready?"ALIEN_PVP_VENTS_READY":"ALIEN_PVP_NOT_READY",ready?json:"Local Alien ventilation is not ready."};
 }
 
 GameCommandExecutionResult GameCommandExecutor::ExecuteItemSyncApply(

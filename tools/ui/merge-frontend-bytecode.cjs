@@ -2,7 +2,7 @@
 // compile ActionScript; its rewritten display list must never be shipped.
 const fs = require('node:fs');
 const zlib = require('node:zlib');
-const [originalPath, compiledPath, outputPath] = process.argv.slice(2);
+const [originalPath, compiledPath, outputPath, ...requiredStrings] = process.argv.slice(2);
 if (!outputPath) throw new Error('Usage: node merge-frontend-bytecode.cjs original.GFX compiled.GFX output.GFX');
 
 function unpack(data, preserveOpaqueTail = false) {
@@ -38,7 +38,7 @@ function unpack(data, preserveOpaqueTail = false) {
 
 const original = unpack(fs.readFileSync(originalPath), true);
 const compiled = unpack(fs.readFileSync(compiledPath), true);
-for (const value of ['Match Type', 'Alien vs Survivors', 'SET_ALIEN_ROLE', 'alienVsSurvivors']) {
+for (const value of requiredStrings.length ? requiredStrings : ['Match Type', 'Alien vs Survivors', 'SET_ALIEN_ROLE', 'alienVsSurvivors']) {
   if (!compiled.abc.payload.includes(Buffer.from(value))) throw new Error(`Compiled menu missing ${value}`);
 }
 const bytecode = compiled.raw.subarray(compiled.abc.start, compiled.abc.end);
@@ -52,4 +52,4 @@ if (!check.raw.subarray(0, check.abc.start).equals(original.raw.subarray(0, orig
   throw new Error('Visual tags changed');
 }
 if (!fs.readFileSync(originalPath).equals(result) || outputPath !== originalPath) fs.writeFileSync(outputPath, result);
-console.log('Alien menu bytecode compiled; original Scaleform tags and tail preserved.');
+console.log('UI bytecode compiled; original Scaleform tags and tail preserved.');

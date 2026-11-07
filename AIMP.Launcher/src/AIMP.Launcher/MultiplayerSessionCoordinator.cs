@@ -637,6 +637,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _ = TryConvergeRemoteCharactersAsync(runtime, now);
         _ = TryAdvanceRemoteMovementAsync(runtime, now);
         TryScheduleAlienPvPBinding(runtime, now);
+        TryScheduleAlienVentMap(runtime,now);
         UpdateVoiceSession(runtime);
     }
 
@@ -743,7 +744,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _controller.ItemSyncSpawnProduced -= OnNativeItemSyncSpawnProduced;
         _controller.ThrowableProduced -= OnNativeThrowableProduced;
         StopNetworkAsync("Launcher closed").GetAwaiter().GetResult();
-        Task.WhenAll(_missionReportTask, _missionApplyTask).GetAwaiter().GetResult();
+        Task.WhenAll(_missionReportTask, _missionApplyTask,_alienVentPollTask).GetAwaiter().GetResult();
         _commandGate.Dispose();
         _alienPvPOperationGate.Dispose();
         _spawnGate.Dispose();
