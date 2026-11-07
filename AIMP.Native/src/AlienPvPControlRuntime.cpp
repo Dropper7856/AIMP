@@ -226,8 +226,13 @@ void Drain(std::uint64_t now) noexcept {
         } else if(f.kind==Kind::Resolution) {
             ApplyResolution(f,now);
         } else if(f.kind==Kind::Correction && !g.context.host) {
-            if(!g.aligned && (f.flags&(PoseValid|Backstage|NativeBusy))==PoseValid &&
-                !ActionBusy() && OrdinaryCycle(g.context.character)) {
+            std::uint8_t initialState{};bool initialBackstage{};
+            const bool initialStage=NativeStage(g.context.character,initialState,initialBackstage);
+            const bool sameStage=initialStage && initialBackstage==((f.flags&Backstage)!=0U);
+            const bool initialIdle=OrdinaryCycle(g.context.character) ||
+                (initialBackstage && initialState==77U);
+            if(!g.aligned && (f.flags&(PoseValid|NativeBusy))==PoseValid &&
+                sameStage && initialIdle && !ActionBusy()) {
                 // AIMP fences ordinary spawn/lifecycle replay for the possessed
                 // Alien. Apply the Host's first authenticated placement once,
                 // before predicting any movement from a different local spawn.

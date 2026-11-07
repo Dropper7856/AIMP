@@ -116,6 +116,13 @@ OwnershipCheck InspectMovementBoundary(const OwnershipMemory& memory,const Actor
     OwnershipBoundaryFailure* failure) noexcept {return InspectBoundary(memory,actor,quiet,false,failure);}
 OwnershipCheck InspectInitialBackstageBoundary(const OwnershipMemory& memory,const ActorLifetime& actor,bool quiet,
     OwnershipBoundaryFailure* failure) noexcept {return InspectBoundary(memory,actor,quiet,false,failure,true);}
+OwnershipCheck InspectAlienPossessionBoundary(const OwnershipMemory& memory,const ActorLifetime& actor,bool quiet,
+    OwnershipBoundaryFailure* failure) noexcept {
+    if(failure)*failure={};
+    std::uint8_t a{},b{};
+    if(!Read(memory,actor.character+0x2DAU,a)||!Read(memory,actor.character+0x2DBU,b))return OwnershipCheck::Unknown;
+    return InspectBoundary(memory,actor,quiet,false,failure,a!=0U||b!=0U);
+}
 OwnershipCheck InspectInteractionBoundary(const OwnershipMemory& memory,const ActorLifetime& actor,
     OwnershipBoundaryFailure* failure) noexcept {return InspectBoundary(memory,actor,false,true,failure);}
 OwnershipCheck InspectAuthoritativeExecutionBoundary(const OwnershipMemory& memory,const ActorLifetime& actor,bool quiet,

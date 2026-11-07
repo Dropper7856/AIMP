@@ -131,6 +131,32 @@ void InitialBackstageHold() {
     m.Put(m.actor.character+0x297U,std::uint8_t{});m.Put(m.actor.character+0x32CU,3U);CHECK(inspect()==OwnershipCheck::Waiting);
     m.Put(m.actor.character+0x32CU,1U);m.mutateAt=Memory::cycle+0x44U;CHECK(inspect()==OwnershipCheck::Unknown);
 }
+void AlienPossessionDoesNotCancelSpawnPassage() {
+    Memory m;
+    m.Put(m.actor.character+0x2DAU,std::uint8_t{});
+    m.Put(m.actor.character+0x2DBU,std::uint8_t{});
+    const auto inspect=[&](bool quiet) {
+        return InspectAlienPossessionBoundary({0x400000U,&m,&Memory::Read},m.actor,quiet);
+    };
+    // The observed Host cycle75 is still moving out of its map spawn.
+    // The PRE-drain boundary must refuse it, even with an active scheduler.
+    m.Cycle(0xDBB2A0U,75U);m.Put(m.actor.character+0x2CD8U,1U);
+    CHECK(inspect(false)==OwnershipCheck::Waiting);
+    m.Cycle(0xDBB360U,76U);CHECK(inspect(false)==OwnershipCheck::Waiting);
+    // Retail completion produces a stationary backstage hold. This may now
+    // retire the scheduler, but full possession still requires quiet resources.
+    m.Cycle(0xDBB1B8U,77U);m.Put(Memory::cycle+0x44U,-1.0F);
+    CHECK(inspect(false)==OwnershipCheck::Waiting); // Frontstage must not borrow this exception.
+    m.Put(m.actor.character+0x2DAU,std::uint8_t{1});
+    CHECK(inspect(false)==OwnershipCheck::Ready);
+    CHECK(inspect(true)==OwnershipCheck::Waiting);
+    m.Put(m.actor.character+0x2CD8U,0U);CHECK(inspect(true)==OwnershipCheck::Ready);
+    m.Put(Memory::movement+0xC4U+0x44U,1U);CHECK(inspect(true)==OwnershipCheck::Waiting);
+    m.Put(Memory::movement+0xC4U+0x44U,0U);
+    m.Cycle(0xDBB2A0U,75U);CHECK(inspect(false)==OwnershipCheck::Waiting);
+    m.Cycle(0xEABF80U,1U);m.Put(m.actor.character+0x2DAU,std::uint8_t{});
+    CHECK(inspect(false)==OwnershipCheck::Ready && inspect(true)==OwnershipCheck::Ready);
+}
 void ExactNativeExecutionProvenance() {
     Memory m;m.actor.creationSerial=11;
     aimp::ai_sync::transactions::Scope scope{};scope.session[0]=1;scope.authorityEpoch=scope.worldEpoch=scope.consumerEpoch=1;
@@ -213,7 +239,7 @@ void PassageCausalReplacement() {
 }
 }
 int main() {
-    NativeIdleAndCycles();SchedulerAndNavigation();FaultsAndLifetimeChanges();NativeInteractionReplacement();InitialBackstageHold();ExactNativeExecutionProvenance();
+    NativeIdleAndCycles();SchedulerAndNavigation();FaultsAndLifetimeChanges();NativeInteractionReplacement();InitialBackstageHold();AlienPossessionDoesNotCancelSpawnPassage();ExactNativeExecutionProvenance();
     ExactPassageLifetime(0xDBB2A0U,0x4BU);ExactPassageLifetime(0xDBB360U,0x4CU);PassageCausalReplacement();
     std::cout<<"Native ownership: movement boundaries, exact passage lifetime and causal replacement PASS (modeled reads only).\n";
 }

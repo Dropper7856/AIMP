@@ -101,5 +101,23 @@ int main() {
     Check(!vents::WithinReach({0,0,0},{0,8,0}),"vent on another floor was interactable");
     Check(!vents::WithinReach({0,0,0},{8,0,0}),"distant vent was interactable");
     Reset(true);
+    cycle[0x1A]=std::byte{77};body[0x2DA]=std::byte{1};
+    LocalInput stationary{};stationary.focused=true;
+    Pump(context);Queue(activate);CaptureLocal(stationary);Pump(context);
+    const auto beforeBackstagePlacement=placements;
+    correction.sequence=1;correction.flags=PoseValid;Queue(correction);Pump(context);
+    Check(placements==beforeBackstagePlacement,"initial placement crossed native stages");
+    correction.sequence=2;correction.flags=PoseValid|Backstage|NativeBusy;Queue(correction);Pump(context);
+    Check(placements==beforeBackstagePlacement,"busy Host passage was used as initial placement");
+    cycle[0x1A]=std::byte{75};correction.sequence=3;correction.flags=PoseValid|Backstage;
+    Queue(correction);Pump(context);
+    Check(placements==beforeBackstagePlacement,"initial placement interrupted local traversal");
+    cycle[0x1A]=std::byte{77};correction.sequence=4;Queue(correction);Pump(context);
+    Check(placements==beforeBackstagePlacement+1,"stationary backstage spawn never aligned");
+    correction.sequence=5;Queue(correction);Pump(context);
+    Check(placements==beforeBackstagePlacement+1,"backstage placement repeated");
+    CaptureLocal(movement);Pump(context);
+    Check(placements>beforeBackstagePlacement+1 && MovingNow(),"backstage movement remained gated after placement");
+    Reset(true);
     std::cout<<"Donor control, Host placement, selected vent transport and interaction reach passed.\n";
 }

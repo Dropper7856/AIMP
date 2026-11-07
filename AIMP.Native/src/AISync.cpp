@@ -10624,6 +10624,21 @@ bool PvPTryDrain(AlienPvPLeaseStatus& status) noexcept {
         gPvPLease.owned=false;status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement);
         status.waitReason=PairSourceBusy(actor->character)?"paired-action":"coop-ownership";return false;
     }
+    const execution::OwnershipMemory memory{gBase,nullptr,
+        [](void*,std::uintptr_t at,void* out,std::size_t size) noexcept {
+            return crash_guard::TryCopy(out,reinterpret_cast<const void*>(at),size);
+        }};
+    const execution::ActorLifetime lifetime{actor->character,actor->runtimeId,
+        gPvPLease.nativeGeneration,gPvPLease.ticket.serial};
+    execution::OwnershipBoundaryFailure failure{};
+    // Fencing stops new AI decisions, but an already-running spawn passage
+    // still owns its movement request. Cancelling it here strands cycle75/76
+    // permanently, so neither replica can ever advertise readiness.
+    if(execution::InspectAlienPossessionBoundary(memory,lifetime,false,&failure)!=Check::Ready) {
+        gPvPLease.boundaryOffset=failure.offset;gPvPLease.boundaryValue=failure.value;
+        status=PvPStatus(AlienPvPLeasePhase::Draining);
+        status.waitReason="initial-native-cycle";return false;
+    }
     if (!gPvPLease.drained) {
         // All per-actor BT decisions are already fenced, and the exact native
         // owner has no transaction/paired lease. Use retail destructors, not
@@ -10638,17 +10653,11 @@ bool PvPTryDrain(AlienPvPLeaseStatus& status) noexcept {
     }
     const character_direct_step_runtime::MovementResourceLease resources(actor->character);
     if (!resources) { status=PvPStatus(AlienPvPLeasePhase::Draining); return false; }
-    const execution::OwnershipMemory memory{gBase,nullptr,
-        [](void*,std::uintptr_t at,void* out,std::size_t size) noexcept {
-            return crash_guard::TryCopy(out,reinterpret_cast<const void*>(at),size);
-        }};
-    const execution::ActorLifetime lifetime{actor->character,actor->runtimeId,
-        gPvPLease.nativeGeneration,gPvPLease.ticket.serial};
-    execution::OwnershipBoundaryFailure failure{};
-    auto check=execution::InspectMovementBoundary(memory,lifetime,true,&failure);
+    failure={};
+    auto check=execution::InspectAlienPossessionBoundary(memory,lifetime,true,&failure);
     if (check == Check::Waiting && PvPTryClearDrainedNavigation(*actor,failure)) {
         failure={};
-        check=execution::InspectMovementBoundary(memory,lifetime,true,&failure);
+        check=execution::InspectAlienPossessionBoundary(memory,lifetime,true,&failure);
     }
     gPvPLease.boundaryOffset=failure.offset;gPvPLease.boundaryValue=failure.value;
     if (check != Check::Ready) {
@@ -10790,7 +10799,7 @@ bool ReleaseAlienPvPLease(AlienPvPLeaseStatus& status) noexcept {
     const execution::ActorLifetime lifetime{actor->character,actor->runtimeId,
         gPvPLease.nativeGeneration,gPvPLease.ticket.serial};
     execution::OwnershipBoundaryFailure failure{};
-    if (execution::InspectMovementBoundary(memory,lifetime,true,&failure) !=
+    if (execution::InspectAlienPossessionBoundary(memory,lifetime,true,&failure) !=
         execution::OwnershipCheck::Ready) {
         gPvPLease.boundaryOffset=failure.offset;
         gPvPLease.boundaryValue=failure.value;

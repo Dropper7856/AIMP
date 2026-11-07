@@ -47,6 +47,10 @@ struct NativeExecutionAnchor {
 // after the drain. This grants no permission to synthesize a cycle transition.
 [[nodiscard]] OwnershipCheck InspectInitialBackstageBoundary(const OwnershipMemory&,
     const ActorLifetime&,bool requireQuiescence,OwnershipBoundaryFailure* failure=nullptr) noexcept;
+// Initial possession only. A backstage stationary hold can be handed off;
+// an active passage must finish with its native requests intact BEFORE drain.
+[[nodiscard]] OwnershipCheck InspectAlienPossessionBoundary(const OwnershipMemory&,
+    const ActorLifetime&,bool requireQuiescence,OwnershipBoundaryFailure* failure=nullptr) noexcept;
 // An authoritative paired transition replaces the current native cycle through
 // its virtual destructor. It does not require an invented intermediate Idle.
 // Caller must independently own the actor, retire competing requests and bind
