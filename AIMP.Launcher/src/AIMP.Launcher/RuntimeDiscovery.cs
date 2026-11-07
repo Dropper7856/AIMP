@@ -1,6 +1,5 @@
 using System.ComponentModel;
 using System.Diagnostics;
-using System.Security.Cryptography;
 
 namespace AIMP.Launcher;
 
@@ -106,20 +105,10 @@ internal static class NativeDllResolver
         if (path is null) throw new FileNotFoundException(
             $"{DllName} was not found in the launcher or native build directories.");
 
-        // Development trees frequently retain an old DLL beside a previously
-        // built Launcher. Keep packaged/local priority when the bytes match, but
-        // if a repository native build exists and differs, prefer that build so
-        // the Launcher cannot silently inject a stale copy. The strict HELLO
-        // version check remains the final compatibility guard.
-        if (!string.IsNullOrWhiteSpace(root)
-            && IsLauncherLocalCandidate(path, launcherDirectory))
-        {
-            var repositoryBuild = candidates
-                .Skip(2)
-                .FirstOrDefault(File.Exists);
-            if (repositoryBuild is not null && !FilesMatch(path, repositoryBuild))
-                return repositoryBuild;
-        }
+        // The DLL delivered alongside this API belongs to the same build and
+        // protocol. A repository build may be older, newer or another branch;
+        // a different hash does not make it compatible. Use repository builds
+        // only when no launcher-local DLL exists. HELLO remains strict.
         return path;
     }
 
@@ -132,32 +121,13 @@ internal static class NativeDllResolver
             Path.Combine(launcherDirectory, DllName),
             Path.Combine(launcherDirectory, "Native", DllName)
         };
-        // Packaged files win when they match the repository build; native
-        // Release builds precede Debug builds as the stale-copy fallback.
+        // Launcher-local files always win. Repository Release builds precede
+        // Debug builds only as a fallback for an unpackaged development API.
         // Within each configuration, prefer the most recently written DLL:
         // an older alphabetically first build must not shadow a fresh build.
         AddBuildCandidates(values, repositoryRoot, "Release");
         AddBuildCandidates(values, repositoryRoot, "Debug");
         return values.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-    }
-
-    private static bool IsLauncherLocalCandidate(string path, string launcherDirectory)
-    {
-        var full = Path.GetFullPath(path);
-        return string.Equals(full, Path.GetFullPath(Path.Combine(launcherDirectory, DllName)),
-                   StringComparison.OrdinalIgnoreCase)
-            || string.Equals(full, Path.GetFullPath(Path.Combine(launcherDirectory, "Native", DllName)),
-                StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool FilesMatch(string left, string right)
-    {
-        var leftInfo = new FileInfo(left);
-        var rightInfo = new FileInfo(right);
-        if (leftInfo.Length != rightInfo.Length) return false;
-        using var leftStream = File.OpenRead(left);
-        using var rightStream = File.OpenRead(right);
-        return SHA256.HashData(leftStream).AsSpan().SequenceEqual(SHA256.HashData(rightStream));
     }
 
     internal static string FindRepositoryRoot(string startDirectory)

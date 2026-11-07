@@ -129,7 +129,7 @@ public static class FrameCodec
         var version = BinaryPrimitives.ReadUInt16LittleEndian(header.Slice(4, 2));
         if (version != ProtocolConstants.Version)
         {
-            throw new ProtocolException($"Incompatible AIMP version: {version}.");
+            throw new ProtocolException($"Incompatible AIMP version: {version} (expected {ProtocolConstants.Version}).");
         }
 
         type = (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(header.Slice(6, 2));

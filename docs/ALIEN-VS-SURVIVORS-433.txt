@@ -1,0 +1,27 @@
+Build 433 — correction du chargement d'une DLL incompatible
+
+Branche : feature/alien-vs-survivors-main
+API : 0.8.4.433 ; DLL : 0.11.4.433-alien-vs-survivors ; protocole : 36.
+
+Diagnostic fourni : AIMP-Diagnostics-20261107-123854.zip.
+Le launcher 432 resolvait la DLL dans
+AIMP.Native/out/build/vs2026-win32/bin/Release/AIMP.NetZ.dll,
+qui annoncait encore le protocole 32. Le resolveur remplacait la DLL locale
+livree dans resources/api des que le hash d'un build de depot etait different.
+La presence d'un depot parent suffisait a declencher cette substitution.
+
+Correction : la DLL situee a cote de l'API (puis dans son sous-dossier Native)
+est toujours prioritaire. Les builds de depot servent uniquement de recours
+lorsqu'aucune DLL locale n'existe. Le controle strict HELLO et le protocole 36
+restent actifs. Le message d'incompatibilite affiche maintenant aussi la
+version de protocole attendue.
+
+Le build de livraison et les trois DLL sont actualises ensemble sur les deux
+PC par build-alien-api.ps1. Aucun rebuild Electron ni test unitaire.
+Preuves de compilation/livraison : artifacts/incompatible-432/ et
+artifacts/avs-v417-port/delivery.json.
+
+Apres livraison, quitter completement AI.exe et le launcher sur les deux PC,
+puis les relancer. Une DLL deja chargee dans le jeu reste l'ancienne jusqu'a
+la fermeture de ce processus ; remplacer son fichier ne remplace pas son code
+en memoire. Le retrait/chargement a chaud n'est pas utilise.

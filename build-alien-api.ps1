@@ -2,7 +2,7 @@
 param(
     [string]$CMakeExe = '',
     [string]$Generator = 'Visual Studio 18 2026',
-    [string]$OutputDirectory = 'artifacts/alien-api-432',
+    [string]$OutputDirectory = 'artifacts/alien-api-433',
     [string]$SecondPcApi = '\\DESKTOP-2JNROA0\Users\Public\Documents\win-unpacked\resources\api',
     [switch]$DeliveryOnly
 )
@@ -50,15 +50,16 @@ try {
       }
       Run $CMakeExe @('-S','AIMP.Native','-B',$native,'-G',$Generator,'-A','Win32','-DBUILD_TESTING=OFF')
       Run $CMakeExe @('--build',$native,'--config','Release','--target','AIMP.NetZ','--parallel','4')
-      Run 'dotnet' @('publish','AIMP.Launcher/src/AIMP.Launcher/AIMP.Launcher.csproj','-c','Release','-r','win-x64','--self-contained','true','-o',$api)
-      Run 'dotnet' @('publish','AIMP.Launcher/src/AIMP.Injector32/AIMP.Injector32.csproj','-c','Release','-r','win-x86','--self-contained','true','-o',(Join-Path $api 'Injector32'))
+      # Keep restore/build intermediates separate from IDE and other RID builds.
+      Run 'dotnet' @('publish','AIMP.Launcher/src/AIMP.Launcher/AIMP.Launcher.csproj','-c','Release','-r','win-x64','--self-contained','true','--artifacts-path',(Join-Path $output 'dotnet'),'-o',$api)
+      Run 'dotnet' @('publish','AIMP.Launcher/src/AIMP.Injector32/AIMP.Injector32.csproj','-c','Release','-r','win-x86','--self-contained','true','--artifacts-path',(Join-Path $output 'dotnet'),'-o',(Join-Path $api 'Injector32'))
       Copy-Item -LiteralPath (Join-Path $native 'bin/Release/AIMP.NetZ.dll') -Destination (Join-Path $api 'AIMP.NetZ.dll') -Force
     }
     foreach ($required in @('AIMP.Launcher.dll','AIMP.Protocol.dll','AIMP.NetZ.dll','UIBridge/NEWFRONTENDMENU.GFX','Injector32/AIMP.Injector32.exe')) {
         if (!(Test-Path -LiteralPath (Join-Path $api $required) -PathType Leaf)) { throw "Incomplete build artifacts: $required" }
     }
 
-    $delivery = [ordered]@{ builtAtUtc=[DateTime]::UtcNow.ToString('o'); apiVersion='0.8.4.432'; protocol=36; unitTestsRun=$false; localDelivered=$false; secondPcDelivered=$false; hashes=@(); failures=@() }
+    $delivery = [ordered]@{ builtAtUtc=[DateTime]::UtcNow.ToString('o'); apiVersion='0.8.4.433'; protocol=36; unitTestsRun=$false; localDelivered=$false; secondPcDelivered=$false; hashes=@(); failures=@() }
     foreach ($target in @($localApi,$SecondPcApi)) {
         try {
             $delivery.hashes += @(Copy-Api $target)
