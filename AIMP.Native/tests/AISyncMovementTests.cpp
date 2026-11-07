@@ -926,6 +926,53 @@ void ObservedBendFeedsNativeRequest() {
     CHECK(std::count(h.calls.begin(),h.calls.end(),1U)==factories&&h.cancellations.empty());
     ReleaseGuided(h);
 }
+void LocalTerminalRetention() {
+    for(const auto status:{3U,4U,6U}) {
+        NativeHarness h;auto move=Move();move.opcode=Op::Submit;move.movement.parts=1;
+        move.movement.companion={};move.movement.companionFlags=move.movement.companionRetainedAfter=0;
+        h.current=move;CHECK(h.adapter.Invoke(move)==NativeOutcome::Admitted);
+        const auto request=reinterpret_cast<std::uintptr_t>(h.requests[0].data());
+        h.clearRetainedOnCancel=true;
+        for(unsigned i=0;i<6U;++i) {
+            NativeHarness::Write(request+0xCU,status);NativeHarness::Write(request+0x68U,8U);
+            NativeHarness::Write(request+0x6CU,3U);h.Head(0);h.Retained(request);
+            move.opcode=Op::Update;++move.parameterRevision;move.movement.after.goal[0]+=2.0F;h.current=move;
+            const auto start=h.calls.size();
+            CHECK(h.adapter.Check(move)==Readiness::Ready&&h.adapter.Invoke(move)==NativeOutcome::Admitted);
+            CHECK(h.calls[start]==30U&&h.calls[start+1U]==31U&&h.calls[start+2U]==1U);
+            CHECK(h.cancellations.size()==i+1U&&h.retainedDrops==0U&&h.adapter.ActiveCount()==1U);
+            CHECK(*reinterpret_cast<const std::uint32_t*>(h.actor.data()+0x2CE4U)==0U);
+        }
+        move.opcode=Op::Release;move.movement={};CHECK(h.adapter.Invoke(move)==NativeOutcome::Admitted);
+        CHECK(h.adapter.ActiveCount()==0U&&h.retainedDrops==0U);
+    }
+    for(const bool fail:{false,true}) {
+        NativeHarness h;auto move=Move();move.opcode=Op::Submit;move.movement.parts=1;
+        move.movement.companion={};move.movement.companionFlags=move.movement.companionRetainedAfter=0;
+        h.current=move;CHECK(h.adapter.Invoke(move)==NativeOutcome::Admitted);
+        const auto request=reinterpret_cast<std::uintptr_t>(h.requests[0].data());
+        NativeHarness::Write(request+0xCU,5U);NativeHarness::Write(request+0x68U,8U);
+        NativeHarness::Write(request+0x6CU,3U);h.Head(0);h.Retained(request);
+        move.opcode=Op::Update;++move.parameterRevision;move.movement.after.goal[0]+=2.0F;h.current=move;
+        const auto start=h.calls.size();
+        CHECK(h.adapter.Check(move)==Readiness::Waiting&&h.calls.size()==start);
+        NativeHarness::Write(request+0xCU,3U);h.Head(request);
+        CHECK(h.adapter.Check(move)==Readiness::Waiting&&h.calls.size()==start);
+        h.Head(0);h.retiredFirst[1]=0U;
+        CHECK(h.adapter.Check(move)==Readiness::Waiting&&h.calls.size()==start);
+        h.Retained(request);
+        const auto navigation=reinterpret_cast<std::uintptr_t>(h.resource.data())+0xC4U;
+        NativeHarness::Write(navigation+0x5CU,1U);
+        CHECK(h.adapter.Check(move)==Readiness::Waiting&&h.calls.size()==start);
+        NativeHarness::Write(navigation+0x5CU,0U);
+        h.failCancel=fail;h.clearRetainedOnCancel=false;
+        CHECK(h.adapter.Check(move)==Readiness::Ready&&h.adapter.Invoke(move)==NativeOutcome::Unknown);
+        CHECK(h.cancellations.size()==1U&&h.calls.back()==30U);
+        // Failed or incomplete native removal stays fenced; no second Cancel
+        // or Ref release may conceal the retained scheduler entry.
+        CHECK(h.adapter.Check(move)!=Readiness::Ready&&h.cancellations.size()==1U);
+    }
+}
 void GoalDependencies() {
     NativeHarness h;auto move=Move();move.opcode=Op::Submit;move.movement.parts=1;
     move.movement.companion={};move.movement.companionFlags=move.movement.companionRetainedAfter=0;
@@ -1141,4 +1188,4 @@ void Native() {
     stance.opcode=Op::Release;stance.mode=0;stance.scalarRetention=3;CHECK(queued.adapter.Invoke(stance)==NativeOutcome::Admitted&&queued.adapter.ActiveCount()==0);
 }
 }
-int main(int argc,char** argv){CHECK(argc==2);Wire(argv[1]);Evidence();PrePassageContinuity();LocalGoalConsumptionPrecedesStop(1);LocalGoalConsumptionPrecedesStop(2);LocalDiscardedGoalRetainsExactHostIntent();LocalPendingGoalCoalescesLatestRevision();LocalContinuousGoalsFinishConsumedParameters();HostInputsAreNotReplacedByPhysicalCarrier(1);HostInputsAreNotReplacedByPhysicalCarrier(2);RejectedRouteRetainsNativeLifetime();GuidedInitialTargetWaitsWithoutFactory();GuidedUpdatesOnlyRetainValues();GuidedUpdateWaitsForRetailWithoutRestart();GuidedGoalConsumptionPrecedesStopAndGait();GuidedRejectedAndDiscardedGoalsRemainPendingIntent();GuidedFailureAwaitsNativeSchedulerAndWorker();GuidedRetainedReplacementKeepsIdentity();GuidedContinuationIsBoundedAndAppended();GuidedContinuationIsBoundedAndAppended(2);RetainedArrivalContinuesWithoutNewHostRevision(1);RetainedArrivalContinuesWithoutNewHostRevision(2);ExhaustedThroughWaypointContinues(1);ExhaustedThroughWaypointContinues(2);PhysicalProgressLimitsNativeGoals();ObservedBendFeedsNativeRequest();GoalDependencies();NativeRouteInitializationOwnership();NativePreemption();NativePreemption(movement::Navigation::HostGuided);LatePreemptedUpdate();Native();std::cout<<"AISync Move wire, paced guidance, full evidence, compound native ownership PASS (offline)\n";}
+int main(int argc,char** argv){CHECK(argc==2);Wire(argv[1]);Evidence();PrePassageContinuity();LocalGoalConsumptionPrecedesStop(1);LocalGoalConsumptionPrecedesStop(2);LocalDiscardedGoalRetainsExactHostIntent();LocalPendingGoalCoalescesLatestRevision();LocalContinuousGoalsFinishConsumedParameters();HostInputsAreNotReplacedByPhysicalCarrier(1);HostInputsAreNotReplacedByPhysicalCarrier(2);RejectedRouteRetainsNativeLifetime();GuidedInitialTargetWaitsWithoutFactory();GuidedUpdatesOnlyRetainValues();GuidedUpdateWaitsForRetailWithoutRestart();GuidedGoalConsumptionPrecedesStopAndGait();GuidedRejectedAndDiscardedGoalsRemainPendingIntent();GuidedFailureAwaitsNativeSchedulerAndWorker();GuidedRetainedReplacementKeepsIdentity();GuidedContinuationIsBoundedAndAppended();GuidedContinuationIsBoundedAndAppended(2);RetainedArrivalContinuesWithoutNewHostRevision(1);RetainedArrivalContinuesWithoutNewHostRevision(2);ExhaustedThroughWaypointContinues(1);ExhaustedThroughWaypointContinues(2);PhysicalProgressLimitsNativeGoals();ObservedBendFeedsNativeRequest();LocalTerminalRetention();GoalDependencies();NativeRouteInitializationOwnership();NativePreemption();NativePreemption(movement::Navigation::HostGuided);LatePreemptedUpdate();Native();std::cout<<"AISync Move wire, paced guidance, full evidence, compound native ownership PASS (offline)\n";}

@@ -10489,6 +10489,35 @@ Counters DiagnosticsSnapshot() noexcept {
     return value;
 }
 void LogDiagnostics(Diagnostics& diagnostics) {
+    static bool movementFailureLogged{};
+    if(!movementFailureLogged) {
+        const auto f=host_producer::FirstMovementCaptureFailure();
+        if(f.stage) {
+            const auto words=[](const movement::Parameters& p) {
+                std::string out="[";
+                const auto append=[&out](std::uint32_t word){if(out.size()>1U)out+=',';out+=std::to_string(word);};
+                append(p.retained);append(p.style);
+                for(const auto v:p.goal)append(std::bit_cast<std::uint32_t>(v));
+                append(std::bit_cast<std::uint32_t>(p.stoppingDistance));append(std::bit_cast<std::uint32_t>(p.stopDistance));
+                for(const auto v:p.query)append(std::bit_cast<std::uint32_t>(v));
+                append(p.flags90);append(p.flags91);out+=']';return out;
+            };
+            diagnostics.Log("error","aisync_host_movement_failure",
+                "First failed capture only. stage1=gait,2=request snapshot,3=pending flag,4=phase,5=invalid Admit,6=invalid Update. Parameter arrays are uint32 raw words: retained,style,goal XYZ,stoppingDistance,stopDistance,query[9],flags90,flags91. Missing native reads remain zero; bundle may be partial for stages1..4. No normalization or recovery authorization.",
+                {{"stage",Diagnostics::Unsigned(f.stage),true},{"request",Diagnostics::Unsigned(f.request),true},
+                 {"sourceKind",Diagnostics::Unsigned(f.kind),true},{"observedKind",Diagnostics::Unsigned(f.observedKind),true},
+                 {"type",Diagnostics::Unsigned(f.type),true},{"status",Diagnostics::Unsigned(f.status),true},
+                 {"phase",Diagnostics::Unsigned(f.phase),true},{"pendingFlags",Diagnostics::Unsigned(f.flags),true},
+                 {"version",Diagnostics::Unsigned(f.bundle.version),true},{"parts",Diagnostics::Unsigned(f.bundle.parts),true},
+                 {"navigation",Diagnostics::Unsigned(static_cast<std::uint32_t>(f.bundle.navigation)),true},
+                 {"gait",Diagnostics::Unsigned(f.gait),true},{"primaryFlags",Diagnostics::Unsigned(f.bundle.primaryFlags),true},
+                 {"companionFlags",Diagnostics::Unsigned(f.bundle.companionFlags),true},
+                 {"companionRetainedAfter",Diagnostics::Unsigned(f.bundle.companionRetainedAfter),true},
+                 {"beforeWords",words(f.bundle.before),true},{"afterWords",words(f.bundle.after),true},
+                 {"companionWords",words(f.bundle.companion),true}});
+            movementFailureLogged=true;
+        }
+    }
     for(std::size_t i=0;i<gMotionTraces.size();++i) {
         MotionTraceSample sample{};std::uint64_t dropped{};
         {const std::lock_guard lock(gMotionTraceGate);if(!gMotionTraceCount)break;

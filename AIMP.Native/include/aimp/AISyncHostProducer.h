@@ -182,6 +182,16 @@ void BeforeNativeAdmission(std::uintptr_t request, std::uint32_t admission = 0) 
 // Source closures by producer site (source line of AISyncHostProducerNative.cpp).
 struct CoverageDiagnostics { std::uint64_t losses{}; std::uint32_t firstSite{}, lastSite{}; };
 [[nodiscard]] CoverageDiagnostics Coverage() noexcept;
+// First failed movement observation in this process. Raw bundle words are
+// preserved by the diagnostic serializer, including NaNs; never normalized.
+// stage1=gait,2=request snapshot,3=pending flag,4=phase,5=Admit,6=Update.
+struct MovementCaptureFailure {
+    std::uint32_t stage{},kind{},status{},phase{},observedKind{},gait{};
+    std::uintptr_t request{},type{};
+    std::uint8_t flags{};
+    movement::Bundle bundle{};
+};
+[[nodiscard]] MovementCaptureFailure FirstMovementCaptureFailure() noexcept;
 // Unobserved requests cancelled at binding so the Host brain reissues them.
 [[nodiscard]] std::uint64_t BootstrapCancels() noexcept;
 void ObserveNativeMutation(std::uintptr_t request) noexcept;

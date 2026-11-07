@@ -498,8 +498,20 @@ Readiness NativeRequestAdapter::CheckMovement(const Record& r,const LocalActorBi
             // A strict route belongs to this native admission and its consumed
             // prefix. An Update cannot resurrect it with a fresh B and rewind
             // that prefix. Only a new Host command may obtain a new admission.
-            if(status>=3&&status<=6)return r.movement.navigation==movement::Navigation::HostRoute?
-                Readiness::Rejected:Resources(actor.character);
+            if(status>=3&&status<=6) {
+                if(r.movement.navigation==movement::Navigation::HostRoute)return Readiness::Rejected;
+                if(r.nativeKind==1U&&r.movement.parts==1U&&r.movement.navigation==movement::Navigation::LocalNative) {
+                    movement::native_guidance::Snapshot ended{};std::uint32_t count{};
+                    // A completed request may still be held by the scheduler.
+                    // Keep its exact cleanup identity until native removal is
+                    // safe; dropping only our Ref leaks the retained entry.
+                    if(MovementExecutionOwned(actor.character)||!Read(actor.character+kScheduler+8U,count)||count!=0U||
+                        !ReadGuidance(*primary,ended)||!movement::native_guidance::Renewable(ended)||
+                        !ended.routeUpdateQuiet||(!ended.retainedReferenceAbsent&&!ended.retainedReferencePresent)||
+                        !GuidanceCanRestart(*primary)) {waitReason_=7U;return Readiness::Waiting;}
+                }
+                return Resources(actor.character);
+            }
             if(status!=1&&status!=2)return Readiness::Rejected;
             // Companion mutations require their own native setter contract.
             if(!movement::Same(r.movement.companion,primary->movement.companion)||
@@ -537,10 +549,16 @@ Readiness NativeRequestAdapter::CheckMovement(const Record& r,const LocalActorBi
 bool NativeRequestAdapter::RestartMovement(Lease& lease,const Record& r,const LocalActorBinding& actor) noexcept {
     const bool guided=r.movement.navigation==movement::Navigation::HostGuided;
     const bool passageRepair=passageRepairAuthority_!=nullptr;
+    std::uint32_t observedStatus{};
+    if(!Read(lease.ref.object+0xCU,observedStatus))return false;
+    const bool localTerminal=r.nativeKind==1U&&r.movement.parts==1U&&
+        r.movement.navigation==movement::Navigation::LocalNative&&observedStatus>=3U&&observedStatus<=6U;
+    const bool terminalCleanup=passageRepair||localTerminal;
     movement::native_guidance::Snapshot repairState{};
-    if(passageRepair) {
+    if(terminalCleanup) {
         std::uint32_t count{};
-        if(!MovementRevalidate(r,lease)||!Read(actor.character+kScheduler+8U,count)||count!=0U||
+        if(MovementExecutionOwned(actor.character)||!MovementRevalidate(r,lease)||
+            !Read(actor.character+kScheduler+8U,count)||count!=0U||!GuidanceCanRestart(lease)||
             !ReadGuidance(lease,repairState)||!movement::native_guidance::SchedulerEnded(repairState)||
             !movement::native_guidance::Renewable(repairState)||!repairState.routeUpdateQuiet||
             (!repairState.retainedReferenceAbsent&&!repairState.retainedReferencePresent)||
@@ -553,15 +571,15 @@ bool NativeRequestAdapter::RestartMovement(Lease& lease,const Record& r,const Lo
     lease.unknown=true;
     std::uint32_t status{};
     if(!Read(lease.ref.object+0xC,status))return false;
-    if(passageRepair&&status!=repairState.status)return false;
+    if(terminalCleanup&&status!=repairState.status)return false;
     // Terminal3/4/6 may still own a Ref in the native retained list. Cancel
     // removes that exact retained entry before our independent Ref is dropped.
     // Status5 reached here only with proven absence from that list.
-    const bool cleanupRetained=passageRepair&&repairState.retainedReferencePresent&&
+    const bool cleanupRetained=terminalCleanup&&repairState.retainedReferencePresent&&
         (status==3U||status==4U||status==6U);
     if((guided||status<=2||cleanupRetained)&&
         (!CancelRetiring(lease.ref.object)||!MovementRevalidate(r,lease)))return false;
-    if(passageRepair) {
+    if(terminalCleanup) {
         std::uint32_t count{};movement::native_guidance::Snapshot after{};
         if(!Read(actor.character+kScheduler+8U,count)||count!=0U||!ReadGuidance(lease,after)||
             !movement::native_guidance::SchedulerEnded(after)||!after.workerQuiet||

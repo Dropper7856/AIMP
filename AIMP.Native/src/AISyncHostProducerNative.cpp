@@ -73,6 +73,8 @@ std::array<std::atomic<std::uint64_t>,16> gUncoveredKinds{};
 std::atomic<std::uint64_t> gCoverageLosses{};
 std::atomic<std::uint32_t> gLastLossSite{}, gFirstLossSite{};
 std::atomic<std::uint64_t> gBootstrapCancels{};
+std::mutex gMovementFailureGate;
+MovementCaptureFailure gMovementFailure{};
 void Lost(std::uint32_t site, execution::Recovery reason = execution::Recovery::NativeUnavailable) noexcept {
     if (EngineProducer().Bound()) {
         gCoverageLosses.fetch_add(1U,std::memory_order_relaxed);
@@ -89,6 +91,17 @@ struct NativeCallScope {
 template<class T> bool Read(std::uintptr_t at, T& value) noexcept {
     __try { value = *reinterpret_cast<const T*>(at); return true; }
     __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+void MovementFailure(const Lease& lease,const Command& parameters,std::uint32_t stage) noexcept {
+    const std::lock_guard lock(gMovementFailureGate);
+    if(gMovementFailure.stage)return;
+    auto& f=gMovementFailure;f.stage=stage;f.kind=lease.sourceKind?lease.sourceKind:parameters.kind;
+    f.request=lease.ref.object;f.bundle=parameters.movement;f.gait=parameters.movement.gait;
+    static_cast<void>(Read(f.request,f.type));static_cast<void>(Read(f.request+0x10U,f.observedKind));
+    static_cast<void>(Read(f.request+0xCU,f.status));
+    if(f.kind==1U) {
+        static_cast<void>(Read(f.request+0x68U,f.phase));static_cast<void>(Read(f.request+0xB8U,f.flags));
+    }
 }
 bool Strong(std::uintptr_t request, Ref& ref) noexcept {
     __try {
@@ -299,6 +312,7 @@ void FinalizeMovement(Lease& lease) noexcept {
             lease.parameters.movement.after.retained=retained;
         }
         if(EngineProducer().Admit(lease.owner,lease.ref.object,lease.parameters)!=SourceResult::Ok) {
+            if(!movement::Validate(lease.parameters.movement))MovementFailure(lease,lease.parameters,5U);
             lease.unknown=true;Lost(__LINE__);return;
         }
         lease.submitted=true;
@@ -306,22 +320,30 @@ void FinalizeMovement(Lease& lease) noexcept {
             std::uint8_t flags{};std::uint32_t phase{};
             if(Read(lease.ref.object+0xB8,flags)&&Read(lease.ref.object+0x68,phase)&&(flags&0x40)&&phase==3) {
                 auto parameters=lease.parameters;parameters.movement.after.goal=pendingGoal;
-                if(EngineProducer().Update(lease.ref.object,parameters)!=SourceResult::Ok){lease.unknown=true;return;}
+                if(EngineProducer().Update(lease.ref.object,parameters)!=SourceResult::Ok){
+                    if(!movement::Validate(parameters.movement))MovementFailure(lease,parameters,6U);
+                    lease.unknown=true;return;
+                }
                 lease.parameters=parameters;
             }
         }
     } else {
         if(lease.parameters.kind==2)return; // Marker updates have a dedicated immutable-geometry path.
         auto parameters=lease.parameters;std::uint8_t flags{};std::uint32_t phase{};
-        if(!SnapshotGait(lease.character,parameters.movement.gait)||
-            !SnapshotMovement(lease.ref.object,SourceKind(lease),parameters.movement.after,true)||
-            (SourceKind(lease)==1&&(!Read(lease.ref.object+0xB8,flags)||!Read(lease.ref.object+0x68,phase)))) {
+        std::uint32_t failed{};
+        if(!SnapshotGait(lease.character,parameters.movement.gait))failed=1U;
+        else if(!SnapshotMovement(lease.ref.object,SourceKind(lease),parameters.movement.after,true))failed=2U;
+        else if(SourceKind(lease)==1&&!Read(lease.ref.object+0xB8,flags))failed=3U;
+        else if(SourceKind(lease)==1&&!Read(lease.ref.object+0x68,phase))failed=4U;
+        if(failed) {
+            MovementFailure(lease,parameters,failed);
             lease.unknown=true;Lost(__LINE__);return;
         }
         // Only an accepted pending-goal write is a new producer destination.
         // The native cursor/projected goal cannot replace that causal input.
         if(!(flags&0x40)||phase!=3)parameters.movement.after.goal=lease.parameters.movement.after.goal;
         if(EngineProducer().Update(lease.ref.object,parameters)!=SourceResult::Ok) {
+            if(!movement::Validate(parameters.movement))MovementFailure(lease,parameters,6U);
             lease.unknown=true;Lost(__LINE__);return;
         }
         lease.parameters=parameters;
@@ -864,6 +886,9 @@ std::uint32_t FencedOldNativeLeases() noexcept {
 CoverageDiagnostics Coverage() noexcept {
     return {gCoverageLosses.load(std::memory_order_relaxed),gFirstLossSite.load(std::memory_order_relaxed),
         gLastLossSite.load(std::memory_order_relaxed)};
+}
+MovementCaptureFailure FirstMovementCaptureFailure() noexcept {
+    const std::lock_guard lock(gMovementFailureGate);return gMovementFailure;
 }
 std::uint64_t UncoveredKind(std::uint32_t kind) noexcept {
     return kind < gUncoveredKinds.size() ? gUncoveredKinds[kind].load(std::memory_order_relaxed) : 0U;
