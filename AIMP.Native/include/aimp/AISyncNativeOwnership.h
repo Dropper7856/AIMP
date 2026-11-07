@@ -21,6 +21,20 @@ struct NativeExecutionAnchor {
 };
 [[nodiscard]] bool MatchesNativeExecution(const OwnershipMemory&,const NativeExecutionAnchor&,
     const transactions::Scope&,const transactions::OwnerKey&,const ActorLifetime&) noexcept;
+// Exact local result of admitted NativeIntent21/25 (0064A8A0/0064A930), never a
+// Host pose or sampled cycle state. Retail00402310/00402640 set mask0x06 at arrival;
+// 00460CF0 consumes mask0x04. A finished/replaced/unreadable cycle owns nothing.
+[[nodiscard]] bool IsLiveNativePassage(const OwnershipMemory&,const NativeExecutionAnchor&,
+    const transactions::Scope&,const transactions::OwnerKey&,const ActorLifetime&) noexcept;
+[[nodiscard]] constexpr bool OrdinaryPassageTransition(std::uint32_t state) noexcept {
+    // 77 is the backstage compatibility fallback, guarded only at the two
+    // certified scheduler sites after native movement mode5 is established.
+    return state==1U||state==2U||state==0x38U||state==0x3BU||state==0x4DU;
+}
+// An accepted causal replacement releases passage protection. Updates and
+// the direct instruction's immediate Complete/Release do not end its cycle.
+[[nodiscard]] bool SupersedesNativePassage(const NativeExecutionAnchor&,std::uint64_t sequence,
+    std::uint64_t command,const transactions::Record&,transactions::NativeOutcome) noexcept;
 // Read-only exact-build x86 boundary. Caller supplies the stable engine/world
 // lifetime. For requireQuiescence, caller additionally pins Character's M Ref
 // through this entire read. Empty scheduler lists alone are insufficient.

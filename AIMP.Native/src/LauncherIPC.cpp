@@ -2012,12 +2012,12 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
             busActive
                 ? "WS3 native authority bound and compatible World bus opened."
                 : "WS3 native authority bound; compatible World bus remains closed.",
-            {{"session", session, true},
+            {{"session", session},
              {"peerId", Diagnostics::Unsigned(peer), true},
-             {"role", host ? "Host" : "Client", true},
+             {"role", host ? "Host" : "Client"},
              {"generation", Diagnostics::Unsigned(generation), true},
              {"worldBusActive", Diagnostics::Boolean(busActive), true},
-             {"reason", bindReason, true}});
+             {"reason", bindReason}});
         return true;
     }
     case protocol::MessageType::TestModeConfigure: {
@@ -2916,7 +2916,7 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
                     "info",
                     "session_round_boundary",
                     "A lobby start revoked the previous level incarnation; the next observation opens a new generation.",
-                    {{"session", request.sessionLoadingSessionId, true},
+                    {{"session", request.sessionLoadingSessionId},
                      {"previousGeneration", Diagnostics::Unsigned(previous), true},
                      {"transitionGeneration", Diagnostics::Unsigned(next.generation), true}});
             }

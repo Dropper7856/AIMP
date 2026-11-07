@@ -32,6 +32,7 @@ internal static class AISyncNativeIntentCodecTests
         }
         if (id == 21) { w[1] = 4; w[8] = F(-1.5F); w[9] = 0x80000000; w[10] = F(3.25F); }
         if (id == 23) { w[1] = 1; w[2] = 0x80000000; }
+        if (id == 25) { w[1] = 0x14; w[3] = 2; w[8] = F(-1.5F); w[9] = 0x80000000; w[10] = F(3.25F); }
         return w;
     }
     private static AISyncTransaction Record() => new()
@@ -106,17 +107,17 @@ internal static class AISyncNativeIntentCodecTests
     }
     private static void NewContracts()
     {
-        foreach (var id in new uint[] { 21, 22, 23 })
+        foreach (var id in new uint[] { 21, 22, 23, 25 })
         {
             var p = new AISyncNativeIntent(Words(id)); var bytes = AISyncNativeIntentCodec.Encode(p);
             Check(bytes.Length == 144 && AISyncNativeIntentCodec.Decode(bytes) == p);
-            if (id == 21) Check(bytes.AsSpan(32, 12).SequenceEqual(new byte[] { 0, 0, 0xC0, 0xBF, 0, 0, 0, 0x80, 0, 0, 0x50, 0x40 }));
+            if (id is 21 or 25) Check(bytes.AsSpan(32, 12).SequenceEqual(new byte[] { 0, 0, 0xC0, 0xBF, 0, 0, 0, 0x80, 0, 0, 0x50, 0x40 }));
             if (id == 23) Check(bytes.AsSpan(8, 4).SequenceEqual(new byte[] { 0, 0, 0, 0x80 }));
             // Negative float zero is data in XYZ/duration, but forbidden in
             // every reserved word, including the fourth vector lane.
             for (var i = 1; i < 36; ++i)
             {
-                if ((id == 21 && (i == 1 || i is >= 8 and <= 10)) || (id == 23 && i is 1 or 2)) continue;
+                if (((id is 21 or 25) && (i == 1 || i is >= 8 and <= 10)) || (id == 25 && i == 3) || (id == 23 && i is 1 or 2)) continue;
                 foreach (var bits in new uint[] { 1, 0x80000000 })
                 {
                     var invalid = Words(id); invalid[i] = bits; Reject(() => _ = new AISyncNativeIntent(invalid));
@@ -125,16 +126,19 @@ internal static class AISyncNativeIntentCodecTests
                 }
             }
         }
-        foreach (var id in new uint[] { 21, 23 })
+        foreach (var id in new uint[] { 21, 23, 25 })
         {
-            foreach (var kind in new uint[] { 0, 1, 2, 4, 5, 0x11 })
+            foreach (var kind in new uint[] { 0, 1, 2, 4, 5, 0x11, 0x14, 0x24 })
             {
-                if (kind == (id == 21 ? 4U : 1U)) continue;
+                if (kind == (id == 25 ? 0x14U : id == 21 ? 4U : 1U)) continue;
                 var invalid = Words(id); invalid[1] = kind; Reject(() => _ = new AISyncNativeIntent(invalid));
+                var wire = AISyncNativeIntentCodec.Encode(new(Words(id)));
+                BinaryPrimitives.WriteUInt32LittleEndian(wire.AsSpan(4, 4), kind);
+                Reject(() => AISyncNativeIntentCodec.Decode(wire));
             }
-            for (var i = id == 21 ? 8 : 2; i < (id == 21 ? 11 : 3); ++i)
+            for (var i = id == 23 ? 2 : 8; i < (id == 23 ? 3 : 11); ++i)
             {
-                foreach (var bits in new uint[] { 0, 0x80000000, 0x7F7FFFFF, 0xFF7FFFFF, 1, 0x80000001 })
+                foreach (var bits in new uint[] { 0, 0x80000000, 0x7F7FFFFF, 0xFF7FFFFF, 1, 0x80000001, 0x11223344 })
                 {
                     var words = Words(id); words[i] = bits; var finite = new AISyncNativeIntent(words);
                     Check(AISyncNativeIntentCodec.Decode(AISyncNativeIntentCodec.Encode(finite)) == finite);
@@ -148,7 +152,23 @@ internal static class AISyncNativeIntentCodecTests
                 }
             }
         }
-        foreach (var id in new uint[] { 24, 25, uint.MaxValue }) Reject(() => _ = new AISyncNativeIntent(Words(id)));
+        foreach (var selector in new uint[] { 0, 2 })
+        {
+            var words = Words(25); words[3] = selector;
+            var passage = new AISyncNativeIntent(words);
+            Check(AISyncNativeIntentCodec.Decode(AISyncNativeIntentCodec.Encode(passage)) == passage);
+            words[8] = words[9] = words[10] = 0;
+            passage = new AISyncNativeIntent(words);
+            Check(AISyncNativeIntentCodec.Decode(AISyncNativeIntentCodec.Encode(passage)) == passage);
+        }
+        foreach (var selector in new uint[] { 1, 3, uint.MaxValue, 0x80000000, 0x11223344, 0x3F800000 })
+        {
+            var words = Words(25); words[3] = selector; Reject(() => _ = new AISyncNativeIntent(words));
+            var wire = AISyncNativeIntentCodec.Encode(new(Words(25)));
+            BinaryPrimitives.WriteUInt32LittleEndian(wire.AsSpan(12, 4), selector);
+            Reject(() => AISyncNativeIntentCodec.Decode(wire));
+        }
+        foreach (var id in new uint[] { 24, 26, uint.MaxValue }) Reject(() => _ = new AISyncNativeIntent(Words(id)));
     }
     private static void EnvelopesAndReceipts()
     {
@@ -195,7 +215,7 @@ internal static class AISyncNativeIntentCodecTests
         Check(AISyncExecutionControlCodec.Decode(AISyncExecutionControlCodec.Encode(control)) == control
             && AISyncExecutionControlCodec.ProfileForKind(AISyncNativeIntentCodec.Kind) == 128);
         Check(BinaryPrimitives.ReadUInt32LittleEndian(AISyncNativeIntentCodec.Encode(r.NativeIntent)) == 9);
-        foreach (var id in new uint[] { 21, 22, 23 })
+        foreach (var id in new uint[] { 21, 22, 23, 25 })
         {
             var operation = r with { NativeIntent = new(Words(id)) };
             var payload = AISyncNativeIntentCodec.Encode(operation.NativeIntent);
@@ -209,6 +229,16 @@ internal static class AISyncNativeIntentCodecTests
             bytes = AISyncExecutionCodec.EncodeReceipt(expected);
             Check(bytes[4] == 3 && bytes.Length == AISyncExecutionCodec.MaximumReceiptBytes
                 && AISyncExecutionCodec.DecodeReceipt(bytes) == expected);
+        }
+        foreach (var selector in new uint[] { 0, 2 })
+        {
+            var words = Words(25); words[3] = selector;
+            var operation = r with { NativeIntent = new(words) };
+            bytes = AISyncExecutionCodec.EncodeBatch(new(scope, 5, new[] { operation }));
+            Check(AISyncExecutionCodec.DecodeBatch(bytes).Records[0] == operation);
+            var expected = receipt with { Operation = operation };
+            Check(AISyncExecutionCodec.DecodeReceipt(AISyncExecutionCodec.EncodeReceipt(expected)) == expected);
+            Reject(() => AISyncExecutionCodec.ValidateExecutable(operation with { NativeKind = AISyncExecutionCodec.MarkerKind }));
         }
     }
 }

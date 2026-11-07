@@ -1,5 +1,6 @@
 #include "aimp/AISyncNativeOwnership.h"
 #include "aimp/AISyncExecutionPolicy.h"
+#include "aimp/AISyncExecutionCodec.h"
 
 namespace aimp::ai_sync::execution {
 namespace {
@@ -15,6 +16,32 @@ bool MatchesNativeExecution(const OwnershipMemory& memory,const NativeExecutionA
     return Read(memory,actor.character+0x50U,runtime)&&runtime==actor.runtimeId&&
         Read(memory,actor.character+0x36CU,cycle)&&cycle==anchor.cycle&&
         Read(memory,cycle+0x19U,serial)&&serial==anchor.serial;
+}
+bool IsLiveNativePassage(const OwnershipMemory& memory,const NativeExecutionAnchor& anchor,
+    const transactions::Scope& scope,const transactions::OwnerKey& owner,const ActorLifetime& actor) noexcept {
+    if(memory.imageBase<0x10000U||memory.imageBase>0xFFFFFFFFULL-0xDBB360U||
+        !actor.runtimeId||!actor.nativeGeneration||!MatchesNativeExecution(memory,anchor,scope,owner,actor))return false;
+    std::uint32_t cycleOwner{},type{},health{};std::uint8_t state{},flags{},grappled{};
+    const auto current=[&]() noexcept {
+        return Read(memory,anchor.cycle+4U,cycleOwner)&&cycleOwner==actor.character&&
+            Read(memory,anchor.cycle,type)&&Read(memory,anchor.cycle+0x1AU,state)&&
+            ((type==memory.imageBase+0xDBB2A0U&&state==0x4BU)||
+             (type==memory.imageBase+0xDBB360U&&state==0x4CU))&&
+            Read(memory,anchor.cycle+8U,flags)&&(flags&0x06U)==0U&&
+            Read(memory,actor.character+0x32CU,health)&&health<3U&&
+            Read(memory,actor.character+0x297U,grappled)&&!grappled;
+    };
+    return current()&&MatchesNativeExecution(memory,anchor,scope,owner,actor)&&current();
+}
+bool SupersedesNativePassage(const NativeExecutionAnchor& anchor,std::uint64_t sequence,
+    std::uint64_t command,const transactions::Record& record,transactions::NativeOutcome outcome) noexcept {
+    if(!sequence||!command||outcome!=transactions::NativeOutcome::Admitted||
+        record.scope!=anchor.scope||record.owner!=anchor.owner||record.globalSeq<=sequence||
+        record.commandId==command||record.opcode!=transactions::Op::Submit)return false;
+    if(record.nativeKind==1U&&record.admission==0U)return true;
+    return record.nativeKind==kRelocateKind||record.nativeKind==kForcedRelocateKind||
+        record.nativeKind==kDirectRelocateKind||record.nativeKind==kDirectForcedRelocateKind||
+        record.nativeKind==kFrontstageKind||(record.nativeKind==kBackstageKind&&record.mode==0U);
 }
 static OwnershipCheck InspectBoundary(const OwnershipMemory& inputMemory,const ActorLifetime& inputActor,bool quiet,
     bool interaction,OwnershipBoundaryFailure* failure) noexcept {

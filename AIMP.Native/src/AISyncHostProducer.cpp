@@ -115,7 +115,7 @@ SourceResult Producer::Admit(const OwnerKey& key, std::uint64_t request, const C
     const auto profile = execution::ProfileForKind(parameters.kind);
     if (profile == 0) { FailLocked(execution::Recovery::NativeUnavailable); return SourceResult::Invalid; }
     if ((binding_.value & profile) == 0) { FailLocked(execution::Recovery::NativeUnavailable); return SourceResult::Invalid; }
-    if(parameters.movement.navigation==movement::Navigation::HostRoute&&(binding_.value&8U)==0) {
+    if(movement::CarriesRoute(parameters.movement.navigation)&&(binding_.value&8U)==0) {
         FailLocked(execution::Recovery::NativeUnavailable);return SourceResult::Invalid;
     }
     // A native Move companion belongs to its bundle, not another command.
@@ -195,7 +195,7 @@ bool Producer::NextRouteKey(const CommandIdentity& identity,std::uint32_t part,r
     for(const auto& entry:commands_)if(entry.used&&entry.command==identity.command&&entry.owner==identity.owner) {
         if(entry.routeBlocked||entry.cancelled||entry.completed||entry.released||entry.revision!=identity.parameterRevision||
             entry.parameters.kind!=identity.nativeKind||(identity.nativeKind!=1&&identity.nativeKind!=2&&identity.nativeKind!=3)||
-            identity.navigation!=movement::Navigation::HostRoute||entry.parameters.movement.navigation!=identity.navigation||
+            !movement::CarriesRoute(identity.navigation)||entry.parameters.movement.navigation!=identity.navigation||
             part>=entry.parameters.movement.parts||part>=entry.routeRevisions.size()||entry.routeRevisions[part]==UINT32_MAX)return false;
         output={binding_.scope,entry.owner,entry.command,entry.revision,entry.routeRevisions[part]+1,part};
         return true;
@@ -211,7 +211,7 @@ SourceResult Producer::AppendRoute(const route::Graph& graph) noexcept {
     for(auto& item:commands_)if(item.used&&item.command==graph.key.commandId&&item.owner==graph.key.owner) {entry=&item;break;}
     if(!entry||entry->routeBlocked||entry->cancelled||entry->completed||entry->released||entry->revision!=graph.key.parameterRevision||
         (entry->parameters.kind!=1&&entry->parameters.kind!=2&&entry->parameters.kind!=3)||graph.key.part>=entry->parameters.movement.parts||
-        entry->parameters.movement.navigation!=movement::Navigation::HostRoute||
+        !movement::CarriesRoute(entry->parameters.movement.navigation)||
         entry->routeRevisions[graph.key.part]==UINT32_MAX||graph.key.routeRevision!=entry->routeRevisions[graph.key.part]+1) {
         return SourceResult::Conflict;
     }
@@ -233,7 +233,7 @@ bool Producer::PreviousRouteAuxiliary(const CommandIdentity& identity,std::uint3
     if(!Bound()||identity.scope!=binding_.scope||part>=2)return false;
     for(const auto& entry:commands_)if(entry.used&&entry.command==identity.command&&entry.owner==identity.owner&&
         entry.revision==identity.parameterRevision&&entry.parameters.kind==identity.nativeKind&&
-        entry.parameters.movement.navigation==movement::Navigation::HostRoute&&!entry.cancelled&&!entry.completed&&!entry.released&&entry.routeAuxiliaryKnown[part]) {
+        movement::CarriesRoute(entry.parameters.movement.navigation)&&!entry.cancelled&&!entry.completed&&!entry.released&&entry.routeAuxiliaryKnown[part]) {
         output=entry.routeAuxiliary[part];return true;
     }
     return false;

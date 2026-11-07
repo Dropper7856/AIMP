@@ -1,5 +1,11 @@
 namespace AIMP.Protocol;
 
+// Diagnostics only. Milliseconds measure local queue residence and socket
+// writer wait, never network RTT or native CATHODE acceptance.
+public readonly record struct AISyncExecutionTransportTiming(
+    ulong PeerId, int PendingPackets, int PendingBytes, long OldestPendingMs,
+    long MaxQueuedMs, long MaxSendMs);
+
 public sealed partial class LobbyHost
 {
     private sealed class ExecutionPeer(ClientState state, AISyncExecutionControl offer, AISyncExecutionSender sender)
@@ -22,6 +28,17 @@ public sealed partial class LobbyHost
 
     // Snapshot only: obtaining the roster does not grant a peer a publisher role.
     public LobbySnapshotPayload GetAISyncExecutionRoster() => CreateSnapshot();
+    public AISyncExecutionTransportTiming[] GetAISyncExecutionTransportTimings()
+    {
+        lock (_stateLock)
+            return _executionPeers.Select(peer =>
+            {
+                var timing = peer.Value.Sender.Snapshot();
+                return new AISyncExecutionTransportTiming(peer.Key, timing.PendingPackets,
+                    timing.PendingBytes, timing.OldestPendingMs, timing.MaxQueuedMs,
+                    timing.MaxSendMs);
+            }).ToArray();
+    }
 
     // Explicit API only. A peer cannot negotiate itself into the Host's publisher role.
     public AISyncExecutionScope OfferAISyncExecution(ulong peerId, int worldGeneration, ulong authorityEpoch,

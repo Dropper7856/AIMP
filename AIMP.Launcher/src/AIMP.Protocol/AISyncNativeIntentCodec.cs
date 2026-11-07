@@ -33,6 +33,10 @@ public static class AISyncNativeIntentCodec
     // words2..9: resource SHA256 LE;10: one-based cover;11: zero-based marker;
     // 12/13: opaque R+B4 before/after admission;14..35: zero.
     public const uint MarkerContract = 24, MarkerSchema = 1, MarkerMaxOrdinal = 1000000;
+    // 0064A930 (RET8) ->004017E0 copies XYZ and a speed table selector.
+    // Only selectors0/2 occur in the verified retail callers.
+    // words:0=25,1=0x14,3=selector,8..10=XYZ; all other words zero.
+    public const uint PassageTraverseContract = 25, PassageSchema = 0x14;
     public static void Validate(AISyncNativeIntent? value)
     {
         if (value is not null) ValidateWords(value.Words);
@@ -48,6 +52,14 @@ public static class AISyncNativeIntentCodec
             if (value[1] != MarkerSchema || !digest || value[10] is 0 or > MarkerMaxOrdinal
                 || value[11] > MarkerMaxOrdinal || value[12] > 1 || value[13] > 1 || !Zero(value, 14, 36))
                 throw new ProtocolException("Invalid level-marker identity or opaque bytes.");
+            return;
+        }
+        if (id == PassageTraverseContract)
+        {
+            var passageValid = value[1] == PassageSchema && value[2] == 0 && value[3] is 0 or 2
+                && Zero(value, 4, 8) && Zero(value, 11, 36);
+            for (var i = 8; i < 11; ++i) passageValid &= float.IsFinite(BitConverter.UInt32BitsToSingle(value[i]));
+            if (!passageValid) throw new ProtocolException("Invalid passage destination or speed selector.");
             return;
         }
         var valid = id is >= 1 and <= 23 and not (11 or 14 or 18) && value[35] == 0;

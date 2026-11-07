@@ -26,7 +26,10 @@ constexpr ULONGLONG kRouteWaitMilliseconds=2000;
 std::atomic<std::uint32_t> gFailureSite{},gFailureResult{},gImportStage{},gContextCheck{};
 std::atomic<std::uint64_t> gAppendPublished{},gContinuationPublished{},gCompoundRequests{};
 std::atomic<std::uint64_t> gOrphanQuarantined{},gOrphanQuarantineRejected{};
-std::atomic<std::uint64_t> gCorridorJoins{};
+std::atomic<std::uint64_t> gCorridorJoins{},gTrailBridges{},gTrailMisses{};
+std::atomic<std::uint32_t> gTrailMissDetail{};
+std::atomic<std::uint64_t> gNativeHandoffCandidates{},gNativeHandoffConfirmed{},gNativeHandoffStalled{};
+std::uint64_t gInstallSerial{};
 std::atomic<std::uint32_t> gLastAdmissionMode{},gLastIncomingCount{},gLastCompoundParts{};
 bool gPumping{};
 template<class T> bool Read(std::uintptr_t at,T& value) noexcept {
@@ -49,6 +52,8 @@ struct Slot {
     route_identity::BindingIncarnation meshBinding{};
     NativeRouteResult writer;
     std::unique_ptr<Graph> desired;
+    // Exact Host graph when desired is its joined/bridged installed range.
+    std::unique_ptr<Graph> hostGraph;
     // Exact graphs staged for the whole native reset footprint. Continuations
     // retain the same Host identity; they are never new route decisions.
     std::unique_ptr<Graph> planned;
@@ -60,9 +65,18 @@ struct Slot {
     std::array<std::uint32_t,43> queryOptions{};
     std::uint32_t startCheck{};
     ULONGLONG waitingSince{};
+    std::uint64_t installSerial{};
+    bool physicalProgressVerified{};
 };
 struct Cached {std::unique_ptr<Graph> graph;};
-struct Hybrid {bool used{};execution::NavigationBinding binding{};};
+struct Hybrid {
+    bool used{};
+    execution::NavigationBinding binding{};
+    std::uint64_t observedInstallSerial{};
+    std::uintptr_t candidateBlock{};
+    ULONGLONG awaitingSince{};
+    route::NativeHandoffProbe probe{};
+};
 struct State {
     std::array<std::unique_ptr<Slot>,kCapacity> slots;
     // Confirmed dead-world requests can retain native M/R/mesh refs after the
@@ -72,6 +86,8 @@ struct State {
     std::array<std::unique_ptr<Slot>,kCapacity> quarantined;
     std::array<Cached,kCapacity> cache;
     std::array<Hybrid,kCapacity> hybrid;
+    // Host-authored corridor history per owner/part; see HostTrail.
+    std::array<std::unique_ptr<HostTrail>,kCapacity> trails;
 };
 State* gState{}; // Unresolved native pins are never destroyed by DLL static teardown.
 struct Frame {std::uintptr_t navigation{},block{};std::array<float,3> start{};bool startValid{};Frame* previous{};};
@@ -161,19 +177,41 @@ bool Guard(void* context,const Key& key,const LocalContext& local,
     return local==slot.local||(phase==GuardPhase::Read&&slot.installed&&
         local.navigation==slot.local.navigation&&local.block==slot.local.block&&!local.result&&!local.resultControl);
 }
-// A delayed failure from an old request must not seize movement back from a
-// newer Host route which CATHODE has actually installed and still owns.
-bool NativeRouteResumed(const execution::NavigationBinding& rejected) noexcept {
-    if(!gState)return false;
-    for(const auto& candidate:gState->slots)if(candidate&&candidate->installed&&
+// Installation is not locomotion. A delayed failure of an older HostRoute
+// may be ignored only once a current native route has demonstrably moved
+// (or settled at a stationary Host state) while hybrid control was released.
+const Graph* Latest(const execution::NavigationBinding&) noexcept;
+Slot* ResumingCandidate(const execution::NavigationBinding& rejected,bool allowPending=false) noexcept {
+    if(!gState)return nullptr;
+    Slot* selected{};
+    std::uint64_t selectedCommand{};
+    std::uint32_t selectedRevision{};
+    for(const auto& candidate:gState->slots)if(candidate&&
         !candidate->failed&&!candidate->retiring&&!candidate->retirementFault&&
         candidate->binding.command.scope==rejected.command.scope&&
         candidate->binding.command.owner==rejected.command.owner&&
-        candidate->binding.command.actor==rejected.command.actor&&
-        HybridResumeCurrent(rejected.command.command,rejected.command.revision,
-            candidate->binding.command.command,candidate->binding.command.revision)&&
-        Current(*candidate))return true;
-    return false;
+        candidate->binding.command.actor==rejected.command.actor) {
+        execution::NavigationBinding current{};
+        if(!Current(*candidate,&current)||
+            !HybridResumeCurrent(rejected.command.command,rejected.command.revision,
+                current.command.command,current.command.revision))continue;
+        // An Update advances a retained B without changing the slot's initial
+        // identity. Compare the ACTUAL native revision, not the stale slot copy.
+        // A prior hybrid owner can block Populate() before EndAdmission().
+        const bool pending=allowPending&&candidate->skipped&&candidate->result&&
+            (Latest(current)!=nullptr||candidate->planned!=nullptr);
+        if(!candidate->installed&&!pending)continue;
+        if(!selected || HybridResumeCurrent(selectedCommand,selectedRevision,
+            current.command.command,current.command.revision)) {
+            selected=candidate.get();selectedCommand=current.command.command;
+            selectedRevision=current.command.revision;
+        }
+    }
+    return selected;
+}
+bool NativeRouteResumed(const execution::NavigationBinding& rejected) noexcept {
+    const auto* candidate=ResumingCandidate(rejected);
+    return candidate&&candidate->physicalProgressVerified;
 }
 bool Reject(const execution::NavigationBinding& binding) noexcept {
     // A route may fail after native cancellation already invalidated its
@@ -335,6 +373,54 @@ bool JoinCorridor(Slot& slot,const Graph& graph,Graph& output) noexcept {
     if(Validate(suffix)!=Result::Ok||!StartsHere(slot,suffix,true))return false;
     output=suffix;return true;
 }
+const HostTrail* Trail(const Key& key) noexcept {
+    if(gState)for(const auto& trail:gState->trails)if(trail&&SameTrailOwner(trail->graph.key,key))return trail.get();
+    return nullptr;
+}
+std::uint32_t TrailArea(Slot& slot,const Graph& graph,std::size_t index) noexcept {
+    const auto& node=graph.nodes[index];route_identity::ElementMapping mapping{};
+    return slot.registry.MapElement({graph.resources[node.resourceIndex],node.ordinal},mapping)==route_identity::Result::Ok?
+        mapping.localReference:0U;
+}
+bool TrailCovers(Slot& slot,const Graph& graph,std::uint32_t area) noexcept {
+    const auto* trail=Trail(graph.key);Graph ignored{};
+    return trail&&BridgeHostTrail(*trail,graph,area,
+        [&](const Graph& g,std::size_t i) noexcept {return TrailArea(slot,g,i);},ignored);
+}
+// The actor is BEHIND the Host route start (Host re-planned from its newer
+// pose). Resume the Host's own recent corridor at the actor's area, joined to
+// this exact Host graph. Same proofs as JoinCorridor; refused when off-trail.
+bool BridgeTrail(Slot& slot,const Graph& graph,Graph& output) noexcept {
+    if(!slot.startValid)return false;
+    const auto* trail=Trail(graph.key);Graph bridged{};
+    // Miss detail: 1000 no trail, 2000 trail of another revision, 3000 actor
+    // area not on the Host trail, 4000+startCheck native start proof refused.
+    std::uint32_t miss{};
+    if(!trail)miss=1000U;
+    else if(trail->graph.key!=graph.key||!trail->latestBegin)miss=2000U;
+    else if(!BridgeHostTrail(*trail,graph,slot.queryOptions[0x94/4],
+        [&](const Graph& g,std::size_t i) noexcept {return TrailArea(slot,g,i);},bridged))miss=3000U;
+    else if(!StartsHere(slot,bridged,true))miss=4000U+slot.startCheck;
+    if(miss){++gTrailMisses;gTrailMissDetail=miss;return false;}
+    output=bridged;return true;
+}
+void RecordTrail(const Graph& graph) noexcept {
+    std::unique_ptr<HostTrail>* target{};std::unique_ptr<HostTrail>* empty{};
+    for(auto& trail:gState->trails) {
+        if(trail&&SameTrailOwner(trail->graph.key,graph.key)){target=&trail;break;}
+        if(!empty&&(!trail||!execution_runtime::Matches(trail->graph.key.scope)))empty=&trail;
+    }
+    // A late graph of an older command never rewrites the newer Host trail.
+    if(target&&(graph.key.commandId<(*target)->graph.key.commandId||
+        (SameCommand(graph.key,(*target)->graph.key)&&!NewerRoute((*target)->graph.key,graph.key))))return;
+    if(!target)target=empty;
+    // Capacity matches the native request adapter; without a slot the trail
+    // is simply not extended and admission behaves as before.
+    if(!target)return;
+    auto next=std::make_unique<HostTrail>();
+    ExtendHostTrail(*target?target->get():nullptr,graph,*next);
+    *target=std::move(next);
+}
 // These writes consume the Host's endpoint command, not a selected Client
 // waypoint. 0044D320 would otherwise choose a local end polygon and edit N.
 bool Endpoint(std::uintptr_t b,const std::array<float,3>& goal) noexcept {
@@ -353,7 +439,12 @@ bool WriteEndpoint(std::uintptr_t block,std::uintptr_t node,const Graph& graph) 
     }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
 }
 bool ApplyEndpoint(Slot& slot,const Graph& graph) noexcept {
-    if(!slot.installed||!slot.desired||!EndpointRevision(*slot.desired,graph))return false;
+    if(!slot.installed||!slot.desired)return false;
+    // A joined/bridged admission installed a different node range of the
+    // same Host graph. The endpoint edit is proven against that exact Host
+    // graph, then applied to the installed range sharing its terminal node.
+    Graph next{};
+    if(!InstalledEndpointRevision(slot.hostGraph?*slot.hostGraph:*slot.desired,*slot.desired,graph,next))return false;
     std::uint32_t stop{};
     if(!Read(slot.local.block+0x30,stop)||!StopTrimDisabled(stop))return false;
     // Read the Client's actual remaining native B interval. It must still be
@@ -365,14 +456,16 @@ bool ApplyEndpoint(Slot& slot,const Graph& graph) noexcept {
     if(captured!=Result::Ok)return false;
     remaining.statuses=slot.desired->statuses;
     if(!PreserveEndpointPrefix(*slot.desired,remaining,verified)||verified!=*slot.desired)return false;
-    if(slot.writer.Preflight(graph,slot.local,slot.protection)!=Result::Ok||
-        !Guard(&slot,graph.key,slot.local,{},GuardPhase::Read))return false;
+    if(slot.writer.Preflight(next,slot.local,slot.protection)!=Result::Ok||
+        !Guard(&slot,next.key,slot.local,{},GuardPhase::Read))return false;
     std::uintptr_t terminal{},node{};
     if(!Read(slot.local.block+0x3C,terminal)||!terminal||!Read(terminal+8,node)||!node)return false;
     // Exact0044D320 same-handle branch: mutate terminal vectors and B.goal.
     // Preserve B distances, N cursor, history, world token and locomotion.
-    if(!WriteEndpoint(slot.local.block,node,graph)){Fail(slot,__LINE__,Result::NativeFault);return false;}
-    slot.desired=std::make_unique<Graph>(graph);++gReplacements;return true;
+    if(!WriteEndpoint(slot.local.block,node,next)){Fail(slot,__LINE__,Result::NativeFault);return false;}
+    slot.desired=std::make_unique<Graph>(next);
+    if(slot.hostGraph)*slot.hostGraph=graph;
+    ++gReplacements;return true;
 }
 bool RemainingHostRange(Slot& slot,Graph& remaining) noexcept {
     if(!slot.installed||!slot.desired)return false;
@@ -474,7 +567,8 @@ bool RequestReplacement(Slot& slot,const Graph& graph) noexcept {
     if(leadingNode.type==1||leading.slot->registry.MapElement(
         {leading.graph->resources[leadingNode.resourceIndex],leadingNode.ordinal},leadingArea)!=route_identity::Result::Ok||
         (currentArea!=leadingArea.localReference&&
-         (leading.continuation||!CorridorIndex(*leading.slot,*leading.graph,currentArea)))) {gReplacementReason=1U;++gReplacementWaits;return false;}
+         (leading.continuation||(!CorridorIndex(*leading.slot,*leading.graph,currentArea)&&
+          !TrailCovers(*leading.slot,*leading.graph,currentArea))))) {gReplacementReason=1U;++gReplacementWaits;return false;}
     if(slot.registry.Revalidate(first)!=route_identity::Result::Ok||!Current(slot))return false;
     gReplacementReason=0U;++gReplacementRequests;
     gLastCompoundParts=static_cast<std::uint32_t>(live);if(live>1)++gCompoundRequests;
@@ -545,10 +639,12 @@ bool Populate(Slot& slot) noexcept {
     // proves that identity and leaves the earlier range/cursor untouched.
     // For a retained continuation, the first point is the certified cursor
     // suffix, not the original Host query start (which is now behind us).
-    Graph joined{};bool joining{};
+    const Graph* host=graph;Graph joined{};bool joining{},bridging{};
     if(!StartsHere(slot,*graph,slot.continuation)) {
         const auto refused=slot.startCheck;
-        if(slot.continuation||refused!=203||!JoinCorridor(slot,*graph,joined)) {
+        bool admissible=!slot.continuation&&refused==203&&JoinCorridor(slot,*graph,joined);
+        if(!admissible&&!slot.continuation&&refused==203)admissible=bridging=BridgeTrail(slot,*graph,joined);
+        if(!admissible) {
             slot.startCheck=refused;Fail(slot,__LINE__,Result::LocalInvalidity);return false;
         }
         const auto rejoined=slot.writer.CertifyAdmission(joined,slot.local,slot.protection,admission);
@@ -560,7 +656,10 @@ bool Populate(Slot& slot) noexcept {
             slot.writer.Rearm(slot.writer.Identity(),*graph,slot.local,slot.protection);
         if(armed!=Result::Ok){Fail(slot,__LINE__,armed);return false;}
     }
-    if(!slot.continuation&&(!slot.desired||slot.desired->key!=graph->key))slot.desired=std::make_unique<Graph>(*graph);
+    if(!slot.continuation&&(!slot.desired||slot.desired->key!=graph->key)) {
+        slot.desired=std::make_unique<Graph>(*graph);
+        slot.hostGraph=joining?std::make_unique<Graph>(*host):nullptr;
+    }
     // Native admission sees exactly this graph's parameter revision and goal.
     if(!Endpoint(slot.local.block,graph->goal)){Fail(slot,__LINE__,Result::NativeFault);return false;}
     const auto result=slot.writer.Populate(*graph,slot.local,slot.protection,ImportPoint::ReplacementNoWorker);
@@ -568,7 +667,7 @@ bool Populate(Slot& slot) noexcept {
     gLastAdmissionMode=static_cast<std::uint32_t>(admission.mode);gLastIncomingCount=admission.incomingCount;
     if(admission.mode==AdmissionMode::Append)++gAppendPublished;
     if(slot.continuation)++gContinuationPublished;
-    if(joining)++gCorridorJoins;
+    if(bridging)++gTrailBridges;else if(joining)++gCorridorJoins;
     ++gPublished;return true;
 }
 using Query=void(__thiscall*)(void*,void*,void*,void*,void*);
@@ -577,14 +676,28 @@ void __fastcall QueryFrame(void* n,void*,void* start,void* goal,void* b,void* pr
     FrameScope frame(reinterpret_cast<std::uintptr_t>(n),reinterpret_cast<std::uintptr_t>(b),reinterpret_cast<std::uintptr_t>(start));
     reinterpret_cast<Query>(gBase+0x61280U)(n,start,goal,b,previous);
 }
+enum class QueryPlan { Retail, Imported, Refuse };
+QueryPlan PlanQuery(execution::NavigationOwnership ownership,movement::Navigation policy,
+    bool retained,bool qualified) noexcept {
+    if(ownership==execution::NavigationOwnership::Unowned)return retained?QueryPlan::Imported:QueryPlan::Retail;
+    if(policy==movement::Navigation::HostRoute)return QueryPlan::Imported;
+    const bool ready=ownership==execution::NavigationOwnership::Ready||ownership==execution::NavigationOwnership::Admitting;
+    return ready&&qualified?QueryPlan::Retail:QueryPlan::Refuse;
+}
 void __fastcall Dispatch(void* scheduler,void*,void* parameters,void* reference) {
     using Native=void(__thiscall*)(void*,void*,void*);
     if(!gEngine||!gEngine()||!gFrame)return reinterpret_cast<Native>(gBase+0x570D0U)(scheduler,parameters,reference);
     execution::NavigationBinding binding{};
     const auto ownership=execution_runtime::IdentifyNavigation(gFrame->navigation,gFrame->block,binding);
     auto* retained=Find(gFrame->navigation);
-    if(!retained&&(ownership==execution::NavigationOwnership::Unowned||binding.policy!=movement::Navigation::HostRoute))
-        return reinterpret_cast<Native>(gBase+0x570D0U)(scheduler,parameters,reference);
+    // Only an exact, current typed request can start a local native solve.
+    // A preempted/revoked known B never escapes through a policy mismatch.
+    // An older strict Slot may still pin a DIFFERENT B/R on the same N. It
+    // retains cleanup ownership but cannot veto this newer typed local solve.
+    const auto plan=PlanQuery(ownership,binding.policy,retained!=nullptr,
+        gQualify&&gQualify(binding.command.scope));
+    if(plan==QueryPlan::Retail)return reinterpret_cast<Native>(gBase+0x570D0U)(scheduler,parameters,reference);
+    if(plan==QueryPlan::Refuse){++gRejected;return;}
     ++gSuppressed;
     if((ownership!=execution::NavigationOwnership::Ready&&ownership!=execution::NavigationOwnership::Admitting)||!Qualified(binding)) {
         if(retained)Fail(*retained);else {++gRejected;Reject(binding);}return;
@@ -691,13 +804,10 @@ void EndAdmission(std::uintptr_t n) noexcept {
     if(Current(*slot)&&Read(n+0x5C,pending)&&!pending&&Read(slot->local.block+0x40,phase)&&phase==3) {
         if(slot->replacementRequested){++gReplacementCommits;++gReplacements;gReplacementReason=0U;}
         slot->installed=true;slot->waitingSince=0;slot->replacementRequested=false;
-        // Only an ACTUALLY installed current/newer native route hands motion
-        // back. A received graph or a Submit receipt is insufficient.
-        for(auto& entry:gState->hybrid)if(entry.used&&
-            entry.binding.command.scope==slot->binding.command.scope&&entry.binding.command.owner==slot->binding.command.owner&&
-            entry.binding.command.actor==slot->binding.command.actor&&
-            HybridResumeCurrent(entry.binding.command.command,entry.binding.command.revision,
-                slot->binding.command.command,slot->binding.command.revision))entry={};
+        slot->physicalProgressVerified=false;slot->installSerial=++gInstallSerial;
+        // Keep the hybrid recovery ticket until CATHODE has proven physical
+        // progression. NativeHandoffCandidate temporarily yields the hybrid
+        // motor so the next frame can observe genuine native movement.
         slot->planned.reset();slot->continuation=false;
         // The native installer no longer references the old R. Route/history
         // nodes retain their own Refs and the slot retains the backing mesh.
@@ -743,7 +853,7 @@ bool Offer(const Graph& graph) noexcept {
         if(graph.key.parameterRevision<entry.graph->key.parameterRevision||
             (graph.key.parameterRevision==entry.graph->key.parameterRevision&&graph.key.routeRevision<entry.graph->key.routeRevision))return true;
         if(graph.key==entry.graph->key)return graph==*entry.graph;
-        entry.graph=std::make_unique<Graph>(graph);return true;
+        entry.graph=std::make_unique<Graph>(graph);RecordTrail(graph);return true;
     }
     if(!empty)for(auto& entry:gState->cache)if(entry.graph&&entry.graph->key.scope==graph.key.scope&&
         entry.graph->key.owner==graph.key.owner&&entry.graph->key.commandId<graph.key.commandId) {
@@ -753,7 +863,22 @@ bool Offer(const Graph& graph) noexcept {
         if(!retained){empty=&entry;break;}
     }
     if(!empty)return false;
-    empty->graph=std::make_unique<Graph>(graph);return true;
+    empty->graph=std::make_unique<Graph>(graph);RecordTrail(graph);return true;
+}
+const Graph* Guidance(const execution::NavigationBinding& binding,const std::array<float,3>& authoredGoal) noexcept {
+    if(!gState||!gEngine||!gEngine()||!gQualify||!gQualify(binding.command.scope)||
+        binding.policy!=movement::Navigation::HostGuided)return nullptr;
+    const auto* latest=Latest(binding);
+    if(!latest) {
+        const Key current{binding.command.scope,binding.command.owner,binding.command.command,
+            binding.command.revision,0U,binding.part};
+        for(const auto& cached:gState->cache)if(cached.graph&&
+            movement::RetainGuidanceGeometry(*cached.graph,current,authoredGoal)&&
+            (!latest||cached.graph->key.parameterRevision>latest->key.parameterRevision))latest=cached.graph.get();
+    }
+    if(!latest)return nullptr;
+    for(const auto& trail:gState->trails)if(trail&&trail->graph.key==latest->key)return &trail->graph;
+    return latest;
 }
 // Called on the engine thread before a replacement world's configuration.
 // The old M and mesh have independent pins; this marks retirement eligibility
@@ -761,6 +886,7 @@ bool Offer(const Graph& graph) noexcept {
 void RevokePreviousWorld() noexcept {
     if(!gState||!gEngine||!gEngine())return;
     for(auto& entry:gState->hybrid)entry={};
+    for(auto& trail:gState->trails)trail.reset();
     for(auto& slot:gState->slots)if(slot)slot->worldRevoked=true;
 }
 void ConfirmActorDestroyed(const execution::ActorLifetime& actor) noexcept {
@@ -907,9 +1033,85 @@ bool HybridBinding(std::uintptr_t character,execution::NavigationBinding& output
     }
     return false;
 }
+bool NativeHandoffCandidate(std::uintptr_t character) noexcept {
+    if(!gState||!gEngine||!gEngine())return false;
+    for(auto& entry:gState->hybrid)if(entry.used&&Qualified(entry.binding)&&
+        entry.binding.command.actor.character==character) {
+        const auto* candidate=ResumingCandidate(entry.binding,true);
+        if(!candidate)return false;
+        if(entry.candidateBlock!=candidate->local.block||
+            entry.observedInstallSerial!=candidate->installSerial||!entry.awaitingSince) {
+            entry.candidateBlock=candidate->local.block;
+            entry.observedInstallSerial=candidate->installSerial;
+            entry.awaitingSince=GetTickCount64();
+            entry.probe={};++gNativeHandoffCandidates;
+        }
+        return true;
+    }
+    return false;
+}
+route::NativeHandoffResult ObserveNativeHandoff(std::uintptr_t character,
+    std::uint64_t now,bool valid,const std::array<float,3>& local,
+    const std::array<float,3>& host,bool hostMoving,bool suspended,bool discontinuity) noexcept {
+    if(!gState||!gEngine||!gEngine())return route::NativeHandoffResult::Pending;
+    for(auto& entry:gState->hybrid)if(entry.used&&Qualified(entry.binding)&&
+        entry.binding.command.actor.character==character) {
+        auto* candidate=ResumingCandidate(entry.binding,true);
+        if(!candidate)return route::NativeHandoffResult::Pending;
+        if(entry.candidateBlock!=candidate->local.block||
+            entry.observedInstallSerial!=candidate->installSerial||!entry.awaitingSince) {
+            entry.candidateBlock=candidate->local.block;
+            entry.observedInstallSerial=candidate->installSerial;
+            entry.awaitingSince=now;entry.probe={};
+            ++gNativeHandoffCandidates;
+        }
+        // An authored vent transition or paired capture may hold locomotion
+        // legitimately. Suspend probation instead of declaring the Host route
+        // stuck while native action ownership is intentionally unavailable.
+        if(suspended) {
+            entry.awaitingSince=now;
+            entry.probe={};
+            return route::NativeHandoffResult::Pending;
+        }
+        if(!candidate->installed) {
+            // Give the native query time to populate, but do not leave the
+            // hybrid lease disabled forever when the imported route stalls.
+            if(now>=entry.awaitingSince&&now-entry.awaitingSince>=kRouteWaitMilliseconds) {
+                ++gNativeHandoffStalled;
+                Fail(*candidate,__LINE__,Result::Deferred);
+                entry.probe={};
+                return route::NativeHandoffResult::Stalled;
+            }
+            return route::NativeHandoffResult::Pending;
+        }
+        // The client hybrid lease must actually be gone. A positional change
+        // sampled while it still owns the motor is NOT native route evidence.
+        const bool nativeSample=valid&&!execution::MovementExecutionOwned(character);
+        const auto result=entry.probe.Observe(now,nativeSample,local,host,hostMoving,discontinuity);
+        if(result==route::NativeHandoffResult::Confirmed) {
+            if(!Current(*candidate))return route::NativeHandoffResult::Pending;
+            candidate->physicalProgressVerified=true;++gNativeHandoffConfirmed;
+            entry={};
+        } else if(result==route::NativeHandoffResult::Stalled) {
+            ++gNativeHandoffStalled;
+            // Native refusal already publishes the fallback ticket before
+            // cancelling the request. A stalled native route cannot silently
+            // extinguish a previously valid Host-authorized recovery.
+            Fail(*candidate,__LINE__,Result::Deferred);
+            entry.probe={};
+        }
+        return result;
+    }
+    return route::NativeHandoffResult::Pending;
+}
+HandoffReport NativeHandoffDiagnostics() noexcept {
+    return {gNativeHandoffCandidates.load(),gNativeHandoffConfirmed.load(),
+        gNativeHandoffStalled.load()};
+}
 void BeginScope(const transactions::Scope& scope) noexcept {
     if(!gState||!gEngine||!gEngine())return;
     for(auto& entry:gState->hybrid)if(entry.used&&entry.binding.command.scope!=scope)entry={};
+    for(auto& trail:gState->trails)if(trail&&trail->graph.key.scope!=scope)trail.reset();
     // After the prior scope passed its retirement gate, old portable graphs
     // must not consume the finite cache needed by the next round.
     for(auto& entry:gState->cache)if(entry.graph&&entry.graph->key.scope!=scope)entry.graph.reset();
@@ -920,7 +1122,7 @@ bool CommandRetired(const transactions::Scope& scope,const transactions::OwnerKe
         slot->binding.command.owner==owner&&slot->binding.command.command==command)return false;
     return true;
 }
-Counters Diagnostics() noexcept{return {gSuppressed.load(),gPublished.load(),gInstalled.load(),gReplacements.load(),gRejected.load(),gRetired.load(),gFailureCommand.load(),gFailureSite.load(),gFailureResult.load(),gImportStage.load(),gContextCheck.load(),gAppendPublished.load(),gContinuationPublished.load(),gCompoundRequests.load(),gLastAdmissionMode.load(),gLastIncomingCount.load(),gLastCompoundParts.load(),gCorridorJoins.load()};}
+Counters Diagnostics() noexcept{return {gSuppressed.load(),gPublished.load(),gInstalled.load(),gReplacements.load(),gRejected.load(),gRetired.load(),gFailureCommand.load(),gFailureSite.load(),gFailureResult.load(),gImportStage.load(),gContextCheck.load(),gAppendPublished.load(),gContinuationPublished.load(),gCompoundRequests.load(),gLastAdmissionMode.load(),gLastIncomingCount.load(),gLastCompoundParts.load(),gCorridorJoins.load(),gTrailBridges.load(),gTrailMisses.load(),gTrailMissDetail.load()};}
 ReplacementReport ReplacementDiagnostics() noexcept {
     return {gReplacementRequests.load(),gReplacementCommits.load(),gReplacementWaits.load(),gReplacementCommand.load(),
         gReplacementReason.load(),gReplacementArea.load(),gReplacementExpected.load(),gReplacementParameters.load(),gReplacementRevision.load()};

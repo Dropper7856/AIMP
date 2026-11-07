@@ -137,8 +137,10 @@ struct CommandState {
     // Logical Submit is not proof that the native executor admitted a request.
     bool nativeAdmitted{};
     bool nativeReleased{};
-    // Replaced before any native entry by a newer Host intent of this owner.
+    // Replaced by a newer Host intent. Native admission/release evidence stays
+    // independent: supersession never releases an already entered request.
     bool superseded{};
+    std::uint32_t nativeKind{}; // Retained across checkpoints with native ownership.
 };
 
 // Single-threaded portable model, intentionally disconnected from the engine.

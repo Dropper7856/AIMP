@@ -599,9 +599,12 @@ void BeforeNativeAdmission(std::uintptr_t request,std::uint32_t admission) noexc
         lease->order=++gAdmissionOrder;lease->parameters.admission=admission;
         lease->admissionActive=true;
         auto& b=lease->parameters.movement;b.version=1;b.parts=1;
-        // Capture route choice on the Host. Missing/incompatible route data
-        // must be refused by the importer, never replaced by a Client solve.
-        b.navigation=movement::Navigation::HostRoute;
+        // Replay the actual producer destination/stop/gait inputs. Replacing
+        // a long Host Move with a short physical-carrier target starts native
+        // stop mode6; 0044D320 then discards goal edits even with a live tail.
+        // LocalNative uses retail pathfinding only; the Client brain remains
+        // fenced and all actions/targets still come from the Host journal.
+        b.navigation=movement::Navigation::LocalNative;
         if(!HostScope(lease->scope)||!Read(character+0x50,lease->runtime)||
             !SnapshotMovement(request,kind,b.before,false)||!Strong(request,lease->ref)||!Live(*lease)) {
             lease->unknown=true;Lost(__LINE__);return;
@@ -633,9 +636,14 @@ void BeforeNativeAdmission(std::uintptr_t request,std::uint32_t admission) noexc
 void EndNativeMove() noexcept {
     if(gMoveOverflow){--gMoveOverflow;return;}if(!gMoveDepth)return;
     const auto frame=gMoveFrames[--gMoveDepth];gMoveFrames[gMoveDepth]={};
-    if(!frame.bound||!gGuard||!gGuard()||!EngineProducer().Bound())return;
+    if(!frame.bound||!gGuard||!gGuard())return;
     auto* lease=Find(frame.primary);if(!lease)return;
+    // The Move frame has returned even when a recovery unbound the source in
+    // between. Leaving this frame bit set made RetireNative skip the lease
+    // forever, so the next authority Offer could never qualify (Host stream
+    // permanently silent after a same-world recovery).
     lease->producerActive=false;
+    if(!EngineProducer().Bound())return;
     if(lease->submitted)FinalizeMovement(*lease);else FinalizePending();
 }
 void ObserveNativeMutation(std::uintptr_t request) noexcept {
@@ -710,7 +718,14 @@ bool InstallNative(std::uintptr_t base, HookManager& hooks, NativeContext contex
     gInstalled = true; return true;
 }
 void ObserveNativeAdmission(std::uintptr_t request, bool accepted) noexcept {
-    if (!gGuard || !gGuard() || !EngineProducer().Bound()) return;
+    if (!gGuard || !gGuard()) return;
+    if (!EngineProducer().Bound()) {
+        // Same boundary as EndNativeMove: the native admission has returned,
+        // so an unbound source must not keep this lease pinned as in-flight.
+        // Nothing is published; RetireNative releases it normally.
+        if(auto* move=Find(request))move->admissionActive=false;
+        return;
+    }
     if(auto* move=Find(request)) {
         if(request==move->ref.object)move->primaryAccepted=accepted;else move->companionAccepted=accepted;
         if(move->parameters.kind==2) {
@@ -781,8 +796,8 @@ void PumpNative() noexcept {
         }
     }
 }
-void RetireNative(bool liveWorld) noexcept {
-    if(gNativeCallDepth.load(std::memory_order_acquire)!=0||gMoveDepth||gMoveOverflow){RetireHost();return;}
+void RetireNative(bool liveWorld, bool retireSource) noexcept {
+    if(gNativeCallDepth.load(std::memory_order_acquire)!=0||gMoveDepth||gMoveOverflow){if(retireSource)RetireHost();return;}
     const NativeCallScope frame;
     // Never chase an old Character after a world barrier. An unresolved Ref
     // remains visible and prevents a new source from claiming clean coverage.
@@ -800,7 +815,7 @@ void RetireNative(bool liveWorld) noexcept {
         }
         if (ReleaseRef(lease.ref)) lease = {};
     }
-    RetireHost();
+    if(retireSource)RetireHost();
 }
 bool NativeIdle() noexcept { for (const auto& lease : gLeases) if (lease.used) return false; return true; }
 bool NativeNeedsLiveWorldRetirement() noexcept {

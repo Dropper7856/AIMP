@@ -12,6 +12,7 @@
 #include "aimp/CharacterActionProbeDiagnostics.h"
 #include "aimp/CharacterActionRuntime.h"
 #include "aimp/CharacterDirectStepRuntime.h"
+#include "aimp/HidingPresentationAudio.h"
 #include "aimp/CharacterReplicationBinder.h"
 #include "aimp/CrashGuard.h"
 #include "aimp/DescriptorRegistry.h"
@@ -1091,6 +1092,7 @@ DWORD Bootstrap::RunImpl() {
             paired_transform_guard::LogDiagnostics(diagnostics);
             teardown_reference_guard::LogDiagnostics(diagnostics);
             item_sync::LogDiagnostics(diagnostics);
+            hiding_presentation_audio::LogMetadataDiagnostics(diagnostics);
             lastPauseCounterLogTick = GetTickCount64();
         }
         if (ipc.ShutdownRequested()) {

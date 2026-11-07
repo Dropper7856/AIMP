@@ -110,6 +110,45 @@ internal static class AISyncExecutionTransportTests
         await Wait(() => host.AISyncExecutionReady(client.PeerId, fresh), token);
         await host.StopAISyncExecutionAsync();
     }
+    internal static async Task SenderQueueTelemetryAsync()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var token = timeout.Token;
+        var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resume = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sent = new ConcurrentQueue<byte>();
+        var failures = 0;
+        await using (var sender = new AISyncExecutionSender(async (_, bytes, ct) =>
+        {
+            entered.TrySetResult(true);
+            await resume.Task.WaitAsync(ct).ConfigureAwait(false);
+            sent.Enqueue(bytes.ToArray()[0]);
+        }, () => Interlocked.Increment(ref failures), token))
+        {
+            AssertEx.True(sender.Enqueue(MessageType.AISyncExecutionNetworkBatch, new byte[] { 1 }));
+            await entered.Task.WaitAsync(token);
+            AssertEx.True(sender.Enqueue(MessageType.AISyncExecutionNetworkBatch, new byte[] { 2 }));
+            AssertEx.True(sender.Enqueue(MessageType.AISyncExecutionNetworkBatch, new byte[] { 3 }));
+            await Task.Delay(40, token);
+            var waiting = sender.Snapshot();
+            AssertEx.Equal(2, waiting.PendingPackets);
+            AssertEx.Equal(3, waiting.PendingBytes);
+            AssertEx.True(waiting.OldestPendingMs >= 20);
+            resume.TrySetResult(true);
+            await Wait(() => sent.Count == 3, token);
+            AssertEx.SequenceEqual(new byte[] { 1, 2, 3 }, sent.ToArray(),
+                "Congestion telemetry must not change FIFO causal delivery order.");
+            // The last send callback can complete just before its worker has
+            // published the timing snapshot; wait for that handoff as well.
+            await Wait(() => sender.Snapshot().PendingBytes == 0, token);
+            var after = sender.Snapshot();
+            AssertEx.Equal(0, after.PendingPackets);
+            AssertEx.True(after.MaxQueuedMs >= 20);
+            AssertEx.True(after.MaxSendMs >= 20);
+            AssertEx.Equal(0, failures);
+        }
+    }
+
     internal static async Task IsolationAsync()
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(25)); var token = timeout.Token;

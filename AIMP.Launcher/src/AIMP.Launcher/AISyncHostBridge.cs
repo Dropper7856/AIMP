@@ -6,15 +6,35 @@ namespace AIMP.Launcher;
 internal sealed record AISyncHostBinding(LobbyHost? Host, Guid Session, int WorldGeneration,
     int NativeGeneration, int ProcessId, Guid ConnectionIdentity, long Epoch, bool Active);
 
-// The producer owns the decision stream. Fan-out changes only consumerEpoch;
-// it never derives a command from a pose, shadow observation or Client packet.
+
+// A terminal native receipt is evidence that this executable scope cannot
+// reach a settled checkpoint. Neither a rejected call nor an uncertain
+// already-entered call may be reissued under the same command identity.
+internal static class AISyncNativeRecoveryPolicy
+{
+    internal const int MaxAutomaticRepairs = 3;
+    internal const long MovementWaitingTimeoutMs = 12000;
+
+    internal static bool Terminal(AISyncExecutionStage stage) =>
+        stage is AISyncExecutionStage.Rejected or AISyncExecutionStage.Unknown;
+
+    internal static bool MovementTimedOut(AISyncTransaction operation, long ageMilliseconds) =>
+        ageMilliseconds >= MovementWaitingTimeoutMs && (operation.NativeKind is 1 or 3) &&
+        (operation.Opcode is AISyncTransactionOpcode.Submit or AISyncTransactionOpcode.Update);
+
+    internal static bool MayRepair(int completedRepairs) =>
+        completedRepairs >= 0 && completedRepairs < MaxAutomaticRepairs;
+}
+
 internal sealed partial class AISyncHostBridge : IDisposable
 {
     private sealed record Work(AISyncHostBinding Binding, NativeAISyncExecution? Native,
         ulong Peer, AISyncExecutionControl? Control, AISyncExecutionReceipt? Receipt);
     private readonly record struct CommandKey(uint A, uint B, uint Birth, uint Class,
         AISyncTransactionCapability Capability, ulong OwnerEpoch, ulong Command);
-    private sealed record Waiting(AISyncTransaction Operation, long Tick);
+    private sealed record Waiting(AISyncTransaction Operation, long Tick, long FirstTick);
+    private sealed record NativeFault(ulong Peer, AISyncTransaction Operation,
+        AISyncExecutionStage Stage, AISyncExecutionResult Result);
     private static CommandKey Identity(AISyncTransaction operation) => new(operation.EntityA,
         operation.EntityB, operation.Birth, operation.CharacterClass, operation.Capability,
         operation.OwnerEpoch, operation.CommandId);
@@ -28,6 +48,16 @@ internal sealed partial class AISyncHostBridge : IDisposable
     private readonly CancellationTokenSource _shutdown = new();
     private readonly Dictionary<ulong, AISyncExecutionScope> _peers = new();
     private readonly Dictionary<(ulong Peer, ulong Sequence), Waiting> _waiting = new();
+    private readonly AISyncRetryPlanner _retryPlanner = new();
+    private ulong _hostRetriesAttempted, _hostRetryCooling;
+    private long _maxHostWaitingAge;
+    private long _lastHostRetryLog;
+    private NativeFault? _nativeFault;
+    private AISyncHostBinding? _repairBinding;
+    private int _automaticNativeRepairs;
+    private bool _nativeRecoveryExhausted;
+    internal int NativeFaultRecoveries { get; private set; }
+    internal int NativeRepairLimitHits { get; private set; }
     private LobbyHost? _host;
     private AISyncHostBinding? _binding, _attempted;
     private AISyncExecutionScope? _scope;
@@ -120,13 +150,23 @@ internal sealed partial class AISyncHostBridge : IDisposable
         await RefreshBindingAsync().ConfigureAwait(false);
         ProcessQueued();
         if (_binding is null || _scope is null) return;
+        var retries = RetryHeads();
+        if (await RecoverNativeFaultAsync(retries).ConfigureAwait(false)) return;
         ValidateRoster();
         await OfferSourceAsync().ConfigureAwait(false);
-        if (_ready) { RetryWaiting(); await CheckpointAsync().ConfigureAwait(false); }
+        if (_ready) { RetryWaiting(retries); await CheckpointAsync().ConfigureAwait(false); }
+        LogRetryLatency();
     }
     private async Task RefreshBindingAsync()
     {
         var current = _capture();
+        // A reconnect, round transition or native process rebinding is a new
+        // repair opportunity. A repeating refusal in the SAME binding is not.
+        if (_repairBinding != current)
+        {
+            _repairBinding = current; _automaticNativeRepairs = 0;
+            _nativeRecoveryExhausted = false; _nativeFault = null;
+        }
         if (_binding is not null && (_binding != current || !current.Active ||
             Volatile.Read(ref _lossEpoch) == current.Epoch))
         {
@@ -134,7 +174,8 @@ internal sealed partial class AISyncHostBridge : IDisposable
                 _log("Host command stream refused: bounded ingress lost coverage.");
             await RetireAsync().ConfigureAwait(false);
         }
-        if (_binding is null && current.Active && ReferenceEquals(current.Host, _host) &&
+        if (_binding is null && !_nativeRecoveryExhausted && current.Active &&
+            ReferenceEquals(current.Host, _host) &&
             (current != _attempted || Environment.TickCount64 >= _reopenAt))
         {
             if (current == _attempted) { Reopens++; _log($"Host command stream reopening (attempt {Reopens})."); }
@@ -185,19 +226,88 @@ internal sealed partial class AISyncHostBridge : IDisposable
         _log($"Client execution roster Ready, offering Host source: round={_binding!.WorldGeneration}, authority={_scope!.Value.AuthorityEpoch}.");
         await SendAsync(_binding!, new(_scope!.Value, AISyncExecutionControlKind.Offer, _profiles)).ConfigureAwait(false);
     }
-    private void RetryWaiting()
+    private async Task<bool> RecoverNativeFaultAsync(KeyValuePair<(ulong Peer, ulong Sequence), Waiting>[] retries)
     {
-        foreach (var pair in RetryHeads())
+        if (_nativeFault is null && _ready)
         {
-            if (Environment.TickCount64 - pair.Value.Tick < 20) continue;
+            // A movement still Waiting for 12 seconds on the SAME current
+            // actor is no longer making useful progress. Never impose this
+            // timeout on captures, placement, markers or Release. The next
+            // authority epoch must re-establish native resources from scratch.
+            var now = Environment.TickCount64;
+            foreach (var pair in retries)
+            {
+                if (!AISyncNativeRecoveryPolicy.MovementTimedOut(
+                    pair.Value.Operation, now - pair.Value.FirstTick)) continue;
+                _nativeFault = new(pair.Key.Peer, pair.Value.Operation,
+                    AISyncExecutionStage.Waiting, AISyncExecutionResult.OwnerBusy);
+                break;
+            }
+        }
+        if (_nativeFault is not { } fault) return false;
+        if (!AISyncNativeRecoveryPolicy.MayRepair(_automaticNativeRepairs))
+        {
+            _nativeRecoveryExhausted = true;
+            ++NativeRepairLimitHits;
+            _log($"AISync native recovery exhausted: attempts={_automaticNativeRepairs}, "
+                + $"peer={fault.Peer}, stage={fault.Stage}, seq={fault.Operation.GlobalSequence}, "
+                + $"command={fault.Operation.CommandId}; native rebind or new round required. "
+                + "Old commands cannot be replayed.");
+            await RetireAsync().ConfigureAwait(false);
+            return true;
+        }
+        ++_automaticNativeRepairs;
+        ++NativeFaultRecoveries;
+        _log($"AISync native recovery: attempt={_automaticNativeRepairs}, peer={fault.Peer}, "
+            + $"stage={fault.Stage}, result={fault.Result}, seq={fault.Operation.GlobalSequence}, "
+            + $"command={fault.Operation.CommandId}, kind={fault.Operation.NativeKind}; "
+            + "retiring old scope before a fresh authority epoch. Unknown is never replayed.");
+        // Close the Host source and all consumer scopes through the existing
+        // native retirement barrier. In particular an unknown partial Ref
+        // release cannot become an implicit successful cleanup.
+        await RetireAsync().ConfigureAwait(false);
+        return true;
+    }
+    private void RetryWaiting(KeyValuePair<(ulong Peer, ulong Sequence), Waiting>[] retries)
+    {
+        var now = Environment.TickCount64;
+        foreach (var pair in retries)
+        {
+            _maxHostWaitingAge = Math.Max(_maxHostWaitingAge, Math.Max(0, now - pair.Value.FirstTick));
+            if (now - pair.Value.Tick < AISyncRetryPlanner.HostRetryIntervalMs)
+            { ++_hostRetryCooling; continue; }
             if (!_binding!.Host!.RetryAISyncExecution(pair.Key.Peer, pair.Key.Sequence))
             { ResolveRetryRace(pair.Key); continue; }
             _waiting[pair.Key] = pair.Value with { Tick = Environment.TickCount64 };
+            ++_hostRetriesAttempted;
         }
     }
-    private KeyValuePair<(ulong Peer, ulong Sequence), Waiting>[] RetryHeads() => _waiting
-        .GroupBy(p => (p.Key.Peer, Actor: Identity(p.Value.Operation) with { Command = 0 }))
-        .Select(group => group.MinBy(p => p.Key.Sequence)).ToArray();
+    private KeyValuePair<(ulong Peer, ulong Sequence), Waiting>[] RetryHeads()
+    {
+        var chosen = _retryPlanner.ChooseCycle(_waiting.Select(p => (p.Key.Peer, p.Value.Operation)),
+            AISyncRetryPlanner.MaxHostPerTick);
+        return chosen.Where(key => _waiting.ContainsKey(key))
+            .Select(key => new KeyValuePair<(ulong Peer, ulong Sequence), Waiting>(
+                key, _waiting[key])).ToArray();
+    }
+    private void LogRetryLatency()
+    {
+        var now = Environment.TickCount64;
+        if (_scope is null || now - _lastHostRetryLog < 5000) return;
+        _lastHostRetryLog = now;
+        var transport = _binding?.Host?.GetAISyncExecutionTransportTimings()
+            ?? Array.Empty<AISyncExecutionTransportTiming>();
+        var oldestQueued = transport.Length == 0 ? 0 : transport.Max(p => p.OldestPendingMs);
+        var maxQueued = transport.Length == 0 ? 0 : transport.Max(p => p.MaxQueuedMs);
+        var maxSend = transport.Length == 0 ? 0 : transport.Max(p => p.MaxSendMs);
+        _log($"Host AISync retry timing: waiting={_waiting.Count}, " +
+            $"retryAttempts={_hostRetriesAttempted}, coolingSkips={_hostRetryCooling}, " +
+            $"oldestSelectedWaitMs={_maxHostWaitingAge}, perTickCap={AISyncRetryPlanner.MaxHostPerTick}, " +
+            $"networkPending={transport.Sum(p => p.PendingPackets)}, " +
+            $"networkQueuedBytes={transport.Sum(p => p.PendingBytes)}, " +
+            $"networkOldestQueuedMs={oldestQueued}, networkMaxQueuedMs={maxQueued}, networkMaxSendMs={maxSend}; " +
+            "socket send time is not network RTT or native admission.");
+    }
     private void ResolveRetryRace((ulong Peer, ulong Sequence) key)
     {
         if (_binding!.Host!.TryGetAISyncExecutionReceipt(key.Peer, _peers[key.Peer], key.Sequence, out var receipt)
@@ -310,19 +420,29 @@ internal sealed partial class AISyncHostBridge : IDisposable
         // the exact batch/operation echo and legal disposition transition.
         // A refusal settles retry eligibility, not native ownership or cleanup.
         var key = (work.Peer, receipt.Operation.GlobalSequence);
-        if (receipt.Stage is AISyncExecutionStage.Rejected or AISyncExecutionStage.Unknown)
+        if (AISyncNativeRecoveryPolicy.Terminal(receipt.Stage))
         {
             _waiting.Remove(key);
             _log($"Client native command refused: peer={work.Peer}, stage={receipt.Stage}, result={receipt.Result}, "
                 + $"sequence={receipt.Operation.GlobalSequence}, command={receipt.Operation.CommandId}, "
                 + $"kind={receipt.Operation.NativeKind}, opcode={receipt.Operation.Opcode}.");
-            // Leave the final receipt in the consumer journal. In particular,
-            // Unknown cannot authorize a retry, replacement, or checkpoint of
-            // resources whose release has not been proved by native execution.
+            // The final receipt is immutable. It prevents settled checkpoints;
+            // retaining an active stream would eventually strand it forever.
+            // Schedule scoped retirement, not an unsafe native retry.
+            _nativeFault ??= new(work.Peer, receipt.Operation, receipt.Stage, receipt.Result);
             return;
         }
         if (receipt.Stage == AISyncExecutionStage.Waiting)
-            _waiting[key] = new(receipt.Operation, Environment.TickCount64);
+        {
+            var now = Environment.TickCount64;
+            if (_waiting.TryGetValue(key, out var previous))
+                // Repeated Waiting receipts are NOT new retry attempts. Do
+                // not reset the retry timer; otherwise frequent duplicates
+                // can starve the only eligible current Host intention.
+                _waiting[key] = previous with { Operation = receipt.Operation };
+            else _waiting[key] = new(receipt.Operation,
+                now - AISyncRetryPlanner.HostRetryIntervalMs, now);
+        }
         else if (receipt.Stage is AISyncExecutionStage.Entered or AISyncExecutionStage.Admitted
             or AISyncExecutionStage.Released or AISyncExecutionStage.Superseded)
             _waiting.Remove(key);
@@ -338,7 +458,10 @@ internal sealed partial class AISyncHostBridge : IDisposable
         var binding = _binding; var scope = _scope;
         _binding = null; _scope = null; _journal = null; _ready = false; _offered = false;
         _routes?.Fence(); _routes = null;
-        _peers.Clear(); _waiting.Clear(); ResetCheckpoint();
+        _peers.Clear(); _waiting.Clear(); _nativeFault = null;
+        _retryPlanner.Reset(); _maxHostWaitingAge = 0; _lastHostRetryLog = 0;
+        _hostRetriesAttempted = _hostRetryCooling = 0;
+        ResetCheckpoint();
         Interlocked.Exchange(ref _lossEpoch, long.MinValue);
         if (binding is null) return;
         _reopenAt = Environment.TickCount64 + _reopenDelay;

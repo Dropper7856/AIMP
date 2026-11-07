@@ -100,6 +100,48 @@ void Duplicate(TransactionExecutor& executor, Harness& h, const Record& r,
     CHECK(executor.RecordCount() == count);
 }
 
+void AcceptedReplacementFencesLateEdits() {
+    struct Case { std::uint32_t oldKind, newKind, admission; NativeOutcome outcome; bool otherActor, superseded; };
+    const Case cases[]{
+        {1,1,0,NativeOutcome::Admitted,false,true},
+        {7,1,0,NativeOutcome::Admitted,false,true},
+        {1,1,1,NativeOutcome::Admitted,false,false},
+        {1,1,0,NativeOutcome::Rejected,false,false},
+        {1,1,0,NativeOutcome::Unknown,false,false},
+        {1,1,0,NativeOutcome::Admitted,true,false},
+        {5,1,0,NativeOutcome::Admitted,false,false},
+        {1,5,0,NativeOutcome::Admitted,false,false},
+    };
+    for(const auto& test:cases) {
+        Harness h;TransactionExecutor e(h.Adapter(),{},true);
+        auto old=Base();old.nativeKind=test.oldKind;
+        CHECK(e.Configure(old.scope)==Result::Ok);
+        Accepted(e,old,false);old=Next(old,Op::Submit);Accepted(e,old,true);
+        // The old Submit may already be checkpointed when replacement wins.
+        CHECK(e.Checkpoint(old.scope,old.globalSeq)==Result::Ok);
+        auto current=Next(old,Op::Begin);++current.commandId;current.nativeKind=test.newKind;
+        current.admission=test.admission;
+        if(test.otherActor){++current.owner.entityA;current.ownerSeq=1;}
+        Accepted(e,current,false);current=Next(current,Op::Submit);h.outcome=test.outcome;
+        static_cast<void>(e.Execute(current));
+        auto late=Next(old,Op::Update);late.globalSeq=current.globalSeq+1;
+        if(!test.otherActor)late.ownerSeq=current.ownerSeq+1;
+        h.outcome=NativeOutcome::Admitted;
+        const auto checks=h.checked.size(),calls=h.invoked.size();
+        const auto result=e.Execute(late);
+        if(test.superseded) {
+            CHECK(result.status==ExecutionStatus::Superseded&&result.result==Result::Ok);
+            CHECK(result.acceptedLogical&&!result.nativeEntered&&!result.hasNativeOutcome);
+            CHECK(h.checked.size()==checks&&h.invoked.size()==calls);
+            CHECK(e.HasNativeOwnership(old.owner));
+        } else if(test.outcome==NativeOutcome::Unknown) {
+            CHECK(result.result==Result::OutcomeUnknown&&!result.nativeEntered&&h.invoked.size()==calls);
+        } else {
+            CHECK(result.nativeEntered&&result.nativeOutcome==NativeOutcome::Admitted);
+            CHECK(h.invoked.size()==calls+1);
+        }
+    }
+}
 void Lifecycle() {
     Harness h;
     TransactionExecutor e(h.Adapter());
@@ -881,8 +923,8 @@ void Checkpoints() {
 int main() {
     static_assert(!std::is_copy_constructible_v<TransactionExecutor>);
     static_assert(noexcept(TransactionExecutor(TransactionAdapter{})));
-    Lifecycle(); ProfileBinding(); NativePipeline(); NativeIntentEvidence(); NativeIntentOrdering();
+    AcceptedReplacementFencesLateEdits(); Lifecycle(); ProfileBinding(); NativePipeline(); NativeIntentEvidence(); NativeIntentOrdering();
     Waiting(); IndependentOwners(); Failures(); CallbackReentry();
     ValidationAndOrdering(); MissingAdapterAndTerminals(); Capacity(); Generated(); Checkpoints();
-    std::cout << "AISyncTransactionExecutor: 14 groups PASS; 10000 generated traces and 10000 checkpointed commands PASS (offline only)\n";
+    std::cout << "AISyncTransactionExecutor: 15 groups PASS; 10000 generated traces and 10000 checkpointed commands PASS (offline only)\n";
 }

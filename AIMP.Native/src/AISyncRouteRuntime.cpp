@@ -177,7 +177,7 @@ HostAdmission BeforeHostAdmission(std::uintptr_t n) noexcept {
         !Read(input.result+4,ready)||ready!=1||!Read(input.result+0xC,status)||status!=1)return input;
     input.identified=host_producer::IdentifyNativeNavigation(n,pin.local.block,pin.command,pin.part);
     if(input.identified) {
-        if(!gHost(pin.command.scope)||pin.command.navigation!=movement::Navigation::HostRoute)return input;
+        if(!gHost(pin.command.scope)||!movement::CarriesRoute(pin.command.navigation))return input;
     } else if(!host_producer::HostScope(pin.command.scope)||!gHost(pin.command.scope))return input;
     pin.local.result=input.result;
     for(std::size_t i=0;i<6;++i)if(!Read(input.result+0x10+i*4,pin.auxiliary[i]))return input;
@@ -300,7 +300,7 @@ void CaptureHostGoalEdit(std::uintptr_t n,std::uintptr_t b,const std::array<floa
         !Read(b+0x40,state)||state!=3||!Read(n+0xC,cursor)||!Read(n,sentinel)||cursor==sentinel)return;
     HostProtection pin{};pin.local={n,b,0,0};
     if(!host_producer::IdentifyNativeNavigation(n,b,pin.command,pin.part)||!gHost(pin.command.scope)||
-        pin.command.navigation!=movement::Navigation::HostRoute)return;
+        !movement::CarriesRoute(pin.command.navigation))return;
     bool found{};
     for(const auto& metadata:gHostMetadata)if(metadata.used&&!metadata.provisional&&metadata.value.local.navigation==n&&metadata.value.local.block==b&&
         metadata.value.command.scope==pin.command.scope&&metadata.value.command.owner==pin.command.owner&&
@@ -366,7 +366,7 @@ void ObserveHostNavigation(std::uintptr_t n,std::uintptr_t b) noexcept {
     // This is the first operation which can inspect a provisional candidate:
     // the producer still pins the exact request and independently proves M/N/B.
     if(!host_producer::IdentifyNativeNavigation(n,b,identity,part)||!gHost(identity.scope)||
-        identity.navigation!=movement::Navigation::HostRoute)return;
+        !movement::CarriesRoute(identity.navigation))return;
     for(auto& item:gHostMetadata)if(item.used&&item.provisional&&item.value.local.navigation==n&&item.value.local.block==b) {
         auto pin=item.value;const auto start=item.start,finish=item.finish,cursor=item.cursor;const auto goal=item.goal;
         item={};

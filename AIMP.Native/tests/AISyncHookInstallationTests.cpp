@@ -169,6 +169,29 @@ void TestThePlayerNativeAbi(const std::uintptr_t base) {
         "Private ABI page restoration");
     *rootSlot=oldRoot;
 }
+void TestPassageFallbackBytes(const std::uintptr_t base) {
+    // Both seams are after native M+8=5, before the cycle interruption. The
+    // first continuation keeps kind3 completion; neither synthesizes a return.
+    for(const auto site:{0x287396U,0x2873CAU})
+        Require(std::memcmp(reinterpret_cast<const void*>(base+site),"\x8B\x06\x8B\x88\x6C\x03\x00\x00",8)==0,
+            "Passage scheduler seam no longer has its complete eight-byte prefix");
+    Require(std::memcmp(reinterpret_cast<const void*>(base+0x28722DU),"\xC7\x40\x08\x05\x00\x00\x00",7)==0&&
+        std::memcmp(reinterpret_cast<const void*>(base+0x28739EU),"\x8B\x01\x8B\x50\x34\xFF\xD2",7)==0&&
+        std::memcmp(reinterpret_cast<const void*>(base+0x2873D2U),"\x8B\x01\x8B\x50\x34\xFF\xD2",7)==0&&
+        std::memcmp(reinterpret_cast<const void*>(base+0x2873ADU),"\xE8\x0E\x36\xFC\xFF",5)==0&&
+        std::memcmp(reinterpret_cast<const void*>(base+0x2873E1U),"\xE8\xDA\x35\xFC\xFF",5)==0&&
+        std::memcmp(reinterpret_cast<const void*>(base+0x2873B2U),"\x8B\xCE\xE8\x47\xF9\xFF\xFF",7)==0&&
+        std::memcmp(reinterpret_cast<const void*>(base+0x2873E6U),"\x8B\x74\x24\x2C\x85\xF6",6)==0,
+        "Passage native mode, interruption, constructor or continuation contract changed");
+    Require(*reinterpret_cast<const std::uint32_t*>(base+0xDBB2A0U+0x34U)==base+0x16E0U&&
+        *reinterpret_cast<const std::uint32_t*>(base+0xDBB360U+0x34U)==base+0x16E0U&&
+        std::memcmp(reinterpret_cast<const void*>(base+0x16E0U),"\x8A\x41\x08\xA8\x06\x75\x05\x0C\x10\x88\x41\x08\x80\x49\x08\x26\xC3",17)==0,
+        "Passage interruption no longer has the exact relocated flags6/flags26 contract");
+    Require(std::memcmp(reinterpret_cast<const void*>(base+0x24A9B6U),"\xC2\x08\x00",3)==0&&
+        std::memcmp(reinterpret_cast<const void*>(base+0x1853U),"\xC2\x08\x00",3)==0&&
+        std::memcmp(reinterpret_cast<const void*>(base+0x184AU),"\x89\x4E\x50",3)==0,
+        "Passage76 wrapper/constructor lost RET8 or its copied speed selector");
+}
 void TestProductionInstallation(DataImage& image) {
     aimp::HookManager hooks(true, true);
     aimp::LevelGenerationTracker generations;
@@ -176,7 +199,7 @@ void TestProductionInstallation(DataImage& image) {
     std::uintptr_t inactiveRoot{};
     std::string error;
     const auto base = image.Base();
-    constexpr std::array<std::uintptr_t, 3> sites{0x2579F0U, 0x2556F0U, 0x33433EU};
+    constexpr std::array<std::uintptr_t, 6> sites{0x2579F0U, 0x2556F0U, 0x33433EU,0x287396U,0x2873CAU,0x24A930U};
     std::array<std::array<std::byte, 16>, sites.size()> original{};
     for (std::size_t i = 0; i < sites.size(); ++i)
         std::memcpy(original[i].data(), reinterpret_cast<const void*>(base + sites[i]), original[i].size());
@@ -190,7 +213,7 @@ void TestProductionInstallation(DataImage& image) {
         "Production AISync did not publish readiness");
     for (const auto site : sites)
         Require(*reinterpret_cast<const std::uint8_t*>(base + site) == 0xE9U,
-            "Production intention, animation or brain hook missing");
+            "Production intention, animation, brain or passage hook missing");
     TestThePlayerNativeAbi(base);
     // Cover the Host path too: the Retail fast-return can happen to preserve
     // EDX in one optimized build and would conceal the reported defect.
@@ -346,6 +369,7 @@ int main(int argc, char** argv) {
     }
     try {
         DataImage image(argv[1]);
+        TestPassageFallbackBytes(image.Base());
         if (argc == 3 && std::string_view(argv[2]) == "production") {
             TestProductionInstallation(image);
             std::cout << "PASS: production installation/rollback plus exact THE_PLAYER crash-caller ABI on private synthetic objects; no game process.\n";

@@ -1,4 +1,5 @@
 #include "aimp/AISyncHybridMotion.h"
+#include "aimp/AISyncRecoveryMotion.h"
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -12,6 +13,34 @@ void Check(bool value, int line) {
 }
 #define CHECK(...) Check((__VA_ARGS__), __LINE__)
 bool Near(float a, float b) { return std::abs(a - b) < 0.0001F; }
+void RecoveryIntensity() {
+    aimp::ai_sync::State pose{};
+    pose.motionFlags = Valid;
+    pose.moveType = 1U;
+    pose.locomotionIntensity = 1.0F;
+    aimp::ai_sync::RecoveryControl control{};
+    // Walking and sprint samples from the reported client capture must keep
+    // the Host intensity, rather than reusing measured speed as animation input.
+    for (const float speed : {0.324928F, 0.986237F, 8.682479F}) {
+        pose.motionVelocity[0] = speed;
+        CHECK(aimp::ai_sync::TryBuildRecoveryControl(pose, control));
+        CHECK(Near(control.velocityX, speed) && Near(control.velocityZ, 0.0F));
+        CHECK(Near(control.intensity, 1.0F));
+    }
+    pose.motionVelocity[0] = 0.0F;
+    pose.locomotionIntensity = 0.0F;
+    CHECK(aimp::ai_sync::TryBuildRecoveryControl(pose, control) && control.intensity == 0.0F);
+    for (const auto flags : {0U, Valid | NativeAction, Valid | Discontinuity}) {
+        pose.motionFlags = flags;
+        CHECK(!aimp::ai_sync::TryBuildRecoveryControl(pose, control));
+    }
+    pose.motionFlags = Valid;
+    pose.locomotionIntensity = std::numeric_limits<float>::quiet_NaN();
+    CHECK(!aimp::ai_sync::TryBuildRecoveryControl(pose, control));
+    pose.locomotionIntensity = 1.0F;
+    pose.motionVelocity[2] = std::numeric_limits<float>::infinity();
+    CHECK(!aimp::ai_sync::TryBuildRecoveryControl(pose, control));
+}
 Sample Motion(std::uint64_t tick, float x = 0.0F, float vx = 10.0F) {
     return {tick, {x, 2.0F, 3.0F}, {vx, 0.0F, 0.0F}, 0.0F, Valid};
 }
@@ -185,6 +214,7 @@ void ValidationAndCapacity() {
 } // namespace
 
 int main() {
+    RecoveryIntensity();
     EmptyAndReset();
     ClocksAndInterpolation();
     JitterAndDuplicates();

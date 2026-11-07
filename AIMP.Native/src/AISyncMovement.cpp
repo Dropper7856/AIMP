@@ -47,7 +47,7 @@ bool Empty(const Bundle& b) noexcept {
 bool Validate(const Bundle& b) noexcept {
     if(Empty(b))return true;
     return b.version==1 && b.parts>=1 && b.parts<=2 && b.gait<=3 && b.primaryFlags<=7 &&
-        (b.navigation==Navigation::LocalNative || b.navigation==Navigation::HostRoute) &&
+        (b.navigation==Navigation::LocalNative || CarriesRoute(b.navigation)) &&
         Valid(b.before) && Valid(b.after) && (b.parts==2 ?
             Valid(b.companion) && b.companionFlags<=7 && b.companionRetainedAfter<=1 :
             Empty(b.companion) && !b.companionFlags && !b.companionRetainedAfter);

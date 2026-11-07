@@ -193,7 +193,9 @@ void PumpNative() noexcept;
 // After the retail scheduler executes: associate only its active head kind5
 // with the exact resulting cycle. Does not infer ownership from a state alone.
 void ObserveNativeActionExecution(std::uintptr_t scheduler) noexcept;
-void RetireNative(bool liveWorld) noexcept;
+// retireSource=false only for an already unbound source: retiring it again would
+// replace a queued same-world recovery Offer with Close before PumpHost runs.
+void RetireNative(bool liveWorld, bool retireSource = true) noexcept;
 // Correlates only an exact scheduler-executed kind5/cycle binding.
 // Missing/ambiguous evidence returns false, without closing capture coverage.
 [[nodiscard]] bool IdentifyNativeAction(std::uintptr_t character,std::uintptr_t cycle,std::uint32_t typeRva,

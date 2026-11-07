@@ -2,7 +2,7 @@ using System.Buffers.Binary;
 
 namespace AIMP.Protocol;
 
-public enum AISyncMovementNavigation : uint { LocalNative = 1, HostRoute = 2 }
+public enum AISyncMovementNavigation : uint { LocalNative = 1, HostRoute = 2, HostGuided = 3 }
 public readonly record struct AISyncMovementParameters(uint Retained, uint Style,
     float X, float Y, float Z, float StoppingDistance, float StopDistance,
     float Query0, float Query1, float Query2, float Query3, float Query4,
@@ -33,7 +33,7 @@ public static class AISyncMovementCodec
     {
         if (IsEmpty(value)) return;
         if (value.Version != 1 || value.Parts is < 1 or > 2 || value.Gait > 3 || value.PrimaryFlags > 7
-            || value.Navigation is not (AISyncMovementNavigation.LocalNative or AISyncMovementNavigation.HostRoute))
+            || value.Navigation is not (AISyncMovementNavigation.LocalNative or AISyncMovementNavigation.HostRoute or AISyncMovementNavigation.HostGuided))
             throw new ProtocolException("Invalid AISync movement bundle profile.");
         ValidateParameters(value.Before); ValidateParameters(value.After);
         if (value.Parts == 2)

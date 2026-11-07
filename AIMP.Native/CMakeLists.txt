@@ -203,6 +203,19 @@ if(BUILD_TESTING)
     set_target_properties(AIMP.AISyncRouteHandoffTests PROPERTIES
         VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
     add_test(NAME AISyncRouteHandoff COMMAND AIMP.AISyncRouteHandoffTests)
+    add_executable(AIMP.AISyncRouteTrailTests tests/AISyncRouteTrailTests.cpp
+        src/AISyncRouteCodec.cpp src/AISyncRouteIdentity.cpp src/AISyncTransactions.cpp)
+    target_include_directories(AIMP.AISyncRouteTrailTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_options(AIMP.AISyncRouteTrailTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.AISyncRouteTrailTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME AISyncRouteTrail COMMAND AIMP.AISyncRouteTrailTests)
+    add_executable(AIMP.AISyncNativeGuidancePolicyTests tests/AISyncNativeGuidancePolicyTests.cpp)
+    target_include_directories(AIMP.AISyncNativeGuidancePolicyTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_options(AIMP.AISyncNativeGuidancePolicyTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.AISyncNativeGuidancePolicyTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME AISyncNativeGuidancePolicy COMMAND AIMP.AISyncNativeGuidancePolicyTests)
     add_executable(AIMP.AISyncLifecycleTests tests/AISyncLifecycleTests.cpp)
     target_link_libraries(AIMP.AISyncLifecycleTests PRIVATE AIMP.Core)
     target_compile_options(AIMP.AISyncLifecycleTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)

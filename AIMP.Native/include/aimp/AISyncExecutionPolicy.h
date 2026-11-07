@@ -8,6 +8,20 @@
 
 namespace aimp::ai_sync {
 
+enum class PairedPreparationPlan : std::uint8_t { Prepare, Ignore, AbortHostSource };
+[[nodiscard]] constexpr PairedPreparationPlan PlanPairedPreparation(Role role, bool hasCarrier,
+    bool duplicate, bool remoteParticipant, bool localClientVictim) noexcept {
+    if (duplicate) return PairedPreparationPlan::Ignore;
+    if (hasCarrier) return PairedPreparationPlan::Prepare;
+    // Returning without native failure leaves an unprepared 4E holding its
+    // victim indefinitely. Only the Host may abandon this unbound attempt;
+    // Clients still require the exact authoritative result before any effect.
+    if (role == Role::Host && remoteParticipant) return PairedPreparationPlan::AbortHostSource;
+    if (role == Role::Client || role == Role::FrozenClient || remoteParticipant || localClientVictim)
+        return PairedPreparationPlan::Ignore;
+    return PairedPreparationPlan::Prepare;
+}
+
 inline constexpr std::uint32_t kDisableAlien = 1U;
 constexpr bool AlienSuppressionRequested(const Role role, const std::uint32_t flags) noexcept {
     return role == Role::Host && (flags & kDisableAlien) != 0U;
@@ -238,6 +252,12 @@ constexpr bool HostLeftPairedExecution(const bool executionValid, const bool exe
 constexpr bool DeferredSourceEndReady(const bool currentLifetime, const bool hostLeft,
     const bool localEndAction, const bool exactGraphRetained, const bool nonLethalBranch) noexcept {
     return currentLifetime && hostLeft && localEndAction && exactGraphRetained && nonLethalBranch;
+}
+constexpr bool DeadVictimNativeEndReady(const bool hostLeft,const bool localVictim,
+    const bool terminalVictim,const bool nativeDeathApplied) noexcept {
+    // HP zero alone is insufficient. A returned native victim-finish callback
+    // and the Host's source exit can replace a missing local animation marker.
+    return hostLeft&&localVictim&&terminalVictim&&nativeDeathApplied;
 }
 
 // Metadata gives no local ownership until replay succeeds for this revision.

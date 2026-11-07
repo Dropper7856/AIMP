@@ -19,7 +19,22 @@ internal static class AISyncMarkerCodecTests
             NativeKind=2,NativeIntent=new(Words()),Movement=new(1,1,0,AISyncMovementNavigation.HostRoute,before,before with { Retained=1 },default)
         };
     }
-    internal static Task RunAllAsync() { Domain();Operations();return Task.CompletedTask; }
+    internal static Task RunAllAsync() { Domain();Operations();RouteCorrelation();return Task.CompletedTask; }
+    private static void RouteCorrelation() {
+        var begin=Record();var scope=new AISyncExecutionScope(begin.Session,begin.AuthorityEpoch,begin.WorldEpoch,begin.ConsumerEpoch);
+        var submit=begin with { Opcode=AISyncTransactionOpcode.Submit,GlobalSequence=2,OwnerSequence=2 };
+        var journal=new AISyncRouteJournal(scope);
+        var graph=AISyncRouteTransportTests.Graph(submit);var bytes=AISyncRouteCodec.Encode(graph);
+        Check(journal.Observe(new(scope,1,new[]{begin})));
+        Check(journal.Append(bytes)==AISyncExecutionJournalResult.Rejected);
+        Check(journal.Observe(new(scope,2,new[]{submit})));
+        Check(journal.Append(bytes)==AISyncExecutionJournalResult.Accepted);
+        Check(journal.Append(bytes)==AISyncExecutionJournalResult.Duplicate);
+        Check(journal.Append(AISyncRouteCodec.Encode(graph with {Key=graph.Key with {Part=1}}))==AISyncExecutionJournalResult.Rejected);
+        Check(journal.Observe(new(scope,3,new[]{submit with {Opcode=AISyncTransactionOpcode.Release,Movement=default,NativeIntent=null}})));
+        Check(journal.RouteCount==0&&journal.Append(bytes)==AISyncExecutionJournalResult.Rejected);
+        Reject(()=>AISyncExecutionCodec.ValidateExecutable(begin with {Movement=begin.Movement with {Navigation=AISyncMovementNavigation.HostGuided}}));
+    }
     private static void Domain() {
         var words=Words();var p=new AISyncNativeIntent(words);words[2]=0;Check(p.Words[2]==0x03020100);
         var bytes=AISyncNativeIntentCodec.Encode(p);Check(AISyncNativeIntentCodec.Decode(bytes)==p);

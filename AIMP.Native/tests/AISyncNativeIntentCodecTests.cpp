@@ -22,6 +22,7 @@ native_intent::Payload Intent(std::uint32_t id) {
     }
     if (id==21) {w[1]=4;w[8]=std::bit_cast<std::uint32_t>(-1.5F);w[9]=0x80000000U;w[10]=std::bit_cast<std::uint32_t>(3.25F);}
     if (id==23) {w[1]=1;w[2]=0x80000000U;}
+    if (id==25) {w[1]=0x14;w[3]=2;w[8]=std::bit_cast<std::uint32_t>(-1.5F);w[9]=0x80000000U;w[10]=std::bit_cast<std::uint32_t>(3.25F);}
     return p;
 }
 transactions::Record Record() {
@@ -95,16 +96,17 @@ void NewContracts() {
         Check(native_intent::CompletesAtConstruction(timed)==(duration<=0.0F),"native duration completion contract");
     }
     Check(!native_intent::CompletesAtConstruction(Intent(21)),"passage initialization failure hidden");
-    for (auto id : {21U,22U,23U}) {
+    Check(!native_intent::CompletesAtConstruction(Intent(25)),"passage76 construction mistaken for completion");
+    for (auto id : {21U,22U,23U,25U}) {
         const auto p=Intent(id);
         Check(native_intent::Encode(p,bytes)&&native_intent::Decode(bytes,decoded)&&decoded==p,"new contract round trip");
-        if(id==21) Check(bytes[34]==0xC0&&bytes[35]==0xBF&&bytes[39]==0x80&&
+        if(id==21||id==25) Check(bytes[34]==0xC0&&bytes[35]==0xBF&&bytes[39]==0x80&&
             bytes[42]==0x50&&bytes[43]==0x40,"XYZ order or signed zero lost");
         if(id==23) Check(bytes[11]==0x80,"duration signed zero lost");
         // Every unused word, including the fourth vector lane, is canonical
         // integer zero. Negative float zero is also forbidden in padding.
         for(std::size_t i=1;i<36;++i) {
-            if((id==21&&(i==1||(i>=8&&i<=10)))||(id==23&&(i==1||i==2)))continue;
+            if(((id==21||id==25)&&(i==1||(i>=8&&i<=10)))||(id==25&&i==3)||(id==23&&(i==1||i==2)))continue;
             for(auto bits : {1U,0x80000000U}) {
                 auto invalid=p;invalid.words[i]=bits;
                 Check(!native_intent::Validate(invalid)&&!native_intent::Encode(invalid,bytes),"new reserved word admitted");
@@ -113,14 +115,17 @@ void NewContracts() {
             }
         }
     }
-    for(auto id : {21U,23U}) {
-        for(auto kind : {0U,1U,2U,4U,5U,0x11U}) {
-            if(kind==(id==21?4U:1U))continue;
+    for(auto id : {21U,23U,25U}) {
+        for(auto kind : {0U,1U,2U,4U,5U,0x11U,0x14U,0x24U}) {
+            if(kind==(id==25?0x14U:id==21?4U:1U))continue;
             auto invalid=Intent(id);invalid.words[1]=kind;Check(!native_intent::Validate(invalid),"new wrong argument carrier");
+            Check(native_intent::Encode(Intent(id),bytes),"argument carrier wire setup");
+            bytes[4]=static_cast<std::uint8_t>(kind);
+            Check(!native_intent::Decode(bytes,decoded),"new wrong argument carrier decoded");
         }
-        const std::size_t begin=id==21?8:2,end=id==21?11:3;
+        const std::size_t begin=id==23?2:8,end=id==23?3:11;
         for(auto i=begin;i<end;++i) {
-            for(auto bits : {0U,0x80000000U,0x7F7FFFFFU,0xFF7FFFFFU,1U,0x80000001U}) {
+            for(auto bits : {0U,0x80000000U,0x7F7FFFFFU,0xFF7FFFFFU,1U,0x80000001U,0x11223344U}) {
                 auto finite=Intent(id);finite.words[i]=bits;
                 Check(native_intent::Encode(finite,bytes)&&native_intent::Decode(bytes,decoded)&&decoded==finite,"finite float bits changed");
             }
@@ -132,7 +137,20 @@ void NewContracts() {
             }
         }
     }
-    for(auto id : {24U,25U,0xFFFFFFFFU}) Check(!native_intent::Validate(Intent(id)),"future contract admitted");
+    for(auto selector : {0U,2U}) {
+        auto passage=Intent(25);passage.words[3]=selector;
+        Check(native_intent::Encode(passage,bytes)&&native_intent::Decode(bytes,decoded)&&decoded==passage,"passage selector lost");
+        passage.words[8]=passage.words[9]=passage.words[10]=0;
+        Check(native_intent::Encode(passage,bytes)&&native_intent::Decode(bytes,decoded)&&decoded==passage,"passage origin refused");
+    }
+    for(auto selector : {1U,3U,0xFFFFFFFFU,0x80000000U,0x11223344U,0x3F800000U}) {
+        auto invalid=Intent(25);invalid.words[3]=selector;
+        Check(!native_intent::Validate(invalid)&&!native_intent::Encode(invalid,bytes),"unsupported passage speed selector admitted");
+        Check(native_intent::Encode(Intent(25),bytes),"passage selector wire setup");
+        for(std::size_t b=0;b<4;++b)bytes[12+b]=static_cast<std::uint8_t>(selector>>(b*8));
+        Check(!native_intent::Decode(bytes,decoded),"unsupported passage selector decoded");
+    }
+    for(auto id : {24U,26U,0xFFFFFFFFU}) Check(!native_intent::Validate(Intent(id)),"future contract admitted");
 }
 void WireAndReceipts() {
     auto r=Record();execution::Batch batch{};batch.scope=r.scope;batch.batchId=5;batch.count=2;batch.records[0]=r;
@@ -168,13 +186,22 @@ void WireAndReceipts() {
     receipt.operation=batch.records[0];Check(execution::EncodeReceipt(receipt,bytes)&&bytes[4]==2&&execution::DecodeReceipt(bytes,r.scope,echoed),"v2 receipt regression");
     execution::Control control{r.scope,execution::ControlKind::Offer,execution::kProfileNativeIntent};std::array<std::uint8_t,execution::kHeaderSize> offer{};
     Check(execution::EncodeControl(control,offer)&&execution::ProfileForKind(native_intent::kKind)==128,"intent capability");
-    for(auto id : {21U,22U,23U}) {
+    for(auto id : {21U,22U,23U,25U}) {
         auto operation=Record();operation.intent=Intent(id);batch.count=1;batch.records[0]=operation;
         Check(execution::EncodeBatch(batch,bytes)&&bytes[4]==3&&bytes.size()==execution::kBatchHeaderSize+execution::kNativeIntentRecordSize&&
             execution::DecodeBatch(bytes,r.scope,copy)&&copy.records[0].intent==operation.intent,"new contract batch envelope");
         receipt.operation=operation;
         Check(execution::EncodeReceipt(receipt,bytes)&&bytes[4]==3&&bytes.size()==execution::kMaximumReceiptBytes&&
             execution::DecodeReceipt(bytes,r.scope,echoed)&&echoed.operation.intent==operation.intent,"new contract receipt envelope");
+    }
+    for(auto selector : {0U,2U}) {
+        auto passage=Record();passage.intent=Intent(25);passage.intent.words[3]=selector;
+        batch.count=1;batch.records[0]=passage;
+        Check(execution::EncodeBatch(batch,bytes)&&execution::DecodeBatch(bytes,r.scope,copy)&&copy.records[0].intent==passage.intent,"passage batch selector/XYZ loss");
+        receipt.operation=passage;
+        Check(execution::EncodeReceipt(receipt,bytes)&&execution::DecodeReceipt(bytes,r.scope,echoed)&&echoed.operation.intent==passage.intent,"passage receipt selector/XYZ loss");
+        auto marker=passage;marker.nativeKind=execution::kMarkerKind;
+        Check(!execution::ValidateExecutable(marker),"passage contract admitted as level marker");
     }
 }
 }

@@ -119,7 +119,7 @@ bool ExecutionMailbox::QueueBatch(std::span<const std::uint8_t> bytes, bool retr
     if (!DecodeBatch(bytes, requested_.scope, batch) || (retry && batch.count != 1)) { FailLocked(Recovery::InvalidStream); return false; }
     for (std::size_t i = 0; i < batch.count; ++i)
         if ((requested_.value & ProfileForKind(batch.records[i].nativeKind)) == 0 ||
-            (batch.records[i].movement.navigation==movement::Navigation::HostRoute&&(requested_.value&8U)==0)) {
+            (movement::CarriesRoute(batch.records[i].movement.navigation)&&(requested_.value&8U)==0)) {
             FailLocked(Recovery::InvalidStream); return false;
         }
     if (inCount_ == kIncoming) { FailLocked(Recovery::Capacity); return false; }
