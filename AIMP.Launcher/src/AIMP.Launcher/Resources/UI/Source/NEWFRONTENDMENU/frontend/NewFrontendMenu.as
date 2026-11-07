@@ -122,6 +122,10 @@ package frontend
       
       private var _serverMapItem:MenuItemOptionOptionStepper;
       private var _serverAlienItem:MenuItemOptionOptionStepper;
+
+      private var _serverPvPItem:MenuItemOptionOptionStepper;
+
+      private var _mpAlienVsSurvivors:Boolean = false;
       
       private var _survivorMapIds:Array;
       
@@ -170,6 +174,10 @@ package frontend
       private var _clientLobbyPlayer1Item:MenuItem;
       
       private var _clientLobbyPlayer2Item:MenuItem;
+
+      private var _clientLobbyPlayer3Item:MenuItem;
+
+      private var _clientLobbyPlayer4Item:MenuItem;
       
       private var _clientLobbyReadyItem:MenuItemOptionCheckBox;
       
@@ -511,6 +519,7 @@ package frontend
          this._survivorMapDescriptions = ["Uses the first available survivor map until the game playlist data is loaded"];
          this._serverModeItem = new MenuItemOptionOptionStepper("Game Mode",["survival"],["Survival"],this.serverModeChangedHandler);
          this._serverMapItem = new MenuItemOptionOptionStepper("Survivor Map",this._survivorMapIds,this._survivorMapLabels,this.serverMapChangedHandler);
+         this._serverPvPItem = new MenuItemOptionOptionStepper("Match Type",["coop","pvp"],["Co-op","Alien vs Survivors"],this.serverPvPChangedHandler);
          this._serverAlienItem = new MenuItemOptionOptionStepper("Alien",["1","0"],["Enabled","Disabled"]);
          this._serverAlienItem.selectedIndex = 0;
          this._serverMaxPlayersItem = new MenuItemOptionOptionStepper("Max Players",[2,3,4],["2 Players","3 Players","4 Players"],this.serverMaxPlayersChangedHandler);
@@ -532,10 +541,10 @@ package frontend
          this._serverSurvivalItem.data = "";
          this._serverSurvivalItem.enabled = false;
          this._hostLobbyStatusItem = new MenuItem("Status: Waiting for players");
-         this._hostLobbyPlayer1Item = new MenuItem("1  Owner    You    Ready");
-         this._hostLobbyPlayer2Item = new MenuItem("2  Empty");
-         this._hostLobbyPlayer3Item = new MenuItem("3  Empty");
-         this._hostLobbyPlayer4Item = new MenuItem("4  Empty");
+         this._hostLobbyPlayer1Item = new MenuItem("1  Owner    You    Ready",this.mpAssignAlienHandler);
+         this._hostLobbyPlayer2Item = new MenuItem("2  Empty",this.mpAssignAlienHandler);
+         this._hostLobbyPlayer3Item = new MenuItem("3  Empty",this.mpAssignAlienHandler);
+         this._hostLobbyPlayer4Item = new MenuItem("4  Empty",this.mpAssignAlienHandler);
          this._hostLobbyKick2Item = new MenuItem("Kick Player 2",this.kickLobbyPlayerHandler);
          this._hostLobbyKick2Item.data = "slot2";
          this._hostLobbyKick3Item = new MenuItem("Kick Player 3",this.kickLobbyPlayerHandler);
@@ -547,6 +556,8 @@ package frontend
          this._clientLobbyStatusItem = new MenuItem("Status: Joined lobby");
          this._clientLobbyPlayer1Item = new MenuItem("1  Owner    Host");
          this._clientLobbyPlayer2Item = new MenuItem("2  You      Waiting");
+         this._clientLobbyPlayer3Item = new MenuItem("3  Empty");
+         this._clientLobbyPlayer4Item = new MenuItem("4  Empty");
          this._clientLobbyReadyItem = new MenuItemOptionCheckBox("Ready",true,["Ready","Not Ready"],this.readyChangedHandler);
          this._clientLobbyLeaveItem = new MenuItem("Leave Lobby",this.leaveLobbyHandler);
          this._startGameItem = new MenuItemExpandable("AI_UI_FRONTEND_START_GAME");
@@ -619,6 +630,7 @@ package frontend
          this._createServerItem.page.addItem(this._serverPasswordItem);
          this._createServerItem.page.addItem(this._serverModeItem);
          this._createServerItem.page.addItem(this._serverMapItem);
+         this._createServerItem.page.addItem(this._serverPvPItem);
          this._createServerItem.page.addItem(this._serverAlienItem);
          this._createServerItem.page.addItem(this._serverMaxPlayersItem);
          this._createServerItem.page.addItem(this._serverVisibilityItem);
@@ -644,6 +656,8 @@ package frontend
          this._serverLanItem.page.addItem(this._clientLobbyStatusItem);
          this._serverLanItem.page.addItem(this._clientLobbyPlayer1Item);
          this._serverLanItem.page.addItem(this._clientLobbyPlayer2Item);
+         this._serverLanItem.page.addItem(this._clientLobbyPlayer3Item);
+         this._serverLanItem.page.addItem(this._clientLobbyPlayer4Item);
          this._serverLanItem.page.addItem(this._clientLobbyReadyItem);
          this._serverLanItem.page.addItem(this._clientLobbyLeaveItem);
          this._serverCampaignItem.subPage = this._serverLanItem.page;
@@ -965,6 +979,12 @@ package frontend
       {
       }
       
+      private function serverPvPChangedHandler(param1:MenuItemEvent) : void
+      {
+         this.updateServerMapVisibility();
+         this.refreshNetworkMenuRenderers();
+      }
+
       private function serverModeChangedHandler(param1:MenuItemEvent) : void
       {
          this.refreshSurvivorMapOptions();
@@ -1029,7 +1049,7 @@ package frontend
       {
          if(!this.mpBeginCommand("create")) return;
          this.show_network_notification("Creating lobby");
-         this._mpBridge.createLobby(String(this._serverModeItem.selectedItem),int(this._serverMaxPlayersItem.selectedItem),String(this._serverVisibilityItem.selectedItem),this.getSelectedSurvivorMapId(),this.getSelectedSurvivorMapName(),String(this._serverAlienItem.selectedItem) != "0");
+         this._mpBridge.createLobby(String(this._serverModeItem.selectedItem),int(this._serverMaxPlayersItem.selectedItem),String(this._serverVisibilityItem.selectedItem),this.getSelectedSurvivorMapId(),this.getSelectedSurvivorMapName(),String(this._serverAlienItem.selectedItem) != "0" || String(this._serverPvPItem.selectedItem) == "pvp",String(this._serverPvPItem.selectedItem) == "pvp" && String(this._serverModeItem.selectedItem) != "campaign");
       }
       
       private function readyChangedHandler(param1:MenuItemEvent) : void
@@ -1038,6 +1058,19 @@ package frontend
          this._mpBridge.setReady(Boolean(this._clientLobbyReadyItem.selected));
       }
       
+      private function mpAssignAlienHandler(param1:MenuItemEvent) : void
+      {
+         if(!this._mpAlienVsSurvivors || this._mpLobbyRole != "host" || param1 == null || param1.item == null || !this.mpBeginCommand("role")) return;
+         var peerId:String = String(param1.item.data);
+         if(peerId == "" || peerId == "undefined")
+         {
+            this._mpPendingCommand = "";
+            this.mpUpdateControls();
+            return;
+         }
+         this._mpBridge.setAlienRole(peerId);
+      }
+
       private function kickLobbyPlayerHandler(param1:MenuItemEvent) : void
       {
          if(!this.mpBeginCommand("kick")) return;
@@ -1213,6 +1246,11 @@ package frontend
          this._serverStartItem.enabled = idle && outsideLobby;
          this._serverMapItem.enabled = idle && outsideLobby;
          this._serverAlienItem.enabled = idle && outsideLobby;
+         this._serverPvPItem.enabled = idle && outsideLobby;
+         this._hostLobbyPlayer1Item.enabled = idle && this._mpLobbyRole == "host" && this._mpAlienVsSurvivors && String(this._hostLobbyPlayer1Item.data).length > 0;
+         this._hostLobbyPlayer2Item.enabled = idle && this._mpLobbyRole == "host" && this._mpAlienVsSurvivors && String(this._hostLobbyPlayer2Item.data).length > 0;
+         this._hostLobbyPlayer3Item.enabled = idle && this._mpLobbyRole == "host" && this._mpAlienVsSurvivors && String(this._hostLobbyPlayer3Item.data).length > 0;
+         this._hostLobbyPlayer4Item.enabled = idle && this._mpLobbyRole == "host" && this._mpAlienVsSurvivors && String(this._hostLobbyPlayer4Item.data).length > 0;
          this._serverRefreshItem.enabled = idle && outsideLobby;
          this._mpResumeLobbyItem.visible = !outsideLobby;
          this._mpResumeLobbyItem.enabled = idle;
@@ -1336,10 +1374,11 @@ package frontend
          var param5:String = String(values["p3"]);
          var param6:String = String(values["p4"]);
          this._mpLobbyRole = param1;
+         this._mpAlienVsSurvivors = values["alienVsSurvivors"] == "1";
          this._mpCanStart = values["canStart"] == "1";
          this._mpLocalReady = values["localReady"] == "1";
          this._clientLobbyReadyItem.selected = this._mpLocalReady;
-         if(this._mpPendingCommand == "ready" || this._mpPendingCommand == "kick")
+         if(this._mpPendingCommand == "ready" || this._mpPendingCommand == "kick" || this._mpPendingCommand == "role")
          {
             this._mpPendingCommand = "";
          }
@@ -1350,8 +1389,15 @@ package frontend
          this._hostLobbyPlayer2Item.name = param4;
          this._hostLobbyPlayer3Item.name = param5;
          this._hostLobbyPlayer4Item.name = param6;
+         this._hostLobbyPlayer1Item.data = values["peer1"] == undefined ? "" : String(values["peer1"]);
+         this._hostLobbyPlayer2Item.data = values["peer2"] == undefined ? "" : String(values["peer2"]);
+         this._hostLobbyPlayer3Item.data = values["peer3"] == undefined ? "" : String(values["peer3"]);
+         this._hostLobbyPlayer4Item.data = values["peer4"] == undefined ? "" : String(values["peer4"]);
          this._clientLobbyPlayer1Item.name = param3;
          this._clientLobbyPlayer2Item.name = param4;
+         this._clientLobbyPlayer3Item.name = param5;
+         this._clientLobbyPlayer4Item.name = param6;
+         this.mpUpdateControls();
          this.refreshNetworkMenuRenderers();
       }
       
@@ -1524,6 +1570,8 @@ package frontend
          if(this._serverMapItem != null && this._serverModeItem != null)
          {
             this._serverModeItem.visible = this._developerMode;
+            this._serverPvPItem.visible = String(this._serverModeItem.selectedItem) != "campaign";
+            this._serverAlienItem.visible = String(this._serverPvPItem.selectedItem) != "pvp" || !this._serverPvPItem.visible;
             this._serverMapItem.visible = this._developerMode;
             this._serverMapItem.name = String(this._serverModeItem.selectedItem) == "campaign" ? "Campaign Level" : "Survivor Map";
          }

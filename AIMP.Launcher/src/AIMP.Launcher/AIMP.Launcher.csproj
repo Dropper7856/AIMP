@@ -15,6 +15,9 @@
     <ProjectReference Include="..\AIMP.Protocol\AIMP.Protocol.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <EmbeddedResource Include="Resources\AlienPvP\alien_behavior.apb" LogicalName="AIMP.Launcher.AlienPvP.alien_behavior.apb" />
+  </ItemGroup>
+  <ItemGroup>
     <Content Include="Resources\UI\*.GFX">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <TargetPath>UIBridge\%(Filename)%(Extension)</TargetPath>

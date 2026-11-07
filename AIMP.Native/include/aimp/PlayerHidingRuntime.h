@@ -20,6 +20,12 @@ bool Hidden(std::uintptr_t character) noexcept;
 // Engine thread: conceal/reveal representations and mark their hiding spots
 // occupied (non-selectable) or free on this PC.
 void PumpAllOnEngineThread() noexcept;
+// Engine thread, called only for the host-selected victim of the owned PvP
+// Alien. Temporarily removes OUR synthetic invisibility and mirrors the
+// received hiding context through retail logic flags for native availability.
+// It does not open a door, choose a kill or release the locomotion lock.
+bool PreparePvPSearch(std::uintptr_t character,std::uint32_t nativeGeneration) noexcept;
+void FinishPvPSearch(std::uintptr_t character) noexcept;
 // Character destroyed/replaced: drop its state; its hiding spot is freed by
 // the next engine pump.
 void Forget(std::uintptr_t character) noexcept;

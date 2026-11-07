@@ -97,6 +97,8 @@ bool IsKnownMessageType(const std::uint16_t raw) noexcept {
     case MessageType::AISyncHostRoute:
     case MessageType::AISyncClientRoute:
     case MessageType::CharacterIncarnationState:
+    case MessageType::AlienPvPNative:
+    case MessageType::AlienPvPCommand:
     case MessageType::PlayerHidingState:
     case MessageType::MissionSignalProduced:
     case MessageType::TestModeConfigure:

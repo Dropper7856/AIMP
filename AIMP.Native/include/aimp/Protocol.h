@@ -60,6 +60,8 @@ enum class MessageType : std::uint16_t {
     CharacterIncarnationState = 44, // DLL -> Launcher local THE_PLAYER ticket only.
     PlayerHidingState = 47, // DLL -> Launcher local presentation observation only.
     AISyncHostState = 45, // Event carrier in the authoritative execution outbox.
+    AlienPvPNative = 48, // Native -> launcher: copied possession/input/pose observations.
+    AlienPvPCommand = 49, // Launcher -> native: scoped Host-admitted PvP stream.
     AISyncClientState = 46, // Admitted through the execution mailbox.
     MissionSignalProduced = 134,
     TestModeConfigure = 200,

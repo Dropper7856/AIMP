@@ -233,14 +233,15 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             await _controller.SendWorldSyncLifecycleAsync(payload, _lifetime.Token)
                 .ConfigureAwait(false);
             int aiWorldGeneration;
-            bool alienEnabled;
+            bool alienEnabled, alienVsSurvivors;
             lock (_stateGate)
             {
                 aiWorldGeneration = _localWorldContext?.WorldGeneration ?? 0;
                 alienEnabled = _start?.AlienEnabled ?? _lobby?.AlienEnabled ?? true;
+                alienVsSurvivors = _start?.AlienVsSurvivors ?? false;
             }
             await _aiSync.ConfigureAsync(sessionId, isHost, _controller.Snapshot.LevelGeneration,
-                aiWorldGeneration, authorityBound, payload.WorldBusActive, peerId, _lifetime.Token, alienEnabled)
+                aiWorldGeneration, authorityBound, payload.WorldBusActive, peerId, _lifetime.Token, alienEnabled, alienVsSurvivors)
                 .ConfigureAwait(false);
             await ConfigureThrowableSyncAsync(sessionId, peerId, authorityBound && payload.WorldBusActive)
                 .ConfigureAwait(false);
@@ -440,6 +441,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _performanceIsolation = performanceIsolation ?? throw new ArgumentNullException(nameof(performanceIsolation));
         _diagnostics = controller.Diagnostics;
         _aiSync = new AISyncSession(controller, _performanceIsolation);
+        _alienPvPNetwork = new AlienPvPNetworkBridge(controller,CaptureAlienPvPNetworkBinding,
+            text=>_diagnostics.Log("AlienPvP",text));
         _voiceSync = new VoiceSyncSession(controller, settingsStore);
         _bridge.MessageReceived += OnBridgeMessage;
         _controller.StateChanged += OnGameRuntimeStateChanged;
@@ -633,6 +636,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _ = TryAdvanceGameplayAsync(runtime);
         _ = TryConvergeRemoteCharactersAsync(runtime, now);
         _ = TryAdvanceRemoteMovementAsync(runtime, now);
+        TryScheduleAlienPvPBinding(runtime, now);
         UpdateVoiceSession(runtime);
     }
 
@@ -723,6 +727,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _lifetime.Cancel();
+        _alienPvPNetwork.Dispose();
         _aiSync.Dispose();
         _voiceSync.Dispose();
         _bridge.MessageReceived -= OnBridgeMessage;
@@ -740,6 +745,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         StopNetworkAsync("Launcher closed").GetAwaiter().GetResult();
         Task.WhenAll(_missionReportTask, _missionApplyTask).GetAwaiter().GetResult();
         _commandGate.Dispose();
+        _alienPvPOperationGate.Dispose();
         _spawnGate.Dispose();
         _remoteEquipmentProvisionGate.Dispose();
         _remotePlayerSyncGate.Dispose();
@@ -785,6 +791,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             "CREATE_LOBBY" => CreateLobbyAsync(message),
             "JOIN_DIRECT_IP" => JoinDirectAsync(),
             "READY" => SetReadyAsync(message.Get("ready", "0") == "1"),
+            "SET_ALIEN_ROLE" => SetAlienRoleAsync(message),
             "START_GAME" => StartGameAsync(message),
             "START_GAME_ACK" => LogOnlyAsync("Start-game UI acknowledgement received."),
             "CHARACTER_SELECTED" => LogCharacterSelectionAsync(message),
@@ -882,7 +889,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         ResolveLevel(message),
         LobbyCompatibility.Create(settings),
         RequireWorldPreparation: true,
-        AlienEnabled: ReadLobbyAlienEnabled(message));
+        AlienEnabled: ReadLobbyAlienEnabled(message),
+        AlienVsSurvivors: ReadLobbyAlienVsSurvivors(message));
 
     private static string ResolveServerName(
         LauncherSettings settings,
@@ -944,6 +952,18 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             "Join a lobby before changing ready state.");
         await client.SetReadyAsync(ready).ConfigureAwait(false);
         _diagnostics.Log("Multiplayer", $"Client lobby ready state: {ready}.");
+    }
+
+    private async Task SetAlienRoleAsync(ScaleformBridgeMessage message)
+    {
+        LobbyHost? host;
+        lock (_stateGate) host = _host;
+        if (host is null) throw new InvalidOperationException("Only the host can select the Alien.");
+        if (!ulong.TryParse(message.Get("peerId"), NumberStyles.None,
+            CultureInfo.InvariantCulture, out var peerId) || peerId == 0)
+            throw new InvalidOperationException("The selected lobby participant is invalid.");
+        await host.SetAlienPlayerAsync(peerId).ConfigureAwait(false);
+        _diagnostics.Log("Multiplayer", $"Host assigned Alien control to PeerId={peerId}.");
     }
 
     private async Task StartGameAsync(ScaleformBridgeMessage message)
@@ -2480,6 +2500,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private void AttachHost(LobbyHost host)
     {
         _aiSync.BindHost(host);
+        _alienPvPNetwork.Bind(host);
         host.VoiceFrameReceived += _voiceSync.Receive;
         host.SnapshotChanged += OnLobbySnapshot;
         host.Started += OnLobbyStarted;
@@ -2505,6 +2526,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
 
     private void DetachHost(LobbyHost host)
     {
+        _alienPvPNetwork.Unbind(host);
         _aiSync.UnbindHost(host);
         host.VoiceFrameReceived -= _voiceSync.Receive;
         SuspendVoiceSession();
@@ -2533,6 +2555,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private void AttachClient(LobbyClient client)
     {
         _aiSync.BindClient(client);
+        _alienPvPNetwork.Bind(client);
         client.VoiceFrameReceived += _voiceSync.Receive;
         client.SnapshotChanged += OnLobbySnapshot;
         client.Started += OnLobbyStarted;
@@ -2560,6 +2583,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
 
     private void DetachClient(LobbyClient client)
     {
+        _alienPvPNetwork.Unbind(client);
         _aiSync.UnbindClient(client);
         client.VoiceFrameReceived -= _voiceSync.Receive;
         SuspendVoiceSession();
@@ -2912,6 +2936,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             if (_start is null || !_localGameplayReady) return;
             var peerId = LocalPeerId();
             if (peerId == 0 || (_host is null && _client is null)) return;
+            // The Alien's hidden THE_PLAYER is not a human proxy.
+            if (_start.AlienVsSurvivors && peerId == _start.AlienPeerId) return;
 
             _pendingLocalPlayerActions.Enqueue(new PlayerActionEventPayload(
                 _start.SessionId,
@@ -3075,6 +3101,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 return false;
             var peerId = LocalPeerId();
             if (peerId == 0 || (_host is null && _client is null)) return false;
+            if (_start.AlienVsSurvivors && peerId == _start.AlienPeerId) return false;
             var runtime=_controller.Snapshot;var connection=_controller.AISyncConnectionIdentity;
             var incarnation=_playerIncarnations.Observe(_start.SessionId,peerId,_start.LevelGeneration,runtime,connection);
             _aiSync.SetLocalIncarnation(_start.SessionId,peerId,incarnation,runtime,connection);
@@ -3166,6 +3193,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 || _localEquipmentState is not { Valid: true } state) return false;
             var peerId = LocalPeerId();
             if (peerId == 0 || (_host is null && _client is null)) return false;
+            if (_start.AlienVsSurvivors && peerId == _start.AlienPeerId) return false;
 
             var includeActions =
                 _performanceIsolation.IsEnabled(PerformanceIsolationModule.ActionSync);
@@ -4256,6 +4284,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         var localPeerId = LocalPeerId();
         foreach (var player in _lobby.Players
                      .Where(player => player.PeerId != localPeerId)
+                     // Alien is a real native NPC, never a second human Character.
+                     .Where(player => !_start.AlienVsSurvivors || player.PeerId != _start.AlienPeerId)
                      .OrderBy(player => player.PeerId))
         {
             if (_remoteCharacters.ContainsKey(player.PeerId)) continue;
@@ -4281,6 +4311,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 || _remoteCharacters.ContainsKey(peerId)
                 || !_remoteGameplayReadyPeers.Contains(peerId))
                 return false;
+            if (_start.AlienVsSurvivors && _start.AlienPeerId == peerId) return false;
             var player = _lobby.Players.SingleOrDefault(value => value.PeerId == peerId);
             return player is not null && TryCreateSpawnTarget(player, out target);
         }
@@ -4291,6 +4322,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         out RemotePlayerSpawnTarget target)
     {
         target = default!;
+        if (_start?.AlienVsSurvivors == true && player.PeerId == _start.AlienPeerId) return false;
         if (!_assignedCharacters.TryGetValue(player.PeerId, out var character)) return false;
         if (!_remotePositions.TryGetValue(player.PeerId, out var track)) return false;
         var snapshot = track.Snapshot();
@@ -4890,6 +4922,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         DetachNetwork(stopState.Host, stopState.Client);
         try
         {
+            await ReleaseNativeAlienPvPLeaseBestEffortAsync().ConfigureAwait(false);
             await UnbindNativeWorldSyncAuthorityAsync($"network-stop:{reason}").ConfigureAwait(false);
             await StopRemoteCharactersBestEffortAsync(stopState.RemoteCharacters).ConfigureAwait(false);
         }
@@ -5021,21 +5054,31 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             ["mode"] = LevelGameMode(snapshot.Level),
             ["mapId"] = snapshot.Level,
             ["mapName"] = snapshot.Level,
-            ["p1"] = FormatPlayer(players, 0, 1),
-            ["p2"] = FormatPlayer(players, 1, 2),
-            ["p3"] = FormatPlayer(players, 2, 3),
-            ["p4"] = FormatPlayer(players, 3, 4)
+            ["p1"] = FormatPlayer(players, 0, 1, snapshot.AlienVsSurvivors, snapshot.AlienPeerId),
+            ["p2"] = FormatPlayer(players, 1, 2, snapshot.AlienVsSurvivors, snapshot.AlienPeerId),
+            ["p3"] = FormatPlayer(players, 2, 3, snapshot.AlienVsSurvivors, snapshot.AlienPeerId),
+            ["p4"] = FormatPlayer(players, 3, 4, snapshot.AlienVsSurvivors, snapshot.AlienPeerId),
+            ["alienVsSurvivors"] = snapshot.AlienVsSurvivors ? "1" : "0",
+            ["alienPeerId"] = snapshot.AlienPeerId.ToString(CultureInfo.InvariantCulture),
+            ["peer1"] = players.Length > 0 ? players[0].PeerId.ToString(CultureInfo.InvariantCulture) : "",
+            ["peer2"] = players.Length > 1 ? players[1].PeerId.ToString(CultureInfo.InvariantCulture) : "",
+            ["peer3"] = players.Length > 2 ? players[2].PeerId.ToString(CultureInfo.InvariantCulture) : "",
+            ["peer4"] = players.Length > 3 ? players[3].PeerId.ToString(CultureInfo.InvariantCulture) : ""
         });
     }
 
     private static string FormatPlayer(
         IReadOnlyList<LobbyPlayer> players,
         int index,
-        int slot)
+        int slot,
+        bool alienVsSurvivors,
+        ulong alienPeerId)
     {
         if (index >= players.Count) return $"{slot}  Empty";
         var player = players[index];
-        var role = player.IsHost ? "Owner" : "Player";
+        var role = alienVsSurvivors
+            ? player.PeerId == alienPeerId ? "Alien" : "Survivor"
+            : player.IsHost ? "Owner" : "Player";
         var ready = player.Ready ? "Ready" : "Waiting";
         return $"{slot}  {role}  {player.DisplayName}  {ready}";
     }
@@ -5049,6 +5092,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             ["lobbyId"] = start.SessionId.ToString("N"),
             ["syncProtocol"] = ProtocolConstants.Version.ToString(CultureInfo.InvariantCulture),
             ["mode"] = LevelGameMode(start.Level),
+            ["alienVsSurvivors"] = start.AlienVsSurvivors ? "1" : "0",
+            ["alienPeerId"] = start.AlienPeerId.ToString(CultureInfo.InvariantCulture),
             ["mapId"] = start.Level,
             ["mapName"] = start.Level,
             ["engineLevelPath"] = @"Production\" + start.Level,
@@ -5167,6 +5212,7 @@ internal static class RemoteSpawnPlanner
             .ToDictionary(value => value.PeerId);
         return (lobby?.Players ?? Array.Empty<LobbyPlayer>())
             .Where(player => player.PeerId != localPeerId)
+            .Where(player => lobby?.AlienVsSurvivors != true || player.PeerId != lobby.AlienPeerId)
             .Where(player => !existing.ContainsKey(player.PeerId))
             .Where(player => byPeer.ContainsKey(player.PeerId))
             .OrderBy(player => player.PeerId)

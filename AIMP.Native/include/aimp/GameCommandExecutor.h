@@ -191,6 +191,15 @@ public:
     [[nodiscard]] virtual GameCommandExecutionResult ExecuteWorldStateDiscoveryBaseline() const = 0;
     [[nodiscard]] virtual GameCommandExecutionResult ExecuteWorldStateDiscoveryAfter() const = 0;
     [[nodiscard]] virtual GameCommandExecutionResult ExecuteWorldStateDiscoveryStatus() const = 0;
+    [[nodiscard]] virtual GameCommandExecutionResult ExecuteAlienPvPProbe() const {
+        return {false, "ALIEN_PVP_NOT_READY", "Native Alien identity probe is not installed."};
+    }
+    [[nodiscard]] virtual GameCommandExecutionResult ExecuteAlienPvPBind(std::uint64_t) const {
+        return {false, "ALIEN_PVP_NOT_READY", "Native Alien possession is not installed."};
+    }
+    [[nodiscard]] virtual GameCommandExecutionResult ExecuteAlienPvPRelease() const {
+        return {false, "ALIEN_PVP_NOT_READY", "Native Alien possession is not installed."};
+    }
     // Default rejection keeps other executor implementations source-compatible.
     [[nodiscard]] virtual GameCommandExecutionResult ExecuteReturnToFrontend() const {
         return {false, "RETURN_TO_FRONTEND_UNAVAILABLE", "Return to frontend is not supported by this executor."};
@@ -249,6 +258,9 @@ public:
     [[nodiscard]] GameCommandExecutionResult ExecuteWorldStateDiscoveryBaseline() const override;
     [[nodiscard]] GameCommandExecutionResult ExecuteWorldStateDiscoveryAfter() const override;
     [[nodiscard]] GameCommandExecutionResult ExecuteWorldStateDiscoveryStatus() const override;
+    [[nodiscard]] GameCommandExecutionResult ExecuteAlienPvPProbe() const override;
+    [[nodiscard]] GameCommandExecutionResult ExecuteAlienPvPBind(std::uint64_t ownerPeer) const override;
+    [[nodiscard]] GameCommandExecutionResult ExecuteAlienPvPRelease() const override;
     [[nodiscard]] GameCommandExecutionResult ExecuteReturnToFrontend() const override;
     [[nodiscard]] GameCommandExecutionResult ExecuteItemSyncApply(
         const ItemSyncApplyCommand& command) const override;

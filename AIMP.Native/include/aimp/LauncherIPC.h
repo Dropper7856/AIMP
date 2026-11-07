@@ -136,6 +136,7 @@ private:
     void PublishMissionSyncTraffic();
     void PublishItemSyncSpawnTraffic();
     void PublishThrowableTraffic();
+    void PublishAlienPvPTraffic();
     void PublishAISyncTraffic();
     void PublishAISyncTransactionTraffic();
     void PublishAISyncExecutionTraffic();

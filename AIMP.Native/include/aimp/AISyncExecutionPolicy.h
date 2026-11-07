@@ -23,6 +23,7 @@ enum class PairedPreparationPlan : std::uint8_t { Prepare, Ignore, AbortHostSour
 }
 
 inline constexpr std::uint32_t kDisableAlien = 1U;
+inline constexpr std::uint32_t kAlienPvP = 2U;
 constexpr bool AlienSuppressionRequested(const Role role, const std::uint32_t flags) noexcept {
     return role == Role::Host && (flags & kDisableAlien) != 0U;
 }

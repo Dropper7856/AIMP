@@ -50,6 +50,8 @@ public enum MessageType : ushort
     CharacterIncarnationState = 44, // DLL -> Launcher local lifetime, never a peer authority grant.
     PlayerHidingState = 47, // DLL -> Launcher coherent local presentation observation.
     AISyncHostState = 45,
+    AlienPvPNative = 48, // Native -> launcher: copied possession/input/pose observations.
+    AlienPvPCommand = 49, // Launcher -> native: scoped Host-admitted PvP stream.
     AISyncClientState = 46,
 
     LobbyJoin = 100,
@@ -102,6 +104,12 @@ public enum MessageType : ushort
     AISyncCausalStateNetwork = 146, // Host -> Client events in the execution sender.
     PlayerMissionComplete = 147, // Client -> Host only; the sender reached a retail level exit.
     RoundProgress = 148, // Host -> Clients only; finished/dead participants of the round.
+    AlienControlProposal = 149, // The selected Alien player -> Host only.
+    AlienControlReady = 151, // Native lifetime receipts; clients -> Host.
+    AlienControlLease = 152, // Host -> clients; one readiness epoch.
+    AlienActionResolved = 154, // Host-native decision; clients cannot propose targets/portals.
+    AlienControlPose = 153, // Host physical outcome only, never client transforms.
+    AlienControlCommitted = 150, // Host -> Clients: validated player's intent, not Host-generated AI.
 
     TestModeConfigure = 200,
     CapabilityQuery = 201,

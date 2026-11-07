@@ -32,6 +32,7 @@ public sealed partial class LobbyHost
             if (!string.Equals(_state, "Starting", StringComparison.Ordinal)
                 || payload.LevelGeneration != _levelGeneration
                 || _deadPeers.Contains(payload.PeerId)
+                || (_options.AlienVsSurvivors && payload.PeerId == _alienPeerId)
                 || !_finishedPeers.Add(payload.PeerId)) return;
             progress = CreateRoundProgressLocked();
             ended = TryEndRoundLocked();
@@ -62,9 +63,13 @@ public sealed partial class LobbyHost
     }
 
     // Caller holds _stateLock.
-    private RoundProgressPayload CreateRoundProgressLocked()
+    private RoundProgressPayload? CreateRoundProgressLocked()
     {
-        var participants = _clients.Keys.Append(HostPeerId).ToHashSet();
+        var participants = _clients.Keys.Append(HostPeerId)
+            .Where(peer => !_options.AlienVsSurvivors || peer != _alienPeerId).ToHashSet();
+        // Empty survivor team is terminal and handled by TryEndRoundLocked;
+        // never publish an invalid zero-participant informational payload.
+        if (participants.Count == 0) return null;
         var payload = new RoundProgressPayload(SessionId, _levelGeneration,
             _finishedPeers.Count(participants.Contains), _deadPeers.Count(participants.Contains),
             participants.Count);

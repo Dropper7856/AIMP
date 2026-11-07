@@ -32,6 +32,7 @@ internal sealed partial class AISyncSession : IDisposable
     private long _epoch;
     private bool _isHost, _bound, _compatible;
     private bool _alienEnabled = true;
+    private bool _alienVsSurvivors;
     private bool _active, _impactSending, _disposed;
     private bool _availabilityWarningReported;
     private long _lastTrafficLogTick;
@@ -102,7 +103,7 @@ internal sealed partial class AISyncSession : IDisposable
 
     internal async Task ConfigureAsync(Guid session, bool isHost, int nativeGeneration,
         int worldGeneration, bool bound, bool compatible, ulong localPeer, CancellationToken token,
-        bool alienEnabled = true)
+        bool alienEnabled = true, bool alienVsSurvivors = false)
     {
         await _configureGate.WaitAsync(token).ConfigureAwait(false);
         try
@@ -117,6 +118,7 @@ internal sealed partial class AISyncSession : IDisposable
                 _isHost = isHost; _bound = bound; _compatible = compatible;
                 _localPeer = localPeer;
                 _alienEnabled = alienEnabled;
+                _alienVsSurvivors = alienVsSurvivors;
             }
             await ApplyConfigurationAsync(Enabled, token).ConfigureAwait(false);
         }
@@ -230,7 +232,7 @@ internal sealed partial class AISyncSession : IDisposable
             configuration = AISyncCodec.Configuration(role, Math.Max(nativeGeneration, 0),
                 Math.Max(worldGeneration, 0), session, _localPeer, _participants, _alienEnabled,
                 _localEvidence?.Matches(snapshot,connection,nativeGeneration)==true ? _localEvidence.Binding : null,
-                CurrentParticipantEvidence(snapshot));
+                CurrentParticipantEvidence(snapshot), _alienVsSurvivors);
             processId = snapshot.ProcessId;
             var desiredActive = enabled && bound && compatible && (role is 1 or 2) && !_disposed;
             if (snapshot.IpcConnected && _controller.AISyncAvailable &&

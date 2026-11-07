@@ -29,7 +29,9 @@ bool DecodeLocalState(std::span<const std::uint8_t> bytes,Ticket& ticket) noexce
     if(bytes.size()!=kLocalStateBytes||Get(bytes,0,4)!=0x464C4941U||Get(bytes,4,4)!=1||Get(bytes,32,4)>1||Get(bytes,36,4))return false;
     const Ticket value{Get(bytes,8,8),Get(bytes,16,8),static_cast<std::uintptr_t>(Get(bytes,24,4)),
         static_cast<std::uint32_t>(Get(bytes,28,4)),static_cast<Origin>(Get(bytes,32,4))};
-    if(!LocalValid(value))return false;ticket=value;return true;
+    if(!LocalValid(value))return false;
+    ticket=value;
+    return true;
 }
 Result Registry::WorldLocked(std::uint64_t generation) noexcept {
     if(!generation)return Result::Invalid;

@@ -1,4 +1,7 @@
 #include "aimp/PlayerHidingRuntime.h"
+#include "aimp/AISync.h"
+#include "aimp/CharacterIncarnation.h"
+#include "aimp/AlienPvPHidingSearchPolicy.h"
 
 #include <Windows.h>
 #include <array>
@@ -6,6 +9,18 @@
 #include <cmath>
 #include <cstring>
 #include <mutex>
+
+#ifdef AIMP_HIDING_SEARCH_TEST
+#define AIMP_HIDING_TRY try
+#define AIMP_HIDING_CATCH catch(...)
+namespace aimp::hiding_test {
+void SetInvisible(void*,std::uint8_t) noexcept;
+void SetLogic(void*,std::int32_t,std::uint8_t) noexcept;
+}
+#else
+#define AIMP_HIDING_TRY __try
+#define AIMP_HIDING_CATCH __except(EXCEPTION_EXECUTE_HANDLER)
+#endif
 
 namespace aimp::player_hiding {
 namespace {
@@ -58,7 +73,11 @@ struct Slot final {
     // (death, despawn, cinematic): only undo our own concealment.
     bool concealedByUs{};
     bool occupied{};
+    // Latch actual native capture until the owner leaves/re-enters the spot;
+    // repeated old hidden snapshots must not conceal a captured body again.
+    bool pvpCaptureRevealed{};
     std::array<std::uint32_t, 2> selectedKey{};
+    player_hiding_presentation::State presentation{};
     Spot spot{};
     DiagnosticsSnapshot diagnostics{};
 };
@@ -71,6 +90,23 @@ std::uint64_t gEpoch{};
 int gAbi{-1};
 HistorySnapshot gHistory{};
 
+// Only the engine thread owns these leases; IPC can change the copied spot
+// identity but never reads or writes a native Character through this table.
+struct SearchLease final {
+    alien_pvp::hiding::Lease policy{};
+    character_incarnations::Ticket ticket{};
+    std::uintptr_t character{},skeleton{};std::uint32_t runtime{};
+    std::uint8_t oldHiding{},oldInteraction{};bool changedHiding{};
+};
+std::array<SearchLease,40> gSearches{};
+SearchLease* SearchFor(std::uintptr_t character) noexcept {
+    for(auto& lease:gSearches)if(lease.character==character)return &lease;
+    return nullptr;
+}
+bool SearchVisible(std::uintptr_t character) noexcept {
+    const auto* lease=SearchFor(character);
+    return lease && lease->policy.Visible(GetTickCount64());
+}
 bool SameSpot(const Spot& left, const Spot& right) noexcept {
     return left.locked && right.locked && left.manager == right.manager &&
         left.key[0] == right.key[0] && left.key[1] == right.key[1];
@@ -96,15 +132,15 @@ void Orphan(const Spot& spot) noexcept {
     for (auto& orphan : gOrphanSpots) if (!orphan.locked) { orphan = spot; return; }
 }
 
-#if defined(_MSC_VER) && defined(_M_IX86)
+#if (defined(_MSC_VER) && defined(_M_IX86)) || defined(AIMP_HIDING_SEARCH_TEST)
 bool ValidateAbi() noexcept {
     if (gAbi >= 0) return gAbi == 1;
-    __try {
+    AIMP_HIDING_TRY {
         const auto* code = reinterpret_cast<const std::uint8_t*>(gModuleBase + kSetInvisibleRva);
         gAbi = std::memcmp(code, kSetInvisiblePrologue.data(), kSetInvisiblePrologue.size()) == 0 &&
             std::memcmp(code + kSetInvisibleReturnOffset, kSetInvisibleEpilogue.data(),
                 kSetInvisibleEpilogue.size()) == 0 ? 1 : 0;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } AIMP_HIDING_CATCH {
         gAbi = 0;
     }
     return gAbi == 1;
@@ -113,58 +149,95 @@ bool ValidateAbi() noexcept {
 // A representation can reuse player-authored definition flags. Identify the
 // actual local player through retail's table, never its archetype.
 bool IsRemoteCharacter(const std::uintptr_t character) noexcept {
-    const auto definition = *reinterpret_cast<const std::uintptr_t*>(character + 0x64U);
+    const auto definition = *reinterpret_cast<const std::uint32_t*>(character + 0x64U);
     if (definition < 0x10000U) return false;
-    const auto root = *reinterpret_cast<const std::uintptr_t*>(gModuleBase + kPlayerTableRoot);
+    const auto root = *reinterpret_cast<const std::uint32_t*>(gModuleBase + kPlayerTableRoot);
     if (root < 0x10000U) return false;
-    const auto context = *reinterpret_cast<const std::uintptr_t*>(root + 8U);
+    const auto context = *reinterpret_cast<const std::uint32_t*>(root + 8U);
     if (context < 0x10000U) return false;
     const auto count = *reinterpret_cast<const std::uint32_t*>(context + 0x84U);
-    const auto players = *reinterpret_cast<const std::uintptr_t*>(context + 0x80U);
+    const auto players = *reinterpret_cast<const std::uint32_t*>(context + 0x80U);
     if (count == 0U || count > 4U || players < 0x10000U) return false;
     for (std::uint32_t i = 0U; i < count; ++i)
-        if (reinterpret_cast<const std::uintptr_t*>(players)[i] == character) return false;
+        if (reinterpret_cast<const std::uint32_t*>(players)[i] == character) return false;
     return true;
 }
 
 bool GuardRemoteCharacter(const std::uintptr_t character) noexcept {
-    __try { return IsRemoteCharacter(character); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    AIMP_HIDING_TRY { return IsRemoteCharacter(character); }
+    AIMP_HIDING_CATCH { return false; }
 }
 
 // Returns false on fault/guard rejection. `concealed` is the readback.
 bool ApplyVisibility(const std::uintptr_t character, const bool hide, bool& concealed,
     const char*& stage) noexcept {
-    __try {
+    AIMP_HIDING_TRY {
         stage = "abi";
         if (!ValidateAbi()) return false;
         stage = "local-player-guard";
         if (!IsRemoteCharacter(character)) return false;
         stage = hide ? "hide" : "show";
         using SetInvisible = void(__thiscall*)(void*, std::uint8_t);
-        reinterpret_cast<SetInvisible>(gModuleBase + kSetInvisibleRva)(
-            reinterpret_cast<void*>(character), hide ? 1U : 0U);
+#ifdef AIMP_HIDING_SEARCH_TEST
+        const SetInvisible setter=&hiding_test::SetInvisible;
+#else
+        const auto setter=reinterpret_cast<SetInvisible>(gModuleBase+kSetInvisibleRva);
+#endif
+        setter(reinterpret_cast<void*>(character),hide?1U:0U);
         concealed = *reinterpret_cast<const std::uint8_t*>(character + kInvisibleOffset) != 0U;
         return concealed == hide;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } AIMP_HIDING_CATCH {
         stage = "fault";
         return false;
     }
 }
 
 bool ReadConcealed(const std::uintptr_t character, bool& concealed) noexcept {
-    __try {
+    AIMP_HIDING_TRY {
         concealed = *reinterpret_cast<const std::uint8_t*>(character + kInvisibleOffset) != 0U;
         return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } AIMP_HIDING_CATCH {
         return false;
     }
 }
 
+bool SearchIdentity(SearchLease& lease,bool capture) noexcept {
+    AIMP_HIDING_TRY {
+        if(!character_incarnations::NativeRegistry().Current(lease.ticket) || !GuardRemoteCharacter(lease.character) ||
+            *reinterpret_cast<const std::uint32_t*>(lease.character+0x2F90U)!=0U)return false;
+        const auto runtime=*reinterpret_cast<const std::uint32_t*>(lease.character+0x50U);
+        const auto skeleton=*reinterpret_cast<const std::uint32_t*>(lease.character+0x718U);
+        if(!runtime || !skeleton)return false;
+        if(capture){lease.runtime=runtime;lease.skeleton=skeleton;return true;}
+        return lease.runtime==runtime && lease.skeleton==skeleton;
+    } AIMP_HIDING_CATCH{return false;}
+}
+bool SetSearchFlag(std::uintptr_t character,std::uint32_t flag,std::uint8_t value) noexcept {
+    AIMP_HIDING_TRY {
+        // FUN_00785B10 invokes the native side effect for hiding flag 0xD;
+        // bypassing it with a byte write leaves the native selector inconsistent.
+        constexpr std::array<std::uint8_t,8> expected{0x56,0x57,0x8B,0x7C,0x24,0x0C,0x8B,0xF1};
+        const auto at=gModuleBase+0x00385B10U;
+        if(std::memcmp(reinterpret_cast<const void*>(at),expected.data(),expected.size())!=0)return false;
+        using Fn=void(__thiscall*)(void*,std::int32_t,std::uint8_t);
+#ifdef AIMP_HIDING_SEARCH_TEST
+        const Fn setter=&hiding_test::SetLogic;
+#else
+        const auto setter=reinterpret_cast<Fn>(at);
+#endif
+        setter(reinterpret_cast<void*>(character),static_cast<std::int32_t>(flag),value);
+        return *reinterpret_cast<const std::uint8_t*>(character+0x423CU+flag)==value;
+    } AIMP_HIDING_CATCH{return false;}
+}
+bool ReadSearchFlags(SearchLease& lease,std::uint8_t& hiding,std::uint8_t& interaction) noexcept {
+    AIMP_HIDING_TRY {hiding=*reinterpret_cast<const std::uint8_t*>(lease.character+0x4249U);
+        interaction=*reinterpret_cast<const std::uint8_t*>(lease.character+0x425BU);return true;}
+    AIMP_HIDING_CATCH{return false;}
+}
 std::uintptr_t Manager() noexcept {
-    __try {
-        return *reinterpret_cast<const std::uintptr_t*>(gModuleBase + kInteractableManagerRva);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    AIMP_HIDING_TRY {
+        return *reinterpret_cast<const std::uint32_t*>(gModuleBase + kInteractableManagerRva);
+    } AIMP_HIDING_CATCH {
         return 0U;
     }
 }
@@ -191,7 +264,7 @@ float SlotDistance(const std::uintptr_t slot, const std::array<float, 3>& anchor
 // prompt to the anchor. Returns false when no candidate exists or on fault.
 bool ResolveSpot(const std::uintptr_t manager, const std::array<float, 3>* anchor, Spot& spot,
     float& distance, const std::uint32_t* exactKey = nullptr) noexcept {
-    __try {
+    AIMP_HIDING_TRY {
         if (spot.locked && spot.manager != manager) spot = {};
         if (spot.locked && LiveSlot(spot.slot, spot.key)) return true;
         std::uintptr_t best{};
@@ -231,7 +304,7 @@ bool ResolveSpot(const std::uintptr_t manager, const std::array<float, 3>* ancho
         if (const auto* other = OtherOwner(spot)) spot.retailBits = other->retailBits;
         distance = bestDistance;
         return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } AIMP_HIDING_CATCH {
         return false;
     }
 }
@@ -239,7 +312,7 @@ bool ResolveSpot(const std::uintptr_t manager, const std::array<float, 3>* ancho
 // Keep the spot non-selectable. A non-zero value means retail rewrote it after
 // an icon event: that is the new state to restore on release.
 bool HoldSpot(Spot& spot) noexcept {
-    __try {
+    AIMP_HIDING_TRY {
         if (!LiveSlot(spot.slot, spot.key)) return false;
         auto& flags = *reinterpret_cast<std::uint8_t*>(spot.slot + kSlotFlags);
         if ((flags & kSlotSelectable) != 0U) {
@@ -251,7 +324,7 @@ bool HoldSpot(Spot& spot) noexcept {
             flags = static_cast<std::uint8_t>(flags & ~kSlotSelectable);
         }
         return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } AIMP_HIDING_CATCH {
         return false;
     }
 }
@@ -265,18 +338,21 @@ bool ReleaseSpot(const std::uintptr_t manager, Spot& spot) noexcept {
         return true;
     }
     float ignored{};
-    __try {
+    AIMP_HIDING_TRY {
         if (manager != 0U && ResolveSpot(manager, nullptr, spot, ignored)) {
             auto& flags = *reinterpret_cast<std::uint8_t*>(spot.slot + kSlotFlags);
             flags = static_cast<std::uint8_t>((flags & ~kSlotSelectable) | spot.retailBits);
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } AIMP_HIDING_CATCH {
     }
     spot = {};
     return true;
 }
 #else
 bool GuardRemoteCharacter(std::uintptr_t) noexcept { return false; }
+bool SearchIdentity(SearchLease&,bool) noexcept{return false;}
+bool SetSearchFlag(std::uintptr_t,std::uint32_t,std::uint8_t) noexcept{return false;}
+bool ReadSearchFlags(SearchLease&,std::uint8_t&,std::uint8_t&) noexcept{return false;}
 bool ApplyVisibility(std::uintptr_t, bool, bool&, const char*& stage) noexcept {
     stage = "unsupported";
     return false;
@@ -292,10 +368,29 @@ bool ReleaseSpot(std::uintptr_t, Spot& spot) noexcept {
 }
 #endif
 
+void RetireSearch(SearchLease& lease,bool captured) noexcept {
+    if(!lease.character)return;
+    if(!SearchIdentity(lease,false)){lease={};return;}
+    if(captured) {lease.policy.Entered();return;} // never overwrite pair-owned flags
+    std::uint8_t hiding{},interaction{};
+    if(!ReadSearchFlags(lease,hiding,interaction))return;
+    if(lease.changedHiding && hiding==1U && !SetSearchFlag(lease.character,0xDU,lease.oldHiding))return;
+    lease={};
+}
+void MaintainSearches() noexcept {
+    for(auto& lease:gSearches)if(lease.character) {
+        const bool captured=ai_sync::AlienPvPCaptureVictim(lease.character);
+        if(captured){lease.policy.Entered();continue;}
+        bool same{};
+        {std::scoped_lock lock(gMutex);const auto* slot=Find(lease.character);
+         same=slot && lease.policy.Same(slot->epoch,slot->presentation);}
+        if(!same || lease.policy.ShouldRetire(GetTickCount64()))RetireSearch(lease,false);
+    }
+}
 void UpdateSpot(Slot& state, const std::uintptr_t manager, std::uint64_t& locked,
     std::uint64_t& released, std::uint64_t& missing) noexcept {
     auto& spot = state.spot;
-    if (!state.occupied) {
+    if (!state.occupied || state.pvpCaptureRevealed) {
         if (ReleaseSpot(manager, spot)) ++released;
         return;
     }
@@ -319,6 +414,7 @@ void UpdateSpot(Slot& state, const std::uintptr_t manager, std::uint64_t& locked
 }
 
 void PumpOnEngineThread(const std::uintptr_t character, const std::uintptr_t manager) noexcept {
+    const bool captured=ai_sync::AlienPvPCaptureVictim(character);
     Slot state{};
     {
         std::scoped_lock lock(gMutex);
@@ -331,13 +427,14 @@ void PumpOnEngineThread(const std::uintptr_t character, const std::uintptr_t man
             ++gHistory.failures;
             return;
         }
+        if(captured)slot->pvpCaptureRevealed=true;
         UpdateSpot(*slot, manager, slot->diagnostics.spotsLocked,
             slot->diagnostics.spotsReleased, slot->diagnostics.spotsMissing);
         slot->diagnostics.spotLocked = slot->spot.locked;
         state = *slot;
     }
 
-    const auto desired = state.diagnostics.desired;
+    const auto desired = state.diagnostics.desired && !state.pvpCaptureRevealed && !SearchVisible(character);
     bool concealed{}, applied{}, success{true};
     const auto readable = ReadConcealed(character, concealed);
     // Hide whenever the owner is hidden and the body is visible (retail may
@@ -446,6 +543,8 @@ bool Publish(const std::uintptr_t character, const bool hidden, const std::array
         slot->character = character;
         slot->epoch = ++gEpoch;
     }
+    if(!concealed || (!slot->diagnostics.desired && concealed) || slot->selectedKey!=key)
+        slot->pvpCaptureRevealed=false;
     if (slot->diagnostics.desired != concealed) {
         slot->retryAt = 0U;
         if (concealed) {
@@ -463,6 +562,7 @@ bool Publish(const std::uintptr_t character, const bool hidden, const std::array
     slot->diagnostics.desired = concealed;
     slot->occupied = occupied;
     slot->selectedKey = key;
+    slot->presentation = presentation?*presentation:player_hiding_presentation::State{};
     if (hidden) slot->diagnostics.anchor = anchor;
     else if (phase != 0U) slot->diagnostics.anchor = presentation->position;
     return true;
@@ -471,10 +571,49 @@ bool Publish(const std::uintptr_t character, const bool hidden, const std::array
 bool Hidden(const std::uintptr_t character) noexcept {
     std::scoped_lock lock(gMutex);
     const auto* slot = Find(character);
-    return slot != nullptr && slot->occupied;
+    return slot != nullptr && slot->occupied && !slot->pvpCaptureRevealed;
 }
 
+bool PreparePvPSearch(const std::uintptr_t character,const std::uint32_t nativeGeneration) noexcept {
+    Slot state{};
+    {std::scoped_lock lock(gMutex);const auto* slot=Find(character);
+     // Local real player and non-hidden victims already have their retail
+     // state. Never synthesize a hiding context for them.
+     if(!slot || !slot->occupied)return true;
+     state=*slot;}
+    if(!alien_pvp::hiding::Searchable(state.presentation) || !GuardRemoteCharacter(character))return false;
+    auto* lease=SearchFor(character);
+    if(lease && !lease->policy.Same(state.epoch,state.presentation)) {
+        RetireSearch(*lease,ai_sync::AlienPvPCaptureVictim(character));
+        if(lease->character)return false;
+    }
+    if(!lease)for(auto& candidate:gSearches)if(!candidate.character){lease=&candidate;break;}
+    if(!lease)return false;
+    if(!lease->character) {
+        lease->character=character;
+        if(character_incarnations::NativeRegistry().Find(nativeGeneration,character,lease->ticket)!=character_incarnations::Result::Ok)
+            {*lease={};return false;}
+        if(!SearchIdentity(*lease,true) || !ReadSearchFlags(*lease,lease->oldHiding,lease->oldInteraction) ||
+            !lease->policy.Begin(state.epoch,state.presentation,GetTickCount64())) {*lease={};return false;}
+        lease->changedHiding=lease->oldHiding==0U;
+    }
+    if(!SearchIdentity(*lease,false) || !lease->policy.Refresh(state.epoch,state.presentation,GetTickCount64()))return false;
+    if(lease->changedHiding && !SetSearchFlag(character,0xDU,1U)) {
+        lease->policy.Release();RetireSearch(*lease,false);return false;
+    }
+    bool concealed{};const char* stage="pvp-native-search";
+    if(state.concealedByUs && !ApplyVisibility(character,false,concealed,stage))return false;
+    // Keep concealedByUs latched: on rejection the next pump re-conceals OUR
+    // body. The occupancy/locomotion lock remains until actual native capture.
+    return true;
+}
+void FinishPvPSearch(const std::uintptr_t character) noexcept {
+    if(auto* lease=SearchFor(character)) {
+        lease->policy.Release();RetireSearch(*lease,ai_sync::AlienPvPCaptureVictim(character));
+    }
+}
 void PumpAllOnEngineThread() noexcept {
+    MaintainSearches();
     std::array<std::uintptr_t, 40> characters{};
     const auto manager = Manager();
     {
@@ -514,3 +653,6 @@ HistorySnapshot History() noexcept {
     return gHistory;
 }
 }
+
+#undef AIMP_HIDING_TRY
+#undef AIMP_HIDING_CATCH

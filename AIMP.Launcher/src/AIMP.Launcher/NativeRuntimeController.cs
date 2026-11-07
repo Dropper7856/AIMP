@@ -67,6 +67,7 @@ internal sealed class NativeRuntimeController : IDisposable
     internal event EventHandler<ReadOnlyMemory<byte>>? AISyncImpactProduced;
     internal event EventHandler<NativeAISyncObservation>? AISyncTransactionObservationProduced;
     internal event EventHandler<NativeAISyncExecution>? AISyncExecutionProduced;
+    internal event EventHandler<NativeAlienPvP>? AlienPvPNativeProduced;
 
     internal void RefreshProcessStatus()
     {
@@ -400,6 +401,14 @@ internal sealed class NativeRuntimeController : IDisposable
             throw new InvalidOperationException("AISync configuration belongs to a retired native IPC instance.");
         return session.SendAISyncAsync(MessageType.AISyncConfigure, payload, token);
     }
+    internal Task SendAlienPvPAsync(Guid connection,int processId,AlienPvPNativeFrame frame,CancellationToken token)
+    {
+        var session=GetCommandSession();
+        if(session.ConnectionIdentity!=connection || session.TargetProcessId!=processId)
+            throw new InvalidOperationException("PvP command belongs to a retired native IPC instance.");
+        return session.SendAlienPvPAsync(frame,token);
+    }
+
     internal Task SendAISyncExecutionAsync(MessageType type, Guid connection, int processId,
         ReadOnlyMemory<byte> payload, CancellationToken token)
     {
@@ -656,6 +665,7 @@ internal sealed class NativeRuntimeController : IDisposable
         session.AISyncImpactProduced += OnAISyncImpactProduced;
         session.AISyncTransactionObservationProduced += OnAISyncTransactionObservationProduced;
         session.AISyncExecutionProduced += OnAISyncExecutionProduced;
+        session.AlienPvPNativeProduced += OnAlienPvPNativeProduced;
         session.ConnectionClosed += OnConnectionClosed;
     }
 
@@ -681,6 +691,7 @@ internal sealed class NativeRuntimeController : IDisposable
         session.AISyncImpactProduced -= OnAISyncImpactProduced;
         session.AISyncTransactionObservationProduced -= OnAISyncTransactionObservationProduced;
         session.AISyncExecutionProduced -= OnAISyncExecutionProduced;
+        session.AlienPvPNativeProduced -= OnAlienPvPNativeProduced;
         session.ConnectionClosed -= OnConnectionClosed;
     }
 
@@ -704,6 +715,11 @@ internal sealed class NativeRuntimeController : IDisposable
         if (sender is DllIpcSession session && ReferenceEquals(session, _ipc))
             AISyncTransactionObservationProduced?.Invoke(this,
                 new NativeAISyncObservation(session.ConnectionIdentity, session.TargetProcessId, bytes));
+    }
+    private void OnAlienPvPNativeProduced(object? sender,AlienPvPNativeFrame frame)
+    {
+        if(sender is DllIpcSession session && ReferenceEquals(session,_ipc))
+            AlienPvPNativeProduced?.Invoke(this,new(session.ConnectionIdentity,session.TargetProcessId,frame));
     }
     private void OnAISyncExecutionProduced(object? sender, (MessageType Type, ReadOnlyMemory<byte> Bytes) packet)
     {

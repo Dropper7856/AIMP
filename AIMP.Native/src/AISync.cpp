@@ -1,5 +1,11 @@
 #include <intrin.h>
 #include "aimp/AISync.h"
+#include "aimp/AlienPvPLocalController.h"
+#include "aimp/AlienPvPControlRuntime.h"
+#include "aimp/AlienPvPActionPolicy.h"
+#include "aimp/AlienPvPNativeActionAbi.h"
+#include "aimp/PlayerHidingRuntime.h"
+#include <limits>
 #include "aimp/AISyncProfiling.h"
 #include "aimp/AISyncExecutionPolicy.h"
 #include "aimp/AISyncNavigation.h"
@@ -544,6 +550,10 @@ std::array<PairBinding, kActors> gPairSources{};
 std::array<PairBinding, kParticipants + 1U> gPairParticipants{};
 std::array<std::atomic<bool>, kActors> gPairSourceBusy{};
 std::atomic<std::uint32_t> gPairBindingEpoch{1U};
+// Published on the engine thread; health hooks may read on native workers.
+// No raw pointer permission survives a pair-binding generation rollover.
+std::atomic<std::uint64_t> gPvPTechnicalPeer{};
+std::atomic<std::uint32_t> gPvPTechnicalEpoch{};
 thread_local std::uintptr_t gVictimAdmissionSource{}, gVictimAdmissionTarget{}, gVictimAdmissionCycle{};
 thread_local std::uint32_t gVictimAdmissionDepth{};
 struct NativeVictimSubmission final {
@@ -605,6 +615,24 @@ std::array<ULONGLONG, kActors> gIncomingAt{};
 std::array<ULONGLONG, kActors> gNextIdentityProbe{};
 Configuration gCurrent{}; // engine thread only
 std::atomic<Role> gRole{Role::Retail};
+// Engine-thread-only PvP scope; pointers are never persisted beyond a qualified
+// Character incarnation. This does not grant locomotion/camera control.
+struct AlienPvPNativeLease final {
+    character_incarnations::Ticket ticket{};
+    std::uintptr_t tree{};
+    std::uint64_t sessionCookie{}, ownerPeer{};
+    std::uint32_t nativeGeneration{}, worldGeneration{}, entityA{}, entityB{}, runtimeId{};
+    std::uint32_t boundaryOffset{}, boundaryValue{};
+    bool fenced{}, drained{}, owned{}, navigationDrainEntered{}, releasing{};
+};
+AlienPvPNativeLease gPvPLease{};
+bool PvPCharacterFenced(std::uintptr_t character) noexcept;
+const alien_pvp::ActionHooks& PvPActionHooks() noexcept;
+void RetirePvPActions() noexcept;
+bool PvPLeaseScopeCurrent() noexcept;
+bool PvPLeaseLiveIdentity() noexcept;
+void ForgetPvPLease(std::uintptr_t destroyedCharacter = 0U) noexcept;
+
 std::atomic<bool> gAlienSuppressed{};
 std::atomic<bool> gInstalled{}, gStopping{};
 std::atomic<void*> gUpdateOriginal{}, gCoordinatorOriginal{}, gInteractionOriginal{};
@@ -1747,9 +1775,11 @@ bool PairedCycleMatches(const std::uintptr_t character, const State& interaction
         targetA == interaction.interactionTargetA && targetB == interaction.interactionTargetB;
 }
 bool NativeVictimFlowRunning(std::uintptr_t source, std::uintptr_t victim) noexcept;
+bool IsPvPTechnicalParticipant(std::uintptr_t character) noexcept;
 std::uint32_t __fastcall HostilityDetour(void* logical, void*, const std::uintptr_t target) noexcept {
     const auto original = reinterpret_cast<Hostility>(gHostilityOriginal.load(std::memory_order_acquire));
     if (original == nullptr) return 0U;
+    if (IsPvPTechnicalParticipant(target)) return 0U;
     std::uintptr_t owner{};
     std::uint32_t type{};
     if (gRole.load(std::memory_order_acquire) != Role::Host || !EngineThread() || !Stable() ||
@@ -1883,7 +1913,23 @@ bool PairIdentityLive(const PairIdentity& value) noexcept {
         value.generation==gActiveNativeGeneration.load(std::memory_order_acquire)&&
         value.epoch==gPairBindingEpoch.load(std::memory_order_acquire);
 }
+bool IsPvPTechnicalParticipant(const std::uintptr_t character) noexcept {
+    const auto peer=gPvPTechnicalPeer.load(std::memory_order_acquire);
+    const auto epoch=gPvPTechnicalEpoch.load(std::memory_order_acquire);
+    if(!peer || !character || epoch!=gPairBindingEpoch.load(std::memory_order_acquire))return false;
+    for(const auto& slot:gPairParticipants) {
+        PairIdentity participant{};
+        if(LoadPairBinding(slot,participant) && participant.character==character && participant.peer==peer &&
+            participant.epoch==epoch && PairIdentityLive(participant) &&
+            peer==gPvPTechnicalPeer.load(std::memory_order_acquire) &&
+            epoch==gPvPTechnicalEpoch.load(std::memory_order_acquire))return true;
+    }
+    return false;
+}
 bool AllowLocalNativeDamage(const std::uintptr_t character, const std::uintptr_t source) noexcept {
+    // Only the exact published technical player of the Alien owner is immune.
+    // Does not patch health, protect the Alien NPC or alter survivor damage.
+    if(IsPvPTechnicalParticipant(character))return false;
     if (!Client()) return true;
     const auto* submission = gNativeVictimSubmission;
     if (submission != nullptr && submission->authoritativeClient && submission->slot < kActors &&
@@ -2279,6 +2325,7 @@ std::uint32_t AdaptParticipantEligibility(void* logical, const std::uintptr_t ow
     if (!EligibilityParticipant(logical, owner, target) ||
         (expectedTarget != 0U && target != expectedTarget)) return retail;
     checks.fetch_add(1U, std::memory_order_relaxed);
+    if (IsPvPTechnicalParticipant(target)) return 1U;
     // A dead proxy can still pass the physical execution predicate. Preserve
     // an already running native death pair, then exclude it from new choices.
     if (NativeVictimFlowRunning(owner, target)) return 0U;
@@ -2334,6 +2381,7 @@ std::uint8_t __fastcall RecordInvalidDetour(void* context, void*) noexcept {
 }
 bool RecordMatches(std::uintptr_t record, std::uintptr_t owner, std::uintptr_t target) noexcept;
 bool AdmitParticipantCandidate(const std::uintptr_t senses, const std::uintptr_t target) noexcept {
+    if (IsPvPTechnicalParticipant(target)) return false;
     // Mirror the ordinary Character candidate admission. The retail helper
     // owns allocation, insertion, Character lifetime and reference counting.
     // Its forced-perception flag (+493) is removed for a newly admitted record;
@@ -6091,7 +6139,9 @@ bool HostNativeCaptureGuard() noexcept {
     return HostNativeCaptureQualified();
 }
 bool HostNativeCaptureContext(std::uintptr_t character, transactions::OwnerKey& owner) noexcept {
-    if (!HostNativeCaptureGuard()) return false;
+    // Old lifecycle completions must remain observable while the fence is
+    // draining. Only a proven owned incarnation has left the Coop producer.
+    if (!HostNativeCaptureGuard() || (gPvPLease.owned && PvPCharacterFenced(character))) return false;
     const auto* actor = Find(character); std::uint32_t runtime{};
     if (!actor || actor->duplicate || actor->faulted || !actor->birth || !actor->characterClass ||
         (actor->entityA == 0 && actor->entityB == 0) || !Read(character + 0x50U,runtime) || runtime != actor->runtimeId) return false;
@@ -7149,6 +7199,9 @@ void PumpHostAuthority() noexcept {
 
     for (auto& actor : gActors) {
         if (actor.character == 0U || actor.duplicate || actor.faulted) continue;
+        if(gPvPLease.owned && PvPCharacterFenced(actor.character)) {
+            Publish(actor);continue;
+        }
         if (actor.lastManagerUpdate != 0U &&
             now - actor.lastManagerUpdate <= kManagerDormancyPeriod) continue;
         // Dormant publication already uses this cadence. Avoid a complete
@@ -7456,6 +7509,21 @@ void __fastcall UpdateDetour(void* manager, void*, std::uint32_t previousTime, f
         return;
     }
 
+    // A single selected retail Alien must never run its autonomous decision
+    // branch while the PvP native lease is fencing or owned. Preserve the
+    // manager's retail housekeeping exactly as we do for PlayerSync proxies.
+    if (PvPCharacterFenced(c)) {
+        Actor pvpProxy{};
+        pvpProxy.character = c;
+        pvpProxy.blocked = true;
+        auto* previous = gUpdating;
+        gUpdating = &pvpProxy;
+        gSuspended.fetch_add(1U, std::memory_order_relaxed);
+        callOriginal();
+        gUpdating = previous;
+        return;
+    }
+
     if (!OwnsAI()) { callOriginal(); return; }
     if (!Client() && !Stable()) { callOriginal(); return; }
     gManagerUpdates.fetch_add(1U, std::memory_order_relaxed);
@@ -7529,12 +7597,15 @@ void __fastcall UpdateDetour(void* manager, void*, std::uint32_t previousTime, f
             actor->lastSend = 0U;
         }
         actor->lastManagerUpdate = now;
-        SampleParticipantPerception(*actor, reinterpret_cast<std::uintptr_t>(manager), now);
-        Publish(*actor);
+        if (!PvPCharacterFenced(c)) {
+            SampleParticipantPerception(*actor, reinterpret_cast<std::uintptr_t>(manager), now);
+            Publish(*actor);
+        }
     } else if (Client() && Stable() && !actor->faulted && !actor->duplicate) {
         const auto now=GetTickCount64();
         SamplePresentation(*actor,now);
-        static_cast<void>(ApplyCommandAction(*actor,now)); // records its own holds
+        if (!PvPCharacterFenced(c))
+            static_cast<void>(ApplyCommandAction(*actor,now)); // records its own holds
     }
 }
 void __fastcall PrepassDetour(void* context, void*) noexcept {
@@ -7548,6 +7619,7 @@ void __fastcall PrepassDetour(void* context, void*) noexcept {
         Read(manager + 0x128U, owner)) {
         if (PairSourceBusy(owner)) return;
         if (PlayerRepresentation(owner)) return;
+        if (EngineThread() && PvPCharacterFenced(owner)) return;
         if (Client() && Eligible(owner, type)) return;
     }
     const auto original = reinterpret_cast<void(__thiscall*)(void*)>(gPrepassOriginal.load());
@@ -7574,6 +7646,7 @@ void __fastcall CoordinatorDetour(void* tree, void*, std::uint32_t execute) noex
     if (Read(reinterpret_cast<std::uintptr_t>(tree) + 0xCU, owner)) {
         if (PairSourceBusy(owner)) return;
         if (PlayerRepresentation(owner)) return;
+        if (EngineThread() && PvPCharacterFenced(owner)) return;
         if (Client() && Eligible(owner, type)) return;
     }
     if (original == nullptr) return;
@@ -8476,6 +8549,10 @@ void DrainHostLifecycleEvents() noexcept {
         auto* actor=Find(event.character);std::uint32_t runtime{};
         if(!actor||actor->birth!=event.birth||actor->runtimeId!=event.runtime||
             !Read(event.character+0x50U,runtime)||runtime!=event.runtime){pop();continue;} // Retired construction.
+        // The owned PvP actor has its own command stream. Its locomotion
+        // lifecycle must not turn a deliberate Coop exclusion into a global
+        // LoseCoverage/recovery. Pre-ownership draining events still pass.
+        if(gPvPLease.owned && PvPCharacterFenced(event.character)){pop();continue;}
         if(!PublishLifecycleBaseline(*actor,scope)) {
             // Retain the fact, but never let a later command cross an
             // unrepresentable baseline and start a silently divergent stream.
@@ -9586,7 +9663,7 @@ bool Configure(const std::span<const std::byte> payload) noexcept {
     Configuration value{};
     if (payload.size() != sizeof(value) || !Installed()) return false;
     std::memcpy(&value, payload.data(), sizeof(value));
-    if (value.version != 3U || value.participantCount > kParticipants || (value.flags & ~kDisableAlien) != 0U ||
+    if (value.version != 3U || value.participantCount > kParticipants || (value.flags & ~(kDisableAlien | kAlienPvP)) != 0U ||
         static_cast<std::uint32_t>(value.role) > 3U ||
         (value.role != Role::Retail && value.sessionCookie == 0U) ||
         (value.role != Role::Retail && value.localPeer == 0U) ||
@@ -9961,6 +10038,40 @@ void PumpOnEngineThread() noexcept {
     // Own native path-query references independently of Characters. Maintain
     // them before taking the IPC mailbox mutex; cleanup can invoke native code.
     PumpHostNavigationContext();
+    // Native Alien local pilot is deliberately outside the IPC mailbox lock.
+    // Only the proven lease owner may issue physical requests on this process.
+    const auto pvpPhysicalGeneration=gGenerations->CurrentGeneration();
+    const auto currentRole=gRole.load(std::memory_order_acquire);
+    if (gPvPLease.releasing || (gPvPLease.fenced && (gCurrent.flags & kAlienPvP)==0U)) {
+        AlienPvPLeaseStatus ignored{};
+        static_cast<void>(ReleaseAlienPvPLease(ignored));
+    }
+    const bool activeLease=(currentRole==Role::Host || currentRole==Role::Client) &&
+        gPvPLease.owned && !gPvPLease.releasing && (gCurrent.flags & kAlienPvP)!=0U && PvPLeaseScopeCurrent() &&
+        PvPLeaseLiveIdentity() && gCurrent.localPeer!=0U;
+    if(activeLease) {
+        gPvPTechnicalEpoch.store(gPairBindingEpoch.load(std::memory_order_acquire),std::memory_order_release);
+        gPvPTechnicalPeer.store(gPvPLease.ownerPeer,std::memory_order_release);
+    } else gPvPTechnicalPeer.store(0U,std::memory_order_release);
+    const bool localLease=activeLease && gPvPLease.ownerPeer==gCurrent.localPeer;
+    alien_pvp_local::Pump({gBase,
+        localLease?gPvPLease.ticket.character:0U,
+        localLease?LocalPlayer():0U,
+        static_cast<std::uint32_t>(pvpPhysicalGeneration),
+        gPvPLease.ownerPeer,gCurrent.localPeer,localLease});
+    const auto pilot=alien_pvp_local::Snapshot();
+    alien_pvp::Context pvp{};
+    if(activeLease) {
+        pvp.scope={gPvPLease.nativeGeneration,gPvPLease.worldGeneration,
+            gPvPLease.sessionCookie,gPvPLease.ownerPeer,gPvPLease.ticket.serial,
+            gPvPLease.entityA,gPvPLease.entityB};
+        pvp.base=gBase;pvp.character=gPvPLease.ticket.character;
+        pvp.host=currentRole==Role::Host;pvp.localOwner=localLease;pvp.owned=true;
+        pvp.pilotReady=!localLease || (pilot.inputIsolated && pilot.cameraBound && pilot.technicalHidden);
+    }
+    pvp.actions=&PvPActionHooks();
+    RetirePvPActions();
+    alien_pvp::Pump(pvp);
     std::unique_lock lock(gMailboxMutex, std::try_to_lock);
     if (!lock.owns_lock()) return; // never wait for IPC on the engine thread
     if (gConfigurationPending) {
@@ -9970,6 +10081,14 @@ void PumpOnEngineThread() noexcept {
         const bool sameLifetime = gRequested.sessionCookie == gCurrent.sessionCookie &&
             gRequested.worldGeneration == gCurrent.worldGeneration && gRequested.nativeGeneration == gCurrent.nativeGeneration &&
             gRequested.localPeer == gCurrent.localPeer;
+        // Retire PvP while the old actor registry/configuration is still
+        // available. Never erase gActors and strand a fenced live Character.
+        if(gPvPLease.fenced && (contextChanged || (gRequested.flags & kAlienPvP)==0U)) {
+            lock.unlock();
+            AlienPvPLeaseStatus status{};
+            static_cast<void>(ReleaseAlienPvPLease(status));
+            return;
+        }
         // A disconnect may freeze immediately. OFF/new-session/Host handoff
         // in a live world must not wake a brain while old native Refs remain.
         // A generation already destroyed by the engine is handled below without
@@ -10211,6 +10330,7 @@ void BeforeCharacterDestruction(const std::uintptr_t c) noexcept {
     execution_runtime::BeforeActorDestruction({c,runtime,static_cast<std::uint32_t>(gGeneration),ticket.serial});
 }
 void ForgetCharacter(const std::uintptr_t c) noexcept {
+    if (EngineThread()) ForgetPvPLease(c);
     InvalidatePairTransactions(c);
     InvalidatePairCharacter(c);
     const bool playerRepresentation = RegisteredPlayerRepresentation(c);
@@ -10243,6 +10363,7 @@ void ForgetCharacter(const std::uintptr_t c) noexcept {
 }
 void ForgetSpawnKey(const std::uint32_t id) noexcept {
     if (id == 0U) return;
+    if (EngineThread() && gPvPLease.runtimeId == id) ForgetPvPLease();
     // The manager's key-based destroy wrapper runs BEFORE FullDestroy. Drain
     // while its actor/ownership mapping is still live, rather than revoking it
     // here and making the later FullDestroy preflight unable to find it.
@@ -10321,11 +10442,375 @@ bool PairedParticipantVictim(const std::uintptr_t character) noexcept {
             now < gPairedParticipantVictimUntil[i].load(std::memory_order_acquire)) return true;
     return false;
 }
+bool AlienPvPCaptureVictim(const std::uintptr_t character) noexcept {
+    if(!EngineThread() || !gPvPLease.owned || gPvPLease.releasing ||
+        !PvPLeaseScopeCurrent() || !PvPLeaseLiveIdentity() || !PairedParticipantVictim(character))return false;
+    const auto* actor=Find(gPvPLease.ticket.character);
+    std::uintptr_t cycle{};std::uint8_t state{};
+    return actor && !actor->faulted && !actor->duplicate &&
+        ParticipantForPeer(actor->desired.interactionTargetPeer)==character &&
+        Read(actor->character+0x36CU,cycle) && cycle && Read(cycle+0x1AU,state) && state==78U;
+}
 std::uintptr_t ResolveLivingParticipant(const std::uint64_t peer,
     const std::uint32_t nativeGeneration) noexcept {
     if (!EngineThread() || !Stable() || gCurrent.nativeGeneration != nativeGeneration) return 0U;
     const auto character = ParticipantForPeer(peer);
     return LivingCharacter(character) ? character : 0U;
+}
+
+// No native Character is dereferenced by this helper; the local incarnation
+// registry is our lifetime authority. Every call occurs on the certified
+// engine thread, including ManagerUpdate/BT detours.
+namespace {
+// Fencing is tied to the physical native lifetime, NOT to the lobby
+// configuration. Unbinding a disconnected Host must not wake an Alien whose
+// old movement requests are still in flight in that same retail world.
+bool PvPLeaseLifetimeCurrent() noexcept {
+    return gPvPLease.fenced && EngineThread() && gGenerations != nullptr &&
+        gPvPLease.nativeGeneration != 0U &&
+        gGenerations->CurrentGeneration() == gPvPLease.nativeGeneration &&
+        character_incarnations::NativeRegistry().Current(gPvPLease.ticket);
+}
+bool PvPLeaseScopeCurrent() noexcept {
+    return PvPLeaseLifetimeCurrent() && Installed() && Stable() &&
+        gPvPLease.sessionCookie != 0U && gPvPLease.sessionCookie == gCurrent.sessionCookie &&
+        gPvPLease.nativeGeneration == gCurrent.nativeGeneration &&
+        gPvPLease.worldGeneration == gCurrent.worldGeneration;
+}
+bool PvPCharacterFenced(const std::uintptr_t character) noexcept {
+    return character != 0U && gPvPLease.ticket.character == character &&
+        PvPLeaseLifetimeCurrent();
+}
+void ForgetPvPLease(const std::uintptr_t destroyedCharacter) noexcept {
+    if (destroyedCharacter != 0U && gPvPLease.ticket.character != destroyedCharacter) return;
+    gPvPTechnicalPeer.store(0U,std::memory_order_release);
+    // Partial input/camera installation must also be undone, not only Drives().
+    alien_pvp_local::Reset(gGenerations!=nullptr &&
+        gGenerations->CurrentGeneration()==gPvPLease.nativeGeneration,false);
+    alien_pvp::Reset(false);
+    gPvPLease={};
+}
+bool PvPLeaseLiveIdentity() noexcept {
+    if (!PvPLeaseLifetimeCurrent()) return false;
+    std::uint32_t a{}, b{}, type{}, runtime{};
+    std::uintptr_t tree{}, owner{};
+    return CharacterIdentity(gPvPLease.ticket.character,a,b,type) && type == 1U &&
+        a == gPvPLease.entityA && b == gPvPLease.entityB &&
+        Read(gPvPLease.ticket.character+0x50U,runtime) && runtime == gPvPLease.runtimeId &&
+        Read(gPvPLease.ticket.character+0x34D8U,tree) && tree == gPvPLease.tree &&
+        Read(tree+0xCU,owner) && owner == gPvPLease.ticket.character;
+}
+AlienPvPLeaseStatus PvPStatus(const AlienPvPLeasePhase phase) noexcept {
+    AlienPvPLeaseStatus status{};
+    status.phase=phase;
+    status.ownerPeer=gPvPLease.ownerPeer;
+    status.entityA=gPvPLease.entityA;
+    status.entityB=gPvPLease.entityB;
+    status.runtimeId=gPvPLease.runtimeId;
+    status.nativeGeneration=gPvPLease.nativeGeneration;
+    status.worldGeneration=gPvPLease.worldGeneration;
+    status.boundaryOffset=gPvPLease.boundaryOffset;
+    status.boundaryValue=gPvPLease.boundaryValue;
+    status.isLocalOwner=gPvPLease.ownerPeer!=0U &&
+        gPvPLease.ownerPeer==gCurrent.localPeer;
+    status.localPilotReady=status.isLocalOwner &&
+        alien_pvp_local::Drives(gPvPLease.ticket.character,gPvPLease.nativeGeneration);
+    if (status.isLocalOwner) {
+        const auto pilot=alien_pvp_local::Snapshot();
+        status.pilotInputIsolated=pilot.inputIsolated;
+        status.pilotCameraBound=pilot.cameraBound;
+        status.pilotTechnicalHidden=pilot.technicalHidden;
+        status.pilotMoving=pilot.moving;
+    }
+    return status;
+}
+// The native movement scheduler can be idle while its N navigation cache
+// still owns list Refs. Copy the already-certified transactional drain gates
+// instead of pretending empty scheduler counts imply a safe possession.
+bool PvPTryClearDrainedNavigation(Actor& actor,
+    const execution::OwnershipBoundaryFailure failure) noexcept {
+    if (failure.offset != 0x10004U && failure.offset != 0x10014U &&
+        failure.offset != 0x10044U) return false;
+    if (gPvPLease.navigationDrainEntered || !PvPLeaseScopeCurrent() ||
+        !PvPLeaseLiveIdentity() || PairSourceBusy(actor.character) ||
+        !UnownedCleanupAllowed(actor)) return false;
+    std::uintptr_t movement{}, control{};
+    if (!Read(actor.character + 0x42A8U,movement) || movement == 0U ||
+        !Read(actor.character + 0x42ACU,control) || control == 0U) return false;
+    const auto navigation=movement+0xC4U;
+    std::uintptr_t owner{};
+    if (!Read(navigation+0x64U,owner) || owner!=movement) return false;
+    for(const auto offset:{0x2CD8U,0x2CE4U}) {
+        std::uint32_t active{};
+        if (!Read(actor.character+offset,active) || active) return false;
+    }
+    for(const auto offset:{0x24U,0x2CU,0x38U,0x40U,0x5CU,0x60U}) {
+        std::uint32_t active{};
+        if (!Read(navigation+offset,active) || active) return false;
+    }
+    // Validate both retail-owned list sentinels before calling their
+    // destructors. Never overwrite N+44 or fabricate a cleared native Ref.
+    for(const auto offset:{0x28U,0x34U}) {
+        std::uintptr_t sentinel{}, next{}, previous{};
+        if (!Read(navigation+offset,sentinel) || !sentinel ||
+            !Read(sentinel,next) || !Read(sentinel+4U,previous) ||
+            next!=sentinel || previous!=sentinel) return false;
+    }
+    const auto current=[&]() noexcept {
+        std::uintptr_t m{}, c{};
+        return PvPLeaseScopeCurrent() && PvPLeaseLiveIdentity() &&
+            !PairSourceBusy(actor.character) && UnownedCleanupAllowed(actor) &&
+            Read(actor.character+0x42A8U,m) && m==movement &&
+            Read(actor.character+0x42ACU,c) && c==control;
+    };
+    if (!current()) return false;
+    gPvPLease.navigationDrainEntered=true;
+    if (!ResetDrainedNavigation(navigation) || !current()) return false;
+    if (!ClearDrainedNavigation(navigation,false) || !current()) return false;
+    if (!ClearDrainedNavigation(navigation,true) || !current()) return false;
+    return true;
+}
+
+#include "AISyncPvPActions.inl"
+
+bool PvPTryDrain(AlienPvPLeaseStatus& status) noexcept {
+    using Check=execution::OwnershipCheck;
+    if (!PvPLeaseScopeCurrent() || !PvPLeaseLiveIdentity()) {
+        gPvPLease.owned=false;
+        status=PvPStatus(AlienPvPLeasePhase::Stale); return false;
+    }
+    auto* actor=Find(gPvPLease.ticket.character);
+    if (!actor || actor->duplicate || actor->faulted || actor->runtimeId != gPvPLease.runtimeId) {
+        gPvPLease.owned=false;
+        status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement); return false;
+    }
+    if (gPvPLease.owned && !gPvPLease.releasing &&
+        (alien_pvp_local::Drives(actor->character,gPvPLease.nativeGeneration) ||
+         alien_pvp::Owns(actor->character,gPvPLease.nativeGeneration))) {
+        // A live local pilot now owns an AIMP locomotion slot. Its legitimate
+        // movement must never be mistaken for a leftover retail AI request
+        // and drained by the periodic bind recheck. The incarnation and native
+        // resource pins are still verified on every renewal.
+        const character_direct_step_runtime::MovementResourceLease resources(actor->character);
+        if (!resources) {
+            status=PvPStatus(AlienPvPLeasePhase::Draining);return false;
+        }
+        status=PvPStatus(AlienPvPLeasePhase::Owned);
+        return true;
+    }
+    if(PairSourceBusy(actor->character) || !UnownedCleanupAllowed(*actor)) {
+        gPvPLease.owned=false;status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement);return false;
+    }
+    if (!gPvPLease.drained) {
+        // All per-actor BT decisions are already fenced, and the exact native
+        // owner has no transaction/paired lease. Use retail destructors, not
+        // a memcpy/zero of movement requests or the shared Alien controller.
+        if (!QuiesceProxyExecution(*actor)) {
+            status=PvPStatus(AlienPvPLeasePhase::Draining); return false;
+        }
+        if (!character_direct_step_runtime::ReleaseAIIntentOwnership(actor->character)) {
+            status=PvPStatus(AlienPvPLeasePhase::Draining); return false;
+        }
+        gPvPLease.drained=true;
+    }
+    const character_direct_step_runtime::MovementResourceLease resources(actor->character);
+    if (!resources) { status=PvPStatus(AlienPvPLeasePhase::Draining); return false; }
+    const execution::OwnershipMemory memory{gBase,nullptr,
+        [](void*,std::uintptr_t at,void* out,std::size_t size) noexcept {
+            return crash_guard::TryCopy(out,reinterpret_cast<const void*>(at),size);
+        }};
+    const execution::ActorLifetime lifetime{actor->character,actor->runtimeId,
+        gPvPLease.nativeGeneration,gPvPLease.ticket.serial};
+    execution::OwnershipBoundaryFailure failure{};
+    auto check=execution::InspectMovementBoundary(memory,lifetime,true,&failure);
+    if (check == Check::Waiting && PvPTryClearDrainedNavigation(*actor,failure)) {
+        failure={};
+        check=execution::InspectMovementBoundary(memory,lifetime,true,&failure);
+    }
+    gPvPLease.boundaryOffset=failure.offset;gPvPLease.boundaryValue=failure.value;
+    if (check != Check::Ready) {
+        gPvPLease.owned=false;
+        status=PvPStatus(AlienPvPLeasePhase::Draining);
+        return false;
+    }
+    gPvPLease.owned=true;
+    status=PvPStatus(AlienPvPLeasePhase::Owned);
+    return true;
+}
+} // namespace
+
+bool AcquireAlienPvPLease(const std::uint64_t ownerPeer, AlienPvPLeaseStatus& status) noexcept {
+    status={};
+    if (!ownerPeer || !Installed() || !EngineThread() || !Stable() || (gCurrent.flags & kAlienPvP)==0U ||
+        gCurrent.role == Role::Retail || gCurrent.role == Role::FrozenClient ||
+        !gCurrent.sessionCookie || !gCurrent.nativeGeneration || !gCurrent.worldGeneration ||
+        !gGenerations || gGenerations->CurrentGeneration() != gCurrent.nativeGeneration) return false;
+    if (gPvPLease.releasing) {
+        status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement);return false;
+    }
+    // Never replace a live fenced incarnation just because a different Alien
+    // was observed in a vent or the lobby selected a different owner. The
+    // old lease must be released or its original Character actually destroyed.
+    if (gPvPLease.fenced && !PvPLeaseLifetimeCurrent()) ForgetPvPLease();
+    if (gPvPLease.fenced && (!PvPLeaseScopeCurrent() || gPvPLease.ownerPeer != ownerPeer)) {
+        status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement);
+        return false;
+    }
+    AlienPvPProbe candidate{};
+    if (!ProbeAlienPvPCandidate(candidate)) return false;
+    if (!candidate.unique) {
+        status=gPvPLease.fenced ? PvPStatus(AlienPvPLeasePhase::AwaitingRetirement) :
+            AlienPvPLeaseStatus{};
+        if (!gPvPLease.fenced)
+            status.phase=candidate.candidates==0U?AlienPvPLeasePhase::WaitingForAlien:
+                AlienPvPLeasePhase::Ambiguous;
+        return false;
+    }
+    if (gPvPLease.fenced) {
+        if (candidate.runtimeId != gPvPLease.runtimeId ||
+            candidate.entityA != gPvPLease.entityA || candidate.entityB != gPvPLease.entityB ||
+            !PvPLeaseLiveIdentity()) {
+            status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement);
+            return false;
+        }
+        // A previous success is not permanent proof. Re-inspect scheduler
+        // and navigation ownership even during a quiet long-lived round.
+        return PvPTryDrain(status);
+    }
+    const auto character=FindCharacterByIdentity(candidate.entityA,candidate.entityB);
+    if (!character) { status.phase=AlienPvPLeasePhase::WaitingForAlien; return false; }
+    auto* actor=Admit(character);
+    if (!actor || actor->duplicate || actor->faulted ||
+        actor->runtimeId!=candidate.runtimeId || actor->characterClass!=1U ||
+        !UnownedCleanupAllowed(*actor) || PairSourceBusy(character)) {
+        status.phase=AlienPvPLeasePhase::AwaitingRetirement;return false;
+    }
+    character_incarnations::Ticket ticket{};
+    auto& registry=character_incarnations::NativeRegistry();
+    auto found=registry.Find(gCurrent.nativeGeneration,character,ticket);
+    if (found==character_incarnations::Result::Missing || found==character_incarnations::Result::WrongGeneration)
+        found=registry.BindExisting(gCurrent.nativeGeneration,character,candidate.runtimeId,ticket);
+    if ((found!=character_incarnations::Result::Ok && found!=character_incarnations::Result::Duplicate) ||
+        ticket.runtimeId!=candidate.runtimeId || !ticket.serial || !registry.Current(ticket)) {
+        status.phase=AlienPvPLeasePhase::AwaitingRetirement;return false;
+    }
+    gPvPLease.ticket=ticket;
+    gPvPLease.tree=actor->tree;
+    gPvPLease.ownerPeer=ownerPeer;
+    gPvPLease.sessionCookie=gCurrent.sessionCookie;
+    gPvPLease.nativeGeneration=gCurrent.nativeGeneration;
+    gPvPLease.worldGeneration=gCurrent.worldGeneration;
+    gPvPLease.entityA=candidate.entityA;
+    gPvPLease.entityB=candidate.entityB;
+    gPvPLease.runtimeId=candidate.runtimeId;
+    gPvPLease.fenced=true;
+    return PvPTryDrain(status);
+}
+bool ReleaseAlienPvPLease(AlienPvPLeaseStatus& status) noexcept {
+    status={};
+    if (!EngineThread()) return false;
+    if (!gPvPLease.fenced) { status.phase=AlienPvPLeasePhase::Released; return true; }
+    // A pending release may span frames. Never rearm the pilot while native
+    // workers or paired cycles are still retiring.
+    if(!gPvPLease.releasing) {
+        gPvPTechnicalPeer.store(0U,std::memory_order_release);
+        gPvPLease.releasing=true;
+        const bool living=PvPLeaseLiveIdentity();
+        alien_pvp_local::Reset(gGenerations!=nullptr &&
+            gGenerations->CurrentGeneration()==gPvPLease.nativeGeneration,living);
+        alien_pvp::Reset(living);
+    }
+    RetirePvPActions();
+    if(pvp_actions::ResourcesPending()){status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement);return false;}
+    if (!PvPLeaseLifetimeCurrent()) {
+        // Destruction or new physical world is the only safe proof that the
+        // old fenced Character cannot receive any more retail decisions.
+        ForgetPvPLease();
+        status.phase=AlienPvPLeasePhase::Released;
+        return true;
+    }
+    if (!PvPLeaseLiveIdentity()) {
+        status=PvPStatus(AlienPvPLeasePhase::Stale);return false;
+    }
+    auto* actor=Find(gPvPLease.ticket.character);
+    if (!actor || actor->duplicate || actor->faulted ||
+        actor->runtimeId!=gPvPLease.runtimeId || PairSourceBusy(actor->character) ||
+        !UnownedCleanupAllowed(*actor)) {
+        status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement);return false;
+    }
+    // The owner must stop locally before the exact native movement boundary
+    // can certify safe release. Repeated RELEASE probes may wait for retirement.
+    if (alien_pvp_local::Drives(actor->character,gPvPLease.nativeGeneration))
+        alien_pvp_local::Reset(true,true);
+    // Native navigation may still retain worker Refs.
+    if (!gPvPLease.owned && !PvPTryDrain(status)) return false;
+    if(!character_direct_step_runtime::ReleaseAIIntentOwnership(actor->character)) {
+        status=PvPStatus(AlienPvPLeasePhase::Draining);return false;
+    }
+    const character_direct_step_runtime::MovementResourceLease resources(actor->character);
+    if (!resources) {status=PvPStatus(AlienPvPLeasePhase::Draining);return false;}
+    const execution::OwnershipMemory memory{gBase,nullptr,
+        [](void*,std::uintptr_t at,void* out,std::size_t size) noexcept {
+            return crash_guard::TryCopy(out,reinterpret_cast<const void*>(at),size);
+        }};
+    const execution::ActorLifetime lifetime{actor->character,actor->runtimeId,
+        gPvPLease.nativeGeneration,gPvPLease.ticket.serial};
+    execution::OwnershipBoundaryFailure failure{};
+    if (execution::InspectMovementBoundary(memory,lifetime,true,&failure) !=
+        execution::OwnershipCheck::Ready) {
+        gPvPLease.boundaryOffset=failure.offset;
+        gPvPLease.boundaryValue=failure.value;
+        status=PvPStatus(AlienPvPLeasePhase::Draining);return false;
+    }
+    if (!character_direct_step_runtime::ReleaseAIIntentOwnership(actor->character)) {
+        status=PvPStatus(AlienPvPLeasePhase::Draining);return false;
+    }
+    ForgetPvPLease();
+    status.phase=AlienPvPLeasePhase::Released;
+    return true;
+}
+
+bool ProbeAlienPvPCandidate(AlienPvPProbe& result) noexcept {
+    result = {};
+    if (!Installed() || !EngineThread() || !Stable() ||
+        gCurrent.nativeGeneration == 0U || gCurrent.worldGeneration == 0U ||
+        gRole.load(std::memory_order_acquire) == Role::Retail)
+        return false;
+
+    result.nativeGeneration = gCurrent.nativeGeneration;
+    result.worldGeneration = gCurrent.worldGeneration;
+    // Enumerate the native Character registry, including currently active
+    // characters that have not yet been admitted into AISync's actor cache.
+    const bool scanned = ForEachCharacter([&](const std::uintptr_t character) noexcept {
+        std::uint32_t entityA{}, entityB{}, type{}, runtimeId{};
+        // A template-class match alone is insufficient: the retail Alien
+        // must own a live behaviour manager/tree. The registry may enumerate
+        // half-constructed or retiring Characters during vent transitions.
+        std::uintptr_t selection{}, manager{}, tree{}, treeOwner{}, managerOwner{};
+        if (CharacterIdentity(character, entityA, entityB, type) &&
+            type == 1U && Eligible(character, type) &&
+            Read(character + 0x50U, runtimeId) && runtimeId != 0U &&
+            Read(character + 0x34D8U, tree) && tree != 0U &&
+            Read(tree + 0xCU, treeOwner) && treeOwner == character &&
+            Read(character + 0x34A8U, selection) && selection != 0U &&
+            Read(selection + 4U, manager) && manager != 0U &&
+            Read(manager + 0x128U, managerOwner) && managerOwner == character) {
+            ++result.candidates;
+            if (result.candidates == 1U) {
+                result.entityA = entityA;
+                result.entityB = entityB;
+                result.runtimeId = runtimeId;
+            }
+        }
+        return true;
+    });
+    if (!scanned) { result = {}; return false; }
+    result.unique = result.candidates == 1U;
+    if (!result.unique) {
+        // No ambiguous or stale identity may be retained as a controller.
+        result.entityA = result.entityB = result.runtimeId = 0U;
+    }
+    return true;
 }
 
 Counters DiagnosticsSnapshot() noexcept {

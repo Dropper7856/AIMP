@@ -76,6 +76,7 @@ internal sealed class DllIpcSession : IAsyncDisposable
     internal event EventHandler<ReadOnlyMemory<byte>>? ThrowableProduced;
 
 
+    internal event EventHandler<AlienPvPNativeFrame>? AlienPvPNativeProduced;
     internal event EventHandler<ReadOnlyMemory<byte>>? AISyncImpactProduced;
     internal event EventHandler<ReadOnlyMemory<byte>>? AISyncTransactionObservationProduced;
     internal event EventHandler<(MessageType Type, ReadOnlyMemory<byte> Bytes)>? AISyncExecutionProduced;
@@ -455,6 +456,13 @@ internal sealed class DllIpcSession : IAsyncDisposable
     {
         switch (frame.Type)
         {
+            case MessageType.AlienPvPNative:
+                if(!IsReady)throw new ProtocolException("PvP data preceded the native handshake.");
+                var alien=AlienPvPNativeCodec.Decode(frame.Payload.Span);
+                if(!AlienPvPDelivery.NativeToManaged(alien.Kind))
+                    throw new ProtocolException("Native tried to grant its own PvP authority.");
+                AlienPvPNativeProduced?.Invoke(this,alien);
+                return true;
             case MessageType.AISyncExecutionBinding:
             case MessageType.AISyncExecutionReceipt:
             case MessageType.AISyncHostBatch:
@@ -748,6 +756,14 @@ internal sealed class DllIpcSession : IAsyncDisposable
     {
         EnsureReady();
         return NextProcessSequence();
+    }
+
+    internal Task SendAlienPvPAsync(AlienPvPNativeFrame frame,CancellationToken token)
+    {
+        EnsureReady();
+        if(!AlienPvPDelivery.ManagedToNative(frame.Kind))
+            throw new ProtocolException("Launcher cannot fabricate native readiness or input observations.");
+        return SendAsync(MessageType.AlienPvPCommand,AlienPvPNativeCodec.Encode(frame),token);
     }
 
     internal Task SendAISyncAsync(MessageType type, ReadOnlyMemory<byte> payload, CancellationToken token)

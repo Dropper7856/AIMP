@@ -183,7 +183,7 @@ package frontend
          this._lastConnectionError = message;
       }
 
-      public function createLobby(mode:String, maxPlayers:int, visibility:String, mapId:String, mapName:String, alienEnabled:Boolean = true) : void
+      public function createLobby(mode:String, maxPlayers:int, visibility:String, mapId:String, mapName:String, alienEnabled:Boolean = true, alienVsSurvivors:Boolean = false) : void
       {
          var values:Object = {};
          values["mode"] = mode;
@@ -192,6 +192,7 @@ package frontend
          values["mapId"] = mapId;
          values["mapName"] = mapName;
          values["alienEnabled"] = alienEnabled ? "1" : "0";
+         values["alienVsSurvivors"] = alienVsSurvivors ? "1" : "0";
          this.send("CREATE_LOBBY",values);
       }
       
@@ -214,6 +215,13 @@ package frontend
          this.send("JOIN_DIRECT_IP",{});
       }
       
+      public function setAlienRole(peerId:String) : void
+      {
+         var values:Object = {};
+         values["peerId"] = peerId;
+         this.send("SET_ALIEN_ROLE",values);
+      }
+
       public function setReady(ready:Boolean) : void
       {
          var values:Object = {};

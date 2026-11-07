@@ -403,7 +403,9 @@ public static class ModelValidation
             || value.SessionId == Guid.Empty
             || !Bounded(value.Level, 1, 128)
             || value.LevelGeneration < 1
-            || value.StartAtUnixMilliseconds <= 0)
+            || value.StartAtUnixMilliseconds <= 0
+            || (value.AlienVsSurvivors && (!value.AlienEnabled || value.AlienPeerId == 0))
+            || (!value.AlienVsSurvivors && value.AlienPeerId != 0))
         {
             throw new ProtocolException("The launch command is invalid.");
         }
@@ -420,7 +422,9 @@ public static class ModelValidation
             || value.LevelGeneration < 0
             || value.Players is null
             || value.Players.Count is < 1
-            || value.Players.Count > value.Capacity)
+            || value.Players.Count > value.Capacity
+            || (value.AlienVsSurvivors && !value.AlienEnabled)
+            || (!value.AlienVsSurvivors && value.AlienPeerId != 0))
         {
             throw new ProtocolException("The lobby snapshot is invalid.");
         }
@@ -464,6 +468,11 @@ public static class ModelValidation
 
             hostCount += player.IsHost ? 1 : 0;
         }
+
+        if (value.AlienPeerId != 0 && !peerIds.Contains(value.AlienPeerId) && value.State == "Lobby")
+            throw new ProtocolException("Alien player is not a lobby participant.");
+        if (value.AlienVsSurvivors && value.State == "Starting" && value.AlienPeerId == 0)
+            throw new ProtocolException("PvP round cannot start without an assigned Alien.");
 
         if (hostCount != 1)
         {
@@ -892,11 +901,30 @@ public static class ModelValidation
                 StringComparison.Ordinal)
             || string.Equals(
                 value.Command,
+                GameCommandNames.AlienPvPProbe,
+                StringComparison.Ordinal)
+            || string.Equals(
+                value.Command,
+                GameCommandNames.AlienPvPRelease,
+                StringComparison.Ordinal)
+            || string.Equals(
+                value.Command,
                 GameCommandNames.ReturnToFrontend,
                 StringComparison.Ordinal))
         {
             if (value.Arguments.Count != 0)
                 throw new ProtocolException($"{value.Command} parameters are invalid.");
+            return;
+        }
+
+        if (string.Equals(value.Command, GameCommandNames.AlienPvPBind,
+                StringComparison.Ordinal))
+        {
+            if (value.LevelGeneration < 1 || value.Arguments.Count != 1 ||
+                !value.Arguments.TryGetValue("ownerPeer", out var peerText) ||
+                !ulong.TryParse(peerText, NumberStyles.None, CultureInfo.InvariantCulture,
+                    out var ownerPeer) || ownerPeer == 0UL)
+                throw new ProtocolException("ALIEN_PVP_BIND parameters are invalid.");
             return;
         }
 

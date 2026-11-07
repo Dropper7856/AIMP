@@ -252,10 +252,24 @@ internal sealed partial class MultiplayerSessionCoordinator
         var value = fence.Round;
         var seconds = (value.ReturnDelayMilliseconds + 999) / 1000;
         var victory = value.Reason == MissionCompleteReason;
+        var title = victory ? MissionCompleteTitle : RoundEndTitle;
+        var message = victory ? MissionCompleteMessage : RoundEndMessage;
+        if (value.Reason is "AlienWin" or "SurvivorsWin")
+        {
+            bool localAlien;
+            lock (_stateGate)
+                localAlien = _start?.AlienVsSurvivors == true
+                    && _start.AlienPeerId == LocalPeerId();
+            var alienWon = value.Reason == "AlienWin";
+            title = alienWon ? "ALIEN VICTORY" : "SURVIVORS VICTORY";
+            message = alienWon
+                ? (localAlien ? "All survivors eliminated." : "The Alien eliminated all survivors.")
+                : (localAlien ? "The survivors escaped." : "The survivors escaped the Alien.");
+        }
         return _bridge.SendAsync("ROUND_END", new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            ["title"] = victory ? MissionCompleteTitle : RoundEndTitle,
-            ["message"] = victory ? MissionCompleteMessage : RoundEndMessage,
+            ["title"] = title,
+            ["message"] = message,
             ["seconds"] = seconds.ToString(CultureInfo.InvariantCulture),
             ["generation"] = value.LevelGeneration.ToString(CultureInfo.InvariantCulture),
             ["sessionId"] = value.SessionId.ToString("D"),

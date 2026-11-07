@@ -1,4 +1,5 @@
 #include "aimp/GameCommandExecutor.h"
+#include "aimp/AISync.h"
 #include "aimp/ReplicationCore.h"
 #include "aimp/PlayerTorchRuntime.h"
 #include "aimp/PlayerHidingRuntime.h"
@@ -1540,6 +1541,10 @@ bool GameCommandExecutor::CanExecute(const std::string_view command) const noexc
     }
     if (command == "REMOTE_EQUIPMENT_PROVISION") {
         return RemoteEquipmentProvisionAvailable();
+    }
+    if (command == "ALIEN_PVP_PROBE" || command == "ALIEN_PVP_BIND" ||
+        command == "ALIEN_PVP_RELEASE") {
+        return ai_sync::Installed();
     }
     if (command == "RETURN_TO_FRONTEND") {
         return ReturnToFrontendAvailable();
@@ -4157,6 +4162,61 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteMissionSync(
         result.executed = mission_sync::Apply(signal, result.statusCode, result.message);
     }
     return result;
+}
+
+GameCommandExecutionResult GameCommandExecutor::ExecuteAlienPvPProbe() const {
+    ai_sync::AlienPvPProbe probe{};
+    if (!ai_sync::ProbeAlienPvPCandidate(probe))
+        return {false, "ALIEN_PVP_NOT_READY",
+            "Engine thread, AISync generation or Character registry is not ready."};
+    if (!probe.unique)
+        return {false, probe.candidates == 0U ? "ALIEN_PVP_NO_ALIEN" : "ALIEN_PVP_MULTIPLE_ALIENS",
+            "Found " + std::to_string(probe.candidates) +
+            " native Alien candidates; require exactly one before granting control."};
+    return {true, "ALIEN_PVP_PROBE_READY",
+        "Native Alien candidate verified: entityA=" + std::to_string(probe.entityA) +
+        ", entityB=" + std::to_string(probe.entityB) +
+        ", runtimeId=" + std::to_string(probe.runtimeId) +
+        ", nativeGeneration=" + std::to_string(probe.nativeGeneration) +
+        ", worldGeneration=" + std::to_string(probe.worldGeneration) +
+        ". Read-only: no native control lease has been granted."};
+}
+
+GameCommandExecutionResult GameCommandExecutor::ExecuteAlienPvPBind(const std::uint64_t ownerPeer) const {
+    ai_sync::AlienPvPLeaseStatus status{};
+    const auto owned=ai_sync::AcquireAlienPvPLease(ownerPeer,status);
+    std::string code;
+    switch (status.phase) {
+        case ai_sync::AlienPvPLeasePhase::Owned: code="ALIEN_PVP_OWNED";break;
+        case ai_sync::AlienPvPLeasePhase::WaitingForAlien: code="ALIEN_PVP_WAITING_FOR_SPAWN";break;
+        case ai_sync::AlienPvPLeasePhase::Ambiguous: code="ALIEN_PVP_MULTIPLE_ALIENS";break;
+        case ai_sync::AlienPvPLeasePhase::AwaitingRetirement: code="ALIEN_PVP_OWNER_BUSY";break;
+        case ai_sync::AlienPvPLeasePhase::Draining: code="ALIEN_PVP_DRAINING";break;
+        case ai_sync::AlienPvPLeasePhase::Stale: code="ALIEN_PVP_STALE";break;
+        default: code="ALIEN_PVP_NOT_READY";break;
+    }
+    return {owned,code,
+        "Alien PvP native lease: ownerPeer="+std::to_string(status.ownerPeer)+
+        " entityA="+std::to_string(status.entityA)+
+        " entityB="+std::to_string(status.entityB)+
+        " runtimeId="+std::to_string(status.runtimeId)+
+        " boundaryOffset="+std::to_string(status.boundaryOffset)+
+        " boundaryValue="+std::to_string(status.boundaryValue)+
+        " localOwner="+std::to_string(status.isLocalOwner?1:0)+
+        " localPilotReady="+std::to_string(status.localPilotReady?1:0)+
+        " pilotInputIsolated="+std::to_string(status.pilotInputIsolated?1:0)+
+        " pilotCameraBound="+std::to_string(status.pilotCameraBound?1:0)+
+        " pilotTechnicalHidden="+std::to_string(status.pilotTechnicalHidden?1:0)+
+        " pilotMoving="+std::to_string(status.pilotMoving?1:0)+
+        ". Owned means exclusive NPC authority, not verified local camera or locomotion. "+
+        "The local pilot requires an isolated input path and a live camera target."};
+}
+GameCommandExecutionResult GameCommandExecutor::ExecuteAlienPvPRelease() const {
+    ai_sync::AlienPvPLeaseStatus status{};
+    const bool released=ai_sync::ReleaseAlienPvPLease(status);
+    return {released,released?"ALIEN_PVP_RELEASED":"ALIEN_PVP_RELEASE_PENDING",
+        released?"Alien PvP native lease released safely.":
+            "Alien PvP release deferred while native requests are in flight."};
 }
 
 GameCommandExecutionResult GameCommandExecutor::ExecuteItemSyncApply(

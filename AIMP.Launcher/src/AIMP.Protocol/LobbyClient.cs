@@ -483,6 +483,23 @@ public sealed partial class LobbyClient : IAsyncDisposable
                         SpawnRemotePlayersRequested?.Invoke(this, spawn);
                         break;
 
+                    case MessageType.AlienControlCommitted:
+                        HandleAlienControlCommitted(frame.Payload);
+                        break;
+
+                    case MessageType.AlienControlLease:
+                        HandleAlienLease(frame.Payload);
+                        break;
+                    case MessageType.AlienActionResolved:
+                        HandleAlienActionResolution(frame.Payload);
+                        break;
+                    case MessageType.AlienControlPose:
+                        HandleAlienPose(frame.Payload);
+                        break;
+                    case MessageType.AlienControlReady:
+                    case MessageType.AlienControlProposal:
+                        throw new ProtocolException("Only the Host accepts Alien control proposals.");
+
                     case MessageType.PlayerPositionSnapshot:
                         var position = JsonPayload.Deserialize<PlayerPositionSnapshotPayload>(
                             frame.Payload.Span);

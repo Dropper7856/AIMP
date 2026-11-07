@@ -2209,9 +2209,12 @@ void __cdecl ApplyAtNpcLocomotionPreTransform(
             auto replicatedYaw = LoadFloat(slot->replicatedYawBits);
             // Hybrid facing is now animation-owned. Translate world travel
             // using the actual current yaw, not the requested future facing.
-            if (kHybridAnimatedFacing && UsesAIHybridReplication(*slot) && !ReadReplicatedYaw(characterAddress,replicatedYaw)) {
-                slot->protectedFailures.fetch_add(1U,std::memory_order_relaxed);
-                return;
+            if constexpr (kHybridAnimatedFacing) {
+                if (UsesAIHybridReplication(*slot) &&
+                    !ReadReplicatedYaw(characterAddress, replicatedYaw)) {
+                    slot->protectedFailures.fetch_add(1U, std::memory_order_relaxed);
+                    return;
+                }
             }
             if (!GuardedReadValue(
                     orientationObject + kNativeOrientationOffset,

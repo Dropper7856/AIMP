@@ -235,7 +235,7 @@ struct Configuration final {
     std::uint64_t sessionCookie{};
     // Launcher -> local DLL only. Never passed to the lobby transport.
     std::uint64_t localPeer{};
-    std::uint32_t participantCount{}, flags{}; // bit 0: suppress Alien (Host only)
+    std::uint32_t participantCount{}, flags{}; // bit 0: suppress Alien; bit 1: explicit PvP possession permission
     ParticipantBinding localBinding{}; // all zero if not certified yet
     ParticipantBinding participants[32]{};
 };
@@ -289,6 +289,8 @@ bool Installed() noexcept;
 // True while an AI actor pairs with this participant Character (kill/grab),
 // and briefly after. Any thread; network adapters must not move or re-equip it.
 bool PairedParticipantVictim(std::uintptr_t character) noexcept;
+// Certified engine-thread query, only the possessed Alien's active native pair.
+bool AlienPvPCaptureVictim(std::uintptr_t character) noexcept;
 struct Counters final {
     std::uint64_t observed{}, applied{}, dropped{}, refused{}, suspended{}, faults{};
     std::uint64_t missingIdentity{};
@@ -369,6 +371,33 @@ struct Counters final {
     bool stable{};
 };
 Counters DiagnosticsSnapshot() noexcept;
+
+// Read-only identity probe. It never grants possession, creates a Character,
+// modifies CATHODE state or exports process-local Character pointers.
+struct AlienPvPProbe final {
+    std::uint32_t nativeGeneration{}, worldGeneration{}, candidates{};
+    std::uint32_t entityA{}, entityB{}, runtimeId{};
+    bool unique{};
+};
+bool ProbeAlienPvPCandidate(AlienPvPProbe& result) noexcept;
+
+// Native PvP possession is local to one engine instance. A lease grants
+// exclusive authority over exactly one retail Alien Character, never a class.
+// No process address or pointer is returned to the Launcher or network.
+enum class AlienPvPLeasePhase : std::uint32_t {
+    Unavailable, WaitingForAlien, Ambiguous, AwaitingRetirement,
+    Draining, Owned, Released, Stale
+};
+struct AlienPvPLeaseStatus final {
+    AlienPvPLeasePhase phase{AlienPvPLeasePhase::Unavailable};
+    std::uint64_t ownerPeer{};
+    std::uint32_t entityA{}, entityB{}, runtimeId{}, nativeGeneration{}, worldGeneration{};
+    std::uint32_t boundaryOffset{}, boundaryValue{};
+    bool isLocalOwner{}, localPilotReady{};
+    bool pilotInputIsolated{}, pilotCameraBound{}, pilotTechnicalHidden{}, pilotMoving{};
+};
+bool AcquireAlienPvPLease(std::uint64_t ownerPeer, AlienPvPLeaseStatus& status) noexcept;
+bool ReleaseAlienPvPLease(AlienPvPLeaseStatus& status) noexcept;
 // Engine-thread participant identity for source-attributed native subsystems.
 // Uses the same native generation/lifetime proof as perception; never chooses a
 // target. The launcher's world generation is AISync-private and not compared.

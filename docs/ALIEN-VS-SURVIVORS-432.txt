@@ -1,0 +1,108 @@
+Alien vs Survivors — portage sur main, build 432
+
+Branche : feature/alien-vs-survivors-main
+API : 0.8.4.432
+DLL : 0.11.4.432-alien-vs-survivors (MSVC x86)
+Protocole commun : 36 ; IPC Alien AVS3, 200 octets
+
+Utilisation
+
+Fermer puis relancer le launcher et le jeu apres la mise a jour des API.
+Tous les participants doivent posseder le meme build/protocole.
+Dans le menu multijoueur du jeu, creer un serveur en mode Survivor, choisir
+Match Type = Alien vs Survivors, puis cliquer la ligne du participant qui
+doit jouer l'Alien. Reunir au moins deux participants, attendre leur
+preparation puis demarrer. La possession attend le vrai Alien de la carte
+et l'accord de readiness des instances ; aucun Alien arbitraire n'est cree.
+La campagne n'est pas autorisee pour ce mode.
+
+Commandes du joueur Alien :
+  WASD : deplacement ; souris : orientation
+  Ctrl : discret ; Shift : allure rapide ; Espace : course
+  Clic gauche : attaque native contre un survivant valide choisi par l'hote
+  E : entree/sortie de conduit selon l'etat observe ; Q : demander la sortie
+  G : cri ; V : vue premiere/troisieme personne
+
+Le role est attribue dans le lobby. La touche B du mod solo ne sert pas a
+contourner cette attribution. L'hote garde l'autorite sur les effets partages,
+y compris lorsque le joueur Alien est un client. L'Amanda technique est
+parquee/masquee localement puis restauree lors du retrait de possession.
+
+Ne pas installer le BML modifie ni injecter la DLL solo en parallele : cette
+integration reutilise les mecanismes du donneur au sein d'AIMP et attend le
+BML retail certifie. Le precontrole PvP refuse un BML incompatible sans
+l'ecraser. La preparation Coop existante est conservee ; choisir Coop ne
+modifie aucun BML et n'ajoute pas ce precontrole de compatibilite PvP.
+
+Origine et preservation des corrections
+
+Base main : 88142b575e30b03007b00071ddc9982fee17de4e, commit v429.
+Les modifications locales v431 preexistantes sont conservees dans d22a20d.
+Ancetre commun utilise pour la fusion de fichiers : 3ebd87f. Les evolutions
+main/locales n'ont pas ete remplacees par les fichiers complets de la branche
+PvP. Les modules recents de route, retirement et ownership restent preserves.
+
+Archives utilisateur, SHA-256 :
+  AIMP-feature-alien-vs-survivors (1).zip
+  886817F59C53058E30E1AAAA6C6037E6A4CF700B0D04D3C3A5BDEAB64A228F33
+  AIMP-AVS-PATCH-COMPLET-v417.zip
+  B64CC1B9D5D2B408838BEC96E1F60564201D535898056454EAAD05EB8E3FF3C7
+  AI-Playable-Alien-main.zip
+  81585A8554AEADC18CB3845905F9076BF4A4FDDE1492ECD741378B9693DF408E
+
+Les adaptateurs natifs manquants ont ete recuperes dans la base PvP exacte.
+Les contrats lobby, commandes natives, validation, possession, locomotion,
+camera, isolement des entrees/corps, actions, victimes cachees, conduits,
+fiabilite locale et conditions de manche sont portes ensemble. Les fonctions
+Android/facehugger/photo du donneur ne font pas partie de ce mode.
+Licence MIT du donneur : third_party/AI-Playable-Alien/LICENSE.
+
+Menu reellement compile
+
+Les deux classes frontend.NewFrontendMenu et frontend.MultiplayerBridge ont
+ete compilees avec FFDec 20.1.0/Java 21. Une reexportation des classes compilees
+confirme Match Type, Alien vs Survivors, mpAssignAlienHandler et SET_ALIEN_ROLE.
+Seul le tag DoABC du GFX courant a ete remplace : tous les tags visuels et la
+fin opaque Scaleform sont preserves octet pour octet. Le lecteur Flash de
+FFDec emet un avertissement sur un tag Scaleform du fichier original ; sa
+reconstruction de la liste graphique n'est pas utilisee pour la livraison.
+Outil de transplantation : tools/ui/merge-frontend-bytecode.cjs.
+Le GFX compile est inclus dans les sources et dans l'API livree.
+
+Compilation et livraison
+
+Depuis PowerShell a la racine :
+  .\build-alien-api.ps1
+
+Le script compile uniquement AIMP.NetZ en Release x86 (BUILD_TESTING=OFF),
+publie le launcher x64 et l'injecteur x86 autonomes, puis copie resources/api
+local et sur le second PC sans supprimer les fichiers propres aux destinations.
+Il compare les trois DLL et le menu par SHA-256 et enregistre delivery.json.
+Il ne reconstruit pas Electron et n'execute aucun test unitaire.
+
+Resultat du 7 novembre 2026 :
+  Compilation C# launcher/protocole : reussie.
+  Compilation MSVC x86 DLL native : reussie, avertissements traites en erreurs.
+  Publication injecteur x86 : reussie.
+  Architectures PE launcher x64, injecteur et DLL x86 : verifiees.
+  API locale dist/win-unpacked/resources/api : mise a jour, SHA-256 conformes.
+  Second PC : ECHEC, partage inaccessible, Robocopy 16. Pas de livraison confirmee.
+  Aucun fichier de test unitaire ajoute/modifie pour ce portage ; aucun execute.
+  Controle de demarrage API : bloque par la politique d'execution automatique.
+  Session en jeu et validation deux PC : non effectuees.
+
+Build et empreintes locaux : artifacts/avs-v417-port/delivery.json.
+Logs : artifacts/avs-v417-port/native-build.log et build-and-delivery.log.
+Pour retenter seulement la livraison de ce build lorsque le partage revient :
+  .\build-alien-api.ps1 -DeliveryOnly -OutputDirectory artifacts/avs-v417-port
+
+Validation en jeu restante
+
+Le portage compile et le menu est livre ; cela ne certifie pas les effets des
+appels moteur. Verifier avec deux PC : Alien hote puis Alien client, camera et
+collisions, attaque sur survivant debout/cache, entree/sortie de conduits,
+fin d'une capture, deconnexion, seconde manche et retour Coop. Observer les
+diagnostics AlienPvP en cas de readiness manquante. Un ACK de livraison ne
+prouve ni attaque reussie ni mort. Les scripts propres aux cartes peuvent
+encore viser THE_PLAYER ; le parking de l'Amanda ne constitue pas une preuve
+de compatibilite universelle de toutes les cartes.

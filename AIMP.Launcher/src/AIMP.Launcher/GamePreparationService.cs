@@ -147,6 +147,28 @@ public sealed class GamePreparationService
             throw new InvalidOperationException(string.IsNullOrEmpty(state.Error) ? "Game preparation is not ready." : state.Error);
     }
 
+    // PvP requires the certified retail behavior. Keep ordinary Coop's existing
+    // preparation unchanged; switching modes never rewrites a live behavior tree.
+    internal Task PrepareAlienVsSurvivorsAsync(bool enabled, CancellationToken cancellationToken) =>
+        Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!enabled) return;
+            var game = _settings.Load().GameDirectory;
+            lock (_sync)
+            {
+                if (_status.State != "Ready" || !SameDirectory(game, _status.GameDirectory) || _receipt is null)
+                    throw new InvalidOperationException("Prepare the game installation before selecting Alien vs Survivors.");
+            }
+            // Both modes use the same retail BML. This preview's possession,
+            // locomotion and camera do not depend on donor behavior branches.
+            // Read-only verification cannot prove what an already running game
+            // loaded: never alter its BML before switching modes in the lobby.
+            AlienPvPBehaviorInstaller.VerifyNativeRetail(game);
+            _diagnostics.Log("AlienPvP",
+                "Retail BML verified. Alien possession, camera, movement, attack and vent adapters await native readiness.");
+        }, cancellationToken);
+
     // This path is intentionally read-only. No imports or cold compilation after launch.
     internal Task<PreparedWorldManifest> PrepareLevelAsync(string level, CancellationToken cancellationToken, bool allowCampaign = false) =>
         Task.Run(() =>

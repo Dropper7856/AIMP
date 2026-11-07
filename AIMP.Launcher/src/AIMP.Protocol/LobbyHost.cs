@@ -17,7 +17,8 @@ public sealed record LobbyHostOptions(
     CompatibilityInfo Compatibility,
     bool OpaqueRelayEnabled = false,
     bool RequireWorldPreparation = false,
-    bool AlienEnabled = true);
+    bool AlienEnabled = true,
+    bool AlienVsSurvivors = false);
 
 public readonly record struct WorldHostAcceptedMutation(
     WorldNetworkMutation Mutation,
@@ -69,6 +70,7 @@ public sealed partial class LobbyHost : IAsyncDisposable
     private Task? _worldMutationBroadcastLoop;
     private string _level;
     private string _state = "Lobby";
+    private ulong _alienPeerId; // Host-owned lobby role, never assigned by a client packet.
     private int _levelGeneration;
     // Participants whose THE_PLAYER died during _levelGeneration. Guarded by
     // _stateLock and cleared whenever a generation starts or a round ends.
@@ -138,8 +140,32 @@ public sealed partial class LobbyHost : IAsyncDisposable
                 return string.Equals(_state, "Lobby", StringComparison.Ordinal)
                     && _clients.Count >= 1
                     && _clients.Values.All(client => client.IsReady)
+                    && (!_options.AlienVsSurvivors || (_alienPeerId != 0 &&
+                        (_alienPeerId == HostPeerId || _clients.ContainsKey(_alienPeerId))))
                     && (!_options.RequireWorldPreparation || AllLobbyPreparationsMatchLocked());
         }
+    }
+
+    // Only the local host API may choose the unique Alien. There is deliberately no
+    // corresponding client-to-host message, preventing role spoofing.
+    public async Task SetAlienPlayerAsync(ulong peerId, CancellationToken cancellationToken = default)
+    {
+        if (!_options.AlienVsSurvivors)
+            throw new InvalidOperationException("The lobby is not an Alien vs Survivors game.");
+        await _admissionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            lock (_stateLock)
+            {
+                if (_state != "Lobby") throw new InvalidOperationException("Roles are locked after start.");
+                if (peerId != 0 && peerId != HostPeerId && !_clients.ContainsKey(peerId))
+                    throw new InvalidOperationException("Selected Alien is not in the lobby.");
+                _alienPeerId = peerId;
+            }
+        }
+        finally { _admissionGate.Release(); }
+        PublishSnapshot();
+        await BroadcastSnapshotAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public event EventHandler<LobbySnapshotPayload>? SnapshotChanged;
@@ -258,6 +284,9 @@ public sealed partial class LobbyHost : IAsyncDisposable
                         "At least one connected client is required and every client must be ready.");
                 }
 
+                if (_options.AlienVsSurvivors && (_alienPeerId == 0 ||
+                    (_alienPeerId != HostPeerId && !_clients.ContainsKey(_alienPeerId))))
+                    throw new InvalidOperationException("The host must assign exactly one Alien before launch.");
                 if (_options.RequireWorldPreparation && !AllLobbyPreparationsMatchLocked())
                     throw new InvalidOperationException(
                         "Every participant must prepare the selected level with the same WorldManifest before launch.");
@@ -274,7 +303,9 @@ public sealed partial class LobbyHost : IAsyncDisposable
                     startAtUtc.ToUnixTimeMilliseconds(),
                     _level,
                     _levelGeneration,
-                    _options.AlienEnabled);
+                    _options.AlienEnabled,
+                    _options.AlienVsSurvivors,
+                    _alienPeerId);
             }
         }
         finally
@@ -331,6 +362,8 @@ public sealed partial class LobbyHost : IAsyncDisposable
             if (!string.Equals(_state, "Starting", StringComparison.Ordinal)
                 || payload.LevelGeneration != _levelGeneration
                 || _finishedPeers.Contains(payload.PeerId)
+                // The Alien's hidden technical THE_PLAYER is not the Alien NPC.
+                || (_options.AlienVsSurvivors && payload.PeerId == _alienPeerId)
                 || !_deadPeers.Add(payload.PeerId)) return;
             progress = CreateRoundProgressLocked();
             ended = TryEndRoundLocked();
@@ -362,9 +395,29 @@ public sealed partial class LobbyHost : IAsyncDisposable
     // connected client of the active generation is terminal: dead or finished.
     private RoundEndedPayload? TryEndRoundLocked()
     {
-        if (!RoundTerminalLocked(HostPeerId)
-            || _clients.Keys.Any(peerId => !RoundTerminalLocked(peerId))) return null;
-        var reason = RoundEndReasonLocked();
+        string reason;
+        if (_options.AlienVsSurvivors)
+        {
+            // In PvP the Alien's hidden retail player is not a survivor.
+            // All survivor deaths -> Alien victory. Any survivor escape ->
+            // survivor victory. A departed client Alien forfeits the round.
+            var survivors = _clients.Keys.Append(HostPeerId)
+                .Where(peer => peer != _alienPeerId).ToArray();
+            var alienLeft = _alienPeerId != 0 && _alienPeerId != HostPeerId && !_clients.ContainsKey(_alienPeerId);
+            var survivorsEscape = survivors.Any(_finishedPeers.Contains);
+            // If the last survivor leaves an active round, do not keep the
+            // Alien alone in a round that can never finish. Alien departure
+            // still has priority below, including simultaneous disconnects.
+            var survivorsAllDead = survivors.All(_deadPeers.Contains);
+            if (!alienLeft && !survivorsEscape && !survivorsAllDead) return null;
+            reason = survivorsEscape || alienLeft ? "SurvivorsWin" : "AlienWin";
+        }
+        else
+        {
+            if (!RoundTerminalLocked(HostPeerId)
+                || _clients.Keys.Any(peerId => !RoundTerminalLocked(peerId))) return null;
+            reason = RoundEndReasonLocked();
+        }
         _state = "Lobby";
         _sessionPreparedPeers.Clear();
         _sessionReleasedGeneration = 0;
@@ -372,6 +425,8 @@ public sealed partial class LobbyHost : IAsyncDisposable
         _finishedPeers.Clear();
         _collectedItems.Clear();
         ClearSpawnDecisionsLocked();
+        if (_options.AlienVsSurvivors && _alienPeerId != HostPeerId && !_clients.ContainsKey(_alienPeerId))
+            _alienPeerId = 0;
         var payload = new RoundEndedPayload(SessionId, _levelGeneration,
             reason, RoundReturnDelayMilliseconds);
         ModelValidation.Validate(payload);
@@ -382,6 +437,7 @@ public sealed partial class LobbyHost : IAsyncDisposable
         RoundEndedPayload payload,
         CancellationToken cancellationToken)
     {
+        await RevokeAlienControlAsync(cancellationToken).ConfigureAwait(false);
         await StopAISyncShadowAsync().ConfigureAwait(false);
         await StopAISyncExecutionAsync().ConfigureAwait(false);
         Log?.Invoke(this, $"Round {payload.LevelGeneration} ended: {payload.Reason}.");
@@ -1187,6 +1243,9 @@ public sealed partial class LobbyHost : IAsyncDisposable
                 await RemoveShadowPeerAsync(state.PeerId).ConfigureAwait(false);
                 await RemoveExecutionPeerAsync(state.PeerId).ConfigureAwait(false);
                 lock (_stateLock) {
+                    // Preserve the departed Alien identity until PvP round logic
+                    // can declare a survivor victory. Clear it for a lobby exit.
+                    if (_alienPeerId == state.PeerId && _state == "Lobby") _alienPeerId = 0;
                     _lobbyPreparations.Remove(state.PeerId);
                     _sessionPreparedPeers.Remove(state.PeerId);
                 }
@@ -1331,6 +1390,20 @@ public sealed partial class LobbyHost : IAsyncDisposable
                     await HandlePlayerEquipmentAsync(state, frame.Payload, cancellationToken)
                         .ConfigureAwait(false);
                     break;
+
+                case MessageType.AlienControlProposal:
+                    await HandleAlienControlProposalAsync(state, frame.Payload, cancellationToken)
+                        .ConfigureAwait(false);
+                    break;
+
+                case MessageType.AlienControlReady:
+                    await HandleAlienReadyAsync(state,frame.Payload,cancellationToken).ConfigureAwait(false);
+                    break;
+                case MessageType.AlienControlLease:
+                case MessageType.AlienActionResolved:
+                case MessageType.AlienControlPose:
+                case MessageType.AlienControlCommitted:
+                    throw new ProtocolException("Only the Host may commit Alien control intents.");
 
                 case MessageType.PlayerActionEvent:
                     await HandlePlayerActionAsync(state, frame.Payload, cancellationToken)
@@ -1800,6 +1873,7 @@ public sealed partial class LobbyHost : IAsyncDisposable
         PlayerActionEventPayload payload,
         ulong expectedPeerId)
     {
+        RejectAlienTechnicalPlayerSync(expectedPeerId);
         ModelValidation.Validate(payload);
         if (payload.SessionId != SessionId || payload.PeerId != expectedPeerId)
             throw new InvalidOperationException("Player-action identity is invalid.");
@@ -1810,16 +1884,28 @@ public sealed partial class LobbyHost : IAsyncDisposable
         PlayerEquipmentSnapshotPayload payload,
         ulong expectedPeerId)
     {
+        RejectAlienTechnicalPlayerSync(expectedPeerId);
         ModelValidation.Validate(payload);
         if (payload.SessionId != SessionId || payload.PeerId != expectedPeerId)
             throw new InvalidOperationException("Player-equipment identity is invalid.");
         ValidateActiveGeneration(payload.LevelGeneration);
     }
 
+    // PvP inputs and native Alien outcomes travel on their own transport. No
+    // hidden Amanda position, torch, weapon or attack may be presented as the
+    // bound Alien to other participants.
+    private void RejectAlienTechnicalPlayerSync(ulong peerId)
+    {
+        lock (_stateLock)
+            if (_options.AlienVsSurvivors && _state == "Starting" && _alienPeerId == peerId)
+                throw new ProtocolException("Human PlayerSync from the Alien peer is forbidden.");
+    }
+
     private void ValidatePlayerPosition(
         PlayerPositionSnapshotPayload payload,
         ulong expectedPeerId)
     {
+        RejectAlienTechnicalPlayerSync(expectedPeerId);
         ModelValidation.Validate(payload);
         if (payload.SessionId != SessionId || payload.PeerId != expectedPeerId)
             throw new InvalidOperationException("Player-position identity is invalid.");
@@ -1942,7 +2028,9 @@ public sealed partial class LobbyHost : IAsyncDisposable
             preparationToken,
             preparations,
             _options.RequireWorldPreparation,
-            _options.AlienEnabled);
+            _options.AlienEnabled,
+            _options.AlienVsSurvivors,
+            _alienPeerId);
         ModelValidation.Validate(snapshot);
         return snapshot;
     }

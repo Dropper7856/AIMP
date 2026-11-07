@@ -6,6 +6,7 @@
 #include "aimp/AISyncHostProducer.h"
 #include "aimp/VoiceSync.h"
 #include "aimp/LauncherIPC.h"
+#include "aimp/AlienPvPControlRuntime.h"
 #include "aimp/PlayerAnimationClipCapture.h"
 #include "aimp/IpcWriteBatch.h"
 #include "aimp/WorldSemanticReconciliation.h"
@@ -730,6 +731,16 @@ void LauncherIPC::PublishAISyncHostTraffic() {
     }
 }
 
+void LauncherIPC::PublishAlienPvPTraffic() {
+    if (!sessionConfigured_.load(std::memory_order_acquire) ||
+        !worldSyncAuthorityBound_ || !worldSyncWorldBusActive_) return;
+    std::array<std::uint8_t,alien_pvp::kWireBytes> bytes{};
+    for(std::size_t i=0;i<32U && alien_pvp::TryPopObservation(bytes);++i) {
+        if(!Queue(protocol::MessageType::AlienPvPNative,0U,
+            localSequence_.fetch_add(1U,std::memory_order_relaxed),std::as_bytes(std::span(bytes)))) break;
+    }
+}
+
 void LauncherIPC::PublishAISyncTraffic() {
     ai_sync::ImpactEvent impact{};
     for (std::size_t i = 0U; i < 16U && ai_sync::TryPopObservedImpact(impact); ++i) {
@@ -1370,6 +1381,7 @@ void LauncherIPC::Run() {
             PublishMissionSyncTraffic();
             PublishItemSyncSpawnTraffic();
             PublishThrowableTraffic();
+            PublishAlienPvPTraffic();
             PublishAISyncTraffic();
             PublishAISyncTransactionTraffic();
             PublishAISyncExecutionTraffic();
@@ -1877,6 +1889,11 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
         netzReadySent_.store(queued, std::memory_order_release);
         return queued;
     }
+    case protocol::MessageType::AlienPvPCommand:
+        if(sessionConfigured_.load(std::memory_order_acquire) &&
+            worldSyncAuthorityBound_ && worldSyncWorldBusActive_)
+            static_cast<void>(alien_pvp::QueueCommand(frame.payload));
+        return true; // stale input expires; it never tears down other IPC systems.
     case protocol::MessageType::AISyncExecutionBinding:
     case protocol::MessageType::AISyncExecutionBatch:
     case protocol::MessageType::AISyncClientState:
@@ -3190,6 +3207,15 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
                 pending->request.command == "WORLD_STATE_DISCOVERY_STATUS") {
                 result = gameCommands_->ExecuteWorldStateDiscoveryStatus();
             } else if (
+                pending->request.command == "ALIEN_PVP_PROBE") {
+                result = gameCommands_->ExecuteAlienPvPProbe();
+            } else if (
+                pending->request.command == "ALIEN_PVP_BIND") {
+                result = gameCommands_->ExecuteAlienPvPBind(pending->request.alienPvPOwnerPeer);
+            } else if (
+                pending->request.command == "ALIEN_PVP_RELEASE") {
+                result = gameCommands_->ExecuteAlienPvPRelease();
+            } else if (
                 pending->request.command == "RETURN_TO_FRONTEND") {
                 result = gameCommands_->ExecuteReturnToFrontend();
             } else if (
@@ -3226,7 +3252,8 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
                 !result.executed &&
                 ((pending->request.command == "WORLD_MANIFEST_LOAD" &&
                   nativeStatusCode == "WORLD_MANIFEST_PREPARING") ||
-                 nativeStatusCode.rfind("ITEM_SYNC_", 0U) == 0U);
+                 nativeStatusCode.rfind("ITEM_SYNC_", 0U) == 0U ||
+                 nativeStatusCode.rfind("ALIEN_PVP_", 0U) == 0U);
             if (remoteEquipmentRetry || remoteEquipmentTerminal || preservedStatus) {
                 // Preserve the native equipment provisioning stage/status so
                 // the Launcher can distinguish convergence from terminal

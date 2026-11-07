@@ -350,7 +350,9 @@ public sealed record LobbyStartPayload(
     long StartAtUnixMilliseconds,
     string Level,
     int LevelGeneration,
-    bool AlienEnabled = true);
+    bool AlienEnabled = true,
+    bool AlienVsSurvivors = false,
+    ulong AlienPeerId = 0);
 
 public sealed record LobbyPlayer(
     ulong PeerId,
@@ -371,7 +373,9 @@ public sealed record LobbySnapshotPayload(
     Guid PreparationToken = default,
     IReadOnlyList<LobbyPreparationPayload>? Preparations = null,
     bool WorldPreparationRequired = false,
-    bool AlienEnabled = true);
+    bool AlienEnabled = true,
+    bool AlienVsSurvivors = false,
+    ulong AlienPeerId = 0);
 
 public sealed record DiscoveryAnnouncement(
     ushort ProtocolVersion,
