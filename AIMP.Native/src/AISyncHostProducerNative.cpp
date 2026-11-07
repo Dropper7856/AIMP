@@ -624,9 +624,10 @@ void BeforeNativeAdmission(std::uintptr_t request,std::uint32_t admission) noexc
         // Replay the actual producer destination/stop/gait inputs. Replacing
         // a long Host Move with a short physical-carrier target starts native
         // stop mode6; 0044D320 then discards goal edits even with a live tail.
-        // LocalNative uses retail pathfinding only; the Client brain remains
-        // fenced and all actions/targets still come from the Host journal.
-        b.navigation=movement::Navigation::LocalNative;
+        // Destination equality alone does not preserve the Host corridor or
+        // its vent links. Import its certified native route; missing geometry
+        // must wait/fail through the route barrier rather than solve locally.
+        b.navigation=movement::Navigation::HostRoute;
         if(!HostScope(lease->scope)||!Read(character+0x50,lease->runtime)||
             !SnapshotMovement(request,kind,b.before,false)||!Strong(request,lease->ref)||!Live(*lease)) {
             lease->unknown=true;Lost(__LINE__);return;

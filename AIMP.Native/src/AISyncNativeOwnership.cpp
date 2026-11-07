@@ -1,6 +1,7 @@
 #include "aimp/AISyncNativeOwnership.h"
 #include "aimp/AISyncExecutionPolicy.h"
 #include "aimp/AISyncExecutionCodec.h"
+#include <cmath>
 
 namespace aimp::ai_sync::execution {
 namespace {
@@ -44,7 +45,7 @@ bool SupersedesNativePassage(const NativeExecutionAnchor& anchor,std::uint64_t s
         record.nativeKind==kFrontstageKind||(record.nativeKind==kBackstageKind&&record.mode==0U);
 }
 static OwnershipCheck InspectBoundary(const OwnershipMemory& inputMemory,const ActorLifetime& inputActor,bool quiet,
-    bool interaction,OwnershipBoundaryFailure* failure) noexcept {
+    bool interaction,OwnershipBoundaryFailure* failure,bool initialBackstage=false) noexcept {
     if(failure)*failure={};
     const auto memory=inputMemory;
     const auto actor=inputActor;
@@ -59,6 +60,14 @@ static OwnershipCheck InspectBoundary(const OwnershipMemory& inputMemory,const A
         !Read(memory,actor.character+0x297U,grappled)||!Read(memory,actor.character+0x32CU,health))
         return OwnershipCheck::Unknown;
     bool cycleAllowed=type>=memory.imageBase&&MovementDrainCycleAllowed(type-memory.imageBase,state);
+    // 00401520 constructs a timed stationary hold. 00401580 destroys only
+    // its base cycle; unlike75/76 it owns no traversal path/listener. Drain
+    // the scheduler normally and leave this cycle to the next Host constructor.
+    if(initialBackstage&&type==memory.imageBase+0xDBB1B8U&&state==0x4DU) {
+        float deadline{};
+        if(!Read(memory,cycle+0x44U,deadline))return OwnershipCheck::Unknown;
+        cycleAllowed=std::isfinite(deadline);
+    }
     if(interaction&&type>=memory.imageBase) {
         // 0065C4E0/0065BF60 dispatch the CURRENT cycle destructor before
         // constructing the pair. This is a native transition contract, not a
@@ -105,6 +114,8 @@ static OwnershipCheck InspectBoundary(const OwnershipMemory& inputMemory,const A
 }
 OwnershipCheck InspectMovementBoundary(const OwnershipMemory& memory,const ActorLifetime& actor,bool quiet,
     OwnershipBoundaryFailure* failure) noexcept {return InspectBoundary(memory,actor,quiet,false,failure);}
+OwnershipCheck InspectInitialBackstageBoundary(const OwnershipMemory& memory,const ActorLifetime& actor,bool quiet,
+    OwnershipBoundaryFailure* failure) noexcept {return InspectBoundary(memory,actor,quiet,false,failure,true);}
 OwnershipCheck InspectInteractionBoundary(const OwnershipMemory& memory,const ActorLifetime& actor,
     OwnershipBoundaryFailure* failure) noexcept {return InspectBoundary(memory,actor,false,true,failure);}
 OwnershipCheck InspectAuthoritativeExecutionBoundary(const OwnershipMemory& memory,const ActorLifetime& actor,bool quiet,

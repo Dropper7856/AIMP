@@ -289,6 +289,19 @@ Result Ledger::Apply(const Record& r) noexcept {
     owners_[ownerIndex].lastSeq = r.ownerSeq;
     const bool dispatchable=r.opcode==Op::Submit||r.opcode==Op::Cancel||r.opcode==Op::Stop||r.opcode==Op::Release||
         (r.opcode==Op::Update&&next.phase==Phase::Submitted);
+    // Kind5 passage reservations do not construct a cycle. If the Host
+    // explicitly cancels one before LOCAL native entry, never replay that old
+    // reservation merely to cancel it again. Direct Host constructors remain
+    // ordered evidence; pairs/attacks and entered/Unknown requests stay intact.
+    if(nativePipeline_&&r.nativeKind==5U&&(r.mode==75U||r.mode==76U||r.mode==77U)&&
+        (r.opcode==Op::Cancel||r.opcode==Op::Stop)) {
+        for(std::size_t i=0;i<recordCount_;++i) {
+            auto& earlier=operations_[i];Record pending{};
+            if(earlier.commandIndex==commandIndex&&earlier.nativeKind==5U&&earlier.opcode==Op::Submit&&
+                earlier.native==NativeState::NotEntered&&Decode(earlier.bytes,pending)==Result::Ok&&pending.mode==r.mode)
+                earlier.native=NativeState::Superseded;
+        }
+    }
     if(nativePipeline_&&!PreserveNativeOperations(r.nativeKind)&&(r.opcode==Op::Cancel||r.opcode==Op::Stop||r.opcode==Op::Complete)) {
         for(std::size_t i=0;i<recordCount_;++i)if(operations_[i].commandIndex==commandIndex&&operations_[i].dispatchable&&
             !PreserveNativeOperations(operations_[i].nativeKind)&&

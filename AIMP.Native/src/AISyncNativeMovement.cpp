@@ -18,6 +18,15 @@
 namespace aimp::ai_sync::execution {
 namespace {
 using namespace transactions;
+bool FinishedStopMetadata(const Record& r,const movement::Bundle& previous) noexcept {
+    if(r.nativeKind!=3U||r.opcode!=Op::Update||r.movement.parts!=1U||
+        r.movement.navigation!=movement::Navigation::HostRoute)return false;
+    auto value=r.movement;
+    value.before.retained=previous.before.retained;
+    value.after.retained=previous.after.retained;
+    value.gait=previous.gait;
+    return movement::Same(value,previous);
+}
 std::atomic<std::uint64_t> gUpdatesAfterLocalEnd{},gHostPathSteers{},gFencedRestartsSkipped{};
 std::atomic<std::uint64_t> gGuidanceDeferred{},gGuidanceSuspended{},gGuidanceFaults{},gGuidanceWithoutRoute{};
 std::atomic<std::uint64_t> gGuidanceContinuations{},gGuidanceContinuationLimits{},gGuidanceExhaustedTailContinuations{};
@@ -499,6 +508,7 @@ Readiness NativeRequestAdapter::CheckMovement(const Record& r,const LocalActorBi
             // prefix. An Update cannot resurrect it with a fresh B and rewind
             // that prefix. Only a new Host command may obtain a new admission.
             if(status>=3&&status<=6) {
+                if(FinishedStopMetadata(r,primary->movement))return Resources(actor.character);
                 if(r.movement.navigation==movement::Navigation::HostRoute)return Readiness::Rejected;
                 if(r.nativeKind==1U&&r.movement.parts==1U&&r.movement.navigation==movement::Navigation::LocalNative) {
                     movement::native_guidance::Snapshot ended{};std::uint32_t count{};
@@ -694,6 +704,18 @@ NativeOutcome NativeRequestAdapter::InvokeMovement(const Record& r,const LocalAc
     }
     if(!primary||primary->unknown)return NativeOutcome::Rejected;
     if(r.opcode==Op::Update) {
+        std::uint32_t stopStatus{};
+        if(FinishedStopMetadata(r,primary->movement)&&Read(primary->ref.object+0xC,stopStatus)&&stopStatus>=3U&&stopStatus<=6U) {
+            // Retention/current gait can be sampled after the Stop completed.
+            // Apply only the retained byte, never reconstruct B, reinstall the
+            // consumed corridor, change gait or invoke another stop animation.
+            primary->unknown=true;
+            __try {*reinterpret_cast<std::uint8_t*>(primary->ref.object+0x18)=static_cast<std::uint8_t>(r.movement.after.retained);}
+            __except(EXCEPTION_EXECUTE_HANDLER){return NativeOutcome::Unknown;}
+            if(!MovementRevalidate(r,*primary))return NativeOutcome::Unknown;
+            primary->movement=r.movement;primary->revision=r.parameterRevision;primary->unknown=false;
+            return NativeOutcome::Admitted;
+        }
         if(r.nativeKind==1&&r.movement.navigation==movement::Navigation::HostGuided&&!steering_) {
             // No native mutation here, including after local completion.
             // Latest desired Host state is independent of the in-flight

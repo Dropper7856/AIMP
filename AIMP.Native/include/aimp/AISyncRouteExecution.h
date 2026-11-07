@@ -31,6 +31,9 @@ void ConfirmActorDestroyed(const execution::ActorLifetime&) noexcept;
 // pinned M/mesh resources with no live native B/R/work may be drained; this
 // never treats an in-flight request or a world transition as a Ref release.
 void RevokePreviousWorld() noexcept;
+// Engine-thread execution retirement, including a recovery in the SAME world.
+// Revokes slot permission only; native resources wait for B/R/worker quiescence.
+void RetireScope(const transactions::Scope&) noexcept;
 [[nodiscard]] bool BeginAdmission(std::uintptr_t navigation) noexcept;
 [[nodiscard]] bool Owns(std::uintptr_t navigation) noexcept;
 void EndAdmission(std::uintptr_t navigation) noexcept;

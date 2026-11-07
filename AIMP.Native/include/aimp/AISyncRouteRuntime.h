@@ -20,6 +20,8 @@ void Pump() noexcept; // Engine thread only, no IPC locks held.
 // Producer's immediate callback after complete Submit/Update finalization.
 // Caller retains and revalidates the exact request/M owner for this N/B.
 // Consumes only metadata observed at the native post-install capture seam.
+// After an Update, re-certifies a settled installed suffix before publishing
+// the retained full prefix under the new exact parameter revision.
 void ObserveHostNavigation(std::uintptr_t navigation,std::uintptr_t block) noexcept;
 // Copied diagnostic, any thread. Command fence covers both parts and Updates;
 // no native ownership or completion is inferred from this value.

@@ -41,6 +41,12 @@ struct NativeExecutionAnchor {
 // This proves a movement handoff, not graph/listener disposal or Character death.
 [[nodiscard]] OwnershipCheck InspectMovementBoundary(const OwnershipMemory&,
     const ActorLifetime&,bool requireQuiescence,OwnershipBoundaryFailure* failure=nullptr) noexcept;
+// Initial local backstage HOLD only (00401520/00401580), never traversal75/76.
+// Caller proves the current incarnation, initial placement and absence of a
+// replayed Host cycle. Scheduler/navigation quiescence is still mandatory
+// after the drain. This grants no permission to synthesize a cycle transition.
+[[nodiscard]] OwnershipCheck InspectInitialBackstageBoundary(const OwnershipMemory&,
+    const ActorLifetime&,bool requireQuiescence,OwnershipBoundaryFailure* failure=nullptr) noexcept;
 // An authoritative paired transition replaces the current native cycle through
 // its virtual destructor. It does not require an invented intermediate Idle.
 // Caller must independently own the actor, retire competing requests and bind

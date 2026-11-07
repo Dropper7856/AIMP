@@ -59,7 +59,7 @@ struct Slot {
     std::unique_ptr<Graph> planned;
     bool continuation{};
     Protection protection{};
-    bool skipped{},failed{},installing{},actorDestroyed{},worldRevoked{};
+    bool skipped{},failed{},installing{},actorDestroyed{},worldRevoked{},scopeRetired{};
     bool installed{},startValid{},retiring{},retirementFault{},rejectionQueued{},replacementRequested{};
     std::array<float,3> queryStart{};
     std::array<std::uint32_t,43> queryOptions{};
@@ -106,7 +106,7 @@ bool Qualified(const execution::NavigationBinding& binding) noexcept {
 }
 bool Current(Slot& slot,execution::NavigationBinding* output=nullptr) noexcept {
     execution::NavigationBinding actual{};
-    if(!Qualified(slot.binding))return false;
+    if(slot.scopeRetired||!Qualified(slot.binding))return false;
     const auto state=execution_runtime::IdentifyNavigation(slot.local.navigation,slot.local.block,actual);
     if((state!=execution::NavigationOwnership::Ready&&state!=execution::NavigationOwnership::Admitting)||
         actual.command.scope!=slot.binding.command.scope||actual.command.owner!=slot.binding.command.owner||
@@ -889,6 +889,10 @@ void RevokePreviousWorld() noexcept {
     for(auto& trail:gState->trails)trail.reset();
     for(auto& slot:gState->slots)if(slot)slot->worldRevoked=true;
 }
+void RetireScope(const transactions::Scope& scope) noexcept {
+    if(!gState||!gEngine||!gEngine())return;
+    for(auto& slot:gState->slots)if(slot&&slot->binding.command.scope==scope)slot->scopeRetired=true;
+}
 void ConfirmActorDestroyed(const execution::ActorLifetime& actor) noexcept {
     if(!gState||!gEngine||!gEngine()||!actor.creationSerial)return;
     const execution::LocalActorBinding local{actor.character,actor.runtimeId,true,actor.creationSerial};
@@ -902,14 +906,14 @@ bool DrainNative(std::uintptr_t n,bool route) noexcept {
         return true;
     }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
 }
-bool Drain(Slot& slot,bool route=false) noexcept {
+bool Drain(Slot& slot,bool route=false,bool(*erase)(std::uintptr_t,bool) noexcept=DrainNative) noexcept {
     if(slot.retiring||slot.retirementFault)return false;
     std::uintptr_t history{},sentinel{};
     if(!Read(slot.local.navigation+0x10,history)||!history||!Read(slot.local.navigation,sentinel)||!sentinel)return false;
     // Native Ref destructors may reenter. Close this slot before the ONE erase
     // attempt; a fault or changed lifetime remains pinned and is never retried.
     slot.retiring=true;
-    const auto drained=DrainNative(slot.local.navigation,route);
+    const auto drained=erase(slot.local.navigation,route);
     std::uintptr_t afterHistory{},afterRoute{};
     const bool valid=drained&&!slot.retirementFault&&
         Read(slot.local.navigation+0x10,afterHistory)&&afterHistory==history&&
@@ -918,8 +922,8 @@ bool Drain(Slot& slot,bool route=false) noexcept {
     if(!valid){slot.retirementFault=true;Fail(slot);}
     return valid;
 }
-bool RetireDestroyedRoute(Slot& slot) noexcept {
-    if((!slot.actorDestroyed&&!slot.worldRevoked)||!slot.skipped||slot.installing||slot.retiring||slot.retirementFault||!slot.pin||
+bool RetireDestroyedRoute(Slot& slot,bool(*erase)(std::uintptr_t,bool) noexcept=DrainNative) noexcept {
+    if((!slot.actorDestroyed&&!slot.worldRevoked&&!slot.scopeRetired)||!slot.skipped||slot.installing||slot.retiring||slot.retirementFault||!slot.pin||
         !slot.pin->movement||!*slot.pin->movement||slot.pin->movement->Object()+0xC4!=slot.local.navigation)return false;
     const auto n=slot.local.navigation;
     // Never reset a navigation object now shared by a different live owner.
@@ -927,15 +931,18 @@ bool RetireDestroyedRoute(Slot& slot) noexcept {
     // wait for the others deadlocked a mid-route round end at contextBlocker 4
     // (every part revoked, none destroyed), freezing the next round's Client.
     for(const auto& other:gState->slots)if(other&&other.get()!=&slot&&other->local.navigation==n&&
-        !other->actorDestroyed&&!(slot.worldRevoked&&other->worldRevoked))return false;
+        !other->actorDestroyed&&!(slot.worldRevoked&&other->worldRevoked)&&
+        !(slot.scopeRetired&&other->scopeRetired&&other->binding.command.scope==slot.binding.command.scope))return false;
     if(!EmptyRing(n,0x28)||!EmptyRing(n,0x34)||!HistoryRing(n,0)||!HistoryRing(n))return false;
     for(const auto offset:{0x40U,0x44U,0x5CU,0x60U}) {
         std::uintptr_t value{};if(!Read(n+offset,value)||value)return false;
     }
-    // No B, result or solver worker remains, and the Character destructor has
-    // returned. M is still strongly pinned here. Clear leftover route/history
-    // through retail list/Ref destructors; do not wait for a dead actor to tick.
-    return Drain(slot,true);
+    // No B, result or solver worker remains. The Character was destroyed,
+    // its world revoked, or this exact execution scope explicitly retired.
+    // M stays pinned: erase cached route/history through retail destructors.
+    // Same-world recovery cannot wait for geometry to disappear by locomotion
+    // after cancelling every request which would have consumed it.
+    return Drain(slot,true,erase);
 }
 // After the original Character destructor has returned, a worker-free Host
 // result can remain in N forever: the native owner which would consume/cancel
@@ -969,7 +976,7 @@ void Pump() noexcept {
     struct PumpGuard {PumpGuard(){gPumping=true;}~PumpGuard(){gPumping=false;}} pumping;
     for(auto& value:gState->slots)if(value) {
         auto& slot=*value;
-        if(slot.actorDestroyed||slot.worldRevoked)static_cast<void>(RetireDestroyedRoute(slot));
+        if(slot.actorDestroyed||slot.worldRevoked||slot.scopeRetired)static_cast<void>(RetireDestroyedRoute(slot));
         // Quiet route/history still take the normal verified destruction path.
         // Non-quiet orphan results must not permanently fence the next round.
         if(!Quiet(slot,false)&&QuarantineDestroyedWorldSlot(value))continue;

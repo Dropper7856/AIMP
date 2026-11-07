@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <map>
+#include <limits>
 
 using namespace aimp::ai_sync::execution;
 namespace {
@@ -104,6 +105,32 @@ void NativeInteractionReplacement() {
     m.Put(m.actor.character+0x32CU,std::uint32_t{1});m.mutateAt=table+0x60U;
     CHECK(inspect()==OwnershipCheck::Unknown);
 }
+void InitialBackstageHold() {
+    Memory m;m.Cycle(0xDBB1B8U,0x4DU);m.Put(Memory::cycle+0x44U,-1.0F);
+    const auto inspect=[&](bool quiet=true) {
+        return InspectInitialBackstageBoundary({0x400000U,&m,&Memory::Read},m.actor,quiet);
+    };
+    CHECK(m.Inspect(false)==OwnershipCheck::Waiting);
+    CHECK(inspect(false)==OwnershipCheck::Ready&&inspect()==OwnershipCheck::Ready);
+    for(const auto offset:{0x2CD8U,0x2CE4U}) {
+        m.Put(m.actor.character+offset,1U);CHECK(inspect()==OwnershipCheck::Waiting);
+        m.Put(m.actor.character+offset,0U);
+    }
+    m.Put(Memory::movement+0xC4U+0x5CU,1U);CHECK(inspect()==OwnershipCheck::Waiting);
+    m.Put(Memory::movement+0xC4U+0x5CU,0U);
+    for(const auto state:{0x4BU,0x4CU,0x4EU,0x4FU}) {
+        m.Cycle(0xDBB1B8U,static_cast<std::uint8_t>(state));CHECK(inspect(false)==OwnershipCheck::Waiting);
+    }
+    for(const auto type:{0xDBB2A0U,0xDBB360U,0xEAE5D0U}) {
+        m.Cycle(type,0x4DU);CHECK(inspect(false)==OwnershipCheck::Waiting);
+    }
+    m.Cycle(0xDBB1B8U,0x4DU);
+    m.Put(Memory::cycle+0x44U,std::numeric_limits<float>::quiet_NaN());CHECK(inspect()==OwnershipCheck::Waiting);
+    m.Put(Memory::cycle+0x44U,-1.0F);m.failAt=Memory::cycle+0x44U;CHECK(inspect()==OwnershipCheck::Unknown);
+    m.failAt=0;m.Put(m.actor.character+0x297U,std::uint8_t{1});CHECK(inspect()==OwnershipCheck::Waiting);
+    m.Put(m.actor.character+0x297U,std::uint8_t{});m.Put(m.actor.character+0x32CU,3U);CHECK(inspect()==OwnershipCheck::Waiting);
+    m.Put(m.actor.character+0x32CU,1U);m.mutateAt=Memory::cycle+0x44U;CHECK(inspect()==OwnershipCheck::Unknown);
+}
 void ExactNativeExecutionProvenance() {
     Memory m;m.actor.creationSerial=11;
     aimp::ai_sync::transactions::Scope scope{};scope.session[0]=1;scope.authorityEpoch=scope.worldEpoch=scope.consumerEpoch=1;
@@ -186,7 +213,7 @@ void PassageCausalReplacement() {
 }
 }
 int main() {
-    NativeIdleAndCycles();SchedulerAndNavigation();FaultsAndLifetimeChanges();NativeInteractionReplacement();ExactNativeExecutionProvenance();
+    NativeIdleAndCycles();SchedulerAndNavigation();FaultsAndLifetimeChanges();NativeInteractionReplacement();InitialBackstageHold();ExactNativeExecutionProvenance();
     ExactPassageLifetime(0xDBB2A0U,0x4BU);ExactPassageLifetime(0xDBB360U,0x4CU);PassageCausalReplacement();
     std::cout<<"Native ownership: movement boundaries, exact passage lifetime and causal replacement PASS (modeled reads only).\n";
 }

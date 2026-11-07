@@ -6461,6 +6461,9 @@ execution::OwnershipCheck PrepareTransactionActor(void*, const transactions::Sco
     gHandoffStage=4;
     const auto ready=OwnsReplayedCycle(*actor,scope,owner,lifetime)?
         execution::InspectAuthoritativeExecutionBoundary(memory,lifetime,false,&failure):
+        (!actor->replayedCycle.cycle||actor->replayedCycle.scope!=scope||
+         actor->replayedCycle.owner!=owner||actor->replayedCycle.actor!=lifetime)?
+        execution::InspectInitialBackstageBoundary(memory,lifetime,false,&failure):
         execution::InspectMovementBoundary(memory,lifetime,false,&failure);
     gHandoffResult=static_cast<std::uint32_t>(ready);gHandoffOffset=failure.offset;gHandoffValue=failure.value;
     return ready;
@@ -6479,6 +6482,9 @@ execution::OwnershipCheck NativeMovementQuiescent(const execution::OwnershipToke
     gHandoffStage=6;
     const auto ready=OwnsReplayedCycle(*actor,token.scope,token.owner,token.actor)?
         execution::InspectAuthoritativeExecutionBoundary(memory,token.actor,true,&failure):
+        (!actor->replayedCycle.cycle||actor->replayedCycle.scope!=token.scope||
+         actor->replayedCycle.owner!=token.owner||actor->replayedCycle.actor!=token.actor)?
+        execution::InspectInitialBackstageBoundary(memory,token.actor,true,&failure):
         execution::InspectMovementBoundary(memory,token.actor,true,&failure);
     if(output)*output=failure;
     gHandoffResult=static_cast<std::uint32_t>(ready);gHandoffOffset=failure.offset;gHandoffValue=failure.value;

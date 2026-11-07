@@ -1164,6 +1164,30 @@ void Native() {
     NativeHarness partial;partial.faultCompanion=true;CHECK(partial.Submit()==NativeOutcome::Unknown&&partial.adapter.ActiveCount()==2);
     CHECK(partial.adapter.Check(partial.current)==Readiness::Rejected);
     NativeHarness recycle;recycle.recycleOnAdmission=true;CHECK(recycle.Submit()==NativeOutcome::Unknown&&recycle.calls.back()==11);
+    for(const auto status:{3U,4U,5U,6U}) {
+        NativeHarness terminal;auto record=Move();record.opcode=Op::Submit;record.nativeKind=3;
+        record.movement.parts=1;record.movement.companion={};record.movement.companionFlags=record.movement.companionRetainedAfter=0;
+        record.movement.primaryFlags=2;record.movement.after=record.movement.before;
+        record.movement.gait=1;
+        CHECK(terminal.adapter.Invoke(record)==NativeOutcome::Admitted);
+        NativeRequestAdapterTestAccess::Policy(terminal.adapter,movement::Navigation::HostRoute);
+        record.movement.navigation=movement::Navigation::HostRoute;
+        terminal.requests[1][0xC]=static_cast<std::uint8_t>(status);
+        record.opcode=Op::Update;++record.parameterRevision;
+        record.movement.after.retained=0;
+        record.movement.gait=3; // v430 trace: Stop completes, Host samples gait1 -> gait3.
+        const auto before=terminal.requests[1];const auto calls=terminal.calls.size();
+        CHECK(terminal.adapter.Check(record)==Readiness::Ready);
+        CHECK(terminal.adapter.Invoke(record)==NativeOutcome::Admitted&&terminal.calls.size()==calls);
+        auto expected=before;expected[0x18]=0;
+        CHECK(terminal.requests[1]==expected); // No B writes, factory, goal, gait or Cancel.
+        auto changed=record;++changed.parameterRevision;changed.movement.after.goal[0]+=1;
+        CHECK(terminal.adapter.Check(changed)==Readiness::Rejected);
+        changed=record;++changed.parameterRevision;changed.movement.primaryFlags^=1U;
+        CHECK(terminal.adapter.Check(changed)==Readiness::Rejected);
+        record.opcode=Op::Release;record.movement={};
+        CHECK(terminal.adapter.Invoke(record)==NativeOutcome::Admitted&&terminal.adapter.ActiveCount()==0);
+    }
     NativeHarness stop;auto rStop=Move();rStop.nativeKind=3;rStop.opcode=Op::Submit;
     rStop.movement.parts=1;rStop.movement.companion={};rStop.movement.companionFlags=rStop.movement.companionRetainedAfter=0;
     rStop.movement.primaryFlags=2;rStop.movement.after=rStop.movement.before;

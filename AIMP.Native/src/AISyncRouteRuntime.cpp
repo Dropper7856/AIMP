@@ -381,6 +381,27 @@ void ObserveHostNavigation(std::uintptr_t n,std::uintptr_t b) noexcept {
         if(!SaveHostMetadata(pin)){++gBlocked;static_cast<void>(host_producer::EngineProducer().BlockRoute(identity,part,route::Failure::Capacity));return;}
         PublishHostPath(pin,10,true);return;
     }
+    // Submit/Update precedes this callback in the shared causal outbox. An
+    // Update can advance the parameter revision without changing B.goal, so
+    // PendingGoalDetour alone cannot publish the graph required by Latest's
+    // exact-revision lookup. Re-capture the installed suffix and preserve the
+    // original admitted prefix through the SAME endpoint proof as a goal edit.
+    // Never merely relabel cached geometry or start a Client connector solve.
+    HostProtection pin{};pin.command=identity;pin.part=part;pin.local={n,b,0,0};
+    auto* metadata=FindHostMetadata(pin);
+    if(!metadata||!metadata->complete||
+        metadata->complete->key.parameterRevision>=identity.parameterRevision)return;
+    // A query, reset or special transition is not a settled installed range.
+    // Its next native admission owns publication; do not turn an observation
+    // during that transition into a command-local Unsupported fence.
+    std::uintptr_t result{},current{},previous{};std::uint32_t state{},mode{};
+    std::uint8_t reset{},dirty{};
+    if(!Read(n+0x5C,result)||result||!Read(n+0x40,current)||current||
+        !Read(n+0x44,previous)||previous||!Read(n+0x48,reset)||reset||
+        !Read(b+0x40,state)||state!=3||!Read(b+0x48,mode)||mode||
+        !Read(b+0x90,dirty)||(dirty&1U))return;
+    pin.auxiliary=metadata->value.auxiliary;pin.statuses=metadata->value.statuses;
+    PublishHostPath(pin,11,false);
 }
 bool QueueCurrent(std::span<const std::uint8_t> bytes,const route::Key& key) noexcept {
     if(Blocked(key)){++gDiscarded;return true;}

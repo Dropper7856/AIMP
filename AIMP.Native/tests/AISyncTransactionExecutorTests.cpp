@@ -315,6 +315,31 @@ void NativeIntentEvidence() {
     CHECK(strict.Configure(scope) == Result::OwnerBusy);
     Accepted(strict, release, true); CHECK(strict.Configure(scope) == Result::Ok);
 }
+void CancelledPassageReservation() {
+    for(const auto mode:{75U,76U,77U,18U,78U,79U})for(const bool entered:{false,true}) {
+        Harness h;TransactionExecutor e(h.Adapter(),{},true);
+        auto r=Base();r.nativeKind=5U;r.mode=mode;
+        CHECK(e.Configure(r.scope)==Result::Ok);Accepted(e,r,false);
+        r=Next(r,Op::Submit);const auto submit=r;
+        h.dependency=entered?Dependency::Ready:Dependency::Waiting;
+        CHECK(e.Execute(r).nativeEntered==entered);
+        r=Next(r,Op::Cancel);h.dependency=Dependency::Ready;
+        const auto cancelled=e.Execute(r);
+        const bool revocable=mode==75U||mode==76U||mode==77U;
+        if(!entered&&!revocable) {
+            CHECK(cancelled.status==ExecutionStatus::Waiting);
+            CHECK(e.Retry(submit).nativeEntered); // Genuine actions retain ordering.
+            CHECK(e.Retry(r).nativeEntered);
+        } else CHECK(cancelled.nativeEntered);
+        if(!entered&&revocable) {
+            CHECK(e.Retry(submit).status==ExecutionStatus::Superseded);
+            CHECK(h.invoked.size()==1U&&h.invoked[0]==Bytes(r));
+        }
+        r=Next(r,Op::Release);Accepted(e,r,true);
+        CHECK(e.Checkpoint(r.scope,r.globalSeq)==Result::Ok);
+        CHECK(!e.HasWaiting()&&!e.HasNativeOwnership(r.owner));
+    }
+}
 
 void NativeIntentOrdering() {
     // Terminals can arrive before the constructor is ready. None may erase its
@@ -923,7 +948,7 @@ void Checkpoints() {
 int main() {
     static_assert(!std::is_copy_constructible_v<TransactionExecutor>);
     static_assert(noexcept(TransactionExecutor(TransactionAdapter{})));
-    AcceptedReplacementFencesLateEdits(); Lifecycle(); ProfileBinding(); NativePipeline(); NativeIntentEvidence(); NativeIntentOrdering();
+    AcceptedReplacementFencesLateEdits(); Lifecycle(); ProfileBinding(); NativePipeline(); NativeIntentEvidence(); NativeIntentOrdering();CancelledPassageReservation();
     Waiting(); IndependentOwners(); Failures(); CallbackReentry();
     ValidationAndOrdering(); MissingAdapterAndTerminals(); Capacity(); Generated(); Checkpoints();
     std::cout << "AISyncTransactionExecutor: 15 groups PASS; 10000 generated traces and 10000 checkpointed commands PASS (offline only)\n";

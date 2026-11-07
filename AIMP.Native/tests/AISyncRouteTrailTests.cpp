@@ -140,6 +140,30 @@ void EndpointEditKeepsBridgedRange() {
     auto truncated=bridged;--truncated.nodeCount;
     Check(!InstalledEndpointRevision(latest,truncated,moved,applied),"terminal mismatch refused");
 }
+void ParameterRevisionKeepsUnconsumedSpecialLinks() {
+    // A gait/stop Update can leave B.goal unchanged while the Host cursor has
+    // advanced. The exact new revision still needs the FULL admitted corridor
+    // for a lagging Client, including the vent link and ordered native tags.
+    auto admitted=Route(10,1,{10,11,12,13,14});
+    admitted.nodes[1].type=1;admitted.nodes[1].markers=0x0807;
+    admitted.nodes[2].markers=9;admitted.nodes[4].markers=11;
+    Check(Validate(admitted)==Result::Ok,"special revision fixture");
+    auto remaining=admitted;remaining.key.parameterRevision=2;
+    remaining.key.routeRevision=1;remaining.nodes={};remaining.nodeCount=3;
+    std::copy_n(admitted.nodes.begin()+2,3,remaining.nodes.begin());
+    remaining.nodes[0].markers=0; // Host consumed this cursor's entry tag.
+    Graph published{};
+    Check(PreserveEndpointPrefix(admitted,remaining,published),"unchanged goal revision certified");
+    auto expected=admitted;expected.key=remaining.key;
+    Check(published==expected,"new revision retains full corridor, vent and tag order");
+    auto changed=remaining;changed.nodes[1].ordinal=99;
+    const auto retained=published;
+    Check(!PreserveEndpointPrefix(admitted,changed,published)&&published==retained,
+        "revision does not relabel a different corridor");
+    changed=remaining;changed.nodes[1].markers=7;
+    Check(!PreserveEndpointPrefix(admitted,changed,published)&&published==retained,
+        "revision does not erase a later transition change");
+}
 void NativeGuidanceKeepsHostBends() {
     using namespace aimp::ai_sync::movement;
     auto graph=Route(50,1,{1,2,3,4});
@@ -447,6 +471,7 @@ int main() {
     RestartsWithoutExactJunction();
     SpecialLinksAndCapacity();
     EndpointEditKeepsBridgedRange();
+    ParameterRevisionKeepsUnconsumedSpecialLinks();
     NativeGuidanceKeepsHostBends();
     ObservedProgressFencesFutureRoute();
     PhysicalTrailSurvivesIntentRevisions();

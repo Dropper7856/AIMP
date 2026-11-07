@@ -471,6 +471,7 @@ void PumpRetirements() noexcept {
     DrainDestroyed();
     if (!gRetireRequested.load(std::memory_order_acquire) && gMailbox.BindingActive() && !gSession->Retired()) return;
     if (!gSession->BeginRetirement()) return;
+    route_execution::RetireScope(gScope);
     gRetireRequested.store(false,std::memory_order_release); gOwnership->RetireAll();
     // Destruction-confirmed leases need no live world/Character access. Their
     // independent Ref can drain even after the old qualification has closed;
