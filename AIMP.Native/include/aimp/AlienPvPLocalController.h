@@ -13,6 +13,7 @@ struct Context {
     std::uint32_t nativeGeneration{};
     std::uint64_t ownerPeer{}, localPeer{};
     bool exclusiveLease{};
+    bool possessionRequested{};
 };
 
 struct Readiness final {

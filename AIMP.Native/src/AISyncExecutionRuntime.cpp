@@ -23,6 +23,7 @@ QualifyScope gQualify{};
 QualifyScope gRetirementQualify{};
 execution::OwnershipAdapter gOwnershipHooks{};
 ReservationQuery gReserved{};
+ReservationQuery gAdmissionReserved{};
 ContextReady gContextReady{};
 PlacementReady gPlacementReady{};
 bool gCommandAdmission{}; // Bootstrap policy, not a wire flag.
@@ -85,7 +86,8 @@ bool ResolveLifecycle(void*,const transactions::OwnerKey& owner,execution::Local
     actor={lifetime.character,lifetime.runtimeId,true,lifetime.creationSerial};return true;
 }
 execution::Readiness ReservedDependency(void*,const transactions::Record& record) noexcept {
-    if(gReserved&&gReserved(record.scope,record.owner,record.globalSeq)&&record.opcode!=transactions::Op::Cancel&&
+    if(((gReserved&&gReserved(record.scope,record.owner,record.globalSeq)) ||
+        (gAdmissionReserved&&gAdmissionReserved(record.scope,record.owner,record.globalSeq)))&&record.opcode!=transactions::Op::Cancel&&
         record.opcode!=transactions::Op::Stop&&record.opcode!=transactions::Op::Complete&&record.opcode!=transactions::Op::Release)
         return execution::Readiness::Waiting;
     return execution::Readiness::Ready;
@@ -165,6 +167,9 @@ transactions::Result Bind(void*, const transactions::Scope& scope, std::uint32_t
 void AdmitWaitingOwner(const transactions::Record& record) noexcept {
     if (!gCommandAdmission || execution::ProfileForKind(record.nativeKind)==execution::kProfileLifecycle || record.nativeKind==native_intent::kKind || record.opcode != transactions::Op::Submit || !gSession->IsWaiting(record) ||
         !MutableOwnership(true)) return;
+    // Reservation is checked before creating an ownership token as well as
+    // before native entry. A reserved manual actor must not get stuck Draining.
+    if (gAdmissionReserved && gAdmissionReserved(record.scope,record.owner,record.globalSeq)) return;
     execution::OwnershipToken token{}; execution::OwnershipPhase phase{};
     if (!gOwnership->Find(record.owner,token,phase)) static_cast<void>(RequestOwnership(record.owner));
     else if (phase == execution::OwnershipPhase::Draining) static_cast<void>(RetryOwnership(record.owner));
@@ -226,7 +231,7 @@ execution::Readiness PermitRetirement(void*, const execution::RetirementIdentity
 }
 bool Initialize(std::uintptr_t base, bool exact, QualifyScope qualify, execution::OwnershipAdapter ownership,
     QualifyScope retirementQualify, bool commandAdmission, ReservationQuery reserved, ContextReady contextReady,
-    PlacementReady placementReady) noexcept {
+    PlacementReady placementReady, ReservationQuery admissionReserved) noexcept {
     if (gSession != nullptr || qualify == nullptr) return false;
     // Partial local adapters must never begin a drain that cannot be retired.
     const bool anyHook = ownership.resolve || ownership.drain || ownership.nativeReleased || ownership.restore || ownership.prepare;
@@ -240,7 +245,7 @@ bool Initialize(std::uintptr_t base, bool exact, QualifyScope qualify, execution
     if (!gSession->Initialize(base, exact, &Permit, &Resolve, nullptr,&ReservedDependency,&ResolveLifecycle)) { gSession.reset(); gOwnership.reset(); return false; }
     gQualify = qualify; gRetirementQualify = retirementQualify; gOwnershipHooks = ownership;
     gCommandAdmission = commandAdmission;
-    gReserved=reserved;gContextReady=contextReady;gPlacementReady=placementReady;
+    gReserved=reserved;gContextReady=contextReady;gPlacementReady=placementReady;gAdmissionReserved=admissionReserved;
     gAvailable.store(true, std::memory_order_release); return true;
 }
 bool QueueBinding(std::span<const std::uint8_t> bytes, std::uint32_t generation) noexcept {

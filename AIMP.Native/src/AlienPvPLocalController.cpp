@@ -347,7 +347,38 @@ void Pump(const Context& context) noexcept {
         context.nativeGeneration!=0U && context.localPeer!=0U &&
         context.ownerPeer==context.localPeer;
     if (!current) {
-        if (gLocal.character!=0U)
+        const bool waiting=context.possessionRequested && context.moduleBase && context.technicalPlayer &&
+            context.nativeGeneration && context.ownerPeer==context.localPeer;
+        if (waiting) {
+            if (gLocal.generation && gLocal.generation!=context.nativeGeneration) Reset(false,false);
+            gLocal.generation=context.nativeGeneration;
+            const auto waitingNow=GetTickCount64();
+            if (!alien_pvp_input::Installed() && waitingNow>=gLocal.nextInputAttemptMs) {
+                gLocal.nextInputAttemptMs=waitingNow+3000U;
+                static_cast<void>(alien_pvp_input::EnsureInstalled(context.moduleBase));
+            }
+            if (!alien_pvp_input::Installed()) return;
+            alien_pvp_input::SetActive(InputAllowed(context.moduleBase));
+            // Keep the original technical identity/home so cancellation also
+            // restores a role which never obtained an Alien camera.
+            if (!gLocal.camera.technical) {
+                CameraBinding camera{};
+                if (!CurrentCameraRoot(context.moduleBase,camera)) return;
+                camera.technical=context.technicalPlayer;camera.generation=context.nativeGeneration;
+                if (!Read(camera.technical+0x50U,camera.technicalRuntime) ||
+                    !Read(camera.technical+kCharacterSkeletonOffset,camera.technicalSkeleton) ||
+                    !TechnicalIdentityCurrent(camera) || !PrepareTechnicalHome(context)) return;
+                gLocal.camera=camera;gCameraBase=context.moduleBase;
+            }
+            // Like the donor, park only after an Alien exists and its camera
+            // can be attached. Moving THE_PLAYER earlier can disturb the map's
+            // initial spawn triggers. The waiting overlay covers the camera.
+            gLocal.visualReady=TechnicalIdentityCurrent(gLocal.camera) &&
+                alien_pvp_visual::HideTechnical(context.technicalPlayer,context.nativeGeneration);
+            alien_pvp::CaptureLocal({});
+            return;
+        }
+        if (gLocal.character!=0U || gLocal.camera.technical!=0U)
             Reset(context.nativeGeneration!=0U && gLocal.generation==context.nativeGeneration,false);
         else alien_pvp_input::SetActive(false);
         return;

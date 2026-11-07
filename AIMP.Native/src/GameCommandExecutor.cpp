@@ -4197,6 +4197,7 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteAlienPvPBind(const std::u
     }
     return {owned,code,
         "Alien PvP native lease: ownerPeer="+std::to_string(status.ownerPeer)+
+        " waitReason="+status.waitReason+
         " entityA="+std::to_string(status.entityA)+
         " entityB="+std::to_string(status.entityB)+
         " runtimeId="+std::to_string(status.runtimeId)+

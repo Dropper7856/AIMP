@@ -5134,6 +5134,11 @@ bool PairTransactionCandidate(const State& state) noexcept {
         state.interactionAuthority!=0U&&state.interactionTransition==1U&&
         (state.stateFlags&InteractionValid)!=0U&&(state.interactionFlags&InteractionActorIsSource)!=0U;
 }
+bool ManualControlReserved(const transactions::Scope&,const transactions::OwnerKey& owner,std::uint64_t) noexcept {
+    // Reservation during discovery grants no native authority. Acquisition
+    // still requires one unique live Alien and a certified per-actor drain.
+    return (gCurrent.flags & kAlienPvP)!=0U && owner.actorClass==1U;
+}
 bool PairTransactionReserved(const transactions::Scope& scope,const transactions::OwnerKey& owner,std::uint64_t globalSeq) noexcept {
     // Receiving an event does not mean its native consequences completed.
     // Later orders wait for this actor's ordered carrier; earlier action
@@ -6139,10 +6144,13 @@ bool HostNativeCaptureGuard() noexcept {
     return HostNativeCaptureQualified();
 }
 bool HostNativeCaptureContext(std::uintptr_t character, transactions::OwnerKey& owner) noexcept {
-    // Old lifecycle completions must remain observable while the fence is
-    // draining. Only a proven owned incarnation has left the Coop producer.
+    // Native retirement remains qualified separately. Manual actors must not
+    // enter the Coop command producer while waiting for their possession.
     if (!HostNativeCaptureGuard() || (gPvPLease.owned && PvPCharacterFenced(character))) return false;
     const auto* actor = Find(character); std::uint32_t runtime{};
+    // Reserve manual Aliens before possession, otherwise the Client's Coop
+    // executor owns the actor before ALIEN_PVP_BIND can acquire it.
+    if (actor && (gCurrent.flags & kAlienPvP) != 0U && actor->characterClass == 1U) return false;
     if (!actor || actor->duplicate || actor->faulted || !actor->birth || !actor->characterClass ||
         (actor->entityA == 0 && actor->entityB == 0) || !Read(character + 0x50U,runtime) || runtime != actor->runtimeId) return false;
     owner = {actor->entityA,actor->entityB,actor->birth,actor->characterClass,transactions::Capability::Movement,
@@ -9632,7 +9640,7 @@ bool Install(const std::uintptr_t base, HookManager& hooks, LevelGenerationTrack
     execution::SetHostProgressQuery(&QueryNativeHostProgress,nullptr);
     const bool ready=execution_runtime::Initialize(base,hooks.ExactBuildValidated(),&ExecutionScopeQualified,
             ownership,&ExecutionRetirementQualified,true,&PairTransactionReserved,&PairTransactionContextReady,
-            &LifecyclePlacementReady) &&
+            &LifecyclePlacementReady,&ManualControlReserved) &&
         host_producer::InstallNative(base,hooks,&HostNativeCaptureContext,&HostNativeCaptureGuard,
             &HostNativeRetirementQualified,error) &&
         marker_identity::Install(base,hooks,&EngineThread,error) &&
@@ -10042,7 +10050,8 @@ void PumpOnEngineThread() noexcept {
     // Only the proven lease owner may issue physical requests on this process.
     const auto pvpPhysicalGeneration=gGenerations->CurrentGeneration();
     const auto currentRole=gRole.load(std::memory_order_acquire);
-    if (gPvPLease.releasing || (gPvPLease.fenced && (gCurrent.flags & kAlienPvP)==0U)) {
+    if (gPvPLease.releasing || (gPvPLease.ownerPeer && ((gCurrent.flags & kAlienPvP)==0U ||
+        gPvPLease.sessionCookie!=gCurrent.sessionCookie || gPvPLease.nativeGeneration!=pvpPhysicalGeneration))) {
         AlienPvPLeaseStatus ignored{};
         static_cast<void>(ReleaseAlienPvPLease(ignored));
     }
@@ -10054,11 +10063,18 @@ void PumpOnEngineThread() noexcept {
         gPvPTechnicalPeer.store(gPvPLease.ownerPeer,std::memory_order_release);
     } else gPvPTechnicalPeer.store(0U,std::memory_order_release);
     const bool localLease=activeLease && gPvPLease.ownerPeer==gCurrent.localPeer;
+    const bool localRequested=(gCurrent.flags & kAlienPvP)!=0U && !gPvPLease.releasing &&
+        gPvPLease.ownerPeer!=0U && gPvPLease.ownerPeer==gCurrent.localPeer &&
+        gPvPLease.sessionCookie==gCurrent.sessionCookie && gPvPLease.nativeGeneration==pvpPhysicalGeneration;
+    if(localRequested) {
+        gPvPTechnicalEpoch.store(gPairBindingEpoch.load(std::memory_order_acquire),std::memory_order_release);
+        gPvPTechnicalPeer.store(gPvPLease.ownerPeer,std::memory_order_release);
+    }
     alien_pvp_local::Pump({gBase,
         localLease?gPvPLease.ticket.character:0U,
-        localLease?LocalPlayer():0U,
+        localRequested?LocalPlayer():0U,
         static_cast<std::uint32_t>(pvpPhysicalGeneration),
-        gPvPLease.ownerPeer,gCurrent.localPeer,localLease});
+        gPvPLease.ownerPeer,gCurrent.localPeer,localLease,localRequested});
     const auto pilot=alien_pvp_local::Snapshot();
     alien_pvp::Context pvp{};
     if(activeLease) {
@@ -10599,7 +10615,8 @@ bool PvPTryDrain(AlienPvPLeaseStatus& status) noexcept {
         return true;
     }
     if(PairSourceBusy(actor->character) || !UnownedCleanupAllowed(*actor)) {
-        gPvPLease.owned=false;status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement);return false;
+        gPvPLease.owned=false;status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement);
+        status.waitReason=PairSourceBusy(actor->character)?"paired-action":"coop-ownership";return false;
     }
     if (!gPvPLease.drained) {
         // All per-actor BT decisions are already fenced, and the exact native
@@ -10656,11 +10673,17 @@ bool AcquireAlienPvPLease(const std::uint64_t ownerPeer, AlienPvPLeaseStatus& st
         status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement);
         return false;
     }
+    // Persist the selected role even before the map creates its Alien. The
+    // local Amanda must be isolated during this wait, not offered as a survivor.
+    if (!gPvPLease.fenced) {
+        gPvPLease.ownerPeer=ownerPeer;gPvPLease.sessionCookie=gCurrent.sessionCookie;
+        gPvPLease.nativeGeneration=gCurrent.nativeGeneration;gPvPLease.worldGeneration=gCurrent.worldGeneration;
+    }
     AlienPvPProbe candidate{};
     if (!ProbeAlienPvPCandidate(candidate)) return false;
     if (!candidate.unique) {
-        status=gPvPLease.fenced ? PvPStatus(AlienPvPLeasePhase::AwaitingRetirement) :
-            AlienPvPLeaseStatus{};
+        status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement);
+        status.waitReason=candidate.candidates==0U?"map-alien-not-created":"multiple-map-aliens";
         if (!gPvPLease.fenced)
             status.phase=candidate.candidates==0U?AlienPvPLeasePhase::WaitingForAlien:
                 AlienPvPLeasePhase::Ambiguous;
@@ -10683,7 +10706,11 @@ bool AcquireAlienPvPLease(const std::uint64_t ownerPeer, AlienPvPLeaseStatus& st
     if (!actor || actor->duplicate || actor->faulted ||
         actor->runtimeId!=candidate.runtimeId || actor->characterClass!=1U ||
         !UnownedCleanupAllowed(*actor) || PairSourceBusy(character)) {
-        status.phase=AlienPvPLeasePhase::AwaitingRetirement;return false;
+        status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement);
+        status.waitReason=!actor?"actor-missing":actor->duplicate?"actor-duplicate":actor->faulted?"actor-faulted":
+            actor->runtimeId!=candidate.runtimeId?"actor-runtime-changed":actor->characterClass!=1U?"actor-class":
+            PairSourceBusy(character)?"paired-action":"coop-ownership";
+        return false;
     }
     character_incarnations::Ticket ticket{};
     auto& registry=character_incarnations::NativeRegistry();
@@ -10692,7 +10719,8 @@ bool AcquireAlienPvPLease(const std::uint64_t ownerPeer, AlienPvPLeaseStatus& st
         found=registry.BindExisting(gCurrent.nativeGeneration,character,candidate.runtimeId,ticket);
     if ((found!=character_incarnations::Result::Ok && found!=character_incarnations::Result::Duplicate) ||
         ticket.runtimeId!=candidate.runtimeId || !ticket.serial || !registry.Current(ticket)) {
-        status.phase=AlienPvPLeasePhase::AwaitingRetirement;return false;
+        status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement);
+        status.waitReason="incarnation-not-current";return false;
     }
     gPvPLease.ticket=ticket;
     gPvPLease.tree=actor->tree;
@@ -10709,7 +10737,7 @@ bool AcquireAlienPvPLease(const std::uint64_t ownerPeer, AlienPvPLeaseStatus& st
 bool ReleaseAlienPvPLease(AlienPvPLeaseStatus& status) noexcept {
     status={};
     if (!EngineThread()) return false;
-    if (!gPvPLease.fenced) { status.phase=AlienPvPLeasePhase::Released; return true; }
+    if (!gPvPLease.fenced) { ForgetPvPLease();status.phase=AlienPvPLeasePhase::Released; return true; }
     // A pending release may span frames. Never rearm the pilot while native
     // workers or paired cycles are still retiring.
     if(!gPvPLease.releasing) {

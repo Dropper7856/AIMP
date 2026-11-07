@@ -5,6 +5,14 @@ namespace AIMP.Launcher;
 
 internal sealed partial class MultiplayerSessionCoordinator
 {
+    // Release world simulation normally so the map can create its Alien. Keep
+    // the local Alien's screen covered until its actual native camera is ready.
+    private Task SendAlienAwareLoadingReleaseAsync(LobbyStartPayload start)
+    {
+        bool alien;
+        lock (_stateGate) alien=start.AlienVsSurvivors && start.AlienPeerId==LocalPeerId();
+        return SendSessionLoadingAsync(start,alien,alien ? "Waiting for the Alien to appear and possession to become ready..." : "Ready");
+    }
     private readonly AlienPvPNetworkBridge _alienPvPNetwork;
     private AlienPvPNetworkBinding CaptureAlienPvPNetworkBinding()
     {
@@ -102,6 +110,15 @@ internal sealed partial class MultiplayerSessionCoordinator
             if (changed)
                 _diagnostics.Log("AlienPvP", (response.Executed ?
                     "Native Alien lease owned: " : "Native Alien lease pending: ") + message);
+            LobbyStartPayload? overlayStart;
+            lock (_stateGate) overlayStart=_loadingHoldStart is null && _start?.AlienVsSurvivors==true &&
+                _start.AlienPeerId==LocalPeerId() ? _start : null;
+            if (overlayStart is not null)
+            {
+                var pilotReady=response.Executed && response.Message.Contains(" localPilotReady=1 ",StringComparison.Ordinal);
+                await SendSessionLoadingAsync(overlayStart,!pilotReady,pilotReady ? "Ready" :
+                    "Waiting for the Alien to appear and possession to become ready...").ConfigureAwait(false);
+            }
             }
             finally { _alienPvPOperationGate.Release(); }
         }

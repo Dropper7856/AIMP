@@ -20,7 +20,7 @@ using PlacementReady = bool(*)(std::uintptr_t character) noexcept;
 [[nodiscard]] bool Initialize(std::uintptr_t imageBase, bool exactBuild, QualifyScope,
     execution::OwnershipAdapter localOwnership = {}, QualifyScope retirementQualify = nullptr,
     bool commandAdmission = false, ReservationQuery reserved = nullptr, ContextReady contextReady = nullptr,
-    PlacementReady placementReady = nullptr) noexcept;
+    PlacementReady placementReady = nullptr, ReservationQuery admissionReserved = nullptr) noexcept;
 // Qualified engine thread only. No network/IPC entry points for these grants.
 [[nodiscard]] execution::OwnershipResult RequestOwnership(const transactions::OwnerKey&) noexcept;
 [[nodiscard]] execution::OwnershipResult RetryOwnership(const transactions::OwnerKey&) noexcept;

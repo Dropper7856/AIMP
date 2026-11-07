@@ -37,9 +37,12 @@ internal sealed partial class MultiplayerSessionCoordinator
         {
             if (_loadingHoldStart is null || now < _nextPreparationProgressUtc) return;
             _nextPreparationProgressUtc = now.AddSeconds(5);
+            var localPeer=LocalPeerId();
+            var expectedHumans=_lobby?.Players.Count(player => player.PeerId!=localPeer &&
+                (_start?.AlienVsSurvivors!=true || player.PeerId!=_start.AlienPeerId)) ?? 0;
             message = $"Loading barrier: overlay={_loadingOverlayAcknowledged}, position={_positionAvailable}, " +
                 $"spawnStable={_gameplayReadiness.IsReady(now)}, localReady={_localGameplayReady}, remoteReady={_remoteGameplayReady}, " +
-                $"characters={_remoteCharacters.Count}/{Math.Max(0, (_lobby?.Players.Count ?? 1) - 1)}, " +
+                $"characters={_remoteCharacters.Count}/{expectedHumans}, " +
                 $"manifest={_loadedManifest is { } loaded && loaded.Native == runtime.LevelGeneration && loaded.Process == runtime.ProcessId}, " +
                 $"world={GetWorldBusLifecycleStateLocked()}, pendingWorld={_activeWorldTransaction is not null}, " +
                 $"dispatches={_worldResultDispatches.Count}, intents={Volatile.Read(ref _queuedWorldIntents)}, " +
@@ -286,7 +289,7 @@ internal sealed partial class MultiplayerSessionCoordinator
             {
                 _diagnostics.Log("Preparation", "Loading screen timeout reached; releasing it automatically.");
                 await SetSessionLoadingHoldAsync(expired, false, _lifetime.Token).ConfigureAwait(false);
-                await SendSessionLoadingAsync(expired, false, "Ready").ConfigureAwait(false);
+                await SendAlienAwareLoadingReleaseAsync(expired).ConfigureAwait(false);
                 lock (_stateGate)
                     if (ReferenceEquals(_loadingHoldStart, expired)) _loadingHoldStart = null;
             }
@@ -305,6 +308,7 @@ internal sealed partial class MultiplayerSessionCoordinator
             // sufficient: keep the opaque screen until every mapping is Ready.
             var localPeer = _host?.HostPeerId ?? _client?.PeerId ?? 0UL;
             if (_lobby.Players.Any(player => player.PeerId != localPeer &&
+                (!current.AlienVsSurvivors || player.PeerId != current.AlienPeerId) &&
                 (!_remoteCharacters.TryGetValue(player.PeerId, out var character) || character == 0U))) return;
             var runtime = _controller.Snapshot;
             if (!runtime.IpcConnected || !runtime.EngineThreadReady) return;
@@ -341,7 +345,7 @@ internal sealed partial class MultiplayerSessionCoordinator
             if (release)
             {
                 await SetSessionLoadingHoldAsync(start, false, _lifetime.Token).ConfigureAwait(false);
-                await SendSessionLoadingAsync(start, false, "Ready").ConfigureAwait(false);
+                await SendAlienAwareLoadingReleaseAsync(start).ConfigureAwait(false);
                 lock (_stateGate)
                     if (_loadingHoldStart?.SessionId == start.SessionId && _loadingHoldStart.LevelGeneration == start.LevelGeneration)
                         _loadingHoldStart = null;

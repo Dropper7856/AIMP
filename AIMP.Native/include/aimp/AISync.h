@@ -395,6 +395,7 @@ struct AlienPvPLeaseStatus final {
     std::uint32_t boundaryOffset{}, boundaryValue{};
     bool isLocalOwner{}, localPilotReady{};
     bool pilotInputIsolated{}, pilotCameraBound{}, pilotTechnicalHidden{}, pilotMoving{};
+    const char* waitReason{"none"}; // static local diagnostic text, never a wire pointer
 };
 bool AcquireAlienPvPLease(std::uint64_t ownerPeer, AlienPvPLeaseStatus& status) noexcept;
 bool ReleaseAlienPvPLease(AlienPvPLeaseStatus& status) noexcept;

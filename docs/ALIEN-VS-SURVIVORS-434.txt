@@ -1,0 +1,63 @@
+Build 434 — possession Alien et preparation de manche
+
+Branche : feature/alien-vs-survivors-main
+API 0.8.4.434 ; DLL 0.11.4.434-alien-vs-survivors ; protocole 36.
+
+Constats des diagnostics 20261107-124706 et 20261107-104709
+
+Les deux instances utilisent le build 433. SET_ALIEN_ROLE et le mode PvP sont
+bien recus. Le joueur selectionne est le client. Aucun bail Alien n'est obtenu :
+WAITING_FOR_SPAWN puis OWNER_BUSY, avec localPilotReady=0. Le client a deja
+effectue une tentative de transfert du controleur Coop (clientHandoffAttempts=1).
+La barriere de preparation du Host attend characters=0/1 : elle exige une
+representation humaine du participant Alien, alors que le chemin d'apparition
+exclut correctement ce participant. Elle finit par etre liberee par timeout.
+
+Corrections
+
+- La barriere attend uniquement les representations des survivants. Les
+  compteurs de diagnostic utilisent maintenant le meme ensemble de participants.
+- Le mode PvP reserve les Aliens contre l'admission du controleur transactionnel
+  Coop des le debut de manche, avant toute demande de possession. Le producteur
+  Host n'emet plus leurs commandes autonomes Coop pendant cette attente. Cette
+  reservation n'accorde pas d'autorite native : le bail exige encore un Alien
+  unique, une incarnation valide et le retrait certifie des ressources natives.
+- Le point d'extension admissionReserved du runtime est distinct des reservations
+  de paires : les captures Coop conservent leur chemin d'acquisition existant.
+- La demande de role est conservee meme lorsque la carte n'a pas encore cree son
+  Alien. L'Amanda technique locale est masquee et ses entrees isolees pendant
+  cette attente. Le parking attend la camera Alien pour conserver les conditions
+  de declenchement initiales de la carte. Identite et position sont conservees pour
+  restauration si le role est annule avant d'avoir obtenu une camera Alien.
+- La simulation du monde est liberee normalement pour laisser avancer les scripts
+  de creation de l'Alien. L'ecran du joueur Alien reste couvert avec un message
+  d'attente jusqu'a confirmation locale localPilotReady=1 (camera/isolement).
+  Ce comportement s'applique aussi au timeout de la barriere generale.
+- Le diagnostic de bail indique waitReason : Alien non cree, candidats multiples,
+  acteur non certifie, reservation Coop, paire active ou incarnation invalide.
+
+Relation avec le mod solo
+
+L'archive donneur jointe a nouveau a le meme SHA-256 que celle deja examinee :
+81585A8554AEADC18CB3845905F9076BF4A4FDDE1492ECD741378B9693DF408E.
+Le controle manuel, la camera, l'isolement de l'Amanda et les actions Alien sont
+adaptes dans AIMP ; la DLL et l'interface completes du mod solo ne sont pas
+injectees en parallele. Le donneur recherche lui aussi un Alien reel. La carte
+doit effectivement le creer ; ce correctif ne remplace pas les scripts de spawn
+par un PNJ arbitraire. Le joueur ne doit plus pouvoir jouer l'Amanda en attendant.
+
+Validation et livraison
+
+Compilation Release MSVC x86 et publication C# x64/injecteur x86 via
+build-alien-api.ps1, BUILD_TESTING=OFF. Aucun test unitaire ajoute ou execute.
+Les instructions de compilation/livraison et les copies sans suppression de
+fichiers destination sont conservees. Logs et preuves :
+  artifacts/alien-possession-433/build-and-delivery-434-final.log
+  artifacts/avs-v417-port/delivery.json
+
+Une compilation et une comparaison de fichiers ne valident pas une possession
+dans AI.exe. Refaire une manche apres fermeture complete du jeu et du launcher
+sur les deux PC. Verifier d'abord que le Host entre normalement dans le monde,
+que le joueur Alien reste en attente pendant le spawn de la carte, puis que sa
+camera suit le vrai Alien. Les journaux doivent ensuite montrer un bail possede
+et localPilotReady=1. Conserver les diagnostics si l'un de ces jalons manque.
