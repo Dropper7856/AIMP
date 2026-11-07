@@ -256,7 +256,8 @@ public static class ModelValidation
     public static void Validate(PlayerSpawnPositionPayload? value)
     {
         if (value is null || value.PeerId == 0 || !ValidSpawnCoordinate(value.X)
-            || !ValidSpawnCoordinate(value.Y) || !ValidSpawnCoordinate(value.Z))
+            || !ValidSpawnCoordinate(value.Y) || !ValidSpawnCoordinate(value.Z)
+            || (value.Character is not null && !PlayerCharacterCatalog.IsKnown(value.Character)))
             throw new ProtocolException("The player spawn position is invalid.");
     }
 
@@ -282,8 +283,10 @@ public static class ModelValidation
             || value.Players.Count is < 2 or > 32)
             throw new ProtocolException("The remote-player spawn request is invalid.");
         foreach (var player in value.Players) Validate(player);
+        var characters = value.Players.Where(player => player.Character is not null).Select(player => player.Character);
         if (value.Players.Select(player => player.PeerId).Distinct().Count() != value.Players.Count
-            || value.Players.All(player => player.PeerId != value.HostPeerId))
+            || value.Players.All(player => player.PeerId != value.HostPeerId)
+            || characters.Distinct(StringComparer.Ordinal).Count() != characters.Count())
             throw new ProtocolException("The remote-player spawn roster is invalid.");
     }
 
@@ -442,6 +445,7 @@ public static class ModelValidation
 
         var peerIds = new HashSet<ulong>();
         var launcherIds = new HashSet<Guid>();
+        var characters = new HashSet<string>(StringComparer.Ordinal);
         var hostCount = 0;
         foreach (var player in value.Players)
         {
@@ -454,6 +458,9 @@ public static class ModelValidation
             {
                 throw new ProtocolException("A lobby player is invalid or duplicated.");
             }
+            if (player.Character is not null
+                && (!PlayerCharacterCatalog.IsKnown(player.Character) || !characters.Add(player.Character)))
+                throw new ProtocolException("A lobby character is invalid or duplicated.");
 
             hostCount += player.IsHost ? 1 : 0;
         }
@@ -1085,8 +1092,11 @@ public static class ModelValidation
             var expected = new HashSet<string>(
                 new[] { "x", "y", "z" },
                 StringComparer.Ordinal);
-            if (value.Arguments.Count != expected.Count
-                || value.Arguments.Keys.Any(key => !expected.Contains(key))
+            // Optional crew representation; omitted means E_RIPLEY.
+            var hasCharacter = value.Arguments.TryGetValue("character", out var characterText);
+            if (value.Arguments.Count != expected.Count + (hasCharacter ? 1 : 0)
+                || value.Arguments.Keys.Any(key => !expected.Contains(key) && key != "character")
+                || (hasCharacter && !PlayerCharacterCatalog.IsKnown(characterText))
                 || !value.Arguments.TryGetValue("x", out var xText)
                 || !value.Arguments.TryGetValue("y", out var yText)
                 || !value.Arguments.TryGetValue("z", out var zText)

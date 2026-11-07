@@ -44,6 +44,7 @@ public sealed partial class LobbyHost : IAsyncDisposable
     private readonly ConcurrentDictionary<ulong, ClientState> _clients = new();
     private readonly CancellationTokenSource _shutdown = new();
     private readonly object _stateLock = new();
+    private readonly Dictionary<ulong, string> _characterByPeer = new();
     private readonly PlayerPositionReceiveWindow _hostPositionWindow = new();
     private readonly object _snapshotPublishLock = new();
     private readonly SemaphoreSlim _admissionGate = new(1, 1);
@@ -943,12 +944,28 @@ public sealed partial class LobbyHost : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         var payload = new SpawnRemotePlayersPayload(SessionId, round.Request.RequestId,
-            HostPeerId, round.Request.LevelGeneration, positions);
+            HostPeerId, round.Request.LevelGeneration, AssignCharacters(positions));
         ModelValidation.Validate(payload);
         await BroadcastAsync(MessageType.SpawnRemotePlayers, JsonPayload.Serialize(payload),
             cancellationToken).ConfigureAwait(false);
         SpawnRemotePlayersRequested?.Invoke(this, payload);
         return payload;
+    }
+
+    // One distinct crew character per player. A player keeps its character for
+    // the whole session (later rounds and levels); departed players free theirs.
+    // The Host is E_RIPLEY, newcomers take the first free one in catalog order.
+    private IReadOnlyList<PlayerSpawnPositionPayload> AssignCharacters(
+        IReadOnlyList<PlayerSpawnPositionPayload> positions)
+    {
+        IReadOnlyDictionary<ulong, string> characters;
+        lock (_stateLock)
+            characters = PlayerCharacterCatalog.Assign(_characterByPeer,
+                positions.Select(p => p.PeerId).ToArray(), HostPeerId);
+        return positions.Select(p => p with
+        {
+            Character = characters.TryGetValue(p.PeerId, out var name) ? name : null
+        }).ToArray();
     }
 
     private GameplayReadyPayload CreateGameplayReady(ulong peerId, int levelGeneration)
@@ -1905,6 +1922,15 @@ public sealed partial class LobbyHost : IAsyncDisposable
         players.AddRange(_clients.Values
             .Select(client => client.ToPlayer())
             .OrderBy(player => player.PeerId));
+        lock (_stateLock)
+        {
+            var characters = PlayerCharacterCatalog.Assign(_characterByPeer,
+                players.Select(player => player.PeerId).ToArray(), HostPeerId);
+            players = players.Select(player => player with
+            {
+                Character = characters.TryGetValue(player.PeerId, out var name) ? name : null
+            }).ToList();
+        }
         var snapshot = new LobbySnapshotPayload(
             SessionId,
             _options.ServerName,

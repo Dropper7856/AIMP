@@ -15,7 +15,7 @@ internal static class GamePreparationSynchronization
 
 public sealed class GamePreparationService
 {
-    private const int RecipeVersion = 12; // Remote crouch animations (ANIMATION.PAK) for the E_RIPLEY representation.
+    private const int RecipeVersion = 13; // Crew representations (E_RIPLEY, DALLAS, PARKER, LAMBERT, ASH) and their ANIMATION.PAK patch.
     private readonly object _sync = new();
     private readonly LauncherSettingsStore _settings;
     private readonly LauncherDiagnostics _diagnostics;

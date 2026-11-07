@@ -2,8 +2,11 @@
 #include "aimp/PlayerTorchRuntime.h"
 #include "aimp/ExperimentalProtocol.h"
 #include "aimp/Common.h"
+#include "aimp/PlayerCharacters.h"
 
+#include <algorithm>
 #include <cstddef>
+#include <tuple>
 #include <cmath>
 #include <limits>
 #include <iostream>
@@ -49,7 +52,7 @@ int main() {
     const auto validLight = light;
     Check(!aimp::player_torch::BuildAimTransform({0, 0, 0}, {2, 3, 4}, light) && light == validLight,
         "Invalid camera ray cannot mutate the transform");
-    static_assert(aimp::kProtocolVersion == 31U);
+    static_assert(aimp::kProtocolVersion == 32U);
     using namespace aimp::player_posture;
     State value{};
     Check(Decode("0,0,0,0,0,0,0", value), "Standing state");
@@ -141,5 +144,33 @@ int main() {
         "Native IPC rejects aim on disabled torch");
     aimp::player_torch::ForgetAll();
     Check(!aimp::player_torch::Snapshot(character).desired, "Torch lifetime cleanup");
+    // Crew representation choice on SpawnCharacter: optional, closed set.
+    const std::string spawnPrefix = R"({"schemaVersion":1,"requestId":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","levelGeneration":3,"portableDummyId":"11111111-1111-1111-1111-111111111111","command":"SpawnCharacter","arguments":{"x":"1.000","y":"2.000","z":"3.000")";
+    for (const auto& [suffix, expected, hash] : {
+        std::tuple{std::string("}}"), true, 0x21F92DEAU},
+        std::tuple{std::string(R"(,"character":"DALLAS"}})"), true, 0xE4CDDDE2U},
+        std::tuple{std::string(R"(,"character":"ASH"}})"), true, 0x5BAD7BDFU},
+        std::tuple{std::string(R"(,"character":"dallas"}})"), false, 0U},
+        std::tuple{std::string(R"(,"character":"BISHOP"}})"), false, 0U},
+        std::tuple{std::string(R"(,"character":null}})"), false, 0U},
+        std::tuple{std::string(R"(,"other":"DALLAS"}})"), false, 0U}}) {
+        aimp::experimental::GameCommandRequest spawn{};
+        const auto json = spawnPrefix + suffix;
+        Check(aimp::experimental::DecodeGameCommand(std::as_bytes(std::span(json.data(), json.size())), spawn)
+            == expected, "IPC spawn character validation");
+        if (!expected) continue;
+        const auto identity = std::find_if(aimp::player_characters::kAll.begin(),
+            aimp::player_characters::kAll.end(), [hash](const auto& c) { return c.nameHash == hash; });
+        Check(spawn.spawnCharacter.characterHash == hash && identity != aimp::player_characters::kAll.end() &&
+            spawn.spawnCharacter.displayModelGuid == identity->displayModelGuid,
+            "IPC spawn character identity decoded");
+    }
+    for (const auto& identity : aimp::player_characters::kAll) {
+        std::uint32_t hash = 2166136261U;
+        for (const auto c : identity.name) { hash ^= static_cast<std::uint8_t>(c); hash *= 16777619U; }
+        Check(hash == identity.nameHash && aimp::player_characters::IsRepresentation(hash),
+            "Crew name hash is the retail FNV-1a identity");
+    }
+    Check(!aimp::player_characters::IsRepresentation(0U), "Unknown database is not a representation");
     return failures == 0 ? 0 : 1;
 }

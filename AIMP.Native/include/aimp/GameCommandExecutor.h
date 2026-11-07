@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include "aimp/PlayerCharacters.h"
 #include "aimp/PlayerPostureRuntime.h"
 #include "aimp/PlayerHidingPresentation.h"
 
@@ -32,6 +33,9 @@ struct SpawnCharacterCommand {
     float x{};
     float y{};
     float z{};
+    // Crew representation identity (PlayerCharacters.h); default E_RIPLEY.
+    std::uint32_t characterHash{player_characters::kDefault.nameHash};
+    std::uint32_t displayModelGuid{player_characters::kDefault.displayModelGuid};
 };
 
 struct CharacterDirectMoveCommand {
