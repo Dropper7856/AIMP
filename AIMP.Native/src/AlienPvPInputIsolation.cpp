@@ -28,6 +28,9 @@ constexpr std::size_t kSlotCount=6U;
 std::array<ImportSlot,kSlotCount> gSlots{};
 std::atomic<bool> gActive{},gInstalled{};
 std::atomic<int> gCameraWheel{};
+std::atomic<bool> gMapMode{};
+std::atomic<bool> gMapClicked{};
+std::atomic<int> gMapX{},gMapY{},gMapWheel{};
 std::uintptr_t gExecutableBase{};
 AsyncKeyFn gOriginalAsync{};
 RawInputFn gOriginalRaw{};
@@ -83,8 +86,15 @@ UINT WINAPI HookRaw(const HRAWINPUT input,const UINT command,
         }
     } else if (raw->header.dwType==RIM_TYPEMOUSE &&
         result>=sizeof(RAWINPUTHEADER)+sizeof(RAWMOUSE)) {
+        const bool map=gMapMode.load(std::memory_order_relaxed);
         if((raw->data.mouse.usButtonFlags&RI_MOUSE_WHEEL)!=0U)
-            gCameraWheel.fetch_add(static_cast<SHORT>(raw->data.mouse.usButtonData),std::memory_order_relaxed);
+            (map?gMapWheel:gCameraWheel).fetch_add(static_cast<SHORT>(raw->data.mouse.usButtonData),std::memory_order_relaxed);
+        if(map) {
+            if((raw->data.mouse.usButtonFlags&RI_MOUSE_LEFT_BUTTON_UP)!=0U)gMapClicked=true;
+            gMapX.fetch_add(raw->data.mouse.lLastX,std::memory_order_relaxed);
+            gMapY.fetch_add(raw->data.mouse.lLastY,std::memory_order_relaxed);
+            raw->data.mouse.lLastX=raw->data.mouse.lLastY=0;
+        }
         raw->data.mouse.usButtonFlags=0U;
         raw->data.mouse.usButtonData=0U;
         raw->data.mouse.ulRawButtons=0U;
@@ -211,9 +221,24 @@ void ResetPublished() noexcept {
 }
 } // namespace
 int TakeCameraWheel() noexcept {return gCameraWheel.exchange(0,std::memory_order_relaxed);}
+void SetMapMode(bool enabled) noexcept {
+    if(gMapMode.exchange(enabled)==enabled)return;
+    gMapX=0;gMapY=0;gMapWheel=0;gMapClicked=false;
+}
+MapPointer TakeMapPointer() noexcept {
+    static float x=480,y=270;
+    if(!gMapMode.load()){x=480;y=270;return {};}
+    x+=static_cast<float>(gMapX.exchange(0));y+=static_cast<float>(gMapY.exchange(0));
+    x=x<0?0:x>960?960:x;y=y<0?0:y>540?540:y;
+    const auto foreground=GetForegroundWindow();DWORD process{};
+    if(foreground)GetWindowThreadProcessId(foreground,&process);
+    const bool focused=process==GetCurrentProcessId();
+    return {x,y,gMapWheel.exchange(0),focused&&(GetAsyncKeyState(VK_LBUTTON)&0x8000)!=0,focused&&gMapClicked.exchange(false)};
+}
 
 bool Installed() noexcept { return gInstalled.load(std::memory_order_acquire); }
 void SetActive(bool enabled) noexcept {
+    if(!enabled)SetMapMode(false);
     gActive.store(enabled && Installed(),std::memory_order_release);
 }
 bool EnsureInstalled(const std::uintptr_t gameModule) noexcept {

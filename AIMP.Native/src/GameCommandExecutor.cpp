@@ -4219,9 +4219,9 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteAlienPvPRelease() const {
         released?"Alien PvP native lease released safely.":
             "Alien PvP release deferred while native requests are in flight."};
 }
-GameCommandExecutionResult GameCommandExecutor::ExecuteAlienPvPVents(std::uint32_t page) const {
+GameCommandExecutionResult GameCommandExecutor::ExecuteAlienPvPVents(std::uint32_t page,int goTo,std::uint64_t incarnation) const {
     std::string json;
-    const bool ready=ai_sync::SnapshotAlienVents(page,json);
+    const bool ready=ai_sync::SnapshotAlienVents(page,json,goTo,incarnation);
     return {ready,ready?"ALIEN_PVP_VENTS_READY":"ALIEN_PVP_NOT_READY",ready?json:"Local Alien ventilation is not ready."};
 }
 

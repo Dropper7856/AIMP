@@ -227,7 +227,10 @@ void Drain(std::uint64_t now) noexcept {
             ApplyAction(f,now);
         } else if(f.kind==Kind::Resolution) {
             ApplyResolution(f,now);
-        } else if(f.kind==Kind::Correction && !g.context.host) {
+        } else if(f.kind==Kind::Correction && (!g.context.host || (f.flags&OwnerMeasured)!=0U)) {
+            // The owner already rendered this measured position. Feeding the
+            // echoed sample back into its predictor creates a latency loop.
+            if(g.context.localOwner && (f.flags&OwnerMeasured)!=0U)continue;
             std::uint8_t initialState{};bool initialBackstage{};
             const bool initialStage=NativeStage(g.context.character,initialState,initialBackstage);
             const bool sameStage=initialStage && initialBackstage==((f.flags&Backstage)!=0U);
@@ -261,12 +264,35 @@ void StopMovement() noexcept {
     g.moving=false;
 }
 void ApplyMovement(std::uint64_t now,float dt) noexcept {
-    if(!g.context.host && !g.aligned){static_cast<void>(StopDonorMovement());ReleaseCarrier();return;}
+    if(!g.context.host && !g.aligned && (g.context.localOwner || !g.correctionAt ||
+        (g.correction.flags&OwnerMeasured)==0U)){static_cast<void>(StopDonorMovement());ReleaseCarrier();return;}
     const bool active=g.window.ActiveAt(now) && !g.deliveryFault;
     const bool fresh=g.context.localOwner ?
         active && g.context.pilotReady && Fresh(now,g.capturedAt,150U) &&
             Fresh(now,g.lastAckAt,kAuthorityTimeoutMs) : g.window.InputFresh(now);
     if(ActionBusy() || g.hasDeferredAction) {static_cast<void>(StopDonorMovement());static_cast<void>(CancelRecovery());ReleaseCarrier();return;}
+    if(active && !g.context.localOwner && g.correctionAt && Fresh(now,g.correctionAt,250U) &&
+        (g.correction.flags&(PoseValid|OwnerMeasured|NativeBusy))==(PoseValid|OwnerMeasured) &&
+        g.context.actions && g.context.actions->replicatePose) {
+        Frame body{};if(!ReadPose(body))return;
+        auto target=g.correction;
+        const float age=std::min(0.05F,static_cast<float>(now-g.correctionAt)/1000.0F);
+        std::uint8_t state{};bool backstage{};
+        const bool transition=NativeStage(g.context.character,state,backstage) && backstage!=((target.flags&Backstage)!=0U);
+        const auto alpha=transition || std::hypot(target.x-body.x,target.z-body.z)>8.0F ? 1.0F : std::min(1.0F,dt*25.0F);
+        target.x=body.x+(target.x+target.velocityX*age-body.x)*alpha;
+        target.z=body.z+(target.z+target.velocityZ*age-body.z)*alpha;
+        target.y=body.y+(target.y-body.y)*alpha;
+        if(g.context.actions->drive) {
+            const auto& input=g.window.Input();
+            static_cast<void>(g.context.actions->drive(g.context,&input));
+        }
+        if(g.context.actions->replicatePose(g.context,target)) {
+            g.appliedInput=g.window.LastInput();g.appliedHost=g.window.LastHost();
+            g.moving=std::hypot(target.velocityX,target.velocityZ)>0.05F;g.aligned=true;
+        }
+        return;
+    }
     std::uint8_t cycle{};bool backstage{};
     const bool stageKnown=NativeStage(g.context.character,cycle,backstage);
     if(fresh && stageKnown && spatial::ManualBackstage(cycle,backstage,false)) {
@@ -410,7 +436,7 @@ void PublishInput(std::uint64_t now) noexcept {
     if(!g.context.localOwner || !g.context.pilotReady || g.deliveryFault || !g.window.Granted() || !g.window.Epoch())return;
     // Do not let a newer steering sequence overtake an unacknowledged click.
     if(g.outbox.Has(Kind::Input))return;
-    if(g.lastInputSent && now-g.lastInputSent<50U && !g.actionCount)return;
+    if(g.lastInputSent && now-g.lastInputSent<16U && !g.actionCount)return;
     if(g.inputSequence==UINT64_MAX)return;
     Frame frame{};frame.kind=Kind::Input;frame.epoch=g.window.Epoch();frame.sequence=++g.inputSequence;
     frame.flags=Flags(now);frame.gait=g.local.gait;frame.forward=g.local.forward;frame.strafe=g.local.strafe;
@@ -495,8 +521,8 @@ void Pump(const Context& context) noexcept {
         if(ReadPose(status))status.flags|=PoseValid;
         Publish(status,now);g.lastStatus=now;
     }
-    if(context.host && g.window.Granted() && g.window.Epoch() &&
-        (!g.lastPose || now-g.lastPose>=50U) && g.poseSequence!=UINT64_MAX) {
+    if((context.host || context.localOwner) && g.window.Granted() && g.window.Epoch() &&
+        (!g.lastPose || now-g.lastPose>=33U) && g.poseSequence!=UINT64_MAX) {
         Frame pose{};pose.kind=Kind::Pose;pose.epoch=g.window.Epoch();pose.sequence=++g.poseSequence;
         pose.flags=Flags(now);pose.hostSequence=g.appliedHost;pose.acknowledgedInput=g.appliedInput;
         pose.gait=g.window.Input().gait;

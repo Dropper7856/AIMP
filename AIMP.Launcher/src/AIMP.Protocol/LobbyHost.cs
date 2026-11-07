@@ -1399,6 +1399,9 @@ public sealed partial class LobbyHost : IAsyncDisposable
                 case MessageType.AlienControlReady:
                     await HandleAlienReadyAsync(state,frame.Payload,cancellationToken).ConfigureAwait(false);
                     break;
+                case MessageType.AlienPoseObservation:
+                    await HandleAlienPoseObservationAsync(state,frame.Payload,cancellationToken).ConfigureAwait(false);
+                    break;
                 case MessageType.AlienControlLease:
                 case MessageType.AlienActionResolved:
                 case MessageType.AlienControlPose:

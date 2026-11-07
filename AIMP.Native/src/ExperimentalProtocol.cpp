@@ -927,7 +927,17 @@ bool DecodeGameCommand(
         }
 
         if(command->stringValue=="ALIEN_PVP_VENTS") {
-            if(arguments->objectValue.size()!=1U)return false;
+            if(arguments->objectValue.size()!=1U && arguments->objectValue.size()!=3U)return false;
+            if(arguments->objectValue.size()==3U) {
+                const auto* go=Field(*arguments,"go",JsonType::String);
+                const auto* serial=Field(*arguments,"incarnation",JsonType::String);
+                if(!go||!serial||go->stringValue.empty()||go->stringValue.size()>4U||serial->stringValue.empty()||serial->stringValue.size()>20U)return false;
+                unsigned index{};std::uint64_t incarnation{};
+                const auto a=std::from_chars(go->stringValue.data(),go->stringValue.data()+go->stringValue.size(),index);
+                const auto b=std::from_chars(serial->stringValue.data(),serial->stringValue.data()+serial->stringValue.size(),incarnation);
+                if(a.ec!=std::errc{}||a.ptr!=go->stringValue.data()+go->stringValue.size()||index>=4096U||b.ec!=std::errc{}||b.ptr!=serial->stringValue.data()+serial->stringValue.size()||!incarnation)return false;
+                output.alienPvPVentGo=static_cast<int>(index);output.alienPvPVentIncarnation=incarnation;
+            }
             const auto* page=Field(*arguments,"page",JsonType::String);
             if(!page || page->stringValue.empty() || page->stringValue.size()>2U)return false;
             std::uint32_t parsed{};const auto* first=page->stringValue.data();const auto* last=first+page->stringValue.size();

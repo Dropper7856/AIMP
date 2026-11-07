@@ -3216,7 +3216,7 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
                 pending->request.command == "ALIEN_PVP_RELEASE") {
                 result = gameCommands_->ExecuteAlienPvPRelease();
             } else if(pending->request.command=="ALIEN_PVP_VENTS") {
-                result=gameCommands_->ExecuteAlienPvPVents(pending->request.alienPvPVentPage);
+                result=gameCommands_->ExecuteAlienPvPVents(pending->request.alienPvPVentPage,pending->request.alienPvPVentGo,pending->request.alienPvPVentIncarnation);
             } else if (
                 pending->request.command == "RETURN_TO_FRONTEND") {
                 result = gameCommands_->ExecuteReturnToFrontend();

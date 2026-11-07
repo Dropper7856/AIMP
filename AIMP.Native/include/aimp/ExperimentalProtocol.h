@@ -51,6 +51,8 @@ struct GameCommandRequest : RequestEnvelope {
     std::string command;
     std::uint64_t alienPvPOwnerPeer{};
     std::uint32_t alienPvPVentPage{};
+    int alienPvPVentGo{-1};
+    std::uint64_t alienPvPVentIncarnation{};
     bool worldSync3EmptyCallbackEnabled{};
     std::string performanceIsolationModule;
     bool performanceIsolationEnabled{};

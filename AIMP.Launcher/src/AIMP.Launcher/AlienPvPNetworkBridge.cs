@@ -117,7 +117,7 @@ internal sealed class AlienPvPNetworkBridge : IDisposable
             while(!_shutdown.IsCancellationRequested)
             {
                 // A timed pump also resends a lost ACK without waiting for new input.
-                await Task.Delay(20,_shutdown.Token).ConfigureAwait(false);
+                await Task.Delay(5,_shutdown.Token).ConfigureAwait(false);
                 if(Interlocked.Exchange(ref _overflow,0)!=0)_transportFault=true;
                 for(var budget=0;budget<32;++budget)
                 {
@@ -303,13 +303,16 @@ internal sealed class AlienPvPNetworkBridge : IDisposable
             else if(b.Client is not null)await b.Client.SendAlienControlAsync(intent,token).ConfigureAwait(false);
             ++_inputs;
         }
-        else if(f.Kind==AlienPvPNativeKind.Pose && b.Host is not null &&
-            f.Flags.HasFlag(AlienPvPNativeFlags.Host) && f.Flags.HasFlag(AlienPvPNativeFlags.PoseValid))
+        else if(f.Kind==AlienPvPNativeKind.Pose && f.Flags.HasFlag(AlienPvPNativeFlags.PoseValid))
         {
-            await b.Host.PublishHostAlienPoseAsync(new(b.Session,b.RoundGeneration,b.OwnerPeer,f.Epoch,
+            var pose=new AlienControlPose(b.Session,b.RoundGeneration,b.OwnerPeer,f.Epoch,
                 f.Sequence,f.HostSequence,f.AcknowledgedInput,f.Scope.EntityA,f.Scope.EntityB,
                 f.X,f.Y,f.Z,f.Yaw,f.VelocityX,f.VelocityZ,f.Gait,
-                f.Flags.HasFlag(AlienPvPNativeFlags.NativeBusy),f.Flags.HasFlag(AlienPvPNativeFlags.Backstage)),token).ConfigureAwait(false);
+                f.Flags.HasFlag(AlienPvPNativeFlags.NativeBusy),f.Flags.HasFlag(AlienPvPNativeFlags.Backstage));
+            if(b.Host is not null && f.Flags.HasFlag(AlienPvPNativeFlags.Host))
+                await b.Host.PublishHostAlienPoseAsync(pose,token).ConfigureAwait(false);
+            else if(b.Client is not null && b.OwnerPeer==b.LocalPeer && f.Flags.HasFlag(AlienPvPNativeFlags.LocalOwner))
+                await b.Client.SendAlienPoseObservationAsync(pose,token).ConfigureAwait(false);
             ++_poses;
         }
         else if(f.Kind==AlienPvPNativeKind.Resolution && b.Host is not null && f.Flags.HasFlag(AlienPvPNativeFlags.Host))
@@ -367,13 +370,14 @@ internal sealed class AlienPvPNetworkBridge : IDisposable
     }
     private async Task HandlePoseAsync(AlienControlPose pose,AlienPvPNetworkBinding b,CancellationToken token)
     {
-        if(b.Host is not null || _lease is not {Active:true} lease || !SameLease(lease,b) ||
+        if((b.Host is not null && !pose.OwnerMeasured) || _lease is not {Active:true} lease || !SameLease(lease,b) ||
             pose.SessionId!=b.Session || pose.LevelGeneration!=b.RoundGeneration || pose.AlienPeerId!=b.OwnerPeer ||
             pose.Epoch!=lease.Epoch || pose.EntityA!=lease.EntityA || pose.EntityB!=lease.EntityB)return;
         await SendNativeAsync(new(){Kind=AlienPvPNativeKind.Correction,Scope=_native!.Frame.Scope,
             Epoch=pose.Epoch,Sequence=pose.Sequence,HostSequence=pose.HostSequence,AcknowledgedInput=pose.AcknowledgedInput,
             Flags=AlienPvPNativeFlags.PoseValid|(pose.NativeBusy?AlienPvPNativeFlags.NativeBusy:AlienPvPNativeFlags.None)|
-                (pose.Backstage?AlienPvPNativeFlags.Backstage:AlienPvPNativeFlags.None),
+                (pose.Backstage?AlienPvPNativeFlags.Backstage:AlienPvPNativeFlags.None)|
+                (pose.OwnerMeasured?AlienPvPNativeFlags.OwnerMeasured:AlienPvPNativeFlags.None),
             X=pose.X,Y=pose.Y,Z=pose.Z,Yaw=pose.Yaw,VelocityX=pose.VelocityX,VelocityZ=pose.VelocityZ,Gait=pose.Gait},token).ConfigureAwait(false);
         ++_poses;
     }

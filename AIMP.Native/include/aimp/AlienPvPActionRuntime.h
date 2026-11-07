@@ -18,5 +18,6 @@ struct ActionHooks final {
     // Donor control.cpp: retained native kind9 MoveInDirection request.
     // Null intent retires it before a vent, pair, recovery or lease release.
     bool (*drive)(const Context&,const Frame* intent) noexcept{};
+    bool (*replicatePose)(const Context&,const Frame&) noexcept{};
 };
 } // namespace aimp::alien_pvp

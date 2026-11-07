@@ -402,7 +402,7 @@ bool ReleaseAlienPvPLease(AlienPvPLeaseStatus& status) noexcept;
 // Copied destructor-return proof, drained on the engine thread.
 void ConfirmAlienPvPDestruction(std::uintptr_t character,std::uint32_t runtime,
     std::uint64_t serial,std::uint32_t nativeGeneration) noexcept;
-bool SnapshotAlienVents(std::uint32_t page,std::string& json);
+bool SnapshotAlienVents(std::uint32_t page,std::string& json,int goTo=-1,std::uint64_t incarnation=0);
 // Engine-thread participant identity for source-attributed native subsystems.
 // Uses the same native generation/lifetime proof as perception; never chooses a
 // target. The launcher's world generation is AISync-private and not compared.

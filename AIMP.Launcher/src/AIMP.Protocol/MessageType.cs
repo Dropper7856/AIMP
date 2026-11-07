@@ -108,7 +108,8 @@ public enum MessageType : ushort
     AlienControlReady = 151, // Native lifetime receipts; clients -> Host.
     AlienControlLease = 152, // Host -> clients; one readiness epoch.
     AlienActionResolved = 154, // Host-native decision; clients cannot propose targets/portals.
-    AlienControlPose = 153, // Host physical outcome only, never client transforms.
+    AlienControlPose = 153, // Host-validated physical outcome.
+    AlienPoseObservation = 155, // Selected owner -> Host, validated before replication.
     AlienControlCommitted = 150, // Host -> Clients: validated player's intent, not Host-generated AI.
 
     TestModeConfigure = 200,

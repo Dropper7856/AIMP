@@ -4,6 +4,7 @@
 #include "aimp/AlienPvPControlRuntime.h"
 #include "aimp/AlienPvPControlPolicy.h"
 #include "aimp/AlienPvPVents.h"
+#include "aimp/AlienPvPInputIsolation.h"
 #include "aimp/AlienPvPVentNode.h"
 #include "aimp/AlienPvPActionPolicy.h"
 #include "aimp/AlienPvPNativeActionAbi.h"
@@ -2554,7 +2555,9 @@ void CaptureCharacterBackstage(Actor& actor) noexcept {
 // RET 4, followed on re-entry by animated Character vfunc+1C / frontstage reset.
 // The native entries update presentation/collision ownership themselves.
 bool SetCharacterBackstage(const std::uintptr_t character, const bool backstage) noexcept {
-    if (!EngineThread() || !Stable() || !Client() || character == 0U) return false;
+    if (!EngineThread() || !Stable() || character == 0U ||
+        (!Client() && !(gPvPLease.owned && gPvPLease.ticket.character==character &&
+            gPvPLease.ownerPeer!=gCurrent.localPeer && PvPLeaseScopeCurrent() && PvPLeaseLiveIdentity()))) return false;
     __try {
         using Set = void(__thiscall*)(void*, std::uint8_t);
         reinterpret_cast<Set>(gBase + kCharacterBackstageRva)(
@@ -10594,6 +10597,38 @@ bool PvPTryClearDrainedNavigation(Actor& actor,
     return true;
 }
 
+// Host-validated owner observations update only the exact possessed replica.
+// Native setters restore visibility/collision when leaving backstage; no raw
+// stage bits are fabricated and active pairs/portals retain their ownership.
+bool PvPShowReplica(std::uintptr_t character) noexcept {
+    __try {reinterpret_cast<void(__thiscall*)(void*,bool)>(gBase+0x0038B100U)(reinterpret_cast<void*>(character),false);return true;}
+    __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+bool ReplicatePvPPose(const alien_pvp::Context& context,const alien_pvp::Frame& pose) noexcept {
+    if(context.localOwner || !context.owned || !PvPLeaseScopeCurrent() || !PvPLeaseLiveIdentity() ||
+        context.character!=gPvPLease.ticket.character || PairSourceBusy(context.character) ||
+        PairReservedCharacter(context.character) || (pose.flags&alien_pvp::OwnerMeasured)==0U)return false;
+    std::uintptr_t cycle{};std::uint8_t state{},a{},b{};
+    if(!Read(context.character+0x36CU,cycle)||!cycle||!Read(cycle+0x1AU,state)||
+        !Read(context.character+0x2DAU,a)||!Read(context.character+0x2DBU,b)||
+        (state!=1U&&state!=55U&&state!=56U&&state!=57U&&state!=59U&&state!=77U))return false;
+    const bool backstage=(pose.flags&alien_pvp::Backstage)!=0U;
+    const character_direct_step_runtime::MovementResourceLease resources(context.character);
+    if(!resources)return false;
+    if(!backstage) {
+        std::uintptr_t withdrawal{};std::uint32_t withdrawState{};
+        if(ResolveAlienWithdrawContext(context.character,withdrawal,withdrawState) && withdrawState &&
+            !ApplyAlienWithdrawEntry(withdrawal,0U))return false;
+    }
+    if((a||b)!=backstage && !SetCharacterBackstage(context.character,backstage))return false;
+    if(!backstage) {
+        std::uint8_t invisible{};
+        if(!Read(context.character+0x2D9U,invisible))return false;
+        if(invisible && !PvPShowReplica(context.character))return false;
+    }
+    const float position[]{pose.x,pose.y,pose.z};
+    return character_direct_step_runtime::ApplyAIRecoveryTransform(context.character,position,pose.yaw);
+}
 #include "AISyncPvPActions.inl"
 
 bool PvPTryDrain(AlienPvPLeaseStatus& status) noexcept {
@@ -10817,7 +10852,7 @@ void ConfirmAlienPvPDestruction(std::uintptr_t character,std::uint32_t runtime,
     std::uint64_t serial,std::uint32_t nativeGeneration) noexcept {
     pvp_actions::DonorDestroyed(character,runtime,serial,nativeGeneration);
 }
-bool SnapshotAlienVents(std::uint32_t page,std::string& json) {
+bool SnapshotAlienVents(std::uint32_t page,std::string& json,int goTo,std::uint64_t incarnation) {
     if(page>=64U || !EngineThread() || !PvPLeaseScopeCurrent() || !PvPLeaseLiveIdentity() ||
         !gPvPLease.owned || gPvPLease.releasing || gPvPLease.ownerPeer!=gCurrent.localPeer ||
         !alien_pvp_local::Drives(gPvPLease.ticket.character,gPvPLease.nativeGeneration))return false;
@@ -10827,6 +10862,7 @@ bool SnapshotAlienVents(std::uint32_t page,std::string& json) {
     alien_pvp::vents::Table table{};alien_pvp::vents::Point body{};
     if(!alien_pvp::vents::ReadTable(gPvPLease.ticket.character,reader,table) ||
         !Read(gPvPLease.ticket.character+0x70U,body))return false;
+    if(goTo>=0 && (incarnation!=gPvPLease.ticket.serial || !alien_pvp_local::GoToVent(static_cast<std::uint32_t>(goTo))))return false;
     const auto ui=alien_pvp_local::VentSnapshot();
     const auto authority=alien_pvp::VentAuthority();
     json="AVSVENTS:{\"scope\":\""+std::to_string(gPvPLease.sessionCookie)+":"+
@@ -10847,7 +10883,33 @@ bool SnapshotAlienVents(std::uint32_t page,std::string& json) {
         comma=true;
         json+="["+std::to_string(i)+","+std::to_string(point[0])+","+std::to_string(point[1])+","+std::to_string(point[2])+"]";
     }
-    json+="]}";return true;
+    json+="],\"maps\":[";
+    // Retail UI configuration used by FUN_00773xxx/FUN_0080bc70. Read only;
+    // original floor movies stay in UI.PAK and are loaded by Scaleform.
+    std::uintptr_t globals{},manager{},config{};std::array<float,11> projection{};
+    bool valid=Read(gBase+0x012F0C88U,globals)&&globals&&Read(globals+0x44U,manager)&&manager&&
+        Read(manager+0xBBCU,config)&&config&&Read(config+0x18U,projection);
+    for(const auto value:projection)valid=valid&&std::isfinite(value)&&std::abs(value)<100000.0F;
+    valid=valid&&std::abs(projection[9])>0.01F&&std::abs(projection[10])>0.01F;
+    comma=false;
+    if(valid)for(unsigned floor=0;floor<6;++floor) {
+        std::uintptr_t name{};if(!Read(config+floor*4U,name)||!name)continue;
+        std::string asset;bool safe=false;
+        for(unsigned n=0;n<95;++n) {
+            char c{};if(!Read(name+n,c))break;
+            if(!c){safe=!asset.empty();break;}
+            if(!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_'))break;
+            asset+=c;
+        }
+        if(!safe)continue;
+        if(comma)json+=",";comma=true;json+="\""+asset+"\"";
+    }
+    json+="],\"projection\":[";
+    if(valid)for(unsigned n=0;n<projection.size();++n){if(n)json+=",";json+=std::to_string(projection[n]);}
+    const auto pointer=alien_pvp_input::TakeMapPointer();
+    json+="],\"mx\":"+std::to_string(pointer.x)+",\"my\":"+std::to_string(pointer.y)+
+        ",\"wheel\":"+std::to_string(pointer.wheel)+",\"down\":"+(pointer.down?"true":"false")+
+        ",\"click\":"+(pointer.clicked?"true":"false")+"}";return true;
 }
 
 bool ProbeAlienPvPCandidate(AlienPvPProbe& result) noexcept {

@@ -16,7 +16,7 @@ internal sealed partial class MultiplayerSessionCoordinator
     private void TryScheduleAlienVentMap(NativeRuntimeSnapshot runtime,DateTimeOffset now)
     {
         if(Volatile.Read(ref _disposed)!=0 || now<_nextAlienVentPoll || Interlocked.CompareExchange(ref _alienVentPollRunning,1,0)!=0)return;
-        _nextAlienVentPoll=now.AddMilliseconds(250);
+        _nextAlienVentPoll=now.AddMilliseconds(50);
         _alienVentPollTask=PollAlienVentMapAsync();
     }
     private async Task PollAlienVentMapAsync()
@@ -58,6 +58,24 @@ internal sealed partial class MultiplayerSessionCoordinator
             }
             // Only the current local Alien's gameplay HUD receives this data.
             if(CaptureAlienPvPNetworkBinding()!=binding)return;
+            var players=new List<string>();
+            lock(_stateGate)
+            {
+                var palette=new[]{"79E9DF","F3C96A","E78CDA","8EB8FF"};
+                var color=0;
+                foreach(var player in (_lobby?.Players??Array.Empty<LobbyPlayer>()).OrderBy(p=>p.PeerId))
+                {
+                    var tint=palette[color++%palette.Length];
+                    if(player.PeerId==binding.OwnerPeer || !_remotePositions.TryGetValue(player.PeerId,out var track))continue;
+                    var snapshot=track.Snapshot();
+                    var pose=snapshot?.Latest;
+                    if(pose is null || pose.SessionId!=binding.Session || pose.LevelGeneration!=binding.RoundGeneration ||
+                        snapshot is null || DateTimeOffset.UtcNow-snapshot.ReceivedAtUtc>TimeSpan.FromSeconds(2))continue;
+                    players.Add(string.Join(',',player.PeerId.ToString(CultureInfo.InvariantCulture),tint,
+                        pose.X.ToString("R",CultureInfo.InvariantCulture),pose.Y.ToString("R",CultureInfo.InvariantCulture),
+                        pose.Z.ToString("R",CultureInfo.InvariantCulture),Uri.EscapeDataString(player.DisplayName)));
+                }
+            }
             await _bridge.SendAsync("ALIEN_VENTS",new Dictionary<string,string>
             {
                 ["active"]="1",["scope"]=scope,["count"]=count.ToString(CultureInfo.InvariantCulture),
@@ -69,7 +87,13 @@ internal sealed partial class MultiplayerSessionCoordinator
                 ["phase"]=root.GetProperty("phase").GetInt32().ToString(CultureInfo.InvariantCulture),
                 ["pending"]=root.GetProperty("pending").GetBoolean()?"1":"0",
                 ["x"]=Number(root.GetProperty("x")),["y"]=Number(root.GetProperty("y")),["z"]=Number(root.GetProperty("z")),
-                ["points"]=string.Join(';',points)
+                ["points"]=string.Join(';',points),["players"]=string.Join(';',players),
+                ["maps"]=string.Join(',',root.GetProperty("maps").EnumerateArray().Select(v=>v.GetString()??string.Empty)),
+                ["projection"]=string.Join(',',root.GetProperty("projection").EnumerateArray().Select(Number)),
+                ["mx"]=Number(root.GetProperty("mx")),["my"]=Number(root.GetProperty("my")),
+                ["wheel"]=root.GetProperty("wheel").GetInt32().ToString(CultureInfo.InvariantCulture),
+                ["down"]=root.GetProperty("down").GetBoolean()?"1":"0",
+                ["click"]=root.GetProperty("click").GetBoolean()?"1":"0"
             },_lifetime.Token).ConfigureAwait(false);
             _alienVentHudVisible=true;
         }
@@ -81,6 +105,19 @@ internal sealed partial class MultiplayerSessionCoordinator
             await HideAlienVentMapAsync().ConfigureAwait(false);
         }
         finally {Interlocked.Exchange(ref _alienVentPollRunning,0);}
+    }
+    private async Task GoToAlienVentAsync(ScaleformBridgeMessage message)
+    {
+        var scope=message.Get("scope","");
+        var binding=CaptureAlienPvPNetworkBinding();
+        if(!binding.Active || binding.LocalPeer!=binding.OwnerPeer || scope!=_alienVentScope ||
+            !scope.StartsWith($"{AISyncCodec.SessionCookie(binding.Session)}:{binding.OwnerPeer}:{binding.NativeGeneration}:{binding.WorldGeneration}:",StringComparison.Ordinal) ||
+            !uint.TryParse(message.Get("vent",""),NumberStyles.None,CultureInfo.InvariantCulture,out var index) || index>=4096)return;
+        var serial=scope[(scope.LastIndexOf(':')+1)..];
+        if(!ulong.TryParse(serial,NumberStyles.None,CultureInfo.InvariantCulture,out var incarnation)||incarnation==0)return;
+        await _controller.ExecuteCommandAsync(GameCommandNames.AlienPvPVents,
+            new Dictionary<string,string>{{"page","0"},{"go",index.ToString(CultureInfo.InvariantCulture)},{"incarnation",serial}},
+            _lifetime.Token,waitForExecution:true,expectedLevelGeneration:binding.NativeGeneration).ConfigureAwait(false);
     }
     private async Task HideAlienVentMapAsync()
     {

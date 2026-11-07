@@ -11,4 +11,7 @@ bool Installed() noexcept;
 void SetActive(bool enabled) noexcept;
 void Uninstall() noexcept;
 int TakeCameraWheel() noexcept;
+void SetMapMode(bool enabled) noexcept;
+struct MapPointer {float x{480},y{270};int wheel{};bool down{},clicked{};};
+MapPointer TakeMapPointer() noexcept;
 } // namespace aimp::alien_pvp_input

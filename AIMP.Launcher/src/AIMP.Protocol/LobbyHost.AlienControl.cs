@@ -111,7 +111,7 @@ public sealed partial class LobbyHost
             lock(_stateLock)
             {
                 changed=EvaluateAlienReadinessLocked(Environment.TickCount64);
-                admitted=_alienAuthority.AdmitPose(pose);
+                admitted=_alienAuthority.AdmitPose(pose,Environment.TickCount64);
             }
             await PublishAlienLeaseAsync(changed,token).ConfigureAwait(false);
             if(!admitted)return;
@@ -119,6 +119,29 @@ public sealed partial class LobbyHost
             await BroadcastAsync(MessageType.AlienControlPose,JsonPayload.Serialize(pose),token).ConfigureAwait(false);
         }
         finally{_alienControlDispatchGate.Release();}
+    }
+    private async Task HandleAlienPoseObservationAsync(ClientState client,ReadOnlyMemory<byte> bytes,CancellationToken token)
+    {
+        var pose=JsonPayload.Deserialize<AlienControlPose>(bytes.Span);
+        AlienControlAuthorityValidation.Validate(pose);
+        if(pose.AlienPeerId!=client.PeerId || client.PeerId==HostPeerId)
+            throw new ProtocolException("Only the selected Alien owner may report its physical observation.");
+        await _alienControlDispatchGate.WaitAsync(token).ConfigureAwait(false);
+        try
+        {
+            AlienControlPose? accepted;
+            AlienControlLease? changed;
+            lock(_stateLock)
+            {
+                changed=EvaluateAlienReadinessLocked(Environment.TickCount64);
+                accepted=_alienAuthority.AdmitOwnerPose(pose,Environment.TickCount64);
+            }
+            await PublishAlienLeaseAsync(changed,token).ConfigureAwait(false);
+            if(accepted is null)return;
+            AlienControlPoseReceived?.Invoke(this,accepted);
+            await BroadcastAsync(MessageType.AlienControlPose,JsonPayload.Serialize(accepted),token).ConfigureAwait(false);
+        }
+        finally {_alienControlDispatchGate.Release();}
     }
     // This entry is local-only, fed by the authenticated native IPC of this
     // Host. Client sockets have no handler that can invoke it.

@@ -26,6 +26,7 @@ struct Readiness final {
 [[nodiscard]] Readiness Snapshot() noexcept;
 struct VentInterface {bool open{},backstage{};int nearby{-1},selected{-1};};
 [[nodiscard]] VentInterface VentSnapshot() noexcept;
+bool GoToVent(std::uint32_t index) noexcept;
 void Pump(const Context& context) noexcept;
 // clearCurrentWorld is false during teardown/physical generation rollover:
 // never dereference old Characters or resurrect a camera from the old world.

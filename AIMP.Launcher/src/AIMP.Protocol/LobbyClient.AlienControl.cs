@@ -10,6 +10,15 @@ public sealed partial class LobbyClient
     public event EventHandler<AlienControlLease>? AlienControlLeaseChanged;
     public event EventHandler<AlienControlPose>? AlienControlPoseReceived;
     public event EventHandler<AlienActionResolution>? AlienActionResolved;
+    public Task SendAlienPoseObservationAsync(AlienControlPose pose,CancellationToken token=default)
+    {
+        AlienControlAuthorityValidation.Validate(pose);
+        lock(_alienControlGate)
+            if(pose.AlienPeerId!=PeerId || pose.SessionId!=SessionId ||
+                _alienControlLease is not {Active:true} lease || pose.Epoch!=lease.Epoch ||
+                pose.LevelGeneration!=lease.LevelGeneration)return Task.CompletedTask;
+        return _connection.SendAsync(MessageType.AlienPoseObservation,JsonPayload.Serialize(pose with {OwnerMeasured=false}),token).AsTask();
+    }
     public Task SendAlienControlAsync(AlienControlIntent intent,CancellationToken cancellationToken=default)
     {
         AlienControlProtocol.Validate(intent);

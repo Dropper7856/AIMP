@@ -10,7 +10,7 @@ public sealed record AlienControlLease(Guid SessionId,int LevelGeneration,ulong 
     ulong Epoch,uint EntityA,uint EntityB,bool Active,IReadOnlyList<AlienControlBinding> Bindings);
 public sealed record AlienControlPose(Guid SessionId,int LevelGeneration,ulong AlienPeerId,
     ulong Epoch,ulong Sequence,ulong HostSequence,ulong AcknowledgedInput,uint EntityA,uint EntityB,
-    float X,float Y,float Z,float Yaw,float VelocityX,float VelocityZ,uint Gait,bool NativeBusy,bool Backstage=false);
+    float X,float Y,float Z,float Yaw,float VelocityX,float VelocityZ,uint Gait,bool NativeBusy,bool Backstage=false,bool OwnerMeasured=false);
 
 public static class AlienControlAuthorityValidation
 {
@@ -56,6 +56,10 @@ public sealed class AlienControlAuthority
     private ulong _owner,_epochCounter,_lastInput,_hostSequence,_lastPose,_lastPoseHost,_lastPoseInput;
     private long _rateAt;
     private int _rateCount;
+    private AlienControlPose? _lastPhysicalPose;
+    private AlienActionResolution? _lastVentResolution;
+    private long _physicalAt,_ventAt;
+    private ulong _observationEpoch,_observationSequence;
     public AlienControlLease? Current {get;private set;}
     public void Begin(Guid session,int generation,ulong owner)
     {
@@ -125,15 +129,46 @@ public sealed class AlienControlAuthority
         if(Current is not {Active:true} c || resolution.SessionId!=_session ||
             resolution.LevelGeneration!=_generation || resolution.AlienPeerId!=_owner ||
             resolution.Epoch!=c.Epoch || resolution.EntityA!=c.EntityA || resolution.EntityB!=c.EntityB)return false;
-        return _actions.Accept(resolution,now);
+        if(!_actions.Accept(resolution,now))return false;
+        if(resolution.Phase==AlienActionPhase.Completed && resolution.Action is AlienAction.EnterVent or AlienAction.ExitVent)
+        {_lastVentResolution=resolution;_ventAt=now;}
+        return true;
     }
-    public bool AdmitPose(AlienControlPose pose)
+    public bool AdmitPose(AlienControlPose pose,long now=0)
     {
         AlienControlAuthorityValidation.Validate(pose);
         if(Current is not {Active:true} c || pose.SessionId!=_session || pose.LevelGeneration!=_generation ||
             pose.AlienPeerId!=_owner || pose.Epoch!=c.Epoch || pose.EntityA!=c.EntityA || pose.EntityB!=c.EntityB ||
             pose.Sequence<=_lastPose || pose.AcknowledgedInput>_lastInput || pose.HostSequence>_hostSequence ||
             pose.AcknowledgedInput<_lastPoseInput || pose.HostSequence<_lastPoseHost)return false;
+        if(_observationEpoch==c.Epoch && _observationSequence>0)return false;
+        _lastPhysicalPose=pose;_physicalAt=now;
         _lastPose=pose.Sequence;_lastPoseInput=pose.AcknowledgedInput;_lastPoseHost=pose.HostSequence;return true;
+    }
+    public AlienControlPose? AdmitOwnerPose(AlienControlPose pose,long now)
+    {
+        AlienControlAuthorityValidation.Validate(pose);
+        if(Current is not {Active:true} c || pose.SessionId!=_session || pose.LevelGeneration!=_generation ||
+            pose.AlienPeerId!=_owner || pose.Epoch!=c.Epoch || pose.EntityA!=c.EntityA || pose.EntityB!=c.EntityB ||
+            pose.NativeBusy || pose.HostSequence>_hostSequence || pose.AcknowledgedInput>_lastInput ||
+            pose.HostSequence<_lastPoseHost || pose.AcknowledgedInput<_lastPoseInput ||
+            _lastPhysicalPose is not { } old || old.Epoch!=c.Epoch || now<_physicalAt)return null;
+        if(_observationEpoch!=c.Epoch){_observationEpoch=c.Epoch;_observationSequence=0;}
+        if(pose.Sequence<=_observationSequence)return null;
+        var dt=Math.Min(1.0,(now-_physicalAt)/1000.0);
+        var dx=pose.X-old.X;var dz=pose.Z-old.Z;
+        var ordinary=pose.Backstage==old.Backstage && Math.Sqrt(dx*dx+dz*dz)<=1.0+30.0*dt &&
+            Math.Abs(pose.Y-old.Y)<=2.0+12.0*dt;
+        var vent=_lastVentResolution;
+        var transition=vent is not null && vent.Epoch==c.Epoch && vent.HostSequence<=pose.HostSequence &&
+            now>=_ventAt && now-_ventAt<=2000 && pose.Backstage==(vent.Action==AlienAction.EnterVent) &&
+            Math.Sqrt(Math.Pow(pose.X-vent.ResolvedX,2)+Math.Pow(pose.Z-vent.ResolvedZ,2))<=6.0 &&
+            Math.Abs(pose.Y-vent.ResolvedY)<=5.0;
+        if(!ordinary && !transition)return null;
+        if(_lastPose==ulong.MaxValue)throw new ProtocolException("Alien pose sequence exhausted.");
+        _observationSequence=pose.Sequence;
+        var accepted=pose with {Sequence=_lastPose+1,OwnerMeasured=true};
+        _lastPose=accepted.Sequence;_lastPoseInput=accepted.AcknowledgedInput;_lastPoseHost=accepted.HostSequence;
+        _lastPhysicalPose=accepted;_physicalAt=now;return accepted;
     }
 }

@@ -677,7 +677,7 @@ void RetirePending() noexcept {
 }
 const ap::ActionHooks hooks{&Begin,&Poll,&Busy,&Cancel,&Recover,&CancelRecovery
 #ifndef AIMP_ALIEN_ACTION_TEST
-    ,&DriveDonor
+    ,&DriveDonor,&ReplicatePvPPose
 #endif
 };
 #undef AIMP_ACTION_TRY

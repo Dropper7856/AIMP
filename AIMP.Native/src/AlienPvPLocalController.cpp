@@ -360,7 +360,7 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
     const bool haveVents=UpdateVentInterface(context,vents);
     const auto wheel=alien_pvp_input::TakeCameraWheel();
     const bool middle=focused && Down(VK_MBUTTON);
-    if(focused && gLocal.camera.bound && !gLocal.camera.firstPerson) {
+    if(focused && gLocal.camera.bound && !gLocal.camera.firstPerson && !gLocal.ventMapOpen) {
         if(middle && !gLocal.middleDown) {
             gLocal.cameraDistance=3.0F;gLocal.cameraHeight=2.0F;gLocal.cameraSide=0.5F;
         }
@@ -401,6 +401,7 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
         }
     }
     gLocal.enterDown=interact;gLocal.exitDown=exit;
+    alien_pvp_input::SetMapMode(gLocal.ventMapOpen && focused);
     const bool left=focused && Down(VK_LEFT),right=focused && Down(VK_RIGHT),confirm=focused && Down(VK_RETURN);
     if(gLocal.ventMapOpen && haveVents) {
         const int direction=right&&!gLocal.ventRight?1:(left&&!gLocal.ventLeft?-1:0);
@@ -551,6 +552,18 @@ Readiness Snapshot() noexcept {
 }
 VentInterface VentSnapshot() noexcept {
     return {gLocal.ventMapOpen,gLocal.wasBackstage,gLocal.nearbyVent,gLocal.selectedVent};
+}
+bool GoToVent(std::uint32_t index) noexcept {
+    if(!gLocal.ventMapOpen || !gLocal.wasBackstage || alien_pvp::VentPending() ||
+        !gLocal.camera.bound || !InputAllowed(gCameraBase))return false;
+    alien_pvp::vents::Table table{};alien_pvp::vents::Point point{};
+    if(!alien_pvp::vents::ReadTable(gLocal.character,&VentRead,table) ||
+        !alien_pvp::vents::ReadPoint(table,index,&VentRead,point))return false;
+    gLocal.selectedVent=static_cast<int>(index);
+    alien_pvp::LocalInput input{};input.focused=true;
+    input.action=alien_pvp::Action::ExitVent;input.selectedVent=true;
+    input.ventX=point[0];input.ventY=point[1];input.ventZ=point[2];
+    alien_pvp::CaptureLocal(input);return true;
 }
 bool Drives(const std::uintptr_t character,const std::uint32_t generation) noexcept {
     return character!=0U && gLocal.character==character &&
