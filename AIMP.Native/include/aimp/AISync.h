@@ -141,7 +141,7 @@ struct State final {
     float position[3]{};
     float yaw{};
     float velocityX{}, velocityZ{};
-    std::uint32_t moveType{};
+    std::uint32_t moveType{}; // Host Movement+194 INPUT; +198 is a local output.
     float locomotionIntensity{};
     std::uint32_t locomotionRevision{};
     // Stable action identity/lifecycle metadata for the certified executable:

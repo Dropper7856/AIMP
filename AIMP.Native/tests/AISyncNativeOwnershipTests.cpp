@@ -1,4 +1,5 @@
 #include "aimp/AISyncNativeOwnership.h"
+#include "aimp/AISyncExecutionCodec.h"
 #include <cstdlib>
 #include <iostream>
 #include <map>
@@ -70,7 +71,7 @@ void FaultsAndLifetimeChanges() {
         static_cast<void>(value);Memory m;m.failAt=address;
         CHECK(m.Inspect()==OwnershipCheck::Unknown);
     }
-    for(const auto at:{baseline.actor.character+0x32CU,Memory::movement+0xC4U+0x5CU}) {
+    for(const auto at:std::array<std::uintptr_t,2>{baseline.actor.character+0x32CU,Memory::movement+0xC4U+0x5CU}) {
         Memory m;m.mutateAt=at;CHECK(m.Inspect()==OwnershipCheck::Unknown&&m.mutated);
     }
     Memory stale;++stale.actor.runtimeId;CHECK(stale.Inspect()==OwnershipCheck::Unknown);
@@ -118,8 +119,73 @@ void ExactNativeExecutionProvenance() {
     m.Put(m.actor.character+0x50U,m.actor.runtimeId+1U);CHECK(!matches());m.Put(m.actor.character+0x50U,m.actor.runtimeId);
     m.failAt=Memory::cycle+0x19U;CHECK(!matches());
 }
+void ExactPassageLifetime() {
+    Memory m;m.actor.creationSerial=11;m.Cycle(0xDBB2A0U,0x4BU);
+    m.Put(Memory::cycle+8U,std::uint8_t{0x20});
+    aimp::ai_sync::transactions::Scope scope{};scope.session[0]=1;scope.authorityEpoch=scope.worldEpoch=scope.consumerEpoch=1;
+    const aimp::ai_sync::transactions::OwnerKey owner{1,2,3,4,aimp::ai_sync::transactions::Capability::Movement,5};
+    const NativeExecutionAnchor anchor{scope,owner,m.actor,Memory::cycle,7};
+    const auto live=[&] {return IsLiveNativePassage({0x400000U,&m,&Memory::Read},anchor,scope,owner,m.actor);};
+    CHECK(live());
+    // The exact serial and class matter even when the engine reuses its cycle allocation.
+    m.Cycle(0xEABF80U,0x4BU);CHECK(!live());m.Cycle(0xDBB2A0U,0x38U);CHECK(!live());
+    m.Cycle(0xDBB2A0U,0x4BU);m.Put(Memory::cycle+0x19U,std::uint8_t{8});CHECK(!live());
+    m.Put(Memory::cycle+0x19U,std::uint8_t{7});
+    for(const auto flags:{0x02U,0x04U,0x06U,0x26U}) {
+        m.Put(Memory::cycle+8U,static_cast<std::uint8_t>(flags));CHECK(!live());
+    }
+    m.Put(Memory::cycle+8U,std::uint8_t{0x20});CHECK(live());
+    m.Put(Memory::cycle+4U,std::uint32_t{0x110000});CHECK(!live());
+    m.Put(Memory::cycle+4U,static_cast<std::uint32_t>(m.actor.character));
+    m.Put(m.actor.character+0x36CU,std::uint32_t{0x210000});CHECK(!live());
+    m.Put(m.actor.character+0x36CU,Memory::cycle);
+    ++scope.consumerEpoch;CHECK(!live());--scope.consumerEpoch;
+    ++m.actor.creationSerial;CHECK(!live());--m.actor.creationSerial;
+    ++m.actor.nativeGeneration;CHECK(!live());--m.actor.nativeGeneration;
+    m.Put(m.actor.character+0x32CU,std::uint32_t{3});CHECK(!live());
+    m.Put(m.actor.character+0x32CU,std::uint32_t{1});
+    m.Put(m.actor.character+0x297U,std::uint8_t{1});CHECK(!live());
+    m.Put(m.actor.character+0x297U,std::uint8_t{});
+    for(const auto at:std::array<std::uintptr_t,9>{m.actor.character+0x50U,m.actor.character+0x36CU,m.actor.character+0x32CU,
+        m.actor.character+0x297U,std::uintptr_t{Memory::cycle},Memory::cycle+4U,Memory::cycle+8U,
+        Memory::cycle+0x19U,Memory::cycle+0x1AU}) {
+        m.failAt=at;CHECK(!live());
+    }
+    m.failAt=0;m.mutateAt=m.actor.character+0x32CU;CHECK(!live()&&m.mutated);
+    for(std::uint32_t state=0;state<=0x5DU;++state)
+        CHECK(OrdinaryPassageTransition(state)==(state==1U||state==2U||state==0x38U||state==0x3BU||state==0x4DU));
+}
+void PassageCausalReplacement() {
+    using namespace aimp::ai_sync::transactions;
+    NativeExecutionAnchor anchor{};anchor.scope.session[0]=1;anchor.scope.consumerEpoch=3;
+    anchor.owner={1,2,3,4,Capability::Movement,5};
+    Record record{};record.scope=anchor.scope;record.owner=anchor.owner;
+    record.globalSeq=82;record.commandId=21;record.opcode=Op::Submit;record.nativeKind=1;
+    const auto supersedes=[&](NativeOutcome outcome=NativeOutcome::Admitted) {
+        return SupersedesNativePassage(anchor,81,20,record,outcome);
+    };
+    CHECK(supersedes());
+    CHECK(!supersedes(NativeOutcome::Rejected)&&!supersedes(NativeOutcome::Unknown));
+    // A continuing Move update and the direct call's immediate retirement do not end75.
+    for(const auto op:{Op::Update,Op::Complete,Op::Release,Op::Cancel,Op::Stop}) {
+        record.opcode=op;CHECK(!supersedes());
+    }
+    record.opcode=Op::Submit;record.globalSeq=81;CHECK(!supersedes());record.globalSeq=82;
+    record.commandId=20;CHECK(!supersedes());record.commandId=21;
+    record.admission=1;CHECK(!supersedes());record.admission=2;CHECK(!supersedes());record.admission=0;
+    ++record.scope.consumerEpoch;CHECK(!supersedes());--record.scope.consumerEpoch;
+    ++record.owner.birth;CHECK(!supersedes());--record.owner.birth;
+    for(const auto kind:{1U,kRelocateKind,kForcedRelocateKind,kDirectRelocateKind,kDirectForcedRelocateKind,kFrontstageKind}) {
+        record.nativeKind=kind;CHECK(supersedes());
+    }
+    for(const auto kind:{2U,3U}) {record.nativeKind=kind;CHECK(!supersedes());}
+    record.nativeKind=kBackstageKind;record.mode=1;CHECK(!supersedes());record.mode=0;CHECK(supersedes());
+    record.nativeKind=aimp::ai_sync::native_intent::kKind;record.commandId=20;record.intent.words[0]=21;
+    record.opcode=Op::Release;CHECK(!supersedes());
+}
 }
 int main() {
     NativeIdleAndCycles();SchedulerAndNavigation();FaultsAndLifetimeChanges();NativeInteractionReplacement();ExactNativeExecutionProvenance();
-    std::cout<<"Native movement boundary: typed Idle, scheduler/navigation retention and lifetime faults PASS (modeled reads only).\n";
+    ExactPassageLifetime();PassageCausalReplacement();
+    std::cout<<"Native ownership: movement boundaries, exact passage lifetime and causal replacement PASS (modeled reads only).\n";
 }

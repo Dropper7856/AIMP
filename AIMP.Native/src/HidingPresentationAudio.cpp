@@ -2,6 +2,8 @@
 #include "aimp/CrashGuard.h"
 #include "aimp/HookManager.h"
 #include "aimp/VoiceNativeAudio.h"
+#include "aimp/Diagnostics.h"
+#include "aimp/RuntimeFeatureFlags.h"
 
 #include <Windows.h>
 #include <array>
@@ -35,9 +37,48 @@ std::mutex gMutex;
 std::atomic<std::uintptr_t> gBase{};
 std::atomic<bool> gReady{}, gFilterInstalled{};
 std::uint64_t gEpoch{};
+struct MetadataRow {
+    std::uint32_t eventId{};
+    std::uintptr_t lastKey{};
+    std::array<char, 96U> name{};
+    std::uint64_t observed{}, suppressed{}, reported{}, lastTick{};
+    float weight{}, threshold{};
+};
+std::array<MetadataRow, 64U> gMetadataRows{};
+std::mutex gMetadataMutex;
+std::atomic<std::uint64_t> gMetadataDropped{}, gMetadataReplaced{};
 
 template<class T> bool Read(std::uintptr_t at, T& value) noexcept {
     return at >= 0x10000U && crash_guard::TryCopy(&value, reinterpret_cast<const void*>(at), sizeof(value));
+}
+void ObserveMetadata(std::uintptr_t specification, std::uintptr_t key,
+    float weight, bool suppressed) noexcept {
+    if (!runtime_features::Enabled(runtime_features::Feature::NativeDiagnostics)) return;
+    std::uintptr_t event{};
+    std::uint32_t eventId{};
+    if (!Read(specification + 0x1CU, event) || !Read(event, eventId)) return;
+    // Native callbacks never wait for diagnostic export and retain no Refs.
+    std::unique_lock lock(gMetadataMutex, std::try_to_lock);
+    if (!lock.owns_lock()) { ++gMetadataDropped; return; }
+    MetadataRow* selected = &gMetadataRows.front();
+    for (auto& row : gMetadataRows) {
+        if (row.observed == 0U || row.eventId == eventId) { selected = &row; break; }
+        if (row.lastTick < selected->lastTick) selected = &row;
+    }
+    auto& row = *selected;
+    if (row.observed == 0U || row.eventId != eventId) {
+        if (row.observed != 0U) ++gMetadataReplaced;
+        row = {}; row.eventId = eventId;
+        std::uintptr_t name{};
+        if (Read(event + 4U, name) && name >= 0x10000U) {
+            for (std::size_t i = 0U; i + 1U < row.name.size(); ++i)
+                if (!Read(name + i, row.name[i]) || row.name[i] == '\0') break;
+        }
+    }
+    ++row.observed;
+    if (suppressed) ++row.suppressed;
+    row.lastKey = key; row.lastTick = GetTickCount64(); row.weight = weight;
+    static_cast<void>(Read(specification + 0x20U, row.threshold));
 }
 bool Match(std::uintptr_t base, std::uintptr_t rva, std::initializer_list<std::uint8_t> bytes) noexcept {
     std::array<std::uint8_t, 16U> actual{};
@@ -174,10 +215,12 @@ void __fastcall MetadataFilter(void* manager, void*, std::uintptr_t specificatio
                 ++slot->diagnostics.metadataObserved; ++slot->diagnostics.metadataSuppressed;
                 slot->diagnostics.metadataWeight = weight;
                 static_cast<void>(Read(specification + 0x20U, slot->diagnostics.metadataThreshold));
+                ObserveMetadata(specification, key, weight, true);
                 return;
             }
         }
     }
+    ObserveMetadata(specification, key, weight, false);
     reinterpret_cast<Metadata>(base + 0x2C00B0U)(manager, specification, key, weight);
 }
 }
@@ -261,5 +304,29 @@ DiagnosticsSnapshot Snapshot(std::uintptr_t character) noexcept {
     auto d = slot != nullptr ? slot->diagnostics : DiagnosticsSnapshot{};
     d.initialized = gReady.load(); d.filterInstalled = gFilterInstalled.load();
     return d;
+}
+void LogMetadataDiagnostics(aimp::Diagnostics& diagnostics) {
+    if (!runtime_features::Enabled(runtime_features::Feature::NativeDiagnostics)) return;
+    std::array<MetadataRow, 64U> rows{};
+    {
+        const std::lock_guard lock(gMetadataMutex);
+        for (std::size_t i = 0U; i < rows.size(); ++i) {
+            auto& row = gMetadataRows[i];
+            if (row.observed == row.reported) continue;
+            rows[i] = row; row.reported = row.observed;
+        }
+    }
+    for (const auto& row : rows) if (row.observed != 0U)
+        diagnostics.Log("info", "native_animation_audio_metadata",
+            "Process-wide retail metadata observations; key is local only. Forwarding does not prove playback or audibility.",
+            {{"eventId", Diagnostics::Unsigned(row.eventId), true}, {"eventName", row.name.data()},
+             {"lastKey", Diagnostics::Pointer(reinterpret_cast<const void*>(row.lastKey))},
+             {"observed", Diagnostics::Unsigned(row.observed), true},
+             {"forwarded", Diagnostics::Unsigned(row.observed - row.suppressed), true},
+             {"suppressed", Diagnostics::Unsigned(row.suppressed), true},
+             {"weight", std::to_string(row.weight)}, {"threshold", std::to_string(row.threshold)},
+             {"sampleTick", Diagnostics::Unsigned(row.lastTick), true},
+             {"dropped", Diagnostics::Unsigned(gMetadataDropped.load()), true},
+             {"replaced", Diagnostics::Unsigned(gMetadataReplaced.load()), true}});
 }
 }

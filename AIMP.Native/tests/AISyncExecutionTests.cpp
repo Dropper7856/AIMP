@@ -15,6 +15,9 @@
 
 namespace aimp::ai_sync::execution {
 struct ExecutionSessionTestAccess {
+    static bool Guidance(ExecutionSession& session,const transactions::Record& r) {
+        return session.GuidanceCurrent(&session,{r.scope,r.owner,r.commandId,{},r.nativeKind,r.parameterRevision});
+    }
     static void Adapter(ExecutionSession& session,transactions::TransactionAdapter adapter) {
         session.executor_.~TransactionExecutor();
         ::new (&session.executor_) transactions::TransactionExecutor(adapter,{},true);
@@ -416,8 +419,46 @@ void PlacementAdapter() {
         SetPlacementDedupReady(false);
         ++r.parameterRevision;Require(adapter.Invoke(r)==NativeOutcome::Rejected,"withdrawn dedup proof allowed placement update");
         r.opcode=Op::Release;r.flags=r.mode=0;r.goalX=r.goalY=r.goalZ=r.aux=0;r.scalarRetention=3;
+        Require(adapter.Check(r)==Readiness::Waiting&&calls.cancels==0&&calls.releases==0&&adapter.ActiveCount()==1,
+            "same-drain Release cancelled placement before native execution");
+        // Native scheduler consumes the retained placement on its next frame.
+        float target[3]{};std::memcpy(target,calls.request.data()+0x1C,sizeof(target));
+        std::memcpy(actor.storage.data()+0x70,target,sizeof(target));
+        *reinterpret_cast<std::uint32_t*>(calls.request.data()+0xC)=3;
         Require(adapter.Invoke(r)==NativeOutcome::Admitted&&adapter.ActiveCount()==0&&calls.cancels==1&&calls.releases==1&&
             calls.control[1]==0&&resourceControl[1]==1,"placement retirement leaked native references");
+    }
+    // Reproduce the actual failure: one engine/IPC drain sees the entire Host
+    // lifecycle before CATHODE receives its next frame. The journal must retain
+    // the Release, block its checkpoint, then settle it once retail finished.
+    {
+        Calls calls{};calls.base=image.Base();SyntheticActor actor;NativeRequestAdapter native;
+        Require(native.Initialize(image.Base(),true,&SyntheticActor::Permit,&SyntheticActor::Resolve,&actor),"placement drain init");
+        std::array<LONG,3> control{0,1,1};std::array<std::uint8_t,0x2C> resource{};
+        const std::uintptr_t pin[]{reinterpret_cast<std::uintptr_t>(resource.data()),reinterpret_cast<std::uintptr_t>(control.data())};
+        std::memcpy(actor.storage.data()+0x42A8,pin,sizeof(pin));
+        NativeRequestAdapterTestAccess::Calls(native,&calls,&Calls::Factory,&Calls::Admit,&Calls::Cancel,&Calls::Release);
+        SetPlacementDedupReady(true);
+        TransactionExecutor journal({&native,[](void* p,const Record& r) {
+            const auto state=static_cast<NativeRequestAdapter*>(p)->Check(r);
+            return state==Readiness::Ready?Dependency::Ready:state==Readiness::Waiting?Dependency::Waiting:Dependency::Reject;
+        },[](void* p,const Record& r){return static_cast<NativeRequestAdapter*>(p)->Invoke(r);}}, {},true);
+        auto begin=Command();begin.nativeKind=kPlacementKind;begin.mode=0;begin.distance=0;
+        Require(journal.Configure(begin.scope)==Result::Ok,"placement drain scope");
+        auto submit=begin;submit.opcode=Op::Submit;submit.globalSeq=submit.ownerSeq=2;
+        auto complete=submit;complete.opcode=Op::Complete;complete.globalSeq=complete.ownerSeq=3;
+        complete.flags=0;complete.goalX=complete.goalY=complete.goalZ=complete.aux=0;complete.scalarRetention=3;
+        auto release=complete;release.opcode=Op::Release;release.globalSeq=release.ownerSeq=4;
+        Require(journal.Execute(begin).acceptedLogical&&journal.Execute(submit).nativeOutcome==NativeOutcome::Admitted&&
+            journal.Execute(complete).acceptedLogical,"placement drain admission");
+        Require(journal.Execute(release).status==ExecutionStatus::Waiting&&native.ActiveCount()==1&&calls.cancels==0,
+            "placement lost its native frame in combined lifecycle drain");
+        Require(journal.Checkpoint(begin.scope,4)==Result::OwnerBusy,"placement checkpoint advanced before native completion");
+        *reinterpret_cast<std::uint32_t*>(calls.request.data()+0xC)=3;
+        Require(journal.Retry(release).nativeOutcome==NativeOutcome::Admitted&&native.ActiveCount()==0&&calls.cancels==1&&calls.releases==1,
+            "placement deferred Release failed or cancelled twice");
+        Require(journal.Checkpoint(begin.scope,4)==Result::Ok,"placement checkpoint stayed blocked after release");
+        SetPlacementDedupReady(false);
     }
 }
 bool PermissionCheck(void* opaque, const Record& record) noexcept {
@@ -590,6 +631,32 @@ void DelayedInteractionReservation() {
         Require(EncodeBatch(batch,bytes)&&session.Handle(bytes,batch.scope,true,receipts,count),"unknown replacement sequence");
         Require(session.ActionReadiness(reference,submit.owner,true)==Action::Rejected,"old history bypassed owner quarantine");
     }
+}
+void GuidedAuthorityStopsAtComplete() {
+    struct Probe {
+        static Dependency Check(void*,const Record&) {return Dependency::Ready;}
+        static NativeOutcome Invoke(void*,const Record&) {return NativeOutcome::Admitted;}
+    };
+    FakeImage image;ExecutionSession session;Context context{&session};
+    Require(session.Initialize(image.Base(),true,&PermissionCheck,&MissingActor,&context),"guidance session init");
+    ExecutionSessionTestAccess::Adapter(session,{nullptr,&Probe::Check,&Probe::Invoke});
+    auto begin=Command();begin.nativeKind=1;begin.flags=begin.mode=0;
+    begin.goalX=begin.goalY=begin.goalZ=begin.distance=0;
+    begin.movement.version=begin.movement.parts=1;begin.movement.navigation=movement::Navigation::HostGuided;
+    Require(session.Configure(begin.scope)==Result::Ok,"guidance session scope");
+    Batch batch{};batch.scope=begin.scope;batch.batchId=1;batch.count=2;batch.records[0]=begin;
+    auto submit=begin;submit.opcode=Op::Submit;submit.globalSeq=submit.ownerSeq=2;batch.records[1]=submit;
+    std::vector<std::uint8_t> bytes;std::array<Receipt,16> receipts{};std::size_t count{};
+    Require(EncodeBatch(batch,bytes)&&session.Handle(bytes,begin.scope,true,receipts,count),"guidance sequence");
+    Require(ExecutionSessionTestAccess::Guidance(session,submit),"admitted Host Move cannot guide");
+    auto stale=submit;++stale.parameterRevision;
+    Require(!ExecutionSessionTestAccess::Guidance(session,stale),"foreign revision can guide");
+    stale=submit;++stale.scope.authorityEpoch;
+    Require(!ExecutionSessionTestAccess::Guidance(session,stale),"foreign authority can guide");
+    auto complete=submit;complete.opcode=Op::Complete;complete.movement={};complete.globalSeq=complete.ownerSeq=3;
+    batch.batchId=2;batch.count=1;batch.records[0]=complete;
+    Require(EncodeBatch(batch,bytes)&&session.Handle(bytes,begin.scope,true,receipts,count),"guidance Complete");
+    Require(!ExecutionSessionTestAccess::Guidance(session,submit),"Complete resurrected a retained Move");
 }
 // Encoded Host sequences through the real session; missing actors keep factories out.
 void ActionSequenceScenarios() {
@@ -821,7 +888,7 @@ void RuntimeOwnership(bool commandAdmission) {
 int main(int argc, char** argv) {
     try {
         Require(argc == 2 || (argc == 3 && std::string(argv[2]) == "--command-admission"), "expected shared execution fixture path");
-        CodecGuards(); PlacementCodec(); Fixture(argv[1]); SessionGuards(); ActionCoordinationGuards(); DelayedInteractionReservation(); ActionSequenceScenarios(); NativeReadiness(); NativeIntentAdapter(); SchedulerControlAdapter(); PlacementAdapter(); RuntimeOwnership(argc == 3);
+        CodecGuards(); PlacementCodec(); Fixture(argv[1]); SessionGuards(); ActionCoordinationGuards(); DelayedInteractionReservation(); GuidedAuthorityStopsAtComplete(); ActionSequenceScenarios(); NativeReadiness(); NativeIntentAdapter(); SchedulerControlAdapter(); PlacementAdapter(); RuntimeOwnership(argc == 3);
         std::cout << "PASS AIEX codec, canonical C++/C# fixture and qualified session guards (no game execution)\n";
         return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

@@ -17,7 +17,10 @@ struct Parameters {
     std::uint32_t flags90{}, flags91{}; // Producer-owned bits only.
     bool operator==(const Parameters&) const noexcept = default;
 };
-enum class Navigation : std::uint32_t { LocalNative = 1, HostRoute = 2 };
+enum class Navigation : std::uint32_t { LocalNative = 1, HostRoute = 2, HostGuided = 3 };
+[[nodiscard]] constexpr bool CarriesRoute(Navigation policy) noexcept {
+    return policy==Navigation::HostRoute||policy==Navigation::HostGuided;
+}
 struct Bundle {
     std::uint32_t version{}, parts{}, gait{};
     Navigation navigation{};

@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <string>
 
-namespace aimp { class HookManager; }
+namespace aimp { class HookManager; class Diagnostics; }
 namespace aimp::hiding_presentation_audio {
 
 struct AuthoredEvent final { const char* name{}; std::uint32_t animation{}; };
@@ -21,6 +21,9 @@ bool Initialize(std::uintptr_t moduleBase, std::string& error) noexcept;
 // explicit posts suppress only that same event on the exact admitted remote
 // cycle. Other actors, animations and metadata retain the original consumer.
 bool InstallMetadataFilter(HookManager&, std::string& error);
+// Passive, bounded observation of the existing retail metadata call. Counts
+// are process-wide: forwarding is not proof of successful playback/audibility.
+void LogMetadataDiagnostics(aimp::Diagnostics&);
 // Engine thread, after successful remote scripted-clip admission. Caller owns
 // the Character lifetime. effectiveAge includes network age and local waiting.
 // Consumes each revision once, including baseline/stale/failed attempts. A true

@@ -18,6 +18,21 @@
 
 int main(int argc,char** argv) {
     using namespace aimp::ai_sync;
+    // A Host refusal must take the native failed-source epilogue, while a
+    // duplicate/current authoritative pair and every Client remain protected.
+    for (const auto role : {Role::Retail,Role::Host,Role::Client,Role::FrozenClient})
+        for (const bool carrier : {false,true})
+            for (const bool duplicate : {false,true})
+                for (const bool remote : {false,true}) {
+                    const auto plan=PlanPairedPreparation(role,carrier,duplicate,remote,false);
+                    if(duplicate)assert(plan==PairedPreparationPlan::Ignore);
+                    else if(carrier)assert(plan==PairedPreparationPlan::Prepare);
+                    else if(role==Role::Host&&remote)assert(plan==PairedPreparationPlan::AbortHostSource);
+                    else if(role==Role::Client||role==Role::FrozenClient||remote)
+                        assert(plan==PairedPreparationPlan::Ignore);
+                    else assert(plan==PairedPreparationPlan::Prepare);
+                }
+    assert(PlanPairedPreparation(Role::Client,false,false,false,true)==PairedPreparationPlan::Ignore);
     for(const auto id:{1U,2U,7U}) {
         // Observed reaction53 -> exact Host37 exit cannot be metadata only.
         assert(!HybridMayConsumeConstructor(id,0xEACE68U,0x53U));
@@ -36,6 +51,8 @@ int main(int argc,char** argv) {
     for(unsigned mask=0;mask<32U;++mask)
         assert(DeferredSourceEndReady((mask&1U)!=0U,(mask&2U)!=0U,(mask&4U)!=0U,
             (mask&8U)!=0U,(mask&16U)!=0U)==(mask==31U));
+    for(unsigned mask=0;mask<16U;++mask)
+        assert(DeadVictimNativeEndReady((mask&1U)!=0U,(mask&2U)!=0U,(mask&4U)!=0U,(mask&8U)!=0U)==(mask==15U));
     // Cycle 57 takes float bits, including values whose bit pattern can name
     // readable memory. Their portability must never depend on VirtualQuery.
     const auto* scalarCycle=FindExecutionTransitionContract(0xEAD918U,0x57U);

@@ -6,87 +6,6 @@ namespace AIMP.Launcher;
 internal sealed record AISyncHostBinding(LobbyHost? Host, Guid Session, int WorldGeneration,
     int NativeGeneration, int ProcessId, Guid ConnectionIdentity, long Epoch, bool Active);
 
-// The producer owns the decision stream. Fan-out changes only consumerEpoch;
-// it never derives a command from a pose, shadow observation or Client packet.
-// Native command admission stays in the ledger. This selects only which already
-// Waiting receipt to retry first; it never skips wire records or fabricates
-// admission. Irreversible calls and cleanup remain causally ordered.
-internal static class AISyncIntentRetryPriority
-{
-    internal static ulong Select(IEnumerable<AISyncTransaction> pending)
-    {
-        var ordered = pending.OrderBy(operation => operation.GlobalSequence).ToArray();
-        if (ordered.Length == 0) return 0;
-        var latest = ordered[^1];
-        var prior = ordered.AsSpan(0, ordered.Length - 1);
-        if (latest.Opcode == AISyncTransactionOpcode.Submit && latest.NativeAdmission == 0
-            && Replaceable(latest.NativeKind))
-        {
-            var canPreempt = true;
-            foreach (var operation in prior)
-                if (!Replaceable(operation.NativeKind)
-                    || operation.Opcode is not (AISyncTransactionOpcode.Submit or AISyncTransactionOpcode.Update))
-                { canPreempt = false; break; }
-            if (canPreempt) return latest.GlobalSequence;
-        }
-        if (latest.Opcode == AISyncTransactionOpcode.Update && Replaceable(latest.NativeKind))
-        {
-            var canCoalesce = true;
-            foreach (var operation in prior)
-                if (operation.Opcode != AISyncTransactionOpcode.Update
-                    || operation.CommandId != latest.CommandId
-                    || operation.NativeKind != latest.NativeKind
-                    || operation.ParameterRevision >= latest.ParameterRevision)
-                { canCoalesce = false; break; }
-            if (canCoalesce) return latest.GlobalSequence;
-        }
-        return ordered[0].GlobalSequence;
-    }
-
-    // Exact native kinds whose unentered scalar work the C++ ledger already
-    // supersedes for admission=0 and for same-command parameter revisions.
-    // Kind 2 (marker), 5 (action), 8 (placement), scheduler controls and native
-    // constructors must never be reordered by this retry optimization.
-    private static bool Replaceable(uint nativeKind) => nativeKind is 1 or 3 or 4 or 7 or 9;
-}
-
-// Retry attempts are scheduling hints, not a replacement for causal AIEX
-// records. Return at most ONE eligible candidate per actor and a bounded
-// rotating subset per tick; never discard or rewrite an old wire operation.
-internal static class AISyncRetryPlanner
-{
-    internal const int MaxHostPerTick = 8, MaxLocalPerTick = 8;
-    internal const long HostRetryIntervalMs = 120, LocalRetryIntervalMs = 80;
-
-    internal static (ulong Peer, ulong Sequence)[] ChooseCycle(
-        IEnumerable<(ulong Peer, AISyncTransaction Operation)> waiting, int limit, ref int cursor)
-    {
-        if (limit <= 0) return Array.Empty<(ulong, ulong)>();
-        var groups = waiting
-            .GroupBy(p => (p.Peer, p.Operation.EntityA, p.Operation.EntityB,
-                p.Operation.Birth, p.Operation.CharacterClass,
-                p.Operation.Capability, p.Operation.OwnerEpoch))
-            .Select(g => new
-            {
-                g.Key.Peer,
-                First = g.Min(p => p.Operation.GlobalSequence),
-                Sequence = AISyncIntentRetryPriority.Select(g.Select(p => p.Operation))
-            })
-            .Where(p => p.Sequence != 0)
-            .OrderBy(p => p.First).ThenBy(p => p.Peer).ToArray();
-        if (groups.Length == 0) { cursor = 0; return Array.Empty<(ulong, ulong)>(); }
-        var start = (int)((uint)cursor % (uint)groups.Length);
-        var count = Math.Min(limit, groups.Length);
-        var selected = new (ulong Peer, ulong Sequence)[count];
-        for (var i = 0; i < count; ++i)
-        {
-            var group = groups[(start + i) % groups.Length];
-            selected[i] = (group.Peer, group.Sequence);
-        }
-        cursor = (start + count) % groups.Length;
-        return selected;
-    }
-}
 
 // A terminal native receipt is evidence that this executable scope cannot
 // reach a settled checkpoint. Neither a rejected call nor an uncertain
@@ -129,7 +48,7 @@ internal sealed partial class AISyncHostBridge : IDisposable
     private readonly CancellationTokenSource _shutdown = new();
     private readonly Dictionary<ulong, AISyncExecutionScope> _peers = new();
     private readonly Dictionary<(ulong Peer, ulong Sequence), Waiting> _waiting = new();
-    private int _hostRetryCursor;
+    private readonly AISyncRetryPlanner _retryPlanner = new();
     private ulong _hostRetriesAttempted, _hostRetryCooling;
     private long _maxHostWaitingAge;
     private long _lastHostRetryLog;
@@ -231,10 +150,11 @@ internal sealed partial class AISyncHostBridge : IDisposable
         await RefreshBindingAsync().ConfigureAwait(false);
         ProcessQueued();
         if (_binding is null || _scope is null) return;
-        if (await RecoverNativeFaultAsync().ConfigureAwait(false)) return;
+        var retries = RetryHeads();
+        if (await RecoverNativeFaultAsync(retries).ConfigureAwait(false)) return;
         ValidateRoster();
         await OfferSourceAsync().ConfigureAwait(false);
-        if (_ready) { RetryWaiting(); await CheckpointAsync().ConfigureAwait(false); }
+        if (_ready) { RetryWaiting(retries); await CheckpointAsync().ConfigureAwait(false); }
         LogRetryLatency();
     }
     private async Task RefreshBindingAsync()
@@ -306,7 +226,7 @@ internal sealed partial class AISyncHostBridge : IDisposable
         _log($"Client execution roster Ready, offering Host source: round={_binding!.WorldGeneration}, authority={_scope!.Value.AuthorityEpoch}.");
         await SendAsync(_binding!, new(_scope!.Value, AISyncExecutionControlKind.Offer, _profiles)).ConfigureAwait(false);
     }
-    private async Task<bool> RecoverNativeFaultAsync()
+    private async Task<bool> RecoverNativeFaultAsync(KeyValuePair<(ulong Peer, ulong Sequence), Waiting>[] retries)
     {
         if (_nativeFault is null && _ready)
         {
@@ -315,7 +235,7 @@ internal sealed partial class AISyncHostBridge : IDisposable
             // timeout on captures, placement, markers or Release. The next
             // authority epoch must re-establish native resources from scratch.
             var now = Environment.TickCount64;
-            foreach (var pair in RetryHeads())
+            foreach (var pair in retries)
             {
                 if (!AISyncNativeRecoveryPolicy.MovementTimedOut(
                     pair.Value.Operation, now - pair.Value.FirstTick)) continue;
@@ -348,10 +268,10 @@ internal sealed partial class AISyncHostBridge : IDisposable
         await RetireAsync().ConfigureAwait(false);
         return true;
     }
-    private void RetryWaiting()
+    private void RetryWaiting(KeyValuePair<(ulong Peer, ulong Sequence), Waiting>[] retries)
     {
         var now = Environment.TickCount64;
-        foreach (var pair in RetryHeads())
+        foreach (var pair in retries)
         {
             _maxHostWaitingAge = Math.Max(_maxHostWaitingAge, Math.Max(0, now - pair.Value.FirstTick));
             if (now - pair.Value.Tick < AISyncRetryPlanner.HostRetryIntervalMs)
@@ -364,8 +284,8 @@ internal sealed partial class AISyncHostBridge : IDisposable
     }
     private KeyValuePair<(ulong Peer, ulong Sequence), Waiting>[] RetryHeads()
     {
-        var chosen = AISyncRetryPlanner.ChooseCycle(_waiting.Select(p => (p.Key.Peer, p.Value.Operation)),
-            AISyncRetryPlanner.MaxHostPerTick, ref _hostRetryCursor);
+        var chosen = _retryPlanner.ChooseCycle(_waiting.Select(p => (p.Key.Peer, p.Value.Operation)),
+            AISyncRetryPlanner.MaxHostPerTick);
         return chosen.Where(key => _waiting.ContainsKey(key))
             .Select(key => new KeyValuePair<(ulong Peer, ulong Sequence), Waiting>(
                 key, _waiting[key])).ToArray();
@@ -539,7 +459,7 @@ internal sealed partial class AISyncHostBridge : IDisposable
         _binding = null; _scope = null; _journal = null; _ready = false; _offered = false;
         _routes?.Fence(); _routes = null;
         _peers.Clear(); _waiting.Clear(); _nativeFault = null;
-        _hostRetryCursor = 0; _maxHostWaitingAge = 0; _lastHostRetryLog = 0;
+        _retryPlanner.Reset(); _maxHostWaitingAge = 0; _lastHostRetryLog = 0;
         _hostRetriesAttempted = _hostRetryCooling = 0;
         ResetCheckpoint();
         Interlocked.Exchange(ref _lossEpoch, long.MinValue);

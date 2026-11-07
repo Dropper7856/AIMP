@@ -17,6 +17,12 @@ using Qualify = bool(*)(const transactions::Scope&) noexcept;
 // These static contracts do not certify runtime corridor/traversal fidelity.
 [[nodiscard]] bool Install(std::uintptr_t,HookManager&,EngineThread,Qualify,std::string&);
 [[nodiscard]] bool Offer(const route::Graph&) noexcept;
+// Borrowed only for the synchronous engine-thread call. Nodes guide native
+// goals; they grant neither request ownership nor a Character transform.
+// Parameter-only revisions may retain older geometry for the exact command
+// and unchanged authored goal. The importer still requires its exact key.
+[[nodiscard]] const route::Graph* Guidance(const execution::NavigationBinding&,
+    const std::array<float,3>& authoredGoal) noexcept;
 void Pump() noexcept;
 // Original Character destruction returned for this exact local construction.
 // Does not itself release storage or imply that native B/R lists are empty.
@@ -41,7 +47,7 @@ void EndAdmission(std::uintptr_t navigation) noexcept;
 [[nodiscard]] bool NativeHandoffCandidate(std::uintptr_t character) noexcept;
 [[nodiscard]] route::NativeHandoffResult ObserveNativeHandoff(std::uintptr_t character,
     std::uint64_t now,bool valid,const std::array<float,3>& local,
-    const std::array<float,3>& host,bool hostMoving,bool suspended) noexcept;
+    const std::array<float,3>& host,bool hostMoving,bool suspended,bool discontinuity) noexcept;
 struct HandoffReport {std::uint64_t candidates{}, confirmed{}, stalled{};};
 [[nodiscard]] HandoffReport NativeHandoffDiagnostics() noexcept;
 // Called only after the engine accepted a new full execution scope. Old
@@ -61,6 +67,10 @@ struct Counters {
     std::uint64_t appendPublished{},continuationPublished{},compoundRequests{};
     std::uint32_t lastAdmissionMode{},lastIncomingCount{},lastCompoundParts{};
     std::uint64_t corridorJoins{}; // routes admitted from the actor's area on the Host corridor
+    // Routes admitted from the actor's area on the Host's recent trail (actor
+    // behind the new Host start), and 203 refusals the trail could not bridge.
+    std::uint64_t trailBridges{},trailMisses{};
+    std::uint32_t trailMissDetail{}; // see BridgeTrail
 };
 [[nodiscard]] Counters Diagnostics() noexcept;
 // Copied values only. Wait reasons: 1=start area, 2=native boundary busy,

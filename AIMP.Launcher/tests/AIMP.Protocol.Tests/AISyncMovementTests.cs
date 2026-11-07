@@ -28,6 +28,11 @@ internal static class AISyncMovementTests
         AssertEx.Equal(484, packet.Length); AssertEx.Equal((ushort)2, BinaryPrimitives.ReadUInt16LittleEndian(packet.AsSpan(4)));
         AssertEx.Equal(move, AISyncExecutionCodec.DecodeBatch(packet, scope).Records.Single());
         AssertEx.SequenceEqual(ReadFixture(), packet);
+        var guided = move with { Movement = move.Movement with { Navigation = AISyncMovementNavigation.HostGuided } };
+        var guidedBytes = AISyncExecutionCodec.EncodeBatch(new(scope, 2, new[] { guided }));
+        AssertEx.Equal(guided, AISyncExecutionCodec.DecodeBatch(guidedBytes, scope).Records.Single());
+        AssertEx.False(AISyncExecutionControlCodec.Allows((uint)AISyncExecutionProfiles.Move, guided));
+        AssertEx.True(AISyncExecutionControlCodec.Allows((uint)AISyncExecutionProfiles.Move | 8U, guided));
         var receipt = new AISyncExecutionReceipt(scope, 1, move, AISyncExecutionStage.Waiting, AISyncExecutionResult.OwnerBusy);
         var bytes = AISyncExecutionCodec.EncodeReceipt(receipt);
         AssertEx.Equal(AISyncExecutionCodec.ReceiptBytes + AISyncExecutionCodec.ExtendedRecordBytes - AISyncTransactionCodec.RecordBytes, bytes.Length); AssertEx.Equal(receipt, AISyncExecutionCodec.DecodeReceipt(bytes, scope));

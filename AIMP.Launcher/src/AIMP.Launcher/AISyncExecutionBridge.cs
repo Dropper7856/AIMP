@@ -44,7 +44,7 @@ internal sealed class AISyncExecutionBridge : IDisposable
     // that round trip drained a backlog at ~55 ms per operation and made the
     // Client Alien start/stop moves far behind the Host.
     private readonly Dictionary<ulong, (AISyncExecutionReceipt Receipt, long Tick, long FirstTick)> _localWaiting = new();
-    private int _localRetryCursor;
+    private readonly AISyncRetryPlanner _retryPlanner = new();
     private ulong _localRetries, _localRetryCooling;
     private long _maxLocalWaitingAge;
     private long _openedAt, _lossEpoch = long.MinValue;
@@ -149,10 +149,10 @@ internal sealed class AISyncExecutionBridge : IDisposable
         // One native retry per actor, at most eight per tick. The ledger will
         // still receive all original ordered records; stale retry receipts
         // settle naturally as Superseded without consuming the whole IPC budget.
-        var chosen = AISyncRetryPlanner.ChooseCycle(_localWaiting.Values
+        var chosen = _retryPlanner.ChooseCycle(_localWaiting.Values
             .Where(w => w.Receipt.Scope == _scope)
             .Select(w => (Peer: 0UL, Operation: w.Receipt.Operation)),
-            AISyncRetryPlanner.MaxLocalPerTick, ref _localRetryCursor);
+            AISyncRetryPlanner.MaxLocalPerTick);
         foreach (var (_, sequence) in chosen)
         {
             if (!_localWaiting.TryGetValue(sequence, out var waiting)) continue;
@@ -246,7 +246,7 @@ internal sealed class AISyncExecutionBridge : IDisposable
         }
         if (_scope is not null) await RetireAsync(AISyncExecutionRecovery.RestartRequired).ConfigureAwait(false);
         _scope = control.Scope; _profiles = control.Value; _nativeBinding = work.Binding;
-        _localWaiting.Clear(); _localRetryCursor = 0;
+        _localWaiting.Clear(); _retryPlanner.Reset();
         _waitingReady = true; _openedAt = Environment.TickCount64;
         await SendAsync(MessageType.AISyncExecutionBinding, work.Binding, work.Bytes, _shutdown.Token).ConfigureAwait(false);
     }
@@ -365,7 +365,7 @@ internal sealed class AISyncExecutionBridge : IDisposable
     {
         var scope = _scope; var binding = _nativeBinding;
         _scope = null; _nativeBinding = null; _waitingReady = false;
-        _diagnosticSent.Clear(); _localWaiting.Clear(); _localRetryCursor = 0;
+        _diagnosticSent.Clear(); _localWaiting.Clear(); _retryPlanner.Reset();
         _localRetryCooling = 0; _maxLocalWaitingAge = 0;
         // The Host reopens with a new authority epoch; an old overflow must
         // not refuse that fresh offer for the rest of the round.

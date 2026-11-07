@@ -64,7 +64,7 @@ public sealed class AISyncRouteJournal
             _commands[id] = new(r.ParameterRevision, r.NativeKind, r.Movement.Parts,
                 submitted || previous?.Submitted == true, terminal,
                 r.Opcode == AISyncTransactionOpcode.Release || previous?.Released == true, r.GlobalSequence,
-                r.Movement.Version != 0 ? r.Movement.Navigation == AISyncMovementNavigation.HostRoute : previous?.Authoritative == true);
+                r.Movement.Version != 0 ? r.Movement.Navigation is AISyncMovementNavigation.HostRoute or AISyncMovementNavigation.HostGuided : previous?.Authoritative == true);
             if (terminal || previous?.Revision != r.ParameterRevision) Expire(id);
         }
         return true;
@@ -76,7 +76,7 @@ public sealed class AISyncRouteJournal
     }
     public bool Knows(AISyncRouteKey key) => !RecoveryRequired && key.Scope == _scope
         && _commands.TryGetValue(Identity(key), out var binding) && !binding.Terminal
-        && binding.Submitted && binding.Authoritative && binding.Revision == key.ParameterRevision && binding.Kind is 1 or 3
+        && binding.Submitted && binding.Authoritative && binding.Revision == key.ParameterRevision && binding.Kind is 1 or 2 or 3
         && key.Part < binding.Parts;
 
     public AISyncExecutionJournalResult Append(ReadOnlySpan<byte> bytes)

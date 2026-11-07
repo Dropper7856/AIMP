@@ -158,9 +158,9 @@ void MovementBundle() {
         CHECK(batch.records[0].nativeKind==1&&movement::Empty(batch.records[0].movement));CHECK(p->Commit(packet.token));
     }
 }
-void RouteOrdering() {
+void RouteOrdering(movement::Navigation policy=movement::Navigation::HostRoute) {
     auto source=std::make_unique<Producer>();auto binding=Binding();binding.value=15;Ready(*source,binding);
-    Command move{1};move.movement.version=1;move.movement.parts=1;move.movement.navigation=movement::Navigation::HostRoute;
+    Command move{1};move.movement.version=1;move.movement.parts=1;move.movement.navigation=policy;
     CHECK(source->Admit(Owner(),100,move)==SourceResult::Ok);
     route::Graph graph{};graph.key={binding.scope,Owner(),1,1,1,0};graph.resourceCount=graph.nodeCount=1;
     std::copy_n("TECH_COMMS",10,graph.resources[0].level.begin());graph.resources[0].immutableDigest.fill(5);
@@ -383,4 +383,4 @@ void CheckpointHistory() {
     CHECK(sequence==40000&&lastCommand==10000);
 }
 }
-int main(int argc,char** argv) { CHECK(argc==2);ActionReferences(argv[1]); Lifecycle(); ForcedPlacement(); SchedulerPlacement(); NativeIntentOrdering(); MovementBundle(); RouteOrdering(); RecalculatedRoutes(); RouteFailureIsolation(); Refusals(); Backpressure(); BindingRevocation(); CheckpointHistory(); std::cout << "Host producer: lifecycle, movement bundle, route ordering/recalculations, full scope, allocator reuse, refusal, backpressure, binding revocation and 10000 checkpointed commands passed\n"; }
+int main(int argc,char** argv) { CHECK(argc==2);ActionReferences(argv[1]); Lifecycle(); ForcedPlacement(); SchedulerPlacement(); NativeIntentOrdering(); MovementBundle(); RouteOrdering(); RouteOrdering(movement::Navigation::HostGuided); RecalculatedRoutes(); RouteFailureIsolation(); Refusals(); Backpressure(); BindingRevocation(); CheckpointHistory(); std::cout << "Host producer: lifecycle, movement bundle, route ordering/recalculations, full scope, allocator reuse, refusal, backpressure, binding revocation and 10000 checkpointed commands passed\n"; }

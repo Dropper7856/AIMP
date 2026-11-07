@@ -1901,16 +1901,19 @@ void __fastcall ActivateLocomotionCycleDetour(
     const auto original = reinterpret_cast<ActivateLocomotionCycleFn>(
         gActivateLocomotionTrampoline);
     if (original == nullptr || cycle == nullptr) return;
-    if (!runtime_features::Enabled(
-            runtime_features::Feature::RemoteMovementRuntime)) {
-        original(cycle);
-        return;
-    }
     const auto cycleAddress = reinterpret_cast<std::uintptr_t>(cycle);
     std::uintptr_t owner = 0U;
     if (!GuardedReadValue(
             cycleAddress + kNpcLocomotionCycleOwnerOffset, owner) ||
         owner == 0U) {
+        original(cycle);
+        return;
+    }
+    // 00450710 can request56 while a direct Host passage75 is still live.
+    // Consult its exact native owner before feature/slot fallbacks destroy it.
+    const auto guard = gNativeAITransitionGuard.load(std::memory_order_acquire);
+    if (guard != nullptr && guard(owner, cycleAddress, kNpcLocomotionMoveState)) return;
+    if (!runtime_features::Enabled(runtime_features::Feature::RemoteMovementRuntime)) {
         original(cycle);
         return;
     }

@@ -266,7 +266,7 @@ Result Ledger::Apply(const Record& r) noexcept {
             switch (r.opcode) {
             case Op::Submit:
                 if (next.phase != Phase::Begun) return Result::InvalidTransition;
-                next.phase = Phase::Submitted; break;
+                next.phase = Phase::Submitted; next.nativeKind = r.nativeKind; break;
             case Op::Cancel: case Op::Stop:
                 if (Terminal(next.phase)) return Result::InvalidTransition;
                 next.phase = r.opcode == Op::Cancel ? Phase::Cancelled : Phase::Stopped; break;
@@ -317,7 +317,8 @@ Result Ledger::Apply(const Record& r) noexcept {
                 earlier.native=NativeState::Superseded;
                 if(earlier.opcode==Op::Submit)commands_[earlier.commandIndex].superseded=true;
             }
-        // Later parameter edits of a command that never entered are obsolete too.
+        // Later parameter edits of a superseded command are obsolete too,
+        // including an entered request fenced by an accepted replacement.
         if(r.opcode==Op::Update&&!PreserveNativeOperations(r.nativeKind)&&commands_[commandIndex].superseded)native=NativeState::Superseded;
     }
     operations_[recordCount_++] = Operation{bytes, r.intent, r.globalSeq, commandIndex, native,
@@ -422,6 +423,18 @@ Result Ledger::FinishNative(const Record& r, NativeOutcome outcome) noexcept {
         outcome == NativeOutcome::Rejected ? NativeState::Rejected : NativeState::Unknown;
     if (r.opcode == Op::Submit)
         commands_[operation->commandIndex].nativeAdmitted = outcome == NativeOutcome::Admitted;
+    if (nativePipeline_ && r.opcode == Op::Submit && r.admission == 0 &&
+        outcome == NativeOutcome::Admitted && !PreserveNativeOperations(r.nativeKind)) {
+        // Match the adapter's native preemption fence. A late Host snapshot
+        // of an older retained request is journal evidence, not a failure and
+        // not permission to restore that request's navigation authority.
+        for (std::size_t i = 0; i < commandCount_; ++i) {
+            auto& earlier = commands_[i];
+            if (i != operation->commandIndex && earlier.nativeAdmitted && !earlier.nativeReleased &&
+                !PreserveNativeOperations(earlier.nativeKind) && earlier.owner == r.owner)
+                earlier.superseded = true;
+        }
+    }
     if (r.opcode == Op::Release && outcome == NativeOutcome::Admitted)
         commands_[operation->commandIndex].nativeReleased = true;
     return outcome == NativeOutcome::Unknown ? Result::OutcomeUnknown : Result::Ok;

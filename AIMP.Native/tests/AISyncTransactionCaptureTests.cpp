@@ -487,7 +487,10 @@ void TestTypedMovement(const char* path) {
     Require(producer.Peek(packet)&&!packet.control&&execution::DecodeBatch(std::span(packet.bytes).first(packet.size),scope,batch)&&batch.count==2,
         "bracketed Move did not emit Begin/Submit");
     const auto& b=batch.records[1].movement;
-    Require(b.navigation==movement::Navigation::HostRoute&&b.parts==2&&b.before.flags90==0x21&&b.after.flags90==5&&b.after.stopDistance==.5F&&
+    const std::array<float,3> authoredGoal{10,20,30};
+    Require(b.navigation==movement::Navigation::LocalNative&&b.before.goal==authoredGoal&&b.after.goal==authoredGoal,
+        "Move source must publish the actual Host goal for native replay");
+    Require(b.parts==2&&b.before.flags90==0x21&&b.after.flags90==5&&b.after.stopDistance==.5F&&
         b.companion.retained==0&&b.companionRetainedAfter==1&&b.companionFlags==2&&b.gait==3,"Move submission phases were flattened");
     Require(gNativeStrong==2&&controls[0][1]==2&&controls[1][1]==2&&producer.Commit(packet.token),"Move source refs not pinned");
     host_producer::BeginNativeMove(character,stateAddress);

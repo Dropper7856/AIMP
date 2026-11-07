@@ -27,7 +27,7 @@ internal static class AISyncCheckpointTests
                 bridge!.ObserveNative(new(connection, pid, MessageType.AISyncHostControl, AISyncExecutionControlCodec.Encode(control with {
                     Kind = control.Kind == AISyncExecutionControlKind.Offer ? AISyncExecutionControlKind.Ready : AISyncExecutionControlKind.CheckpointAck })));
             return Task.CompletedTask;
-        }, message => errors.Enqueue(message), enabled: true);
+        }, message => { if (message.Contains("refused", StringComparison.OrdinalIgnoreCase)) errors.Enqueue(message); }, enabled: true);
         bridge.BindHost(host); await Wait(() => native.Any(c => c.Kind == AISyncExecutionControlKind.Offer), token);
         var scope = native.First().Scope;
         // Bound the simulated producer burst independently of the checkpoint

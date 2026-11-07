@@ -339,9 +339,10 @@ void NativeIntentEvidenceAndOrdering() {
 
     // Bypass is an explicit lifecycle/constructor privilege, not >=0x100.
     // Append avoids ordinary replacement supersession hiding the ordering.
+    for (const auto scalarKind : {4U,5U})
     for (const auto kind : {0x100U, 0x105U, 0x106U, 0x1FFU, 0x200U, 0x201U}) {
         Ledger ordered({}, true);
-        auto scalar = Base(); scalar.nativeKind = 4; scalar.admission = 1;
+        auto scalar = Base(); scalar.nativeKind = scalarKind; scalar.admission = 1;
         CHECK(ordered.SetScope(scalar.scope) == Result::Ok && ordered.Apply(scalar) == Result::Ok);
         scalar = next(scalar, Op::Submit); CHECK(ordered.Apply(scalar) == Result::Ok);
         auto native = next(scalar, Op::Begin); ++native.commandId; native.nativeKind = kind;

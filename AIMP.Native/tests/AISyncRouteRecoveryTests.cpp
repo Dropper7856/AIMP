@@ -28,6 +28,19 @@ execution::NavigationBinding Binding(std::uintptr_t character,std::uint64_t comm
 int Run() {
     scope.session[0]=1;scope.authorityEpoch=scope.worldEpoch=scope.consumerEpoch=1;
     gEngine=&Engine;gQualify=&QualifyScope;gState=new State;
+    // An old strict route's retained storage on N must neither block a newer
+    // HostGuided B nor grant an obsolete/unknown B a native solver.
+    using Ownership=execution::NavigationOwnership;
+    for(const auto policy:{movement::Navigation::LocalNative,movement::Navigation::HostGuided}) {
+        CHECK(PlanQuery(Ownership::Ready,policy,true,true)==QueryPlan::Retail);
+        CHECK(PlanQuery(Ownership::Admitting,policy,true,true)==QueryPlan::Retail);
+        CHECK(PlanQuery(Ownership::Ready,policy,true,false)==QueryPlan::Refuse);
+        CHECK(PlanQuery(Ownership::Rejected,policy,false,true)==QueryPlan::Refuse);
+        CHECK(PlanQuery(Ownership::Waiting,policy,false,true)==QueryPlan::Refuse);
+    }
+    CHECK(PlanQuery(Ownership::Unowned,movement::Navigation{},true,true)==QueryPlan::Imported);
+    CHECK(PlanQuery(Ownership::Unowned,movement::Navigation{},false,false)==QueryPlan::Retail);
+    CHECK(PlanQuery(Ownership::Ready,movement::Navigation::HostRoute,true,true)==QueryPlan::Imported);
     execution::NavigationBinding actual{};
     {
         auto slot=std::make_unique<Slot>();slot->binding=Binding(0x1000,7);

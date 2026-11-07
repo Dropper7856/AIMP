@@ -10,6 +10,17 @@
 
 namespace aimp::ai_sync::execution {
 namespace {
+std::atomic<std::uint64_t> gUpdateRefusals{},gUpdateRefusalCommand{};
+std::atomic<std::uint32_t> gUpdateRefusalBits{},gUpdateRefusalStatus{};
+std::atomic<std::uint64_t> gPlacementHolds{},gPlacementTimeouts{};
+constexpr std::uint64_t kPlacementHoldMilliseconds=750U;
+thread_local NativeInvocation gNativeInvocation{};
+struct NativeInvocationScope {
+    NativeInvocation previous;
+    NativeInvocationScope(const transactions::Record& record,const LocalActorBinding& actor) noexcept
+        : previous(gNativeInvocation) {gNativeInvocation={&record,actor};}
+    ~NativeInvocationScope() {gNativeInvocation=previous;}
+};
 std::atomic<IntentCheck> gIntentCheck{};
 std::atomic<IntentInvoke> gIntentInvoke{};
 using namespace transactions;
@@ -126,6 +137,7 @@ bool WriteParameters(std::uintptr_t request, const Record& r) noexcept {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 }
+NativeInvocation CurrentNativeInvocation() noexcept {return gNativeInvocation;}
 bool NativeRequestAdapter::Initialize(std::uintptr_t base, bool exact, Permission permission,
     ResolveActor resolve, void* context, DependencyGate dependencyGate, ResolveActor lifecycleResolver) noexcept {
     if (busy_ || retiring_ || ActiveCount() != 0 || !exact || base == 0 || base > UINTPTR_MAX - 0x00EC0000U ||
@@ -196,8 +208,11 @@ Readiness NativeRequestAdapter::Resources(std::uintptr_t character) noexcept {
 }
 bool NativeRequestAdapter::Resolve(const Record& r, LocalActorBinding& actor) noexcept {
     const bool lifecycle=ProfileForKind(r.nativeKind)==kProfileLifecycle||r.nativeKind==native_intent::kKind;
-    const auto resolver=lifecycle&&lifecycleResolver_?lifecycleResolver_:resolve_;
-    if (base_ == 0 || permission_ == nullptr || resolve_ == nullptr || !permission_(context_, r) ||
+    const bool continuation=steering_&&invokingRecord_&&r.scope==invokingRecord_->scope&&
+        r.owner==invokingRecord_->owner&&r.commandId==invokingRecord_->commandId&&r.nativeKind==1&&
+        r.parameterRevision==invokingRecord_->parameterRevision;
+    const auto resolver=(lifecycle||continuation)&&lifecycleResolver_?lifecycleResolver_:resolve_;
+    if (base_ == 0 || permission_ == nullptr || resolve_ == nullptr || (!continuation&&!permission_(context_, r)) ||
         !resolver(context_, r.owner, actor) || !actor.exclusiveExecution || actor.character == 0 || actor.runtimeId == 0) return false;
     std::uint32_t id{}; std::uintptr_t schedulerOwner{};
     return Read(actor.character + 0x50, id) && id == actor.runtimeId &&
@@ -275,7 +290,32 @@ Readiness NativeRequestAdapter::Check(const Record& r) noexcept {
     }
     if(ProfileForKind(r.nativeKind)==kProfileLifecycle)
         return r.opcode==Op::Submit?Readiness::Ready:Readiness::Rejected;
-    if ((r.nativeKind == 1 || r.nativeKind == 2 || r.nativeKind == 3)) return CheckMovement(r,actor);
+    if ((r.nativeKind == 1 || r.nativeKind == 2 || r.nativeKind == 3)) {
+        if(r.opcode==Op::Submit)for(auto& pending:placements_)if(pending.character&&pending.character==actor.character) {
+            // Applied once the Character reached the target or visibly left
+            // its pre-placement pose. Bounded: never a permanent dependency.
+            std::array<float,3> now{};
+            const bool read=Read(actor.character+0x70,now[0])&&Read(actor.character+0x74,now[1])&&Read(actor.character+0x78,now[2]);
+            const auto distance=[&](const std::array<float,3>& a) noexcept {
+                float sum{};for(std::size_t i=0;i<3;++i){const float d=now[i]-a[i];sum+=d*d;}return sum;
+            };
+            if(pending.runtime!=actor.runtimeId||(read&&(distance(pending.target)<=1.0F||distance(pending.before)>=1.0F))) {pending={};break;}
+            if(GetTickCount64()-pending.since>=kPlacementHoldMilliseconds){++gPlacementTimeouts;pending={};break;}
+            ++gPlacementHolds;waitReason_=10U;return Readiness::Waiting;
+        }
+        const auto readiness=CheckMovement(r,actor);
+        if(readiness==Readiness::Rejected&&r.opcode==Op::Update) {
+            // Observation only: identifies which local state refused it.
+            std::uint32_t bits{},status{255U};
+            if(const auto* lease=Find(r)) {
+                bits=(lease->preempted?2U:0U)|(lease->routeRejected?4U:0U)|(lease->cancelled?8U:0U)|
+                    (!lease->admitted?16U:0U)|(lease->unknown?32U:0U)|(r.parameterRevision<=lease->revision?64U:0U);
+                if(!lease->ref.object||!Read(lease->ref.object+0xC,status))status=255U;
+            } else bits=1U;
+            gUpdateRefusalBits=bits;gUpdateRefusalStatus=status;gUpdateRefusalCommand=r.commandId;++gUpdateRefusals;
+        }
+        return readiness;
+    }
     if (auto* lease = Find(r)) {
         // A later accepted Host replacement revoked this request's ability to
         // change motion. Keep exact Cancel/Release available for native cleanup.
@@ -285,6 +325,13 @@ Readiness NativeRequestAdapter::Check(const Record& r) noexcept {
             std::uint32_t status{};
             if (!Read(lease->ref.object + 0xC, status)) return Readiness::Rejected;
             if (status > 6) return Readiness::Rejected;
+            // Host Complete/Release can arrive in the same IPC drain as
+            // Submit. Placement runs later in the native scheduler; cancelling
+            // it here erased the Host's spawn before its first native frame.
+            // Explicit Cancel/Stop and local retirement remain available.
+            if(lease->kind==kPlacementKind&&lease->admitted&&status<3U) {
+                waitReason_=11U;return Readiness::Waiting;
+            }
         }
         return Resources(actor.character);
     }
@@ -324,6 +371,7 @@ NativeOutcome NativeRequestAdapter::Invoke(const Record& input) noexcept {
         TraceCommand(r,0U,NativeOutcome::Rejected);
         return NativeOutcome::Rejected;
     }
+    const NativeInvocationScope invocation(r,actor);
     NativeOutcome result = NativeOutcome::Rejected;
     if(r.nativeKind==native_intent::kKind) {
         const auto invoke=gIntentInvoke.load(std::memory_order_acquire);
@@ -347,8 +395,17 @@ NativeOutcome NativeRequestAdapter::Invoke(const Record& input) noexcept {
     {
         const character_direct_step_runtime::MovementResourceLease resources(actor.character);
         invokingRecord_=&r;
+        std::array<float,3> before{};
+        const bool posed=Read(actor.character+0x70,before[0])&&Read(actor.character+0x74,before[1])&&Read(actor.character+0x78,before[2]);
         if (resources && permission_(context_, r)) result = InvokePinned(r, actor);
         invokingRecord_=nullptr;
+        if(posed&&result==NativeOutcome::Admitted&&r.opcode==Op::Submit&&r.nativeKind==kPlacementKind) {
+            PendingPlacement* slot{};
+            for(auto& pending:placements_)if(pending.character==actor.character){slot=&pending;break;}
+            if(!slot)for(auto& pending:placements_)if(!pending.character){slot=&pending;break;}
+            if(!slot)slot=&placements_[0];
+            *slot={actor.character,actor.runtimeId,{r.goalX,r.goalY,r.goalZ},before,GetTickCount64()};
+        }
     }
     busy_ = false;
     TraceCommand(r,actor.character,result);
@@ -441,25 +498,6 @@ NativeOutcome NativeRequestAdapter::InvokePinned(const Record& r, const LocalAct
         return NativeOutcome::Unknown;
     }
 }
-// A backstage/frontstage event carries the Host body's pose at that native
-// transition. While hidden, retail moved the Host body along its own backstage
-// (vent) network, which the Client does not replay: without this the Client
-// emerged where it had entered, still inside the vent, its next Move walked
-// the vent again and re-hid it (the Alien killed while invisible). Place only
-// a body that is HIDDEN now, so no visible teleport exists; a visible body is
-// never moved by this path. The write is immediate (the hybrid's own
-// teleport primitive): retail's 007C6330 placement is deferred, so it used to
-// override the Host's explicit relocate issued right after a vent exit and
-// left the Client at the vent mouth, from where it re-entered the vent.
-void NativeRequestAdapter::PlaceHiddenAtTransition(const Record& r,const LocalActorBinding& actor) noexcept {
-    if((r.flags&HasGoal)==0||!std::isfinite(r.goalX)||!std::isfinite(r.goalY)||!std::isfinite(r.goalZ)||!std::isfinite(r.aux))return;
-    std::uint8_t hidden{};float x{},y{},z{};
-    if(!Read(actor.character+0x2DA,hidden)||!hidden||!Read(actor.character+0x70,x)||!Read(actor.character+0x74,y)||!Read(actor.character+0x78,z))return;
-    const auto dx=x-r.goalX,dy=y-r.goalY,dz=z-r.goalZ;
-    if(dx*dx+dy*dy+dz*dz<=0.0001F)return;
-    const float position[]{r.goalX,r.goalY,r.goalZ};
-    if(character_direct_step_runtime::ApplyAIRecoveryTransform(actor.character,position,r.aux))++transitionPlacements_;
-}
 NativeOutcome NativeRequestAdapter::InvokeLifecycle(const Record& r,const LocalActorBinding& actor) noexcept {
     __try {
         if(r.opcode!=Op::Submit)return NativeOutcome::Rejected;
@@ -474,12 +512,12 @@ NativeOutcome NativeRequestAdapter::InvokeLifecycle(const Record& r,const LocalA
                 reinterpret_cast<void(__thiscall*)(void*,const float*,float,std::uint32_t,std::uint32_t)>(base_+0x3C2710U)(
                     reinterpret_cast<void*>(actor.character),position,r.aux,r.mode,r.nativeKind==kDirectForcedRelocateKind?1U:0U);
         } else if(r.nativeKind==kBackstageKind) {
-            // Hidden while placed: emerge at the Host's exit, or carry the
-            // just-hidden body to the Host's entry. Never a visible move.
-            if(r.mode==0U)PlaceHiddenAtTransition(r,actor);
+            // Replay only the Host native transition; no synthetic placement.
+
+
             reinterpret_cast<void(__thiscall*)(void*,std::uint8_t)>(base_+0x38B140U)(
                 reinterpret_cast<void*>(actor.character),static_cast<std::uint8_t>(r.mode));
-            if(r.mode!=0U)PlaceHiddenAtTransition(r,actor);
+
         } else {
             std::uintptr_t table{},getter{};
             if(!Read(actor.character,table)||!Read(table+0x1C,getter)||getter<base_+0x1000U||getter>=base_+0xD9E13BU)
@@ -488,7 +526,7 @@ NativeOutcome NativeRequestAdapter::InvokeLifecycle(const Record& r,const LocalA
             LocalActorBinding current{};
             if(!animated||!Resolve(r,current)||current.character!=actor.character||current.runtimeId!=actor.runtimeId||
                 current.creationSerial!=actor.creationSerial)return NativeOutcome::Unknown;
-            PlaceHiddenAtTransition(r,actor);
+
             reinterpret_cast<void(__thiscall*)(void*)>(base_+0x3C0220U)(reinterpret_cast<void*>(animated));
         }
         LocalActorBinding after{};
@@ -507,5 +545,9 @@ NativeRequestStatus NativeRequestAdapter::Inspect(const Record& r) noexcept {
     result.cancelled = lease->cancelled; result.unknown = lease->unknown;
     if (!lease->unknown && Live(*lease, actor)) static_cast<void>(Read(lease->ref.object + 0xC, result.status));
     return result;
+}
+UpdateRefusalReport UpdateRefusals() noexcept {
+    return {gUpdateRefusals.load(),gUpdateRefusalCommand.load(),gUpdateRefusalBits.load(),gUpdateRefusalStatus.load(),
+        gPlacementHolds.load(),gPlacementTimeouts.load()};
 }
 } // namespace aimp::ai_sync::execution

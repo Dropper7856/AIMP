@@ -95,6 +95,18 @@ internal static class AISyncRouteTransportTests
         { Parts = 1, Companion = default, CompanionFlags = 0, CompanionRetainedAfter = 0 } }).ToArray();
         var one = new AISyncRouteJournal(scope); one.Observe(batch with { Records = single });
         AssertEx.Equal(AISyncExecutionJournalResult.Rejected, one.Append(companion));
+        var guidedRecords = batch.Records.Select(r => r with { Movement = r.Movement with
+        { Navigation = AISyncMovementNavigation.HostGuided } }).ToArray();
+        var guided = new AISyncRouteJournal(scope);
+        AssertEx.True(guided.Observe(batch with { Records = guidedRecords }));
+        AssertEx.Equal(AISyncExecutionJournalResult.Accepted, guided.Append(original));
+        var guidedUpdate = guidedRecords[1] with { Opcode = AISyncTransactionOpcode.Update, ParameterRevision = 2 };
+        AssertEx.True(guided.Observe(new(scope, 2, new[] { guidedUpdate })));
+        AssertEx.Equal(AISyncExecutionJournalResult.Rejected, guided.Append(original));
+        AssertEx.Equal(AISyncExecutionJournalResult.Accepted, guided.Append(AISyncRouteCodec.Encode(Graph(guidedUpdate))));
+        AssertEx.True(guided.Observe(new(scope, 3, new[] { guidedUpdate with
+        { Opcode = AISyncTransactionOpcode.Release, Movement = default } })));
+        AssertEx.Equal(0, guided.RouteCount);
         return Task.CompletedTask;
     }
     internal static Task NegotiationAsync()

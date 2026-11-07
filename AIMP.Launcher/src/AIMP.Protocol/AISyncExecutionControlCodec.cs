@@ -90,5 +90,5 @@ public static class AISyncExecutionControlCodec
     };
     public static bool Allows(uint profiles, AISyncTransaction record) =>
         (profiles & ProfileForKind(record.NativeKind)) != 0
-        && (record.Movement.Navigation != AISyncMovementNavigation.HostRoute || (profiles & 8U) != 0);
+        && (record.Movement.Navigation is not (AISyncMovementNavigation.HostRoute or AISyncMovementNavigation.HostGuided) || (profiles & 8U) != 0);
 }

@@ -18,6 +18,19 @@ std::uint64_t NowMs() noexcept {
 }
 }
 void SetWaitTrace(WaitTrace trace) noexcept {gWaitTrace.store(trace,std::memory_order_release);}
+bool ExecutionSession::GuidanceCurrent(void* context,const RetirementIdentity& identity) noexcept {
+    auto& session=*static_cast<ExecutionSession*>(context);
+    if(!session.configured_||!session.initialized_||session.retired_||identity.scope!=session.scope_)return false;
+    Record record{};record.scope=identity.scope;record.owner=identity.owner;record.commandId=identity.command;
+    CommandState command{};
+    return session.executor_.Find(record,command)&&command.phase==Phase::Submitted&&command.nativeAdmitted&&
+        !command.nativeReleased&&!command.superseded&&command.nativeKind==1&&command.parameterRevision==identity.revision;
+}
+void ExecutionSession::Steer() noexcept {
+    if(busy_||!configured_||!initialized_||retired_)return;
+    const BusyScope callbackGuard(busy_);
+    native_.SteerMovements(&GuidanceCurrent,this);
+}
 void ExecutionSession::NoteWait(const Record& record, const ExecutionDisposition& disposition) noexcept {
     const auto now = NowMs();
     // Orders superseded or checkpointed elsewhere leave their probe here.

@@ -6,13 +6,17 @@ namespace AIMP.Protocol.Tests;
 
 internal static class AISyncHostBridgeTests
 {
+    private static bool SameSource(AISyncExecutionScope first, AISyncExecutionScope second) =>
+        first.Session == second.Session && first.AuthorityEpoch == second.AuthorityEpoch &&
+        first.WorldEpoch == second.WorldEpoch;
+
     internal static Task RetryCongestionPlannerAsync()
     {
         var scope = new AISyncExecutionScope(Guid.NewGuid(), 1, 1, 1);
         AssertEx.Equal(8, AISyncRetryPlanner.MaxHostPerTick);
         AssertEx.Equal(8, AISyncRetryPlanner.MaxLocalPerTick);
         AssertEx.True(AISyncRetryPlanner.HostRetryIntervalMs > AISyncRetryPlanner.LocalRetryIntervalMs);
-        var cursor = 0;
+        var planner = new AISyncRetryPlanner();
         var latest = new List<(ulong Peer, AISyncTransaction Operation)>();
         for (uint actor = 1; actor <= 12; ++actor)
         {
@@ -29,8 +33,8 @@ internal static class AISyncHostBridgeTests
                 latest.Add((0UL, op));
             }
         }
-        var first = AISyncRetryPlanner.ChooseCycle(latest, 8, ref cursor);
-        var second = AISyncRetryPlanner.ChooseCycle(latest, 8, ref cursor);
+        var first = planner.ChooseCycle(latest, 8);
+        var second = planner.ChooseCycle(latest, 8);
         AssertEx.Equal(8, first.Length);
         AssertEx.Equal(8, second.Length);
         AssertEx.Equal(8, first.Select(x => x.Sequence).Distinct().Count());
@@ -39,21 +43,21 @@ internal static class AISyncHostBridgeTests
         AssertEx.True(latest.Any(x => x.Operation.GlobalSequence == second[^1].Sequence));
         AssertEx.True(first.Concat(second).Select(x => x.Sequence).Distinct().Count() == 12,
             "More than eight actors must receive a fair retry window within two ticks.");
-        var selectOne = AISyncRetryPlanner.ChooseCycle(latest, 1, ref cursor);
+        var selectOne = planner.ChooseCycle(latest, 1);
         AssertEx.Equal(1, selectOne.Length);
-        AssertEx.Equal(0, AISyncRetryPlanner.ChooseCycle(latest, 0, ref cursor).Length);
-        AssertEx.Equal(0, AISyncRetryPlanner.ChooseCycle(
-            Array.Empty<(ulong Peer, AISyncTransaction Operation)>(), 8, ref cursor).Length);
+        AssertEx.Equal(0, planner.ChooseCycle(latest, 0).Length);
+        AssertEx.Equal(0, planner.ChooseCycle(
+            Array.Empty<(ulong Peer, AISyncTransaction Operation)>(), 8).Length);
 
         var firstActor = latest.Where(p => p.Operation.EntityA == 1).ToArray();
         var sameActorTwoPeers = firstActor.Concat(firstActor.Select(p => (1UL, p.Operation)));
-        AssertEx.Equal(2, AISyncRetryPlanner.ChooseCycle(sameActorTwoPeers, 8, ref cursor).Length,
+        AssertEx.Equal(2, planner.ChooseCycle(sameActorTwoPeers, 8).Length,
             "Different consumers must never share retry identity.");
         var protectedFirst = firstActor[0].Operation with {
             Opcode = AISyncTransactionOpcode.Release, GlobalSequence = 1
         };
         var protectedCandidates = firstActor.Append((0UL, protectedFirst));
-        var choice = AISyncRetryPlanner.ChooseCycle(protectedCandidates, 8, ref cursor);
+        var choice = planner.ChooseCycle(protectedCandidates, 8);
         AssertEx.Equal(1UL, choice.Single().Sequence,
             "An irreversible Release must not be bypassed by a more recent move.");
         return Task.CompletedTask;
@@ -226,8 +230,9 @@ internal static class AISyncHostBridgeTests
                     AISyncExecutionCodec.EncodeBatch(new(offer.Scope, 1,
                         new[] { Record(offer.Scope),
                             Record(offer.Scope, 2, AISyncTransactionOpcode.Submit) }))));
-                await Wait(() => batches.Any(b => b.Scope == offer.Scope), token);
-                var batch = batches.Single(b => b.Scope == offer.Scope);
+                // Source and consumer have independent ConsumerEpoch values.
+                await Wait(() => batches.Any(b => SameSource(b.Scope, offer.Scope)), token);
+                var batch = batches.Single(b => SameSource(b.Scope, offer.Scope));
                 var stage = i % 2 == 0 ? AISyncExecutionStage.Rejected : AISyncExecutionStage.Unknown;
                 AssertEx.True(client.SendAISyncExecutionReceipt(new(batch.Scope, batch.BatchId,
                     batch.Records[1], stage, stage == AISyncExecutionStage.Unknown

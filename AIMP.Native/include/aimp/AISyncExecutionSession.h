@@ -67,7 +67,7 @@ public:
     [[nodiscard]] bool OperationInProgress() const noexcept { return busy_; }
     [[nodiscard]] WaitReport Waits() const noexcept;
     // Engine thread, per frame: Host-guided Moves follow the Host path points.
-    void Steer() noexcept { if (!busy_ && configured_ && initialized_ && !retired_) native_.SteerMovements(); }
+    void Steer() noexcept;
     [[nodiscard]] bool BeginRetirement() noexcept;
     void ConfirmActorDestroyed(const LocalActorBinding&) noexcept;
     [[nodiscard]] RetirementProgress DrainRetirement(RetirementGuard, void* context, std::size_t budget = 4) noexcept;
@@ -83,6 +83,7 @@ private:
     friend struct ExecutionSessionTestAccess;
     static transactions::Dependency Check(void*, const transactions::Record&);
     static transactions::NativeOutcome Invoke(void*, const transactions::Record&);
+    static bool GuidanceCurrent(void*,const RetirementIdentity&) noexcept;
     struct WaitProbe { std::uint64_t seq{}, start{}; std::uint32_t kind{}, opcode{}, admission{}, reason{}, tracedReasons{}; };
     void NoteWait(const transactions::Record&, const transactions::ExecutionDisposition&) noexcept;
     static Receipt MakeReceipt(const transactions::Record&, std::uint64_t, const transactions::ExecutionDisposition&) noexcept;

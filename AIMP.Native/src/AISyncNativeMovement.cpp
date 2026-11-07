@@ -19,6 +19,15 @@ namespace aimp::ai_sync::execution {
 namespace {
 using namespace transactions;
 std::atomic<std::uint64_t> gUpdatesAfterLocalEnd{},gHostPathSteers{},gFencedRestartsSkipped{};
+std::atomic<std::uint64_t> gGuidanceDeferred{},gGuidanceSuspended{},gGuidanceFaults{},gGuidanceWithoutRoute{};
+std::atomic<std::uint64_t> gGuidanceContinuations{},gGuidanceContinuationLimits{},gGuidanceExhaustedTailContinuations{};
+std::atomic<std::uint64_t> gPacedSamples{},gPacingHoldSamples{},gPacingUnavailable{},gPacingGaitSamples{};
+std::atomic<float> gPacingLead{};
+std::atomic<std::uint64_t> gPhysicalTrailSamples{};
+std::atomic<std::uint64_t> gGuidanceGoalDeposits{},gGuidanceGoalConsumptions{},gGuidanceGoalDiscards{};
+std::atomic<std::uint64_t> gGuidanceStopChanges{},gGuidanceStartWaits{},gGuidanceRetainedWaits{},gGuidanceQueueWaits{};
+HostProgressQuery gHostProgress{};
+void* gHostProgressContext{}; // Installed before the engine starts this module.
 std::atomic<MarkerResolve> gMarkerResolve{};
 constexpr std::uintptr_t kScheduler=0x2CD0;
 struct MarkerBusyScope {
@@ -33,7 +42,31 @@ template<class T> bool Read(std::uintptr_t at,T& value) noexcept {
 }
 bool SameFloat(float a,float b) noexcept {return std::bit_cast<std::uint32_t>(a)==std::bit_cast<std::uint32_t>(b);}
 bool SameGoal(const std::array<float,3>& a,const std::array<float,3>& b) noexcept {
-    for(std::size_t i=0;i<3;++i)if(!SameFloat(a[i],b[i]))return false;return true;
+    for(std::size_t i=0;i<3;++i)if(!SameFloat(a[i],b[i]))return false;
+    return true;
+}
+bool RetainedReferenceAbsent(std::uintptr_t character,std::uintptr_t request) noexcept {
+    // 00683700 may retain replaced status5 in this list. Unlike3/4/6,
+    // 00683DB0 does not remove a nonactive5. An absent, well-formed ring is
+    // the only local proof that dropping its Ref cannot lose that identity.
+    std::uint32_t count{};std::uintptr_t head{},entry{};
+    if(!Read(character+kScheduler+0x14U,count)||count>NativeRequestAdapter::kCapacity)return false;
+    if(!count)return true;
+    if(!Read(character+kScheduler+0x10U,head)||!head||!Read(head,entry))return false;
+    for(std::uint32_t i=0;i<count;++i) {
+        std::uintptr_t held{},next{};
+        if(!entry||entry==head||!Read(entry+8U,held)||!Read(entry,next)||held==request)return false;
+        entry=next;
+    }
+    return entry==head;
+}
+bool GuidanceParametersDiffer(const movement::Parameters& a,const movement::Parameters& b) noexcept {
+    auto x=a,y=b;
+    // Goal and stop variant have their own native setters. Local route/stop
+    // lifecycle bits are not a reason to reapply a Host parameter snapshot.
+    x.goal=y.goal={};x.stopDistance=y.stopDistance=0.0F;
+    x.flags90&=0x3EU;y.flags90&=0x3EU;x.flags91&=0x11U;y.flags91&=0x11U;
+    return !movement::Same(x,y);
 }
 bool MarkerGeometry(const movement::Bundle& a,const movement::Bundle& b) noexcept {
     auto x=a,y=b;
@@ -58,6 +91,7 @@ bool Gait(std::uintptr_t character,std::uint32_t requested) noexcept {
 }
 }
 void SetMarkerResolver(MarkerResolve resolver) noexcept {gMarkerResolve.store(resolver,std::memory_order_release);}
+void SetHostProgressQuery(HostProgressQuery query,void* context) noexcept {gHostProgress=query;gHostProgressContext=context;}
 bool NativeRequestAdapter::MarkerRevalidate(const Lease& lease) noexcept {
     // Binding can be revoked after Submit or from a native callback. Keep the
     // complete operation, including revision and payload, for exact rechecks.
@@ -171,7 +205,7 @@ NavigationOwnership NativeRequestAdapter::IdentifyNavigation(std::uintptr_t navi
             return NavigationOwnership::Rejected;
         if(busy_&&!admitting)return NavigationOwnership::Waiting;
         LocalActorBinding actor{};
-        const auto resolver=invoking?resolve_:(lifecycleResolver_?lifecycleResolver_:resolve_);
+        const auto resolver=invoking&&!steering_?resolve_:(lifecycleResolver_?lifecycleResolver_:resolve_);
         if (!resolver || !resolver(context_,lease.owner,actor) || !actor.exclusiveExecution ||
             !Live(lease,actor) || !lease.movementResource.object ||
             navigation != lease.movementResource.object + 0xC4U) return NavigationOwnership::Rejected;
@@ -183,7 +217,7 @@ NavigationOwnership NativeRequestAdapter::IdentifyNavigation(std::uintptr_t navi
     // permission to run a local solver. Correlate retained values only; this
     // is a refusal identity, never authority to admit an unknown native block.
     for(const auto& lease:leases_)if(lease.used&&!lease.secondary&&lease.ref.object&&
-        (lease.kind==1||lease.kind==2||lease.kind==3)&&lease.movement.navigation==movement::Navigation::HostRoute&&
+        (lease.kind==1||lease.kind==2||lease.kind==3)&&movement::CarriesRoute(lease.movement.navigation)&&
         lease.movementResource.object&&navigation==lease.movementResource.object+0xC4U) {
         output={{lease.scope,lease.owner,lease.command,lease.actor,lease.kind,lease.revision},lease.movement.navigation,0};
         return NavigationOwnership::Rejected;
@@ -246,6 +280,9 @@ bool NativeRequestAdapter::MovementFactory(Lease& lease,std::uint32_t kind) noex
 }
 bool NativeRequestAdapter::MovementAdmit(Lease& lease,std::uint32_t admission,bool& accepted) noexcept {
     __try {
+        // A local continuation only appends; it must never replace a Host
+        // action which became runnable while the previous segment finished.
+        if(steering_&&admission==0)admission=1;
         if(movementAdmission_)return movementAdmission_(movementCallsContext_,lease.ref.object,admission,accepted);
         const auto submit=admission==0?0x283CE0U:(admission==1?0x283C10U:0x283550U);
         accepted=reinterpret_cast<std::uint8_t(__thiscall*)(void*)>(base_+submit)(
@@ -254,16 +291,66 @@ bool NativeRequestAdapter::MovementAdmit(Lease& lease,std::uint32_t admission,bo
 }
 bool NativeRequestAdapter::MovementGoal(Lease& lease,const std::array<float,3>& goal,bool update) noexcept {
     __try {
-        if(movementGoal_)return movementGoal_(movementCallsContext_,lease.ref.object,goal.data(),update);
-        reinterpret_cast<void(__thiscall*)(void*,const float*)>(base_+(update?0x2C7550U:0x2777B0U))(
-            reinterpret_cast<void*>(lease.ref.object),goal.data());return true;
+        if(movementGoal_) {
+            if(!movementGoal_(movementCallsContext_,lease.ref.object,goal.data(),update))return false;
+        } else reinterpret_cast<void(__thiscall*)(void*,const float*)>(base_+(update?0x2C7550U:0x2777B0U))(
+            reinterpret_cast<void*>(lease.ref.object),goal.data());
+        if(!update) {
+            std::array<float,3> actual{};
+            if(!Read(lease.ref.object+0x28U,actual)||!SameGoal(actual,goal))return false;
+            lease.executedGoal=actual;lease.executedGoalKnown=true;
+        }
+        // The update setter is void and can refuse silently. The steerer
+        // verifies deposition, then later verifies actual native consumption.
+        return true;
     } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+movement::Parameters NativeRequestAdapter::ExecutionParameters(Lease& lease,const movement::Parameters& host) noexcept {
+    if(lease.kind!=1||lease.movement.navigation!=movement::Navigation::HostGuided)return host;
+    std::array<float,3> local{};
+    if(!Read(lease.actor.character+0x70U,local)||!movement::FinitePoint(local))return host;
+    const NavigationBinding binding{{lease.scope,lease.owner,lease.command,lease.actor,lease.kind,lease.revision},
+        lease.movement.navigation,0U};
+    const auto* graph=route_execution::Guidance(binding,host.goal);
+    if(!graph)++gGuidanceWithoutRoute;
+    movement::HostProgress progress{};
+    const bool available=gHostProgress&&gHostProgress(gHostProgressContext,binding.command,progress)&&
+        progress.gait<=3U&&movement::FinitePoint(progress.position)&&movement::FinitePoint(progress.velocity);
+    lease.pacingSuspended=available&&progress.protectedMotion;
+    lease.pacingGaitKnown=available&&!progress.protectedMotion;
+    if(lease.pacingGaitKnown)lease.pacingGait=progress.gait;
+    if(lease.pacingSuspended)return host;
+    const auto selected=movement::SelectGuidedGoal(graph,local,host.goal,lease.guidance);
+    float lead{};
+    const auto goal=movement::LimitGuidedProgress(graph,local,available?&progress:nullptr,selected,lease.pacing,lead);
+    lease.pacingGoalLimited=goal.paced;
+    if(available&&progress.observed.valid)++gPhysicalTrailSamples;
+    gPacingLead=lead;
+    if(!available)++gPacingUnavailable;
+    if(goal.paced)++gPacedSamples;
+    if(goal.holding)++gPacingHoldSamples;
+    auto value=host;value.goal=goal.position;
+    // A rolling physical waypoint is a through-goal. Asking retail to brake at
+    // every carrier sample amplifies latency and may never catch the Host.
+    // A deliberate hold (or stationary Host) retains a real stopping radius.
+    const bool through=goal.intermediate||(goal.paced&&!goal.holding&&available&&
+        std::hypot(progress.velocity[0],progress.velocity[2])>0.2F);
+    if(through) {
+        value.stopDistance=value.stoppingDistance=-1.0F;
+        // A rolling waypoint is not the Host's final stop. Native arrival
+        // bit1 survives goal edits; copying Host bit0 onto it would latch3
+        // and make 006C7550 refuse all subsequent goals.
+        value.flags91&=~1U;
+    } else if(goal.paced)value.stopDistance=value.stoppingDistance=0.15F;
+    return value;
 }
 bool NativeRequestAdapter::MovementStop(Lease& lease,float distance,std::uint8_t variant) noexcept {
     __try {
-        if(movementStop_)return movementStop_(movementCallsContext_,lease.ref.object,distance,variant);
-        reinterpret_cast<void(__thiscall*)(void*,float,std::uint8_t)>(base_+0x27D0D0U)(
-            reinterpret_cast<void*>(lease.ref.object),distance,variant);return true;
+        if(movementStop_) {
+            if(!movementStop_(movementCallsContext_,lease.ref.object,distance,variant))return false;
+        } else reinterpret_cast<void(__thiscall*)(void*,float,std::uint8_t)>(base_+0x27D0D0U)(
+            reinterpret_cast<void*>(lease.ref.object),distance,variant);
+        lease.executedStopDistance=distance;lease.executedStopVariant=variant;return true;
     } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
 }
 bool NativeRequestAdapter::MovementParameters(Lease& lease,const movement::Parameters& p,bool initial) noexcept {
@@ -286,7 +373,11 @@ bool NativeRequestAdapter::MovementParameters(Lease& lease,const movement::Param
         f90=static_cast<std::uint8_t>((f90&~authored90)|(p.flags90&authored90));
         // The stop setter owns bit5 and dirty bit6 after construction.
         const auto mask=initial?0x31U:0x11U;
-        f91=static_cast<std::uint8_t>((f91&~mask)|(p.flags91&mask));return true;
+        f91=static_cast<std::uint8_t>((f91&~mask)|(p.flags91&mask));
+        lease.executedStoppingDistance=p.stoppingDistance;
+        if(initial) {lease.executedStopDistance=p.stopDistance;lease.executedStopVariant=(p.flags91>>5)&1U;}
+        lease.executedArrivalKnown=true;
+        lease.executedParameters=p;lease.executedParametersKnown=true;return true;
     } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
 }
 bool NativeRequestAdapter::MovementRevalidate(const Record& r,Lease& lease) noexcept {
@@ -310,7 +401,7 @@ void NativeRequestAdapter::FenceSupersededMovements(const Record& current,const 
     // Only AFTER it has returned accepted may old local route callbacks lose
     // authority. Do not Cancel or RefRelease here: the Host's exact terminal
     // records still own native cleanup, including any retained worker Ref.
-    if(current.admission!=0 || PreserveNativeOperations(current.nativeKind))return;
+    if(steering_||current.admission!=0 || PreserveNativeOperations(current.nativeKind))return;
     for(auto& lease:leases_)
         if(lease.used&&lease.scope==current.scope&&lease.owner==current.owner&&lease.actor==actor&&
             lease.command!=current.commandId&&!PreserveNativeOperations(lease.kind))
@@ -339,6 +430,19 @@ Readiness NativeRequestAdapter::CheckMovement(const Record& r,const LocalActorBi
         }
         // admission 0 replaces natively (00683700 replace=1), as on the Host.
         if(kCapacity-ActiveCount()<r.movement.parts)return Readiness::Rejected;
+        if(r.nativeKind==1&&r.movement.navigation==movement::Navigation::HostGuided) {
+            // A first carrier often equals the Client body. Retain the Host
+            // Submit as Waiting instead of constructing a zero-length Move
+            // which finishes before the first usable route/progress sample.
+            Lease probe{};probe.scope=r.scope;probe.owner=r.owner;probe.command=r.commandId;
+            probe.actor=actor;probe.kind=1;probe.revision=r.parameterRevision;probe.movement=r.movement;
+            std::array<float,3> local{};
+            const auto parameters=ExecutionParameters(probe,r.movement.after);
+            if(!Read(actor.character+0x70U,local)||probe.pacingSuspended||probe.pacing.holding||
+                !movement::native_guidance::MeaningfulTarget(local,parameters.goal,parameters.stopDistance,parameters.stoppingDistance)) {
+                waitReason_=12U;++gGuidanceStartWaits;return Readiness::Waiting;
+            }
+        }
 
     } else {
         if(primary->preempted&&r.opcode==Op::Update)return Readiness::Rejected;
@@ -372,6 +476,16 @@ Readiness NativeRequestAdapter::CheckMovement(const Record& r,const LocalActorBi
                 r.movement.navigation!=primary->movement.navigation)
                 return Readiness::Rejected;
             if(r.nativeKind==2)return status<=2?Resources(actor.character):Readiness::Rejected;
+            if(r.nativeKind==1&&r.movement.navigation==movement::Navigation::HostGuided) {
+                // An Update publishes desired values, even while retail is
+                // queued, planning, ending or protected by an action. Only
+                // the engine steerer may mutate/renew the native request.
+                if(status>6U||!movement::Same(r.movement.companion,primary->movement.companion)||
+                    r.movement.companionFlags!=primary->movement.companionFlags||
+                    r.movement.companionRetainedAfter!=primary->movement.companionRetainedAfter||
+                    r.movement.primaryFlags!=primary->movement.primaryFlags)return Readiness::Rejected;
+                return Resources(actor.character);
+            }
             // A strict route belongs to this native admission and its consumed
             // prefix. An Update cannot resurrect it with a fresh B and rewind
             // that prefix. Only a new Host command may obtain a new admission.
@@ -388,7 +502,7 @@ Readiness NativeRequestAdapter::CheckMovement(const Record& r,const LocalActorBi
                 if(!movement::Same(after,primary->movement.after))return Readiness::Rejected;
             }
             if(!SameGoal(r.movement.after.goal,primary->movement.after.goal)&&
-                r.movement.navigation!=movement::Navigation::HostRoute) {
+                r.movement.navigation==movement::Navigation::LocalNative) {
                 // A goal edit follows native request readiness. The Host path
                 // for its exact parameter revision arrives in the same stream.
                 std::uint32_t phase{};std::uint8_t flags{},stop{};
@@ -409,25 +523,40 @@ Readiness NativeRequestAdapter::CheckMovement(const Record& r,const LocalActorBi
     return Resources(actor.character);
 }
 bool NativeRequestAdapter::RestartMovement(Lease& lease,const Record& r,const LocalActorBinding& actor) noexcept {
+    const bool guided=r.movement.navigation==movement::Navigation::HostGuided;
+    if(guided) {
+        movement::native_guidance::Snapshot native{};
+        if(!steering_||!ReadGuidance(lease,native)||!movement::native_guidance::Renewable(native))return false;
+    }
     lease.unknown=true;
     std::uint32_t status{};
-    if(Read(lease.ref.object+0xC,status)&&status<=2&&(!CancelRetiring(lease.ref.object)||!MovementRevalidate(r,lease)))return false;
+    if(!Read(lease.ref.object+0xC,status))return false;
+    // Terminal3/4/6 may still own a Ref in the native retained list. Cancel
+    // removes that exact retained entry before our independent Ref is dropped.
+    // Status5 reached here only with proven absence from that list.
+    if((guided||status<=2)&&(!CancelRetiring(lease.ref.object)||!MovementRevalidate(r,lease)))return false;
+    if(guided) {
+        movement::native_guidance::Snapshot native{};
+        if(!ReadGuidance(lease,native)||!native.workerQuiet||native.foreignBlock||native.retainsBlock)return false;
+    }
     if(!ReleaseLeaseRef(lease))return false;
     lease.ref={};lease.admitted=lease.cancelled=false;
-    lease.routeRejected=false;
+    lease.routeRejected=false;lease.guidanceGoalPending=false;
+    lease.executedGoalKnown=lease.executedArrivalKnown=lease.executedParametersKnown=false;
     lease.revision=r.parameterRevision;lease.movement=r.movement;
     LocalActorBinding current{};Ref resource{};
     if(!Resolve(r,current)||current!=actor||!Read(actor.character+0x42A8U,resource)||
         resource.object!=lease.movementResource.object||resource.control!=lease.movementResource.control)return false;
     bool accepted{};
-    if(!Gait(actor.character,r.movement.gait)||
+    const auto parameters=ExecutionParameters(lease,r.movement.after);
+    if(!Gait(actor.character,lease.pacingGaitKnown?lease.pacingGait:r.movement.gait)||
         !MovementFactory(lease,1)||!MovementRevalidate(r,lease)||
-        !MovementGoal(lease,r.movement.after.goal,false)||!MovementRevalidate(r,lease)||
-        !MovementParameters(lease,r.movement.after,true)||
+        !MovementGoal(lease,parameters.goal,false)||!MovementRevalidate(r,lease)||
+        !MovementParameters(lease,parameters,true)||
         !MovementAdmit(lease,r.admission,accepted)||!MovementRevalidate(r,lease)||!accepted)return false;
     lease.admitted=true;
-    return MovementParameters(lease,r.movement.after,false)&&
-        MovementStop(lease,r.movement.after.stopDistance,static_cast<std::uint8_t>((r.movement.after.flags91>>5)&1))&&
+    return MovementParameters(lease,parameters,false)&&
+        MovementStop(lease,parameters.stopDistance,static_cast<std::uint8_t>((r.movement.after.flags91>>5)&1))&&
         MovementRevalidate(r,lease);
 }
 NativeOutcome NativeRequestAdapter::InvokeMovement(const Record& r,const LocalActorBinding& actor) noexcept {
@@ -467,10 +596,12 @@ NativeOutcome NativeRequestAdapter::InvokeMovement(const Record& r,const LocalAc
         }
         // 0070A940 sets M+194 before constructing/admitting the Move. Native
         // synchronous callbacks must see the captured gait, not an old input.
-        if(!Gait(actor.character,r.movement.gait)||
+        const auto before=ExecutionParameters(*primary,r.movement.before);
+        const auto after=ExecutionParameters(*primary,r.movement.after);
+        if(!Gait(actor.character,primary->pacingGaitKnown?primary->pacingGait:r.movement.gait)||
             !MovementFactory(*primary,r.nativeKind)||!MovementRevalidate(r,*primary)||
-            (r.nativeKind==1&&(!MovementGoal(*primary,r.movement.before.goal,false)||!MovementRevalidate(r,*primary)))||
-            !MovementParameters(*primary,r.movement.before,true))return NativeOutcome::Unknown;
+            (r.nativeKind==1&&(!MovementGoal(*primary,before.goal,false)||!MovementRevalidate(r,*primary)))||
+            !MovementParameters(*primary,before,true))return NativeOutcome::Unknown;
         if(r.nativeKind==3) {
             __try {
                 auto& flags=*reinterpret_cast<std::uint8_t*>(primary->ref.object+0xB8);
@@ -485,8 +616,8 @@ NativeOutcome NativeRequestAdapter::InvokeMovement(const Record& r,const LocalAc
         // their late route callbacks before subsequent native callbacks can
         // observe the new owner; their strong Refs are released by Host cleanup.
         FenceSupersededMovements(r,actor);
-        if(!MovementParameters(*primary,r.movement.after,false)||
-            (r.nativeKind==1&&!MovementStop(*primary,r.movement.after.stopDistance,static_cast<std::uint8_t>((r.movement.after.flags91>>5)&1)))||
+        if(!MovementParameters(*primary,after,false)||
+            (r.nativeKind==1&&!MovementStop(*primary,after.stopDistance,static_cast<std::uint8_t>((r.movement.after.flags91>>5)&1)))||
             !MovementRevalidate(r,*primary))return NativeOutcome::Unknown;
         if(r.movement.parts==2) {
             Lease* companion{};for(auto& lease:leases_)if(!lease.used){companion=&lease;break;}
@@ -512,6 +643,15 @@ NativeOutcome NativeRequestAdapter::InvokeMovement(const Record& r,const LocalAc
     }
     if(!primary||primary->unknown)return NativeOutcome::Rejected;
     if(r.opcode==Op::Update) {
+        if(r.nativeKind==1&&r.movement.navigation==movement::Navigation::HostGuided&&!steering_) {
+            // No native mutation here, including after local completion.
+            // Latest desired Host state is independent of the in-flight
+            // native goal edit. Host terminal operations still retire it.
+            for(auto& lease:leases_)if(lease.used&&lease.scope==r.scope&&lease.owner==r.owner&&lease.command==r.commandId)
+                lease.revision=r.parameterRevision;
+            primary->movement=r.movement;
+            return NativeOutcome::Admitted;
+        }
         if(primary->routeRejected) {
             const auto quiet=movementRouteQuiet_?movementRouteQuiet_(movementCallsContext_,r):route_execution::CommandRetired(r.scope,r.owner,r.commandId);
             if(r.nativeKind!=1||r.movement.parts!=1||!primary->cancelled||
@@ -546,14 +686,22 @@ NativeOutcome NativeRequestAdapter::InvokeMovement(const Record& r,const LocalAc
         const bool following=!ended&&Read(primary->ref.object+0x68,phase)&&phase==3&&
             Read(primary->ref.object+0xB8,flags)&&!(flags&0x40)&&Read(primary->ref.object+0xB9,stop)&&
             (((stop&~1U)|(r.movement.after.flags91&1U))&3U)!=3U;
-        if((ended||(goalChanged&&!following&&r.movement.navigation!=movement::Navigation::HostRoute))&&r.nativeKind==1&&r.movement.parts==1) {
+        // A retained Move can finish its native stop handshake without moving
+        // request+C to a terminal scheduler status. Its setter refuses further
+        // goals. Only the authority-checked steerer may renew that local
+        // waypoint; wire Updates cannot bypass its quiescence/backoff policy.
+        movement::native_guidance::Snapshot native{};
+        const bool retainedArrival=steering_&&r.movement.navigation==movement::Navigation::HostGuided&&
+            ReadGuidance(*primary,native)&&(movement::native_guidance::RetainedArrival(native)||
+                movement::native_guidance::ExhaustedThroughArrival(native));
+        if((ended||retainedArrival||(goalChanged&&!following&&r.movement.navigation==movement::Navigation::LocalNative))&&r.nativeKind==1&&r.movement.parts==1) {
             // The current Host Move still runs after the local request ended.
             // Recreate that same native request with the current parameters.
             if(!RestartMovement(*primary,r,actor)){MovementUnknown(r);return NativeOutcome::Unknown;}
             primary->movement=r.movement;primary->revision=r.parameterRevision;
             ++gUpdatesAfterLocalEnd;primary->unknown=false;return NativeOutcome::Admitted;
         }
-        if(ended) {
+        if(ended||retainedArrival) {
             // Recreate composite/control moves through the same certified
             // Cancel/Release and Submit paths. The current full bundle is the
             // new construction input; old before-update goals are not replayed.
@@ -565,11 +713,18 @@ NativeOutcome NativeRequestAdapter::InvokeMovement(const Record& r,const LocalAc
             return result;
         }
         primary->unknown=true;
-        if(!Gait(actor.character,r.movement.gait)||!MovementParameters(*primary,r.movement.after,false)||
-            (r.nativeKind==1&&!MovementStop(*primary,r.movement.after.stopDistance,static_cast<std::uint8_t>((r.movement.after.flags91>>5)&1)))||
+        // Keep wire parameters exact in the lease/journal. Derived goals use
+        // the current native revision and are edited later at a safe boundary.
+        auto parameters=r.movement.after;
+        if(r.movement.navigation==movement::Navigation::HostGuided) {
+            primary->revision=r.parameterRevision;
+            parameters=ExecutionParameters(*primary,r.movement.after);
+        }
+        if(!Gait(actor.character,primary->pacingGaitKnown?primary->pacingGait:r.movement.gait)||!MovementParameters(*primary,parameters,false)||
+            (r.nativeKind==1&&!MovementStop(*primary,parameters.stopDistance,static_cast<std::uint8_t>((r.movement.after.flags91>>5)&1)))||
             !MovementRevalidate(r,*primary)||
             (!SameGoal(r.movement.after.goal,primary->movement.after.goal)&&
-                r.movement.navigation!=movement::Navigation::HostRoute&&
+                r.movement.navigation==movement::Navigation::LocalNative&&
                 (!MovementGoal(*primary,r.movement.after.goal,true)||!MovementRevalidate(r,*primary)))) {
             MovementUnknown(r);return NativeOutcome::Unknown;
         }
@@ -598,9 +753,202 @@ NativeOutcome NativeRequestAdapter::InvokeMovement(const Record& r,const LocalAc
 }
 std::uint64_t UpdatesAfterLocalEnd() noexcept { return gUpdatesAfterLocalEnd.load(std::memory_order_relaxed); }
 std::uint64_t FencedRestartsSkipped() noexcept { return gFencedRestartsSkipped.load(std::memory_order_relaxed); }
-void NativeRequestAdapter::SteerMovements() noexcept {
-    // HostRoute is executed from imported native nodes. No waypoint targets,
-    // speed correction, pose chasing or intermediate stop-distance overrides.
+bool NativeRequestAdapter::ReadGuidance(const Lease& lease,movement::native_guidance::Snapshot& out) noexcept {
+    if(!lease.ref.object||!lease.movementResource.object)return false;
+    const auto request=lease.ref.object,navigation=lease.movementResource.object+0xC4U;
+    std::uintptr_t query{},control{},active{},previous{};
+    if(!Read(request+0xCU,out.status)||!Read(request+0x68U,out.phase)||!Read(request+0x6CU,out.execution)||
+        !Read(request+0xB8U,out.flags90)||!Read(request+0xB9U,out.flags91)||
+        !Read(request+0x28U,out.goal)||!Read(request+0x34U,out.pendingGoal)||
+        !Read(navigation+0x5CU,query)||!Read(navigation+0x60U,control)||
+        !Read(navigation+0x40U,active)||!Read(navigation+0x44U,previous))return false;
+    out.workerQuiet=!query&&!control;
+    const auto block=request+0x28U;
+    out.foreignBlock=(active&&active!=block)||(previous&&previous!=block);
+    out.retainsBlock=active==block||previous==block;
+    std::uintptr_t sentinel{},tail{};
+    out.tailExhausted=Read(navigation,sentinel)&&sentinel&&Read(request+0x64U,tail)&&tail&&tail==sentinel;
+    std::uint8_t update48{},update49{};
+    out.routeUpdateQuiet=Read(navigation+0x48U,update48)&&Read(navigation+0x49U,update49)&&!update48&&!update49;
+    if(out.status==5U)out.retainedReferenceAbsent=RetainedReferenceAbsent(lease.actor.character,request);
+    return movement::FinitePoint(out.goal);
+}
+bool NativeRequestAdapter::GuidanceCanRestart(const Lease& current) noexcept {
+    // Appending a continuation behind a future Host action would invert its
+    // order. Retained terminal Refs do not block, but any live/unknown other
+    // command and any foreign native queue member preserve the handoff.
+    for(const auto& held:leases_)if(held.used&&held.actor==current.actor&&
+        (held.scope!=current.scope||held.owner!=current.owner||held.command!=current.command)&&
+        held.admitted&&!held.preempted&&!held.cancelled) {
+        std::uint32_t status{};
+        if(held.unknown||!Read(held.ref.object+0xCU,status)||status<3U||status>6U)return false;
+    }
+    std::uint32_t count{};std::uintptr_t head{},entry{};
+    if(!Read(current.actor.character+kScheduler+8U,count)||count>kCapacity)return false;
+    if(!count)return true;
+    if(!Read(current.actor.character+kScheduler+4U,head)||!head||!Read(head,entry))return false;
+    for(std::uint32_t i=0;i<count;++i) {
+        if(!entry||entry==head)return false;
+        std::uintptr_t request{},next{};
+        if(!Read(entry+8U,request)||!Read(entry,next))return false;
+        bool own{};
+        for(const auto& held:leases_)if(held.used&&held.actor==current.actor&&held.scope==current.scope&&
+            held.owner==current.owner&&held.command==current.command&&held.ref.object==request&&
+            held.admitted&&!held.preempted&&!held.cancelled&&!held.unknown)own=true;
+        if(!own)return false;
+        entry=next;
+    }
+    return entry==head;
+}
+bool NativeRequestAdapter::ApplyGuidanceParameters(Lease& lease,const movement::Parameters& parameters,
+    std::uint32_t gait,std::uint32_t revision) noexcept {
+    // The caller has observed the actual goal and a native-safe phase. In
+    // particular no stop-dirty bit can race an unconsumed pending goal.
+    if(!Gait(lease.actor.character,gait)||!NavigationRevalidate(lease))return false;
+    if(lease.pacingGaitKnown)++gPacingGaitSamples;
+    if((!lease.executedParametersKnown||GuidanceParametersDiffer(lease.executedParameters,parameters))&&
+        (!MovementParameters(lease,parameters,false)||!NavigationRevalidate(lease)))return false;
+    const auto variant=static_cast<std::uint8_t>((parameters.flags91>>5)&1U);
+    if(!lease.executedArrivalKnown||!SameFloat(lease.executedStopDistance,parameters.stopDistance)||
+        lease.executedStopVariant!=variant) {
+        if(!MovementStop(lease,parameters.stopDistance,variant)||!NavigationRevalidate(lease))return false;
+        ++gGuidanceStopChanges;
+    }
+    lease.guidanceAppliedRevision=revision;
+    return true;
+}
+void NativeRequestAdapter::SteerMovements(GuidanceAuthority authority,void* authorityContext) noexcept {
+    using namespace movement::native_guidance;
+    if(busy_||retiring_||!base_||!authority)return;
+    for(auto& lease:leases_) {
+        if(!lease.used||lease.secondary||lease.kind!=1||lease.movement.navigation!=movement::Navigation::HostGuided||
+            !lease.admitted||lease.cancelled||lease.preempted||lease.unknown||lease.routeRejected)continue;
+        const RetirementIdentity identity{lease.scope,lease.owner,lease.command,lease.actor,lease.kind,lease.revision};
+        if(!authority(authorityContext,identity)||MovementExecutionOwned(lease.actor.character)||!NavigationRevalidate(lease)) {++gGuidanceSuspended;continue;}
+        std::uintptr_t head{},first{},request{};std::uint32_t count{};
+        // A queued Move cannot author gait/stop over another native head.
+        // Its OWN compound Stop may be head after a local end; renewal of
+        // that same bundle uses certified secondary-first cleanup below.
+        if(!Read(lease.actor.character+kScheduler+8U,count)||count>kCapacity||
+            (count&&(!Read(lease.actor.character+kScheduler+4U,head)||!head||!Read(head,first)||
+                !first||first==head||!Read(first+8U,request)))) {
+            ++gGuidanceSuspended;++gGuidanceQueueWaits;continue;
+        }
+        const bool primaryHead=!count||request==lease.ref.object;
+        bool ownHead=primaryHead;
+        if(!ownHead)for(const auto& held:leases_)if(held.used&&held.secondary&&held.actor==lease.actor&&
+            held.scope==lease.scope&&held.owner==lease.owner&&held.command==lease.command&&held.ref.object==request&&
+            held.admitted&&!held.preempted&&!held.cancelled&&!held.unknown)ownHead=true;
+        if(!ownHead){++gGuidanceSuspended;++gGuidanceQueueWaits;continue;}
+        std::array<float,3> local{};
+        if(!Read(lease.actor.character+0x70U,local)||!movement::FinitePoint(local)){++gGuidanceSuspended;continue;}
+        if(!lease.guidanceProgressKnown) {lease.guidanceProgress=local;lease.guidanceProgressKnown=true;}
+        const auto dx=local[0]-lease.guidanceProgress[0],dz=local[2]-lease.guidanceProgress[2];
+        if(dx*dx+dz*dz>=0.0625F) {
+            if(dx*dx+dz*dz<=16.0F&&std::abs(local[1]-lease.guidanceProgress[1])<=1.5F)lease.guidanceContinuations=0;
+            lease.guidanceProgress=local;
+        }
+        const auto desired=ExecutionParameters(lease,lease.movement.after);
+        if(lease.pacingSuspended){++gGuidanceSuspended;continue;}
+        Snapshot native{};
+        if(!ReadGuidance(lease,native)){++gGuidanceFaults;continue;}
+        const auto now=movementClock_?movementClock_(movementCallsContext_):GetTickCount64();
+        if(AwaitingScheduler(native)){++gGuidanceDeferred;continue;}
+        if(SchedulerEnded(native)||RetainedArrival(native)||ExhaustedThroughArrival(native)) {
+            if(native.status==5U&&!native.retainedReferenceAbsent){++gGuidanceRetainedWaits;continue;}
+            if(Renewable(native))lease.guidanceGoalPending=false;
+            if(!Renewable(native)||lease.pacing.holding||
+                !MeaningfulTarget(local,desired.goal,desired.stopDistance,desired.stoppingDistance)){++gGuidanceDeferred;continue;}
+            if(!GuidanceCanRestart(lease)){++gGuidanceQueueWaits;continue;}
+            if(!RetryReady(now,lease.lastGuidanceContinuation,lease.guidanceContinuations)) {++gGuidanceContinuationLimits;continue;}
+            const character_direct_step_runtime::MovementResourceLease resources(lease.actor.character);
+            if(!resources||!NavigationRevalidate(lease)||!authority(authorityContext,identity)){++gGuidanceSuspended;continue;}
+            Record frame{};frame.scope=lease.scope;frame.owner=lease.owner;frame.commandId=lease.command;
+            frame.nativeKind=1;frame.parameterRevision=lease.revision;frame.admission=lease.admission;
+            frame.movement=lease.movement;frame.opcode=Op::Update;
+            const auto actor=lease.actor;
+            const auto attempts=lease.guidanceContinuations==UINT32_MAX?UINT32_MAX:lease.guidanceContinuations+1U;
+            busy_=steering_=true;invokingRecord_=&frame;
+            const auto outcome=InvokeMovement(frame,actor);
+            invokingRecord_=nullptr;steering_=busy_=false;
+            if(auto* current=Find(frame)) {
+                current->guidanceContinuations=attempts;current->lastGuidanceContinuation=current->lastGuidanceEdit=now;
+                current->guidanceProgress=local;current->guidanceProgressKnown=true;current->guidanceGoalPending=false;
+                if(outcome!=NativeOutcome::Admitted)current->unknown=true;
+            }
+            if(outcome==NativeOutcome::Admitted) {
+                ++gGuidanceContinuations;
+                if(ExhaustedThroughArrival(native))++gGuidanceExhaustedTailContinuations;
+            } else ++gGuidanceFaults;
+            continue;
+        }
+        if(!primaryHead){++gGuidanceSuspended;continue;}
+        auto parameters=desired;
+        auto gait=lease.pacingGaitKnown?lease.pacingGait:lease.movement.gait;
+        auto revision=lease.revision;
+        bool consumed{};
+        if(lease.guidanceGoalPending) {
+            const auto observation=ObserveGoal(native,lease.pendingGuidanceParameters.goal);
+            if(observation==GoalResult::Waiting||observation==GoalResult::Pending) {++gGuidanceDeferred;continue;}
+            lease.guidanceGoalPending=false;
+            if(observation==GoalResult::Discarded) {
+                // A void setter and a cleared pending bit are not evidence of
+                // a route change. Preserve the desired goal for a later edit.
+                ++gGuidanceGoalDiscards;lease.lastGuidanceEdit=now;continue;
+            }
+            consumed=true;++gGuidanceGoalConsumptions;
+            // Finish the deposited frame before starting another goal. When
+            // the latest target is identical/coalescible, use its newer intent.
+            if(!CoalescibleGoal(native.goal,desired.goal)) {
+                parameters=lease.pendingGuidanceParameters;
+                gait=lease.pendingGuidanceGait;revision=lease.pendingGuidanceRevision;
+            }
+        }
+        if(!Editable(native)){++gGuidanceDeferred;continue;}
+        lease.executedGoal=native.goal;lease.executedGoalKnown=true;
+        if(!consumed&&!CanConsumeGoal(native.goal,parameters.goal)&&!CoalescibleGoal(native.goal,parameters.goal)) {
+            // A vertical-only edit cannot be consumed by 0044D320. Keep the
+            // current native route intact; after its real end a factory can
+            // accept the full three-dimensional Host target.
+            ++gGuidanceDeferred;continue;
+        }
+        const bool changeGoal=!consumed&&CanConsumeGoal(native.goal,parameters.goal);
+        const bool changeParameters=!lease.executedParametersKnown||GuidanceParametersDiffer(lease.executedParameters,parameters)||
+            !lease.executedArrivalKnown||!SameFloat(lease.executedStopDistance,parameters.stopDistance)||
+            lease.executedStopVariant!=((parameters.flags91>>5)&1U);
+        std::uint32_t currentGait{};
+        if(!Read(lease.movementResource.object+0x194U,currentGait)){++gGuidanceFaults;continue;}
+        if(!consumed&&!changeGoal&&!changeParameters&&currentGait==gait)continue;
+        if(!consumed&&now-lease.lastGuidanceEdit<150U){++gGuidanceDeferred;continue;}
+        const character_direct_step_runtime::MovementResourceLease resources(lease.actor.character);
+        if(!resources||!NavigationRevalidate(lease)||!authority(authorityContext,identity)){++gGuidanceSuspended;continue;}
+        Record frame{};frame.scope=lease.scope;frame.owner=lease.owner;frame.commandId=lease.command;
+        frame.nativeKind=1;frame.parameterRevision=lease.revision;frame.admission=lease.admission;
+        frame.movement=lease.movement;frame.opcode=Op::Update;
+        busy_=steering_=true;invokingRecord_=&frame;
+        bool applied{};
+        if(changeGoal) {
+            applied=MovementGoal(lease,parameters.goal,true)&&NavigationRevalidate(lease);
+            if(applied) {
+                Snapshot deposited{};applied=ReadGuidance(lease,deposited);
+                if(applied&&(deposited.flags90&0x40U)&&movement::native_guidance::SameGoal(deposited.pendingGoal,parameters.goal)) {
+                    lease.pendingGuidanceParameters=parameters;lease.pendingGuidanceGait=gait;
+                    lease.pendingGuidanceRevision=revision;lease.guidanceGoalPending=true;++gGuidanceGoalDeposits;
+                } else if(applied)++gGuidanceDeferred; // Retail refused; retain intent, never claim it executed.
+            }
+        } else applied=ApplyGuidanceParameters(lease,parameters,gait,revision);
+        invokingRecord_=nullptr;steering_=busy_=false;
+        if(applied) {lease.lastGuidanceEdit=now;if(!changeGoal)++gHostPathSteers;}
+        else {lease.unknown=true;++gGuidanceFaults;}
+    }
+}
+GuidanceReport GuidanceDiagnostics() noexcept {
+    return {gHostPathSteers.load(),gGuidanceDeferred.load(),gGuidanceSuspended.load(),gGuidanceFaults.load(),gGuidanceWithoutRoute.load(),
+        gGuidanceContinuations.load(),gGuidanceContinuationLimits.load(),gPacedSamples.load(),gPacingHoldSamples.load(),
+        gPacingUnavailable.load(),gPacingGaitSamples.load(),gPhysicalTrailSamples.load(),gPacingLead.load(),
+        gGuidanceGoalDeposits.load(),gGuidanceGoalConsumptions.load(),gGuidanceGoalDiscards.load(),
+        gGuidanceStopChanges.load(),gGuidanceStartWaits.load(),gGuidanceRetainedWaits.load(),gGuidanceQueueWaits.load(),
+        gGuidanceExhaustedTailContinuations.load()};
 }
 std::uint64_t HostPathSteers() noexcept { return gHostPathSteers.load(std::memory_order_relaxed); }
 } // namespace aimp::ai_sync::execution

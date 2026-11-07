@@ -1,6 +1,8 @@
 #pragma once
 
 #include "aimp/AISyncTransactions.h"
+#include "aimp/AISyncGuidedMovement.h"
+#include "aimp/AISyncNativeGuidancePolicy.h"
 #include <array>
 
 namespace aimp::ai_sync::execution {
@@ -13,6 +15,14 @@ struct LocalActorBinding {
     std::uint64_t creationSerial{};
     bool operator==(const LocalActorBinding&) const noexcept = default;
 };
+// Borrowed synchronous context of an explicit Host adapter invocation.
+// Valid only on the calling thread until Invoke returns. Local guidance and
+// continuations never install it and cannot claim a newer Host operation.
+struct NativeInvocation {
+    const transactions::Record* record{};
+    LocalActorBinding actor{};
+};
+[[nodiscard]] NativeInvocation CurrentNativeInvocation() noexcept;
 using ResolveActor = bool(*)(void*, const transactions::OwnerKey&, LocalActorBinding&) noexcept;
 using MarkerResolve = bool(*)(const transactions::Record&, std::uint32_t& localMarker) noexcept;
 void SetMarkerResolver(MarkerResolve) noexcept;
@@ -58,6 +68,12 @@ void SetHostPoseQuery(HostPoseQuery) noexcept;
 using ExecutionOwnedQuery = bool(*)(std::uintptr_t character) noexcept;
 void SetExecutionOwnedQuery(ExecutionOwnedQuery) noexcept;
 [[nodiscard]] bool MovementExecutionOwned(std::uintptr_t character) noexcept;
+// Diagnostics only: lease state at the last refused movement Update. Bits:
+// 1 no lease, 2 preempted, 4 routeRejected, 8 cancelled, 16 not admitted,
+// 32 unknown, 64 revision not newer. status is native +0C (255 unreadable).
+struct UpdateRefusalReport { std::uint64_t count{}, command{}; std::uint32_t bits{}, status{};
+    std::uint64_t placementHolds{}, placementTimeouts{}; }; // movement Submits held behind a Host placement
+[[nodiscard]] UpdateRefusalReport UpdateRefusals() noexcept;
 [[nodiscard]] std::uint64_t SteersSuspended() noexcept;
 [[nodiscard]] std::uint64_t HostProgressCatchups() noexcept;
 [[nodiscard]] std::uint64_t HostStartHolds() noexcept;
@@ -73,6 +89,9 @@ struct RetirementIdentity {
     std::uint32_t kind{}, revision{};
     bool operator==(const RetirementIdentity&) const noexcept = default;
 };
+using GuidanceAuthority = bool(*)(void*,const RetirementIdentity&) noexcept;
+using HostProgressQuery = bool(*)(void*,const RetirementIdentity&,movement::HostProgress&) noexcept;
+void SetHostProgressQuery(HostProgressQuery,void* context) noexcept;
 struct NavigationBinding {
     RetirementIdentity command{};
     movement::Navigation policy{};
@@ -109,7 +128,8 @@ public:
     // Diagnostic only: which native dependency the last Waiting Check reported.
     // 2 dependency gate, 3 actor/ownership, 4 locomotion resources,
     // 5 Host route provider, 6 goal edit not yet accepted natively,
-    // 7 ended Move awaiting native restart. Pose is never an admission gate.
+    // 7 ended Move awaiting native restart, 12 guided target not yet usable.
+    // Waiting retains the Host command; a body pose is never written here.
     [[nodiscard]] std::uint32_t LastWaitReason() const noexcept { return waitReason_; }
     void ClearWaitReason() noexcept { waitReason_ = 0; }
     // Retained diagnostic: synthetic transition pose placements are disabled.
@@ -139,9 +159,9 @@ public:
     // for authoritative Release and fences future Submit/Update. False leaves
     // busy, stale or uncertain work with the caller; never broadens ownership.
     [[nodiscard]] bool RejectNavigation(const NavigationBinding&) noexcept;
-    // Compatibility entry point; HostRoute movement is executed by the native
-    // route importer. This method no longer generates intermediate goals.
-    void SteerMovements() noexcept;
+    // Engine-qualified HostGuided waypoint edits through the retail pending
+    // goal setter. HostRoute actions keep their separate strict importer.
+    void SteerMovements(GuidanceAuthority,void* authorityContext) noexcept;
     [[nodiscard]] bool BeginRetirement(const transactions::Scope&) noexcept;
     [[nodiscard]] RetirementProgress DrainRetirement(RetirementGuard, void* context,
         std::size_t budget = 4) noexcept;
@@ -173,12 +193,28 @@ private:
         std::uint32_t localMarker{};
         bool markerInitializing{}, markerInitialized{};
         Ref movementResource{};
+        movement::GuidanceCursor guidance{};
+        std::array<float,3> executedGoal{};
+        bool executedGoalKnown{};
+        float executedStopDistance{},executedStoppingDistance{};
+        bool executedArrivalKnown{};
+        movement::Parameters executedParameters{},pendingGuidanceParameters{};
+        bool executedParametersKnown{},guidanceGoalPending{};
+        std::uint32_t executedStopVariant{},pendingGuidanceGait{},pendingGuidanceRevision{},guidanceAppliedRevision{};
+        std::uint64_t lastGuidanceEdit{};
+        std::uint64_t lastGuidanceContinuation{};
+        std::array<float,3> guidanceProgress{};
+        std::uint32_t guidanceContinuations{};
+        bool guidanceProgressKnown{};
+        movement::PacingCursor pacing{};
+        bool pacingSuspended{},pacingGaitKnown{},pacingGoalLimited{};
+        std::uint32_t pacingGait{};
     };
     [[nodiscard]] Lease* Find(const transactions::Record&) noexcept;
     [[nodiscard]] bool Resolve(const transactions::Record&, LocalActorBinding&) noexcept;
     [[nodiscard]] bool Live(const Lease&, const LocalActorBinding&) const noexcept;
     [[nodiscard]] transactions::NativeOutcome InvokePinned(const transactions::Record&, const LocalActorBinding&) noexcept;
-    void PlaceHiddenAtTransition(const transactions::Record&, const LocalActorBinding&) noexcept;
+
     [[nodiscard]] transactions::NativeOutcome InvokeLifecycle(const transactions::Record&, const LocalActorBinding&) noexcept;
     [[nodiscard]] Readiness CheckMovement(const transactions::Record&, const LocalActorBinding&) noexcept;
     [[nodiscard]] Readiness Resources(std::uintptr_t character) noexcept;
@@ -186,6 +222,7 @@ private:
     [[nodiscard]] bool MovementFactory(Lease&, std::uint32_t) noexcept;
     [[nodiscard]] bool MovementAdmit(Lease&, std::uint32_t admission, bool& accepted) noexcept;
     [[nodiscard]] bool MovementGoal(Lease&, const std::array<float,3>&, bool update) noexcept;
+    [[nodiscard]] movement::Parameters ExecutionParameters(Lease&, const movement::Parameters&) noexcept;
     [[nodiscard]] bool MovementStop(Lease&, float, std::uint8_t) noexcept;
     [[nodiscard]] bool MovementParameters(Lease&, const movement::Parameters&, bool initial) noexcept;
     [[nodiscard]] bool MovementRevalidate(const transactions::Record&, Lease&) noexcept;
@@ -194,6 +231,9 @@ private:
     [[nodiscard]] bool MarkerRevalidate(const Lease&) noexcept;
     [[nodiscard]] bool NavigationRevalidate(const Lease&) noexcept;
     [[nodiscard]] bool RestartMovement(Lease&, const transactions::Record&, const LocalActorBinding&) noexcept;
+    [[nodiscard]] bool ReadGuidance(const Lease&, movement::native_guidance::Snapshot&) noexcept;
+    [[nodiscard]] bool GuidanceCanRestart(const Lease&) noexcept;
+    [[nodiscard]] bool ApplyGuidanceParameters(Lease&,const movement::Parameters&,std::uint32_t gait,std::uint32_t revision) noexcept;
     void MovementUnknown(const transactions::Record&) noexcept;
     void FenceSupersededMovements(const transactions::Record&, const LocalActorBinding&) noexcept;
     [[nodiscard]] bool CheckImage() const noexcept;
@@ -216,7 +256,17 @@ private:
     ResolveActor lifecycleResolver_{};
     void* context_{};
     bool busy_{};
+    bool steering_{};
     std::uint32_t waitReason_{};
+    // An admitted Host placement (kind8) moves the Character only when the
+    // scheduler runs it. A following Move queried before that frame starts
+    // from the stale pose and its Host route is refused (check 203). Hold the
+    // next movement Submit of that actor until the target is reached, bounded.
+    struct PendingPlacement {
+        std::uintptr_t character{}; std::uint32_t runtime{};
+        std::array<float,3> target{}, before{}; std::uint64_t since{};
+    };
+    std::array<PendingPlacement, 4> placements_{};
     std::uint64_t transitionPlacements_{}, lifecycleEvents_{};
     const transactions::Record* invokingRecord_{}; // Borrowed synchronous frame only.
     bool retiring_{};
@@ -228,6 +278,7 @@ private:
     bool (*retirementRelease_)(void*, std::uintptr_t) noexcept{};
     void* movementCallsContext_{};
     bool (*movementFactory_)(void*,std::uint32_t,std::uintptr_t,std::uintptr_t*) noexcept{};
+    std::uint64_t (*movementClock_)(void*) noexcept{}; // Deterministic guidance cooldown tests.
     bool (*movementAdmission_)(void*,std::uintptr_t,std::uint32_t,bool&) noexcept{};
     bool (*movementGoal_)(void*,std::uintptr_t,const float*,bool) noexcept{};
     bool (*movementStop_)(void*,std::uintptr_t,float,std::uint8_t) noexcept{};
@@ -236,9 +287,17 @@ private:
     bool (*markerGoal_)(void*,std::uintptr_t,const float*) noexcept{};
     bool (*markerInsertion_)(void*,std::uintptr_t,std::uintptr_t) noexcept{};
 };
-// Host Updates accepted as no-op because the local Move had already ended.
+// Native restarts/continuations after a local end, not Host completion.
 [[nodiscard]] std::uint64_t UpdatesAfterLocalEnd() noexcept;
 // Updates of a Host-fenced HostRoute command accepted without recreating it.
 [[nodiscard]] std::uint64_t FencedRestartsSkipped() noexcept;
 [[nodiscard]] std::uint64_t HostPathSteers() noexcept;
+struct GuidanceReport {
+    std::uint64_t edits{},deferred{},suspended{},faults{},withoutRoute{},continuations{},continuationLimits{};
+    std::uint64_t pacedSamples{},holdSamples{},unavailableSamples{},gaitSamples{},physicalTrailSamples{};
+    float lastLead{};
+    std::uint64_t goalDeposits{},goalConsumptions{},goalDiscards{},stopChanges{},startWaits{},retainedWaits{},queueWaits{};
+    std::uint64_t exhaustedTailContinuations{};
+};
+[[nodiscard]] GuidanceReport GuidanceDiagnostics() noexcept;
 } // namespace aimp::ai_sync::execution
