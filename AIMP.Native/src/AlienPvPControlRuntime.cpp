@@ -50,7 +50,7 @@ bool OrdinaryCycle(std::uintptr_t character) noexcept {
     std::uintptr_t cycle{},owner{};std::uint8_t state{};std::uint32_t dead{};
     return Read(character+0x2F90U,dead) && dead==0U &&
         Read(character+0x36CU,cycle) && cycle && Read(cycle+4U,owner) && owner==character &&
-        Read(cycle+0x1AU,state) && (state==1U || state==55U || state==56U || state==59U);
+        Read(cycle+0x1AU,state) && (state==1U || state==55U || state==56U || state==57U || state==59U);
 }
 bool ReadPose(Frame& f) noexcept {
     if(!Read(g.context.character+0x70U,f.x) || !Read(g.context.character+0x74U,f.y) ||
@@ -120,6 +120,9 @@ bool CancelRecovery() noexcept {
         g.context.actions->cancelRecovery(g.context,true);
     g.recovering=!retired;return retired;
 }
+bool StopDonorMovement() noexcept {
+    return !g.context.actions || !g.context.actions->drive || g.context.actions->drive(g.context,nullptr);
+}
 void ApplyAction(const Frame& command,std::uint64_t now) noexcept {
     if(command.action==Action::None || (command.flags&Focused)==0U)return;
     Frame result=command;result.resolutionRevision=1U;
@@ -134,7 +137,7 @@ void ApplyAction(const Frame& command,std::uint64_t now) noexcept {
     // Attack execution is carried by the existing typed AISync pair stream;
     // vent execution waits for the Host-selected real portal resolution.
     if(!g.context.host)return;
-    if(!CancelRecovery()) {
+    if(!StopDonorMovement() || !CancelRecovery()) {
         if(!g.hasDeferredAction) {g.deferredAction=command;g.deferredActionAt=now;g.hasDeferredAction=true;}
         else if(g.deferredAction.hostSequence!=command.hostSequence) {
             result.phase=ActionPhase::Rejected;result.reason=ActionReason::NativeBusy;PublishAction(result,now);
@@ -150,7 +153,7 @@ void ApplyAction(const Frame& command,std::uint64_t now) noexcept {
 }
 void ApplyResolution(const Frame& plan,std::uint64_t now) noexcept {
     if(g.context.host)return;
-    if(!CancelRecovery() && (plan.phase==ActionPhase::Preparing || plan.phase==ActionPhase::Started)) {
+    if((!StopDonorMovement() || !CancelRecovery()) && (plan.phase==ActionPhase::Preparing || plan.phase==ActionPhase::Started)) {
         if(!g.hasDeferredAction || g.deferredAction.hostSequence==plan.hostSequence) {
             if(!g.hasDeferredAction)g.deferredActionAt=now;
             g.deferredAction=plan;g.hasDeferredAction=true;
@@ -169,7 +172,7 @@ void PollAction(std::uint64_t now) noexcept {
             Frame failed=g.deferredAction;failed.phase=ActionPhase::Rejected;failed.reason=ActionReason::NativeBusy;
             failed.resolutionRevision=std::max(std::uint64_t{1},failed.resolutionRevision+1U);
             g.hasDeferredAction=false;PublishAction(failed,now);
-        } else if(CancelRecovery()) {
+        } else if(StopDonorMovement() && CancelRecovery()) {
             const auto pending=g.deferredAction;g.hasDeferredAction=false;
             if(pending.kind==Kind::Resolution)ApplyResolution(pending,now);else ApplyAction(pending,now);
         }
@@ -230,7 +233,7 @@ void Drain(std::uint64_t now) noexcept {
     }
 }
 void StopMovement() noexcept {
-    if(!g.ownsSlot)return;
+    if(!g.ownsSlot){g.moving=false;return;}
     if(OrdinaryCycle(g.context.character)) {
         std::string error;
         static_cast<void>(character_direct_step_runtime::HoldAIIntentIdle(g.context.character,1U,error));
@@ -246,10 +249,11 @@ void ApplyMovement(std::uint64_t now,float dt) noexcept {
     const bool fresh=g.context.localOwner ?
         active && g.context.pilotReady && Fresh(now,g.capturedAt,150U) &&
             Fresh(now,g.lastAckAt,kAuthorityTimeoutMs) : g.window.InputFresh(now);
-    if(ActionBusy() || g.hasDeferredAction) {static_cast<void>(CancelRecovery());ReleaseCarrier();return;}
+    if(ActionBusy() || g.hasDeferredAction) {static_cast<void>(StopDonorMovement());static_cast<void>(CancelRecovery());ReleaseCarrier();return;}
     std::uint8_t cycle{};bool backstage{};
     const bool stageKnown=NativeStage(g.context.character,cycle,backstage);
     if(fresh && stageKnown && spatial::ManualBackstage(cycle,backstage,false)) {
+        if(!StopDonorMovement()){ReleaseCarrier();return;}
         if(!CancelRecovery()){ReleaseCarrier();return;}
         ReleaseCarrier();
         const auto& committed=g.window.Input();
@@ -277,6 +281,7 @@ void ApplyMovement(std::uint64_t now,float dt) noexcept {
         g.expired=false;return;
     }
     if(!fresh || !stageKnown || backstage || !OrdinaryCycle(g.context.character)) {
+        static_cast<void>(StopDonorMovement());
         const bool expired=g.window.Granted() && !fresh;
         if(expired&&!g.expired)gExpired.fetch_add(1U,std::memory_order_relaxed);
         g.expired=expired;static_cast<void>(CancelRecovery());StopMovement();return;
@@ -294,6 +299,7 @@ void ApplyMovement(std::uint64_t now,float dt) noexcept {
         const bool substantial=ready && (std::hypot(g.correction.x-body.x,g.correction.z-body.z)>4.0F ||
             std::abs(g.correction.y-body.y)>1.0F);
         if(substantial || g.recovering) {
+            if(!StopDonorMovement()){ReleaseCarrier();return;}
             ReleaseCarrier();
             g.recovering=g.context.actions->recover(g.context,ready?&g.correction:nullptr);
             if(g.recovering){g.moving=true;return;}
@@ -301,6 +307,26 @@ void ApplyMovement(std::uint64_t now,float dt) noexcept {
     }
     alien_pvp_movement::Plan plan{};
     const bool moving=alien_pvp_movement::TryPlan(input.forward,input.strafe,input.yaw,input.gait,plan);
+    if(g.context.actions && g.context.actions->drive) {
+        ReleaseCarrier();
+        Frame intent{};intent.forward=input.forward;intent.strafe=input.strafe;
+        intent.yaw=input.yaw;intent.gait=input.gait;
+        // Feed bounded observer correction through the same native direction
+        // request. The local owner keeps its immediate control and animation.
+        if(!g.context.host && !g.context.localOwner && g.correctionAt && Fresh(now,g.correctionAt,250U) &&
+            (g.correction.flags&(PoseValid|NativeBusy|Backstage))==PoseValid) {
+            const float dx=g.correction.x-body.x,dz=g.correction.z-body.z;
+            if(std::hypot(dx,dz)>0.25F) {
+                const float vx=(moving?plan.worldX:0.0F)+dx*0.5F;
+                const float vz=(moving?plan.worldZ:0.0F)+dz*0.5F;
+                intent.yaw=std::atan2(vx,vz);intent.forward=1.0F;intent.strafe=0.0F;
+            }
+        }
+        g.moving=g.context.actions->drive(g.context,input.focused?&intent:nullptr) &&
+            (intent.forward!=0.0F || intent.strafe!=0.0F) && input.focused;
+        if(g.moving){g.appliedInput=g.window.LastInput();g.appliedHost=g.window.LastHost();}
+        return;
+    }
     std::string error;bool applied{};
     // Progressive correction uses the already-existing no-snap native carrier,
     // exclusively in PvP. No Coop follower policy or transform writer changes.

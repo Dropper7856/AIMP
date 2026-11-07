@@ -27,6 +27,7 @@ struct ImportSlot final {
 constexpr std::size_t kSlotCount=6U;
 std::array<ImportSlot,kSlotCount> gSlots{};
 std::atomic<bool> gActive{},gInstalled{};
+std::atomic<int> gCameraWheel{};
 std::uintptr_t gExecutableBase{};
 AsyncKeyFn gOriginalAsync{};
 RawInputFn gOriginalRaw{};
@@ -46,6 +47,11 @@ bool PassKey(const std::uint32_t key) noexcept {
 bool Active() noexcept { return gActive.load(std::memory_order_acquire); }
 void FilterMessage(LPMSG message) noexcept {
     if (!Active() || !message) return;
+    if(message->message==WM_MOUSEWHEEL) {
+        // Raw input is the donor's primary wheel source; WM_MOUSEWHEEL is
+        // suppressed so it cannot also select Amanda's equipment.
+        message->message=WM_NULL;return;
+    }
     if (message->message >= WM_KEYFIRST && message->message <= WM_KEYLAST &&
         !PassKey(static_cast<std::uint32_t>(message->wParam))) {
         message->message=WM_NULL;
@@ -77,6 +83,8 @@ UINT WINAPI HookRaw(const HRAWINPUT input,const UINT command,
         }
     } else if (raw->header.dwType==RIM_TYPEMOUSE &&
         result>=sizeof(RAWINPUTHEADER)+sizeof(RAWMOUSE)) {
+        if((raw->data.mouse.usButtonFlags&RI_MOUSE_WHEEL)!=0U)
+            gCameraWheel.fetch_add(static_cast<SHORT>(raw->data.mouse.usButtonData),std::memory_order_relaxed);
         raw->data.mouse.usButtonFlags=0U;
         raw->data.mouse.usButtonData=0U;
         raw->data.mouse.ulRawButtons=0U;
@@ -202,6 +210,7 @@ void ResetPublished() noexcept {
     gOriginalGetW=nullptr;gOriginalGetA=nullptr;
 }
 } // namespace
+int TakeCameraWheel() noexcept {return gCameraWheel.exchange(0,std::memory_order_relaxed);}
 
 bool Installed() noexcept { return gInstalled.load(std::memory_order_acquire); }
 void SetActive(bool enabled) noexcept {

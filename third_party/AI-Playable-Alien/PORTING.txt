@@ -1,0 +1,40 @@
+Upstream: AI-Playable-Alien, copyright (c) 2026 pirletik, MIT license.
+Source: user-supplied AI-Playable-Alien-main.zip, received 2026-11-07.
+Archive SHA-256:
+81585A8554AEADC18CB3845905F9076BF4A4FDDE1492ECD741378B9693DF408E
+
+upstream/ retains the original source files used for this integration.
+They are reference source, not a second DLL or an independently running mod.
+
+AIMP build 435 adaptation map:
+- camera.cpp ApplyFollow, FollowFromCfg, FpKeeperTick -> AlienPvPLocalController:
+  actual FollowBehavior offsets and third-person flag, saved/restored per camera.
+- camera.cpp OnFollowUpdateEnter/Leave, BackstageCamera -> scoped follow hook:
+  living technical player computes mouse orbit backstage, translated to Alien.
+- camera.cpp OnHkWorldEnter, DuctUpdate, Collide -> generation-scoped world
+  observations, low-ceiling camera and three-ray soft collision.
+- camera.cpp CamOffsetKeys -> input firewall wheel capture and camera controls.
+- control.cpp ReadInput/MainTick and native ActionMoveInDirection::Start ->
+  AISyncPvPDonorMovement.inl: kind9 direction/distance/rebase request plus native
+  requested gait. AIMP's existing NativeRequestAdapter owns the strong Ref,
+  scheduler admission, cancellation and destruction retirement.
+- vent.cpp NearestVent, OnVentPickLeave, OnVentPickExitLeave -> native vent
+  Update calls with a thread-scoped override of the Host-selected real opening.
+- alien_extra.cpp ActAlienVoice -> existing replicated Roar adapter retained.
+- donor attack entry is adapted to AIMP's Host-certified survivor target and
+  existing paired-action replication; it never uses the parked technical body
+  as an attack victim. Existing host attack availability/paired execution stays.
+
+Android, facehugger, standalone multiplayer, photo mode, spawning/cloning,
+global behavior-tree switches and the donor's BML are not installed. AIMP
+owns its existing per-Alien lease and routes the donor's native requests there.
+No shared Android/facehugger behavior branches are enabled.
+
+Native contract references supplied in upstream dev/ghidra_dumps:
+moveshut.txt, reqvt_012b19ac.txt, ventpick.txt, flank5.txt, disfb1.txt,
+vt_move.txt. These are historical static evidence, not a recording of build435.
+FollowUpdate and world-ray entry prologues were also checked against local
+AI.exe with Capstone. The offline hook-installation tests verify compatibility.
+
+In-game validation remains required for camera rendering, collision, native
+gait transitions, vent connectivity and two-PC interaction animation timing.

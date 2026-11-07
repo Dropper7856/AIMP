@@ -1,4 +1,5 @@
 #include "aimp/AISyncExecutionRuntime.h"
+#include "aimp/AISync.h"
 #include "aimp/AISyncProfiling.h"
 #include "aimp/AISyncExecutionSession.h"
 #include "aimp/AISyncRouteRuntime.h"
@@ -125,6 +126,7 @@ void DrainDestroyed() noexcept {
     {const std::lock_guard lock(gDestroyedMutex);count=gDestroyedCount;
         std::copy_n(gDestroyed.begin(),count,facts.begin());gDestroyedCount=0;}
     for(std::size_t i=0;i<count;++i) {
+        ConfirmAlienPvPDestruction(facts[i].character,facts[i].runtimeId,facts[i].creationSerial,facts[i].nativeGeneration);
         if(facts[i].nativeGeneration!=gNativeGeneration)continue;
         gSession->ConfirmActorDestroyed({facts[i].character,facts[i].runtimeId,true,facts[i].creationSerial});
         gOwnership->ConfirmDestroyed(facts[i]);route_execution::ConfirmActorDestroyed(facts[i]);

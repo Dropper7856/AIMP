@@ -399,6 +399,9 @@ struct AlienPvPLeaseStatus final {
 };
 bool AcquireAlienPvPLease(std::uint64_t ownerPeer, AlienPvPLeaseStatus& status) noexcept;
 bool ReleaseAlienPvPLease(AlienPvPLeaseStatus& status) noexcept;
+// Copied destructor-return proof, drained on the engine thread.
+void ConfirmAlienPvPDestruction(std::uintptr_t character,std::uint32_t runtime,
+    std::uint64_t serial,std::uint32_t nativeGeneration) noexcept;
 // Engine-thread participant identity for source-attributed native subsystems.
 // Uses the same native generation/lifetime proof as perception; never chooses a
 // target. The launcher's world generation is AISync-private and not compared.

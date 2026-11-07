@@ -15,5 +15,8 @@ struct ActionHooks final {
     // position write. A null goal asks to retire it and returns while busy.
     bool (*recover)(const Context&,const Frame* goal) noexcept{};
     bool (*cancelRecovery)(const Context&,bool living) noexcept{};
+    // Donor control.cpp: retained native kind9 MoveInDirection request.
+    // Null intent retires it before a vent, pair, recovery or lease release.
+    bool (*drive)(const Context&,const Frame* intent) noexcept{};
 };
 } // namespace aimp::alien_pvp

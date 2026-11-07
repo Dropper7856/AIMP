@@ -26,6 +26,7 @@ struct VentSlot final {
     std::uintptr_t frame{},manager{};
     ap::Scope scope{};std::uintptr_t character{};
     bool used{},started{},quarantined{},cancelling{};
+    std::uint32_t selectedIndex{};
 };
 // Node storage must outlive the native frame. On unprovable destruction it is
 // quarantined, never overwritten while an old frame could still refer to it.
@@ -49,6 +50,7 @@ bool Live(const ap::Context& c) noexcept {
         c.scope.incarnation==gPvPLease.ticket.serial && c.scope.ownerPeer==gPvPLease.ownerPeer &&
         c.scope.cookie==gPvPLease.sessionCookie && c.scope.entityA==gPvPLease.entityA && c.scope.entityB==gPvPLease.entityB;
 }
+#include "AISyncPvPDonorMovement.inl"
 bool Body(const std::uintptr_t character,policy::Point& point) noexcept {
     return Read(character+0x70U,point.x) && Read(character+0x74U,point.y) &&
         Read(character+0x78U,point.z) && policy::Finite(point);
@@ -78,13 +80,55 @@ bool ExitPoint(std::uintptr_t descriptor,policy::Point& out) noexcept {
         return policy::Finite(out);
     } AIMP_ACTION_CATCH {return false;}
 }
+bool PortalIndex(const ap::Context& c,const ap::Frame& plan,std::uint32_t& index) noexcept {
+    std::uintptr_t withdraw{},manager{},entries{};std::uint32_t count{};bool found{};
+    if(!Live(c) || !Read(c.character+0x34F0U,withdraw) || !withdraw ||
+        !Read(withdraw+0x24U,manager) || !manager || !Read(manager+8U,entries) || !entries ||
+        !Read(manager+12U,count) || count>4096U)return false;
+    for(std::uint32_t i=0;i<count;++i) {
+        std::uintptr_t descriptor{};policy::Point entrance{},exit{};
+        if(!Read(entries+i*0x30U+0x28U,descriptor) || !descriptor || !Read(descriptor,entrance) || !ExitPoint(descriptor,exit))continue;
+        constexpr float tolerance=policy::kVentMatchTolerance*policy::kVentMatchTolerance;
+        if(policy::DistanceSquared(entrance,{plan.x,plan.y,plan.z})>tolerance ||
+            policy::DistanceSquared(exit,{plan.resolvedX,plan.resolvedY,plan.resolvedZ})>tolerance)continue;
+        if(found)return false;
+        index=i;found=true;
+    }
+    return found;
+}
+// Donor vent.cpp::OnVentPickLeave/OnVentPickExitLeave, scoped to this
+// AIMP-owned node call. Other Aliens and ordinary Coop keep retail selection.
+thread_local VentSlot* selectedPortal{};
+void* ventEnterOriginal{};void* ventExitOriginal{};
+std::uintptr_t PickPortal(std::uintptr_t manager,int reason,bool exit) noexcept {
+    auto* slot=selectedPortal;
+    if(!slot || slot->manager!=manager || !Live(active.context) || reason<0 || reason>1)return 0U;
+    std::uintptr_t entries{},descriptor{};std::uint32_t count{};
+    if(!Read(manager+8U,entries) || !entries || !Read(manager+12U,count) || slot->selectedIndex>=count ||
+        !Read(entries+slot->selectedIndex*0x30U+0x28U,descriptor) || !descriptor)return 0U;
+    const auto offset=(exit?0x48U:0x40U)+static_cast<unsigned>(reason)*4U;
+    AIMP_ACTION_TRY {
+        *reinterpret_cast<std::uint32_t*>(manager+offset)=slot->selectedIndex;
+        return entries+slot->selectedIndex*0x30U;
+    } AIMP_ACTION_CATCH {return 0U;}
+}
+std::uintptr_t __fastcall PickEnterDetour(void* manager,void*,int reason) noexcept {
+    const auto selected=PickPortal(reinterpret_cast<std::uintptr_t>(manager),reason,false);
+    if(selected)return selected;
+    return reinterpret_cast<std::uintptr_t(__thiscall*)(void*,int)>(ventEnterOriginal)(manager,reason);
+}
+std::uintptr_t __fastcall PickExitDetour(void* manager,void*,int reason) noexcept {
+    const auto selected=PickPortal(reinterpret_cast<std::uintptr_t>(manager),reason,true);
+    if(selected)return selected;
+    return reinterpret_cast<std::uintptr_t(__thiscall*)(void*,int)>(ventExitOriginal)(manager,reason);
+}
 bool SelectPortal(const ap::Context& c,const ap::Frame& request,ap::Frame& result) noexcept {
     std::uintptr_t withdraw{},manager{},entries{};std::uint32_t count{};
     if(!Read(c.character+0x34F0U,withdraw) || !withdraw || !Read(withdraw+0x24U,manager) || !manager ||
         !Read(manager+8U,entries) || !Read(manager+12U,count) || !entries || count==0U || count>4096U)return false;
     policy::Point body{};if(!Body(c.character,body))return false;
-    policy::Vent best{},fallback{};bool found{},fallbackFound{};
-    float bestDistance=std::numeric_limits<float>::infinity(),fallbackDistance=std::numeric_limits<float>::infinity();
+    policy::Vent best{};bool found{};
+    float bestDistance=std::numeric_limits<float>::infinity();
     const bool enter=request.action==Action::EnterVent;
     for(std::uint32_t i=0U;i<count;++i) {
         std::uintptr_t descriptor{};policy::Vent vent{};vent.localIndex=i;
@@ -96,9 +140,11 @@ bool SelectPortal(const ap::Context& c,const ap::Frame& request,ap::Frame& resul
                 if(d>policy::kVentEnterReach*policy::kVentEnterReach || std::abs(body.y-p.y)>3.5F)continue;
                 if(!found || d<bestDistance){best=vent;found=true;bestDistance=d;}
             } else {
-                if(d<=policy::kVentEnterReach*policy::kVentEnterReach && std::abs(body.y-p.y)<=3.5F &&
-                    (!fallbackFound || d<fallbackDistance)) {fallback=vent;fallbackFound=true;fallbackDistance=d;}
-                const auto score=policy::DirectedExitScore(body,request.yaw,vent);
+                // Donor vent.cpp::NearestUntried: nearest real opening to
+                // the Alien, with a height penalty. Backstage is often above
+                // the ceiling; a same-floor constraint prevents all exits.
+                const auto score=std::hypot(body.x-vent.entrance.x,body.z-vent.entrance.z)+
+                    std::abs(body.y-vent.entrance.y)*0.7F;
                 if(std::isfinite(score) && (!found || score<bestDistance)) {best=vent;found=true;bestDistance=score;}
             }
         } else {
@@ -110,7 +156,6 @@ bool SelectPortal(const ap::Context& c,const ap::Frame& request,ap::Frame& resul
             best=vent;found=true;
         }
     }
-    if(c.host && !enter && !found && fallbackFound){best=fallback;found=true;}
     std::uintptr_t current{},table{};std::uint32_t size{};
     if(!found || !Read(withdraw+0x24U,current) || current!=manager || !Read(manager+8U,table) || table!=entries ||
         !Read(manager+12U,size) || size!=count)return false;
@@ -134,7 +179,7 @@ bool StartVent(const ap::Context& c,ap::Frame& result,VentSlot& slot) noexcept {
     std::uintptr_t withdraw{};std::uint32_t allocated{};
     if(!Live(c) || !Read(c.character+0x34F0U,withdraw) || !withdraw ||
         !Read(withdraw+0x24U,slot.manager) || !slot.manager ||
-        !Read(gBase+0x012B1C20U,allocated) || allocated>=0x6F6U)return false;
+        !Read(gBase+0x012B1C20U,allocated) || allocated>=0x6F6U || !PortalIndex(c,result,slot.selectedIndex))return false;
     slot.used=true;slot.scope=c.scope;slot.character=c.character;
     AIMP_ACTION_TRY {
         using Constructor=void*(__thiscall*)(void*);
@@ -153,13 +198,16 @@ bool StartVent(const ap::Context& c,ap::Frame& result,VentSlot& slot) noexcept {
 }
 bool StepVent(const ap::Context& c,VentSlot& slot,const ap::Frame& plan,int& result) noexcept {
     if(!VentFrameLive(c,slot))return false;
-    const policy::Point goal=plan.action==Action::EnterVent?policy::Point{plan.x,plan.y,plan.z}:
-        policy::Point{plan.resolvedX,plan.resolvedY,plan.resolvedZ};
+    const auto previous=selectedPortal;selectedPortal=&slot;
     AIMP_ACTION_TRY {
-        using Move=int(__thiscall*)(void*,std::uintptr_t,std::uintptr_t,const void*,std::uint32_t,float,float,std::uint32_t);
-        result=Native<Move>(0x0030A940U)(slot.node.data(),c.character,slot.frame,&goal,0U,0.0F,0.5F,0U);
-        return result>=0 && result<=2;
-    } AIMP_ACTION_CATCH {slot.quarantined=true;return false;}
+        // Run the donor's actual GoBackstage/ComeFrontstage node Update,
+        // including its portal getter, cancel polling and native frame status.
+        using Update=void(__thiscall*)(void*,std::uintptr_t,std::uintptr_t);
+        Native<Update>(plan.action==Action::EnterVent?0x0000F5C0U:0x0000FB10U)(slot.node.data(),c.character,slot.frame);
+        const auto status=*reinterpret_cast<const std::uint32_t*>(slot.frame+4U);
+        result=status==9U?1:(status==8U?2:0);
+        selectedPortal=previous;return true;
+    } AIMP_ACTION_CATCH {selectedPortal=previous;slot.quarantined=true;return false;}
 }
 bool FinishVent(const ap::Context& c,VentSlot& slot,bool cancel,bool& done) noexcept {
     done=false;
@@ -287,6 +335,9 @@ bool Recover(const ap::Context& c,const ap::Frame* goal) noexcept {
     } AIMP_ACTION_CATCH {slot->quarantined=true;return true;}
 }
 bool ResourcesPending() noexcept {
+#ifndef AIMP_ALIEN_ACTION_TEST
+    for(const auto& d:donorMovements)if(d.used && Live(d.context))return true;
+#endif
     if(active.used)return true;
     for(const auto& slot:recoveries)if(slot.used && Live(slot.context))return true;
     return false;
@@ -403,6 +454,7 @@ void Terminal(ap::Frame& result,Phase phase,Reason reason) noexcept {
     active.receipt=result;active.terminalSent=true;
 }
 void Cancel(const ap::Context& c,bool living) noexcept {
+    static_cast<void>(StopDonor(c));
     static_cast<void>(CancelRecovery(c,living));
     if(!Same(c))return;
     if(!living || !Live(c)) {
@@ -587,14 +639,34 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
     return false;
 }
 void RetirePending() noexcept {
+#ifndef AIMP_ALIEN_ACTION_TEST
+    if(gPvPLease.releasing)for(auto& d:donorMovements)if(d.used && Live(d.context))
+        static_cast<void>(StopDonor(d.context));
+#endif
     for(auto& slot:recoveries)if(slot.used && slot.cancelling && !slot.quarantined)
         static_cast<void>(CancelRecovery(slot.context,Live(slot.context)));
     if(!active.used || !active.cancelled)return;
     ap::Frame ignored{};static_cast<void>(Poll(active.context,ignored));
 }
-const ap::ActionHooks hooks{&Begin,&Poll,&Busy,&Cancel,&Recover,&CancelRecovery};
+const ap::ActionHooks hooks{&Begin,&Poll,&Busy,&Cancel,&Recover,&CancelRecovery
+#ifndef AIMP_ALIEN_ACTION_TEST
+    ,&DriveDonor
+#endif
+};
 #undef AIMP_ACTION_TRY
 #undef AIMP_ACTION_CATCH
 } // namespace pvp_actions
 const alien_pvp::ActionHooks& PvPActionHooks() noexcept {return pvp_actions::hooks;}
 void RetirePvPActions() noexcept {pvp_actions::RetirePending();}
+bool InstallPvPDonorVentHooks(HookManager& hooks,std::string& error) {
+    for(const auto exit:{false,true}) {
+        HookRequest request;request.name=exit?"alien_donor_pick_exit":"alien_donor_pick_entry";
+        request.target=reinterpret_cast<void*>(gBase+(exit?0x00013310U:0x000132F0U));
+        request.detour=exit?reinterpret_cast<void*>(&pvp_actions::PickExitDetour):reinterpret_cast<void*>(&pvp_actions::PickEnterDetour);
+        request.patchLength=8U;request.relocationSafePrefix=true;
+        request.expected=MaskedBytes{{0x8B,0x44,0x24,0x04,0x8B,0x44,0x81,static_cast<std::uint8_t>(exit?0x48:0x40)},"xxxxxxxx"};
+        request.trampolineOut=exit?&pvp_actions::ventExitOriginal:&pvp_actions::ventEnterOriginal;
+        if(!hooks.Install(request,error))return false;
+    }
+    return true;
+}

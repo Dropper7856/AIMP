@@ -1,7 +1,11 @@
 #pragma once
 #include <cstdint>
+#include <string>
+
+namespace aimp { class HookManager; }
 
 namespace aimp::alien_pvp_local {
+bool InstallCameraHooks(std::uintptr_t base,HookManager& hooks,std::string& error);
 
 // All entry points run on the certified engine thread. The local controller
 // never accepts a network pointer, never changes the AI lease owner and never

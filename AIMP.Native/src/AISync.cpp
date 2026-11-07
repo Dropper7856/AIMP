@@ -2,6 +2,7 @@
 #include "aimp/AISync.h"
 #include "aimp/AlienPvPLocalController.h"
 #include "aimp/AlienPvPControlRuntime.h"
+#include "aimp/AlienPvPControlPolicy.h"
 #include "aimp/AlienPvPActionPolicy.h"
 #include "aimp/AlienPvPNativeActionAbi.h"
 #include "aimp/PlayerHidingRuntime.h"
@@ -42,6 +43,7 @@
 #include <mutex>
 #include <utility>
 #include <type_traits>
+#include <memory>
 
 namespace aimp::ai_sync {
 namespace {
@@ -629,6 +631,7 @@ AlienPvPNativeLease gPvPLease{};
 bool PvPCharacterFenced(std::uintptr_t character) noexcept;
 const alien_pvp::ActionHooks& PvPActionHooks() noexcept;
 void RetirePvPActions() noexcept;
+bool InstallPvPDonorVentHooks(HookManager&,std::string&);
 bool PvPLeaseScopeCurrent() noexcept;
 bool PvPLeaseLiveIdentity() noexcept;
 void ForgetPvPLease(std::uintptr_t destroyedCharacter = 0U) noexcept;
@@ -9494,6 +9497,8 @@ bool Install(const std::uintptr_t base, HookManager& hooks, LevelGenerationTrack
     // handler operands below are certified PE HIGHLOW relocations; their loaded
     // absolute values remain valid when copied into the trampoline.
     const bool installed =
+        alien_pvp_local::InstallCameraHooks(base,hooks,error) &&
+        InstallPvPDonorVentHooks(hooks,error) &&
         HookNativeOutcomes(hooks, error) &&
         HookLifecycleEvents(hooks,error) &&
         health::InstallDamageObserver(hooks, error) &&
@@ -10796,6 +10801,10 @@ bool ReleaseAlienPvPLease(AlienPvPLeaseStatus& status) noexcept {
     ForgetPvPLease();
     status.phase=AlienPvPLeasePhase::Released;
     return true;
+}
+void ConfirmAlienPvPDestruction(std::uintptr_t character,std::uint32_t runtime,
+    std::uint64_t serial,std::uint32_t nativeGeneration) noexcept {
+    pvp_actions::DonorDestroyed(character,runtime,serial,nativeGeneration);
 }
 
 bool ProbeAlienPvPCandidate(AlienPvPProbe& result) noexcept {

@@ -10,4 +10,5 @@ bool EnsureInstalled(std::uintptr_t gameModule) noexcept;
 bool Installed() noexcept;
 void SetActive(bool enabled) noexcept;
 void Uninstall() noexcept;
+int TakeCameraWheel() noexcept;
 } // namespace aimp::alien_pvp_input

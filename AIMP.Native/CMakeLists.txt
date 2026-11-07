@@ -167,6 +167,14 @@ set_target_properties(AIMP.NetZ PROPERTIES
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(AIMP.AlienPvPDonorControlTests tests/AlienPvPDonorControlTests.cpp
+        src/AlienPvPControlRuntime.cpp src/CrashGuard.cpp)
+    target_include_directories(AIMP.AlienPvPDonorControlTests PRIVATE include)
+    target_compile_definitions(AIMP.AlienPvPDonorControlTests PRIVATE AIMP_ALIEN_PVP_TEST NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_options(AIMP.AlienPvPDonorControlTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.AlienPvPDonorControlTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME AlienPvPDonorControl COMMAND AIMP.AlienPvPDonorControlTests)
     add_executable(AIMP.WorldTransactionSkipTests tests/WorldTransactionSkipTests.cpp)
     target_link_libraries(AIMP.WorldTransactionSkipTests PRIVATE AIMP.Core)
     target_compile_options(AIMP.WorldTransactionSkipTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)

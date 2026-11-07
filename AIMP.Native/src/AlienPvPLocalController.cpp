@@ -9,6 +9,7 @@
 
 #include "aimp/CharacterDirectStepRuntime.h"
 #include "aimp/CrashGuard.h"
+#include "aimp/HookManager.h"
 
 #include <Windows.h>
 #include <algorithm>
@@ -16,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <atomic>
 
 namespace aimp::alien_pvp_local {
 namespace {
@@ -32,17 +34,31 @@ struct CameraBinding final {
     std::uint32_t generation{}, technicalRuntime{}, alienRuntime{};
     std::uintptr_t alienSkeleton{};
     bool bound{}, touched{}, firstPerson{};
+    std::uintptr_t followBehavior{};
+    std::array<float,6> originalFollow{};
+    std::uint8_t originalFirstPerson{};
+    bool followSaved{};
 };
 struct LocalState final {
     CameraBinding camera{};
     alien_pvp::technical::Parking parking{};
     std::uintptr_t character{};
     std::uint32_t generation{};
-    bool moving{}, viewKeyDown{}, visualReady{};
+    bool moving{}, viewKeyDown{}, visualReady{},middleDown{};
     bool attackDown{}, enterDown{}, exitDown{}, roarDown{};
+    float cameraDistance{3.0F},cameraHeight{2.0F},cameraSide{0.5F};
+    bool duct{};unsigned ductRun{};std::uint64_t ductAt{};
+    float collisionScale{1.0F};
     std::uint64_t lastFrameMs{}, nextCameraAttemptMs{}, nextInputAttemptMs{};
 };
 LocalState gLocal{}; // certified game thread only
+std::uintptr_t gCameraBase{};
+std::atomic<DWORD> gPilotThread{};
+void* gFollowTrampoline{};
+void* gWorldTrampoline{};
+std::atomic<std::uint32_t> gCameraGeneration{};
+struct WorldSample {std::atomic<std::uintptr_t> world{};std::atomic<std::uint64_t> at{};std::atomic<std::uint32_t> generation{};};
+std::array<WorldSample,4> gWorlds{};
 
 template<typename T>
 bool Read(const std::uintptr_t at, T& out) noexcept {
@@ -101,6 +117,60 @@ constexpr std::uint32_t BoneAttachedHash() noexcept {
         h+=static_cast<std::uint32_t>(static_cast<std::uint8_t>(name[j]))<<(i&31U);
     return h;
 }
+constexpr std::uint32_t NameHash(const char* name,std::size_t size) noexcept {
+    std::uint32_t h{};
+    for(std::size_t i=0,j=0;i<256U;++i,j=(j+1U)%size)
+        h+=static_cast<std::uint32_t>(static_cast<std::uint8_t>(name[j]))<<(i&31U);
+    return h;
+}
+std::uintptr_t FindFollow(const std::uintptr_t camera) noexcept {
+    std::uintptr_t array{};std::uint32_t count{};
+    if(!Read(camera+0xBCU,array) || !array || !Read(camera+0xC0U,count) || count>256U)return 0U;
+    for(std::uint32_t i=0;i<count;++i) {
+        std::uintptr_t b{};std::uint32_t type{};
+        if(Read(array+i*sizeof(std::uintptr_t),b) && b && Read(b+8U,type) &&
+            type==NameHash("FollowBehavior",14U))return b;
+    }
+    return 0U;
+}
+template<class T> bool Write(std::uintptr_t at,const T& value) noexcept {
+    return at && crash_guard::TryCopy(reinterpret_cast<void*>(at),&value,sizeof(value));
+}
+bool ConfigureFollow(CameraBinding& camera,bool firstPerson) noexcept {
+    const auto b=FindFollow(camera.follow);
+    if(!b || (camera.followSaved && camera.followBehavior!=b))return false;
+    if(!camera.followSaved) {
+        if(!Read(b+0x9CU,camera.originalFollow) || !Read(b+0xF6U,camera.originalFirstPerson))return false;
+        camera.followBehavior=b;camera.followSaved=true;
+    }
+    // Donor camera.cpp::FollowFromCfg, DuctUpdate and FpKeeperTick.
+    const std::array<float,6> values=gLocal.duct?
+        std::array<float,6>{0.0F,0.35F,-0.9F,0.0F,0.3F,1.5F}:
+        std::array<float,6>{gLocal.cameraSide,gLocal.cameraHeight,-gLocal.cameraDistance,
+            0.0F,gLocal.cameraHeight-0.7F,2.0F};
+    return Write(b+0x9CU,values) && Write(b+0xF6U,firstPerson?camera.originalFirstPerson:std::uint8_t{0});
+}
+bool IsBackstage(std::uintptr_t alien) noexcept {
+    std::uint8_t a{},b{};
+    return Read(alien+0x2DAU,a) && Read(alien+0x2DBU,b) && alien_pvp::spatial::Backstage(a,b);
+}
+// Donor Havok ray ABI and camera collision math. All native rays run on the
+// current pilot's engine thread, using worlds observed in this generation.
+bool Ray(std::uintptr_t world,const std::array<float,3>& from,const std::array<float,3>& to,
+    std::array<float,3>& hit) noexcept {
+    alignas(16) float a[4]{from[0],from[1],from[2],0},b[4]{to[0],to[1],to[2],0},p[4]{},n[4]{};
+    alignas(16) std::uint8_t result[16]{};
+#if defined(_MSC_VER)
+    __try {
+        using Fn=void(__thiscall*)(std::uintptr_t,void*,std::uintptr_t,const void*,const void*,void*,void*);
+        reinterpret_cast<Fn>(gCameraBase+0x0028DAB0U)(0U,result,world,a,b,p,n);
+        if(!result[0])return false;
+        hit={p[0],p[1],p[2]};return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+#else
+    return false;
+#endif
+}
 bool AttachHeadBone(const std::uintptr_t camera,const std::uintptr_t alien) noexcept {
     std::uintptr_t array{};
     std::uint32_t count{};
@@ -151,7 +221,6 @@ bool CameraCall(const std::uintptr_t base,const std::uintptr_t manager,
 }
 // Camera restores use a fresh global-root proof and exact engine generation.
 // Never activate a stored pointer after a loading-screen transition.
-std::uintptr_t gCameraBase{};
 bool TechnicalIdentityCurrent(const CameraBinding& camera) noexcept;
 void RestoreLocalCamera(const bool validWorld) noexcept {
     const auto camera=gLocal.camera;
@@ -171,6 +240,10 @@ void RestoreLocalCamera(const bool validWorld) noexcept {
     if (CurrentCameraRoot(gCameraBase,current) &&
         current.root==camera.root && current.manager==camera.manager &&
         current.follow==camera.follow && current.head==camera.head) {
+        if(camera.followSaved && FindFollow(camera.follow)==camera.followBehavior) {
+            static_cast<void>(Write(camera.followBehavior+0x9CU,camera.originalFollow));
+            static_cast<void>(Write(camera.followBehavior+0xF6U,camera.originalFirstPerson));
+        }
         // Retarget without activating: a cinematic may currently own the
         // camera manager, and we must never steal its view on PvP exit.
         static_cast<void>(AttachHeadBone(camera.head,camera.technical));
@@ -211,6 +284,8 @@ bool BindCamera(const Context& context,const std::uint64_t now) noexcept {
     if (!PrepareTechnicalHome(context)) return false;
     camera.generation=context.nativeGeneration;camera.touched=true;
     gLocal.camera=camera;gCameraBase=context.moduleBase; // record partial retarget for rollback
+    if(!ConfigureFollow(gLocal.camera,false)) {RestoreLocalCamera(true);return false;}
+    camera=gLocal.camera;
     if (!CameraCall(context.moduleBase,camera.manager,camera.follow,context.alien)) {
         RestoreLocalCamera(true);return false;
     }
@@ -255,6 +330,18 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
     if (now==gLocal.lastFrameMs) return;
     gLocal.lastFrameMs=now;
     const bool focused=InputAllowed(context.moduleBase);
+    const auto wheel=alien_pvp_input::TakeCameraWheel();
+    const bool middle=focused && Down(VK_MBUTTON);
+    if(focused && gLocal.camera.bound && !gLocal.camera.firstPerson) {
+        if(middle && !gLocal.middleDown) {
+            gLocal.cameraDistance=3.0F;gLocal.cameraHeight=2.0F;gLocal.cameraSide=0.5F;
+        }
+        const float steps=static_cast<float>(wheel)/120.0F;
+        if(Down(VK_SHIFT))gLocal.cameraHeight=std::clamp(gLocal.cameraHeight+steps*0.1F,0.3F,4.5F);
+        else if(Down(VK_CONTROL))gLocal.cameraSide=std::clamp(gLocal.cameraSide+steps*0.1F,-2.0F,2.0F);
+        else gLocal.cameraDistance=std::clamp(gLocal.cameraDistance-steps*0.25F,1.0F,8.0F);
+    }
+    gLocal.middleDown=middle;
     if (focused && gLocal.camera.bound) {
         const bool view=Down('V');
         if (view && !gLocal.viewKeyDown) {
@@ -264,6 +351,7 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
             const bool headPrepared=!wantHead ||
                 alien_pvp_visual::HideAlienHead(context.alien,context.nativeGeneration);
             if (headPrepared &&
+                ConfigureFollow(camera,wantHead) &&
                 (!wantHead || AttachHeadBone(camera.head,context.alien)) &&
                 CameraCall(context.moduleBase,camera.manager,wanted,context.alien)) {
                 camera.firstPerson=wantHead;
@@ -286,9 +374,9 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
         side=static_cast<int>(Down('D'))-static_cast<int>(Down('A'));
     }
     std::uint32_t gait=1U;
-    if (focused && Down(VK_CONTROL)) gait=0U;
-    else if (focused && Down(VK_SPACE)) gait=3U;
+    if (focused && Down(VK_SPACE)) gait=3U;
     else if (focused && Down(VK_SHIFT)) gait=2U;
+    else if (focused && Down(VK_CONTROL)) gait=0U;
     float yaw{};
     if (!Read(context.technicalPlayer+0x174U,yaw) || !std::isfinite(yaw))
         if (!Read(context.alien+0x174U,yaw) || !std::isfinite(yaw)) yaw=0.0F;
@@ -315,7 +403,120 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
     alien_pvp::CaptureLocal(input);
     gLocal.moving=alien_pvp::MovingNow();
 }
+bool CameraHookCurrent(std::uintptr_t behavior) noexcept {
+    if(GetCurrentThreadId()!=gPilotThread.load(std::memory_order_acquire) ||
+        !gCameraGeneration.load(std::memory_order_acquire))return false;
+    CameraBinding current{};std::uint32_t runtime{};std::uintptr_t skeleton{};
+    return gLocal.camera.bound && !gLocal.camera.firstPerson && gCameraBase &&
+        CurrentCameraRoot(gCameraBase,current) && current.manager==gLocal.camera.manager &&
+        current.previous==gLocal.camera.follow && FindFollow(current.follow)==behavior &&
+        TechnicalIdentityCurrent(gLocal.camera) &&
+        Read(gLocal.character+0x50U,runtime) && runtime==gLocal.camera.alienRuntime &&
+        Read(gLocal.character+kCharacterSkeletonOffset,skeleton) && skeleton && skeleton==gLocal.camera.alienSkeleton;
+}
+void FollowBefore(std::uintptr_t behavior) noexcept {
+    if(!CameraHookCurrent(behavior))return;
+    // Donor OnFollowUpdateEnter: backstage actors do not tick the engine's
+    // follow camera. Use the living technical actor to compute the orbit.
+    const auto target=IsBackstage(gLocal.character)?gLocal.camera.technical:gLocal.character;
+    std::uintptr_t current{},child{};
+    if(Read(gLocal.camera.follow+0x148U,current) && current!=target)
+        static_cast<void>(RetargetCamera(gCameraBase,gLocal.camera.follow,target));
+    if(Read(behavior+0x34U,child) && child && child!=gLocal.camera.follow &&
+        Read(child+0x148U,current) && current!=target)
+        static_cast<void>(RetargetCamera(gCameraBase,child,target));
+}
+void FollowAfter(std::uintptr_t behavior) noexcept {
+    if(!CameraHookCurrent(behavior))return;
+    std::array<float,3> body{},base{},position{};
+    if(!Read(gLocal.character+0x70U,body) || !Read(behavior+0x1C0U,base) || !Read(behavior+0x1CU,position))return;
+    if(IsBackstage(gLocal.character)) {
+        // Donor BackstageCamera: translate the engine's computed orbit.
+        std::array<float,3> out{};
+        for(unsigned i=0;i<3;++i)out[i]=body[i]+position[i]-base[i];
+        static_cast<void>(Write(behavior+0x1C0U,body));static_cast<void>(Write(behavior+0x1CU,out));
+        std::uintptr_t camera{};
+        if(Read(behavior+0x34U,camera) && camera) {
+            for(auto offset:{0x14U,0x3CU,0x64U})static_cast<void>(Write(camera+offset,out));
+            body[1]+=1.3F;static_cast<void>(Write(camera+0x10CU,body));
+            static_cast<void>(Write(camera+0x153U,std::uint8_t{1}));
+        }
+        return;
+    }
+    const auto now=GetTickCount64();const auto generation=gCameraGeneration.load(std::memory_order_acquire);
+    std::uintptr_t world{};
+    // Select the donor's world containing the actor's floor; samples from a
+    // previous generation are never candidates after a checkpoint reload.
+    for(auto& sample:gWorlds) {
+        if(sample.generation.load(std::memory_order_acquire)!=generation || now-sample.at.load()>1000U)continue;
+        const auto candidate=sample.world.load();std::array<float,3> hit{};
+        const std::array<float,3> from{body[0],body[1]+1.0F,body[2]},to{body[0],body[1]-5.0F,body[2]};
+        if(candidate && Ray(candidate,from,to,hit)){world=candidate;break;}
+    }
+    if(!world)return;
+    if(now-gLocal.ductAt>=150U) {
+        gLocal.ductAt=now;std::array<float,3> hit{};
+        const bool low=Ray(world,{body[0],body[1]+0.4F,body[2]},{body[0],body[1]+1.9F,body[2]},hit);
+        if(low==gLocal.duct)gLocal.ductRun=0U;
+        else if(++gLocal.ductRun>=5U){gLocal.duct=low;gLocal.ductRun=0U;}
+        static_cast<void>(ConfigureFollow(gLocal.camera,false));
+    }
+    // Donor Collide soft mode: median of three rays, smooth inward/outward.
+    const std::array<float,3> from{base[0],base[1]+1.2F,base[2]};
+    const float dx=position[0]-from[0],dy=position[1]-from[1],dz=position[2]-from[2];
+    const float length=std::max(0.05F,std::sqrt(dx*dx+dy*dy+dz*dz));
+    const float ux=dx/length,uy=dy/length,uz=dz/length,hl=std::hypot(ux,uz);
+    const float sx=hl>0.01F?uz/hl*0.3F:0.3F,sz=hl>0.01F?-ux/hl*0.3F:0.0F;
+    const auto fraction=[&](float ox,float oz) noexcept {
+        std::array<float,3> hit{};
+        if(!Ray(world,from,{position[0]+ox+ux*0.3F,position[1]+uy*0.3F,position[2]+oz+uz*0.3F},hit))return 1.0F;
+        const float x=hit[0]-from[0],y=hit[1]-from[1],z=hit[2]-from[2];
+        return std::min(1.0F,(std::sqrt(x*x+y*y+z*z)-0.3F)/length);
+    };
+    const float t0=fraction(0,0),t1=fraction(sx,sz),t2=fraction(-sx,-sz);
+    const float median=std::max(std::min(t0,t1),std::min(std::max(t0,t1),t2));
+    const float target=std::min(1.0F,std::max(std::max(0.3F,1.0F/length),median));
+    gLocal.collisionScale+=(target-gLocal.collisionScale)*(target<gLocal.collisionScale?0.25F:0.07F);
+    if(std::abs(target-gLocal.collisionScale)<0.02F)gLocal.collisionScale=target;
+    if(gLocal.collisionScale<0.999F) {
+        const std::array<float,3> out{from[0]+dx*gLocal.collisionScale,from[1]+dy*gLocal.collisionScale,from[2]+dz*gLocal.collisionScale};
+        static_cast<void>(Write(behavior+0x1CU,out));
+    }
+}
+void __fastcall FollowDetour(void* self,void*,std::uint32_t a,std::uint32_t b) noexcept {
+    FollowBefore(reinterpret_cast<std::uintptr_t>(self));
+    reinterpret_cast<void(__thiscall*)(void*,std::uint32_t,std::uint32_t)>(gFollowTrampoline)(self,a,b);
+    FollowAfter(reinterpret_cast<std::uintptr_t>(self));
+}
+void __fastcall WorldDetour(void* self,void*,std::uint32_t a,std::uint32_t b) noexcept {
+    const auto generation=gCameraGeneration.load(std::memory_order_acquire);
+    if(generation) {
+        const auto world=reinterpret_cast<std::uintptr_t>(self);const auto now=GetTickCount64();
+        for(auto& sample:gWorlds) {
+            if(sample.world.load()==world || sample.generation.load()!=generation || now-sample.at.load()>3000U) {
+                sample.world.store(world);sample.at.store(now);sample.generation.store(generation,std::memory_order_release);break;
+            }
+        }
+    }
+    reinterpret_cast<void(__thiscall*)(void*,std::uint32_t,std::uint32_t)>(gWorldTrampoline)(self,a,b);
+}
 } // namespace
+
+bool InstallCameraHooks(std::uintptr_t base,HookManager& hooks,std::string& error) {
+    // Both supplied x86 entries start with push ebp; mov ebp,esp;
+    // and esp,-16. Six complete relocation-free instructions bytes.
+    for(const auto world:{false,true}) {
+        HookRequest request;
+        request.name=world?"alien_donor_camera_world":"alien_donor_follow_camera";
+        request.target=reinterpret_cast<void*>(base+(world?0x00748890U:0x0002E970U));
+        request.detour=world?reinterpret_cast<void*>(&WorldDetour):reinterpret_cast<void*>(&FollowDetour);
+        request.patchLength=6U;request.relocationSafePrefix=true;
+        request.expected=MaskedBytes{{0x55,0x8B,0xEC,0x83,0xE4,0xF0},"xxxxxx"};
+        request.trampolineOut=world?&gWorldTrampoline:&gFollowTrampoline;
+        if(!hooks.Install(request,error))return false;
+    }
+    return true;
+}
 
 Readiness Snapshot() noexcept {
     return {alien_pvp_input::Installed(),gLocal.camera.bound,
@@ -327,6 +528,7 @@ bool Drives(const std::uintptr_t character,const std::uint32_t generation) noexc
         gLocal.visualReady && alien_pvp_input::Installed();
 }
 void Reset(const bool sameCameraWorld,const bool certifiedLivingCharacter) noexcept {
+    gCameraGeneration.store(0U,std::memory_order_release);
     // The controller does not release AISync's exclusive lease: only the lease
     // owner does that after the certified request boundary is idle.
     alien_pvp_input::SetActive(false);
@@ -342,6 +544,7 @@ void Reset(const bool sameCameraWorld,const bool certifiedLivingCharacter) noexc
     alien_pvp_input::Uninstall();
 }
 void Pump(const Context& context) noexcept {
+    gPilotThread.store(GetCurrentThreadId(),std::memory_order_release);
     const bool current=context.exclusiveLease && context.moduleBase!=0U &&
         context.alien!=0U && context.technicalPlayer!=0U &&
         context.nativeGeneration!=0U && context.localPeer!=0U &&
@@ -405,6 +608,8 @@ void Pump(const Context& context) noexcept {
         RestoreLocalCamera(true);
     }
     const bool attached=BindCamera(context,now);
+    gCameraGeneration.store(attached?context.nativeGeneration:0U,std::memory_order_release);
+    if(attached)static_cast<void>(ConfigureFollow(gLocal.camera,gLocal.camera.firstPerson));
     // Retail can re-enable a submodel after a camera/animation transition.
     // Reassert head visibility only while we own the exact current Alien.
     if (attached && gLocal.camera.firstPerson &&

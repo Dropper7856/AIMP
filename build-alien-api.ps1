@@ -2,7 +2,7 @@
 param(
     [string]$CMakeExe = '',
     [string]$Generator = 'Visual Studio 18 2026',
-    [string]$OutputDirectory = 'artifacts/alien-api-434',
+    [string]$OutputDirectory = 'artifacts/alien-api-435',
     [string]$SecondPcApi = '\\DESKTOP-2JNROA0\Users\Public\Documents\win-unpacked\resources\api',
     [switch]$DeliveryOnly
 )
@@ -59,7 +59,7 @@ try {
         if (!(Test-Path -LiteralPath (Join-Path $api $required) -PathType Leaf)) { throw "Incomplete build artifacts: $required" }
     }
 
-    $delivery = [ordered]@{ builtAtUtc=[DateTime]::UtcNow.ToString('o'); apiVersion='0.8.4.434'; protocol=36; unitTestsRun=$false; localDelivered=$false; secondPcDelivered=$false; hashes=@(); failures=@() }
+    $delivery = [ordered]@{ builtAtUtc=[DateTime]::UtcNow.ToString('o'); apiVersion='0.8.4.435'; protocol=36; unitTestsRun=$false; localDelivered=$false; secondPcDelivered=$false; hashes=@(); failures=@() }
     foreach ($target in @($localApi,$SecondPcApi)) {
         try {
             $delivery.hashes += @(Copy-Api $target)
@@ -72,5 +72,8 @@ try {
         throw "Delivery incomplete. See $(Join-Path $output 'delivery.json')."
     }
     Write-Host 'API delivered to both PCs; SHA-256 equality verified.'
+    # robocopy returns 1 when it copied files successfully. Do not leak that
+    # success code as a build failure to callers inspecting LASTEXITCODE.
+    $global:LASTEXITCODE = 0
 }
 finally { Pop-Location }
