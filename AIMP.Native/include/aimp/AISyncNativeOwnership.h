@@ -21,8 +21,8 @@ struct NativeExecutionAnchor {
 };
 [[nodiscard]] bool MatchesNativeExecution(const OwnershipMemory&,const NativeExecutionAnchor&,
     const transactions::Scope&,const transactions::OwnerKey&,const ActorLifetime&) noexcept;
-// Exact local result of admitted NativeIntent21 (0064A8A0), never a Host pose
-// or sampled cycle state. Retail 00402310 sets mask0x06 at passage arrival;
+// Exact local result of admitted NativeIntent21/25 (0064A8A0/0064A930), never a
+// Host pose or sampled cycle state. Retail00402310/00402640 set mask0x06 at arrival;
 // 00460CF0 consumes mask0x04. A finished/replaced/unreadable cycle owns nothing.
 [[nodiscard]] bool IsLiveNativePassage(const OwnershipMemory&,const NativeExecutionAnchor&,
     const transactions::Scope&,const transactions::OwnerKey&,const ActorLifetime&) noexcept;

@@ -34,6 +34,10 @@ struct NativeRequestAdapterTestAccess {
     static void Policy(NativeRequestAdapter& a,movement::Navigation policy) {
         for(auto& lease:a.leases_)if(lease.used&&(lease.kind==1||lease.kind==3))lease.movement.navigation=policy;
     }
+    static void PassageLeaseFlags(NativeRequestAdapter& a,unsigned flags) {
+        auto& lease=a.leases_[0];lease.cancelled=(flags&1U)!=0U;lease.preempted=(flags&2U)!=0U;
+        lease.unknown=(flags&4U)!=0U;lease.routeRejected=(flags&8U)!=0U;
+    }
     static void Prepare(NativeRequestAdapter& a,Permission permission,ResolveActor resolve,void* context,
         bool(*factory)(void*,std::uint32_t,std::uintptr_t,std::uintptr_t*) noexcept,
         bool(*admit)(void*,std::uintptr_t,std::uint32_t,bool&) noexcept,
@@ -115,7 +119,11 @@ struct NativeHarness {
     Record current{};std::vector<unsigned> calls;bool accepted{true},faultCompanion{},recycleOnAdmission{},reenter{},failCancel{};
     std::vector<std::uintptr_t> cancellations;
     bool wirePermit{true},localOwned{true},distinctMoves{},guidanceAllowed{true},localSteering{};
-    bool progressAvailable{true},customProgress{},allowDerivedGoal{},refuseGoal{},discardGoal{};
+    bool progressAvailable{true},customProgress{},allowDerivedGoal{},refuseGoal{},discardGoal{},revokeGuidanceOnGoal{};
+    bool installMoveHead{},ownedByCritical{},revokeOnInitialGoal{},revokeOnFactory{};
+    bool passagePermit{true},revokePassageOnFactory{},expectRepairInvocation{};
+    bool revokeOnAdmission{};
+    bool clearRetainedOnCancel{},revokeOnCancel{};
     std::uint64_t now{100000};
     movement::HostProgress progress{};
     std::array<std::uintptr_t,4> schedulerHead{},schedulerFirst{},retiredHead{},retiredFirst{};
@@ -128,7 +136,10 @@ struct NativeHarness {
     }
     void Retained(std::uintptr_t request) {
         retiredHead[0]=reinterpret_cast<std::uintptr_t>(retiredFirst.data());
+        retiredHead[1]=request?reinterpret_cast<std::uintptr_t>(retiredFirst.data()):reinterpret_cast<std::uintptr_t>(retiredHead.data());
         retiredFirst[0]=reinterpret_cast<std::uintptr_t>(retiredHead.data());retiredFirst[2]=request;
+        retiredFirst[1]=reinterpret_cast<std::uintptr_t>(retiredHead.data());
+        if(!request)retiredHead[0]=reinterpret_cast<std::uintptr_t>(retiredHead.data());
         Write(binding.character+0x2CE0U,reinterpret_cast<std::uintptr_t>(retiredHead.data()));
         Write(binding.character+0x2CE4U,request?1U:0U);
     }
@@ -138,7 +149,7 @@ struct NativeHarness {
         Write(binding.character+0x42A8,reinterpret_cast<std::uintptr_t>(resource.data()));
         Write(binding.character+0x42AC,reinterpret_cast<std::uintptr_t>(resourceControl.data()));
         NativeRequestAdapterTestAccess::Prepare(adapter,&Permit,&Resolve,this,&Factory,&Admit,&Goal,&Stop,&Cancel,&Release);
-        SetHostProgressQuery(&Progress,this);NativeRequestAdapterTestAccess::Clock(adapter,&Clock);}
+        SetHostProgressQuery(&Progress,this);NativeRequestAdapterTestAccess::Clock(adapter,&Clock);Retained(0);}
     static std::uint64_t Clock(void* p) noexcept {return static_cast<NativeHarness*>(p)->now;}
     void Advance(std::uint64_t elapsed=200){now+=elapsed;}
     static bool Progress(void* p,const RetirementIdentity& identity,movement::HostProgress& out) noexcept {
@@ -149,7 +160,10 @@ struct NativeHarness {
         if(!h.customProgress) {out.observed.position=out.position;out.observed.valid=true;out.observed.atTip=true;}
         return true;
     }
-    static bool Permit(void* p,const Record&)noexcept{return static_cast<NativeHarness*>(p)->wirePermit;}
+    static bool Permit(void* p,const Record& r)noexcept{
+        const auto& h=*static_cast<NativeHarness*>(p);
+        return h.wirePermit&&(r.nativeKind!=native_intent::kKind||h.passagePermit);
+    }
     static bool Resolve(void* p,const OwnerKey&,LocalActorBinding& b)noexcept{auto& h=*static_cast<NativeHarness*>(p);b=h.binding;return h.localOwned;}
     static bool Factory(void* p,std::uint32_t kind,std::uintptr_t scheduler,std::uintptr_t* ref)noexcept{
         auto& h=*static_cast<NativeHarness*>(p);
@@ -160,12 +174,19 @@ struct NativeHarness {
         const auto type=kind==1?0xEB1A70U:(kind==3?0xEB1A50U:(kind==4?0xEB19CCU:0xEB19BCU));
         Write(ref[0],0x10000000U+type);Write(ref[0]+0x10,kind);Write(ref[0]+0x14,scheduler);
         Write<std::uint8_t>(ref[0]+0xB8,0);Write<std::uint8_t>(ref[0]+0xB9,0);
-        Write(ref[0]+0xC,1U);Write(ref[0]+0x68,3U);Write(ref[0]+0x6C,2U);return true;}
+        Write(ref[0]+0xC,1U);Write(ref[0]+0x68,3U);Write(ref[0]+0x6C,2U);
+        if(h.revokeOnFactory)h.guidanceAllowed=false;
+        if(h.revokePassageOnFactory)h.passagePermit=false;
+        return true;}
     static bool Admit(void* p,std::uintptr_t request,std::uint32_t admission,bool& result)noexcept{
         auto& h=*static_cast<NativeHarness*>(p);h.calls.push_back(admission==1?13U:(admission==2?12U:11U));CHECK(h.resourceControl[1]==2);
         const auto invocation=CurrentNativeInvocation();
         if(h.localSteering)CHECK(invocation.record==nullptr);
         else CHECK(invocation.record!=nullptr&&invocation.actor==h.binding&&invocation.record->commandId!=0);
+        if(h.expectRepairInvocation) {
+            CHECK(invocation.record->nativeKind==1U&&invocation.record->commandId==h.current.commandId);
+            CHECK(admission==1U); // A continuation appends; it cannot replace later Host work.
+        }
         const auto kind=*reinterpret_cast<std::uint32_t*>(request+0x10);
         if((kind==1||kind==3)&&!h.allowDerivedGoal)CHECK(*reinterpret_cast<float*>(request+(kind==3?0x1C:0x28))==
             (kind==1&&h.current.opcode==Op::Update?h.current.movement.after.goal[0]:1.25F));
@@ -186,6 +207,8 @@ struct NativeHarness {
         // request remains strongly retained but can no longer navigate.
         if(h.distinctMoves&&admission==0&&result&&request==reinterpret_cast<std::uintptr_t>(h.requests[4].data()))
             Write(reinterpret_cast<std::uintptr_t>(h.requests[0].data())+0xC,4U);
+        if(h.installMoveHead&&kind==1U&&result)h.Head(request);
+        if(h.revokeOnAdmission)h.guidanceAllowed=false;
         return true;}
     static bool Goal(void* p,std::uintptr_t request,const float* goal,bool update)noexcept{
         auto& h=*static_cast<NativeHarness*>(p);h.calls.push_back(update?24:23);
@@ -196,6 +219,8 @@ struct NativeHarness {
             (pending&0x40U)||(stop&3U)==3U))return true;
         for(std::size_t i=0;i<3;++i)Write(request+(update?0x34:0x28)+i*4,goal[i]);
         if(update)pending|=0x40U;
+        if(update&&h.revokeGuidanceOnGoal)h.guidanceAllowed=false;
+        if(!update&&h.revokeOnInitialGoal)h.guidanceAllowed=false;
         return true;}
     static bool Stop(void* p,std::uintptr_t request,float distance,std::uint8_t variant)noexcept{
         static_cast<NativeHarness*>(p)->calls.push_back(25);
@@ -205,7 +230,10 @@ struct NativeHarness {
         }
         return true;}
     static bool Cancel(void* p,std::uintptr_t request)noexcept{auto& h=*static_cast<NativeHarness*>(p);h.calls.push_back(30);h.cancellations.push_back(request);if(h.failCancel)return false;
-        Write<std::uint8_t>(request+0x18,0U);Write(request+0xC,6U);return true;}
+        Write<std::uint8_t>(request+0x18,0U);Write(request+0xC,6U);
+        if(h.clearRetainedOnCancel&&h.retiredFirst[2]==request)h.Retained(0);
+        if(h.revokeOnCancel)h.guidanceAllowed=false;
+        return true;}
     static bool Release(void* p,std::uintptr_t ref)noexcept{auto& h=*static_cast<NativeHarness*>(p);h.calls.push_back(31);
         auto* pair=reinterpret_cast<std::uintptr_t*>(ref);if(pair[0]&&*reinterpret_cast<std::uint8_t*>(pair[0]+0x18))++h.retainedDrops;
         pair[0]=pair[1]=0;return true;}
@@ -234,6 +262,156 @@ struct NativeHarness {
         localSteering=false;CHECK(CurrentNativeInvocation().record==nullptr);}
     NativeOutcome Submit(){current=Move();current.opcode=Op::Submit;CHECK(adapter.Check(current)==Readiness::Ready);return adapter.Invoke(current);}
 };
+NativeHarness* gPassageHarness{};
+unsigned gPassageInvocations{};
+Readiness PassageReady(const Record&,const LocalActorBinding&) noexcept {return Readiness::Ready;}
+NativeOutcome PassageEntered(const Record& passage,const LocalActorBinding& actor) noexcept {
+    CHECK(gPassageHarness&&actor==gPassageHarness->binding);
+    const auto invocation=CurrentNativeInvocation();
+    CHECK(invocation.record&&invocation.record->commandId==passage.commandId&&invocation.actor==actor);
+    gPassageHarness->calls.push_back(40U);++gPassageInvocations;
+    return NativeOutcome::Admitted;
+}
+bool PassageMoveCurrent(void* context,const RetirementIdentity& identity) noexcept {
+    const auto& h=*static_cast<NativeHarness*>(context);
+    return h.guidanceAllowed&&identity.scope==h.current.scope&&identity.owner==h.current.owner&&
+        identity.command==h.current.commandId&&identity.actor==h.binding&&identity.kind==1U&&
+        identity.revision==h.current.parameterRevision;
+}
+bool PassageCritical(std::uintptr_t character) noexcept {
+    return gPassageHarness&&character==gPassageHarness->binding.character&&gPassageHarness->ownedByCritical;
+}
+void PassageRepairsCurrentMove(unsigned condition,std::uint32_t contract=25U,std::uint32_t status=3U) {
+    // Repair is causally tied to this explicit Host constructor, never a
+    // timer or pose discrepancy. The native calls below are modeled seams.
+    NativeHarness h;h.binding.creationSerial=11;h.allowDerivedGoal=h.installMoveHead=true;
+    h.current=Move();h.current.opcode=Op::Submit;
+    if(condition!=12U) {
+        h.current.movement.parts=1;h.current.movement.companion={};
+        h.current.movement.companionFlags=h.current.movement.companionRetainedAfter=0;
+    }
+    CHECK(h.adapter.Invoke(h.current)==NativeOutcome::Admitted);
+    if(condition!=12U) {
+        // The latest accepted Host revision is retained even when its
+        // native goal deposit did not get consumed before local completion.
+        h.current.opcode=Op::Update;++h.current.parameterRevision;
+        h.current.movement.after.goal={8.0F,2.0F,9.0F};h.current.movement.gait=2;
+        CHECK(h.adapter.Invoke(h.current)==NativeOutcome::Admitted);
+    }
+    const auto request=reinterpret_cast<std::uintptr_t>(h.requests[0].data());
+    const auto navigation=reinterpret_cast<std::uintptr_t>(h.resource.data())+0xC4U;
+    NativeHarness::Write(request+0xCU,status);
+    NativeHarness::Write(request+0x68U,8U);NativeHarness::Write(request+0x6CU,3U);
+    h.requests[0][0xB8]=h.requests[0][0xB9]=0;h.Head(0);h.Retained(0);
+    if(condition==1U){NativeHarness::Write(request+0xCU,2U);h.Head(request);}
+    if(condition>=2U&&condition<=5U)NativeRequestAdapterTestAccess::PassageLeaseFlags(h.adapter,1U<<(condition-2U));
+    if(condition==6U)h.guidanceAllowed=false;
+    if(condition==7U)h.Head(reinterpret_cast<std::uintptr_t>(h.requests[3].data()));
+    if(condition==8U)NativeHarness::Write(navigation+0x5CU,reinterpret_cast<std::uintptr_t>(h.requests[3].data()));
+    if(condition==9U||condition==20U||condition==21U||condition==22U) {
+        h.Retained(request);h.clearRetainedOnCancel=condition!=22U;
+        h.revokeOnCancel=condition==20U;h.failCancel=condition==21U;
+    }
+    if(condition==10U)NativeHarness::Write(navigation+0x40U,reinterpret_cast<std::uintptr_t>(h.requests[3].data()));
+    if(condition==11U)h.ownedByCritical=true;
+    if(condition==13U)NativeRequestAdapterTestAccess::Policy(h.adapter,movement::Navigation::HostGuided);
+    if(condition==14U)NativeHarness::Write(navigation+0x48U,std::uint8_t{1});
+    if(condition==15U) {
+        NativeHarness::Write(h.binding.character+0x2CE4U,1U);
+        NativeHarness::Write(h.binding.character+0x2CE0U,std::uintptr_t{}); // Malformed retained ring, not proof of absence.
+    }
+    if(condition==16U)h.revokeOnFactory=true;
+    if(condition==17U)h.revokeOnInitialGoal=true;
+    if(condition==18U)h.revokePassageOnFactory=true;
+    if(condition==19U)h.revokeOnAdmission=true;
+    if(condition==23U) {h.Retained(request);NativeHarness::Write(h.binding.character+0x2CE4U,2U);}
+    if(condition==24U)h.Head(request); // Even our own terminal head is not an empty queue.
+    h.expectRepairInvocation=true;
+    Record passage{};passage.scope=h.current.scope;passage.owner=h.current.owner;
+    passage.commandId=200U;passage.globalSeq=passage.ownerSeq=20U;passage.parameterRevision=1;
+    passage.opcode=Op::Submit;passage.nativeKind=native_intent::kKind;passage.admission=1U;
+    passage.intent.words[0]=contract;
+    passage.intent.words[1]=contract==25U?native_intent::kPassageSchema:contract==21U?4U:1U;
+    if(contract==25U)passage.intent.words[3]=2U;
+    if(contract==21U||contract==25U)passage.intent.words[8]=std::bit_cast<std::uint32_t>(12.0F);
+    else passage.intent.words[2]=std::bit_cast<std::uint32_t>(2.0F);
+    CHECK(ValidateExecutable(passage));
+    gPassageHarness=&h;gPassageInvocations=0;
+    SetNativeIntentAdapter(&PassageReady,&PassageEntered);SetExecutionOwnedQuery(&PassageCritical);
+    const auto before=PassageRepairs();const auto callCount=h.calls.size();
+    const auto result=h.adapter.Invoke(passage,&PassageMoveCurrent,&h);
+    const bool retainedCleanup=(condition==9U&&status!=5U)||condition==20U||condition==21U||condition==22U;
+    const bool enteredRepair=condition==0U||retainedCleanup||(condition>=16U&&condition<=19U);
+    const bool repairRequested=contract==21U||contract==25U;
+    const bool failed=repairRequested&&(condition==16U||condition==17U||condition==19U||
+        condition==20U||condition==21U||condition==22U);
+    const auto after=PassageRepairs();
+    if(condition==4U) { // Existing Unknown ownership gate remains unchanged.
+        CHECK(result==NativeOutcome::Rejected&&gPassageInvocations==0&&h.calls.size()==callCount);
+    } else if(condition==18U) {
+        CHECK(result==NativeOutcome::Unknown&&gPassageInvocations==0&&after.repaired==before.repaired+1U);
+        CHECK((std::vector<unsigned>(h.calls.begin()+callCount,h.calls.end())==std::vector<unsigned>{31U,1U,23U,13U,25U}));
+    } else if(failed) {
+        CHECK(result==NativeOutcome::Unknown&&gPassageInvocations==0&&after.failed==before.failed+1U);
+        const auto delta=std::vector<unsigned>(h.calls.begin()+callCount,h.calls.end());
+        const auto expected=condition==16U?std::vector<unsigned>{31U,1U}:
+            condition==17U?std::vector<unsigned>{31U,1U,23U}:
+            condition==19U?std::vector<unsigned>{31U,1U,23U,13U}:std::vector<unsigned>{30U};
+        if(delta!=expected) {
+            std::cerr<<"passage repair condition "<<condition<<" status "<<status<<" calls";
+            for(const auto call:delta)std::cerr<<' '<<call;
+            std::cerr<<" expected";for(const auto call:expected)std::cerr<<' '<<call;
+            std::cerr<<'\n';
+        }
+        CHECK(delta==expected);
+        // The partial entry is fenced; retrying cannot allocate again.
+        const auto attempts=h.calls.size();
+        CHECK(h.adapter.Invoke(passage,&PassageMoveCurrent,&h)==NativeOutcome::Rejected&&h.calls.size()==attempts);
+    } else {
+        CHECK(result==NativeOutcome::Admitted&&gPassageInvocations==1U);
+        if(enteredRepair&&repairRequested) {
+            CHECK(after.repaired==before.repaired+1U&&h.calls.back()==40U);
+            const auto delta=std::vector<unsigned>(h.calls.begin()+callCount,h.calls.end());
+            const auto expected=retainedCleanup?std::vector<unsigned>{30U,31U,1U,23U,13U,25U,40U}:
+                std::vector<unsigned>{31U,1U,23U,13U,25U,40U};
+            if(delta!=expected) {
+                std::cerr<<"successful passage repair condition "<<condition<<" status "<<status<<" calls";
+                for(const auto call:delta)std::cerr<<' '<<call;
+                std::cerr<<" expected";for(const auto call:expected)std::cerr<<' '<<call;
+                std::cerr<<'\n';
+            }
+            CHECK(delta==expected);
+            CHECK(*reinterpret_cast<const float*>(request+0x28U)==8.0F&&
+                *reinterpret_cast<const float*>(request+0x30U)==9.0F&&
+                *reinterpret_cast<const float*>(request+0x58U)==h.current.movement.after.stopDistance);
+            CHECK(*reinterpret_cast<const std::uint32_t*>(h.resource.data()+0x194U)==2U);
+            CHECK(NativeRequestAdapterTestAccess::Revision(h.adapter)==h.current.parameterRevision);
+            CHECK(movement::Same(NativeRequestAdapterTestAccess::Desired(h.adapter),h.current.movement));
+        } else CHECK(h.calls.size()==callCount+1U&&after.repaired==before.repaired);
+    }
+    CHECK(h.cancellations.size()==(retainedCleanup&&repairRequested?1U:0U));
+    if(repairRequested&&condition!=4U) {
+        CHECK(after.lastPassageSeq==passage.globalSeq);
+        if(condition==8U)CHECK((after.reasonBits&PassageRepairWorker)!=0U);
+        if(condition==9U&&status==5U)CHECK((after.reasonBits&PassageRepairRetainedReplacement)!=0U);
+        if(condition==15U||condition==23U)CHECK((after.reasonBits&PassageRepairRetainedUnknown)!=0U);
+        if(condition==24U)CHECK((after.reasonBits&PassageRepairQueue)!=0U);
+        if(enteredRepair)CHECK(after.lastMoveCommand==h.current.commandId&&after.status==status);
+    }
+    CHECK(CurrentNativeInvocation().record==nullptr&&h.resourceControl[1]==1);
+    CHECK(*reinterpret_cast<const float*>(h.actor.data()+0x70U)==0.0F&&
+        *reinterpret_cast<const float*>(h.actor.data()+0x74U)==0.0F&&
+        *reinterpret_cast<const float*>(h.actor.data()+0x78U)==0.0F);
+    CHECK(*reinterpret_cast<const std::uint32_t*>(h.resource.data()+8U)==0U); // No forced M mode.
+    SetNativeIntentAdapter(nullptr,nullptr);SetExecutionOwnedQuery(nullptr);gPassageHarness=nullptr;
+}
+void PrePassageContinuity() {
+    for(auto contract:{21U,25U})for(auto status:{3U,4U,5U,6U})PassageRepairsCurrentMove(0U,contract,status);
+    for(unsigned condition=1U;condition<=19U;++condition)PassageRepairsCurrentMove(condition);
+    for(auto status:{4U,5U,6U})PassageRepairsCurrentMove(9U,25U,status);
+    for(unsigned condition=20U;condition<=24U;++condition)PassageRepairsCurrentMove(condition);
+    PassageRepairsCurrentMove(0U,23U); // Timed idle cannot cause a movement restart.
+}
 void RejectedRouteRetainsNativeLifetime() {
     NativeHarness h;CHECK(h.Submit()==NativeOutcome::Admitted);
     NativeRequestAdapterTestAccess::Policy(h.adapter,movement::Navigation::HostRoute);
@@ -324,6 +502,136 @@ void ReleaseGuided(NativeHarness& h) {
     auto release=h.current;release.opcode=Op::Release;release.movement={};
     CHECK(h.adapter.Invoke(release)==NativeOutcome::Admitted&&h.adapter.ActiveCount()==0);
     CHECK(CurrentNativeInvocation().record==nullptr);
+}
+void LocalGoalConsumptionPrecedesStop(std::uint32_t parts) {
+    NativeHarness h;h.current=GuidedMove(parts);
+    h.current.movement.navigation=movement::Navigation::LocalNative;
+    CHECK(h.adapter.Invoke(h.current)==NativeOutcome::Admitted);
+    const auto request=reinterpret_cast<std::uintptr_t>(h.requests[0].data());
+    h.NativeTick();h.NativeTick(); // Complete initial stop-dirty replan.
+    CHECK(*reinterpret_cast<std::uint32_t*>(request+0x68U)==3U);
+    const auto originalStop=*reinterpret_cast<float*>(request+0x58U);
+    const auto originalGoal=*reinterpret_cast<float*>(request+0x28U);
+    const auto stops=std::count(h.calls.begin(),h.calls.end(),25U);
+    auto update=h.current;update.opcode=Op::Update;++update.parameterRevision;
+    update.movement.after.goal[0]+=3.0F;update.movement.after.stopDistance=1.5F;
+    update.movement.gait=1;h.current=update;
+    CHECK(h.adapter.Check(update)==Readiness::Ready&&h.adapter.Invoke(update)==NativeOutcome::Admitted);
+    CHECK(*reinterpret_cast<std::uint32_t*>(h.resource.data()+0x194U)==1U);
+    CHECK(*reinterpret_cast<float*>(request+0x58U)==originalStop);
+    CHECK(std::count(h.calls.begin(),h.calls.end(),25U)==stops);
+    CHECK((h.requests[0][0xB8U]&0x40U)&&!(h.requests[0][0xB9U]&0x40U));
+    const auto deposited=h.calls.size();h.Advance();h.Steer();
+    CHECK(h.calls.size()==deposited); // Never overwrite an outstanding goal.
+
+    // A newer scalar revision is accepted while the same deposit is in flight.
+    // It wins when the goal is consumed, without a second goal setter or Stop.
+    ++update.parameterRevision;update.movement.after.stopDistance=2.0F;update.movement.gait=2;h.current=update;
+    CHECK(h.adapter.Check(update)==Readiness::Ready&&h.adapter.Invoke(update)==NativeOutcome::Admitted);
+    CHECK(h.calls.size()==deposited&&*reinterpret_cast<std::uint32_t*>(h.resource.data()+0x194U)==2U);
+    h.NativeTick(); // Goal consumption; no stop-dirty old-goal replan first.
+    CHECK(*reinterpret_cast<float*>(request+0x28U)==update.movement.after.goal[0]);
+    CHECK(*reinterpret_cast<float*>(request+0x28U)!=originalGoal);
+    h.NativeTick(); // Let the native plan for that new goal return to following.
+    h.guidanceAllowed=false;h.Steer();CHECK(h.calls.size()==deposited);
+    h.guidanceAllowed=true;h.Steer();
+    CHECK(*reinterpret_cast<float*>(request+0x58U)==2.0F);
+    CHECK(std::count(h.calls.begin(),h.calls.end(),25U)==stops+1);
+    CHECK(h.requests[0][0xB9U]&0x40U);
+    h.NativeTick(); // Any stop replan now targets the consumed NEW destination.
+    CHECK(*reinterpret_cast<std::uint32_t*>(request+0x68U)==1U);
+    CHECK(*reinterpret_cast<float*>(request+0x28U)==update.movement.after.goal[0]);
+    const auto completed=h.calls.size();h.Advance();h.Steer();CHECK(h.calls.size()==completed);
+    ReleaseGuided(h);
+    CHECK(h.cancellations.size()==parts);
+}
+void LocalDiscardedGoalRetainsExactHostIntent() {
+    NativeHarness h;h.current=GuidedMove();h.current.movement.navigation=movement::Navigation::LocalNative;
+    CHECK(h.adapter.Invoke(h.current)==NativeOutcome::Admitted);h.NativeTick();h.NativeTick();
+    const auto request=reinterpret_cast<std::uintptr_t>(h.requests[0].data());
+    auto update=h.current;update.opcode=Op::Update;++update.parameterRevision;
+    update.movement.after.goal[0]+=4.0F;update.movement.after.stopDistance=3.0F;h.current=update;
+    CHECK(h.adapter.Invoke(update)==NativeOutcome::Admitted);
+    const auto stops=std::count(h.calls.begin(),h.calls.end(),25U);
+    h.discardGoal=true;h.NativeTick(); // Void native setter accepted then discarded.
+    CHECK(!(h.requests[0][0xB8U]&0x40U));
+    const auto beforeRetry=h.calls.size();h.Steer();CHECK(h.calls.size()==beforeRetry);
+    h.Advance();
+    h.Steer();CHECK(h.requests[0][0xB8U]&0x40U);
+    CHECK(*reinterpret_cast<float*>(request+0x34U)==update.movement.after.goal[0]);
+    CHECK(std::count(h.calls.begin(),h.calls.end(),25U)==stops);
+    h.NativeTick();const auto calls=h.calls.size();h.Steer();CHECK(h.calls.size()==calls); // Bounded retry.
+    h.revokeGuidanceOnGoal=true;h.Advance();h.Steer();CHECK(h.requests[0][0xB8U]&0x40U);
+    h.discardGoal=false;h.NativeTick();h.NativeTick();h.Steer();
+    CHECK(std::count(h.calls.begin(),h.calls.end(),25U)==stops); // Callback revoked authority: no later stop writes.
+    h.guidanceAllowed=true;h.Steer();
+    CHECK(*reinterpret_cast<float*>(request+0x28U)==update.movement.after.goal[0]);
+    CHECK(*reinterpret_cast<float*>(request+0x58U)==3.0F);
+    CHECK(std::count(h.calls.begin(),h.calls.end(),25U)==stops+1);
+    CHECK(std::count(h.calls.begin(),h.calls.end(),1U)==1&&h.cancellations.empty());
+    ReleaseGuided(h);
+}
+void LocalPendingGoalCoalescesLatestRevision() {
+    NativeHarness h;h.current=GuidedMove();h.current.movement.navigation=movement::Navigation::LocalNative;
+    CHECK(h.adapter.Invoke(h.current)==NativeOutcome::Admitted);h.NativeTick();h.NativeTick();
+    const auto request=reinterpret_cast<std::uintptr_t>(h.requests[0].data());
+    auto update=h.current;update.opcode=Op::Update;++update.parameterRevision;
+    update.movement.after.goal[0]=8.0F;h.current=update;
+    CHECK(h.adapter.Invoke(update)==NativeOutcome::Admitted);
+    const auto deposited=h.calls.size();
+    for(const float latest:{10.0F,12.0F,14.0F}) {
+        ++update.parameterRevision;update.movement.after.goal[0]=latest;h.current=update;
+        CHECK(h.adapter.Check(update)==Readiness::Ready&&h.adapter.Invoke(update)==NativeOutcome::Admitted);
+        CHECK(*reinterpret_cast<float*>(request+0x34U)==8.0F&&h.calls.size()==deposited);
+        CHECK(h.cancellations.empty()&&NativeRequestAdapterTestAccess::Revision(h.adapter)==update.parameterRevision);
+    }
+    h.NativeTick();h.NativeTick();h.Steer(); // Finish old consumed parameters before latest goal.
+    h.Advance();h.Steer();
+    CHECK(*reinterpret_cast<float*>(request+0x28U)==8.0F&&*reinterpret_cast<float*>(request+0x34U)==14.0F);
+    CHECK(std::count(h.calls.begin(),h.calls.end(),24U)==2);
+    h.NativeTick();h.NativeTick();h.Steer();
+    CHECK(*reinterpret_cast<float*>(request+0x28U)==14.0F&&h.cancellations.empty());
+    CHECK(NativeRequestAdapterTestAccess::Desired(h.adapter).after.goal==update.movement.after.goal);
+    ReleaseGuided(h);
+}
+void LocalContinuousGoalsFinishConsumedParameters() {
+    NativeHarness h;h.current=GuidedMove();h.current.movement.navigation=movement::Navigation::LocalNative;
+    CHECK(h.adapter.Invoke(h.current)==NativeOutcome::Admitted);h.NativeTick();h.NativeTick();
+    const auto request=reinterpret_cast<std::uintptr_t>(h.requests[0].data());
+    auto update=h.current;update.opcode=Op::Update;++update.parameterRevision;
+    update.movement.after.goal[0]=8.0F;update.movement.after.stopDistance=1.5F;
+    update.movement.gait=1;h.current=update;
+    CHECK(h.adapter.Invoke(update)==NativeOutcome::Admitted);
+    h.NativeTick(); // Consume8, native starts replanning.
+    ++update.parameterRevision;update.movement.after.goal[0]=10.0F;
+    update.movement.after.stopDistance=2.0F;update.movement.gait=2;h.current=update;
+    CHECK(h.adapter.Check(update)==Readiness::Ready&&h.adapter.Invoke(update)==NativeOutcome::Admitted);
+    h.NativeTick();h.Steer();
+    CHECK(*reinterpret_cast<float*>(request+0x28U)==8.0F);
+    CHECK(*reinterpret_cast<float*>(request+0x58U)==1.5F); // Consumed frame's stop is not starved by target10.
+    CHECK(*reinterpret_cast<std::uint32_t*>(h.resource.data()+0x194U)==2U); // Never rewind gait1.
+    CHECK(NativeRequestAdapterTestAccess::Desired(h.adapter).after.goal[0]==10.0F);
+
+    // Still newer Host input supersedes10 before it is deposited.
+    ++update.parameterRevision;update.movement.after.goal[0]=12.0F;
+    update.movement.after.stopDistance=3.0F;update.movement.gait=3;h.current=update;
+    CHECK(h.adapter.Invoke(update)==NativeOutcome::Admitted);
+    h.NativeTick();h.NativeTick();h.Advance();h.Steer();
+    CHECK(*reinterpret_cast<float*>(request+0x34U)==12.0F);
+    h.NativeTick();
+    ++update.parameterRevision;update.movement.after.goal[0]=14.0F;
+    update.movement.after.stopDistance=4.0F;update.movement.gait=1;h.current=update;
+    CHECK(h.adapter.Invoke(update)==NativeOutcome::Admitted);
+    h.NativeTick();h.Steer();
+    CHECK(*reinterpret_cast<float*>(request+0x28U)==12.0F&&*reinterpret_cast<float*>(request+0x58U)==3.0F);
+    CHECK(*reinterpret_cast<std::uint32_t*>(h.resource.data()+0x194U)==1U);
+    CHECK(NativeRequestAdapterTestAccess::Desired(h.adapter).after.goal[0]==14.0F);
+    h.NativeTick();h.NativeTick();h.Advance();h.Steer();
+    CHECK(*reinterpret_cast<float*>(request+0x34U)==14.0F);
+    h.NativeTick();h.NativeTick();h.Steer();
+    CHECK(*reinterpret_cast<float*>(request+0x28U)==14.0F&&*reinterpret_cast<float*>(request+0x58U)==4.0F);
+    CHECK(std::count(h.calls.begin(),h.calls.end(),24U)==3&&h.cancellations.empty());
+    ReleaseGuided(h);
 }
 void GuidedInitialTargetWaitsWithoutFactory() {
     NativeHarness h;h.current=GuidedMove();h.allowDerivedGoal=h.customProgress=true;
@@ -631,9 +939,15 @@ void GoalDependencies() {
     h.current=update;CHECK(h.adapter.Check(update)==Readiness::Ready&&h.adapter.Invoke(update)==NativeOutcome::Admitted);
     ++update.parameterRevision;update.movement.after.goal[0]=9;h.current=update;
     h.requests[0][0xB8]&=~0x40U;NativeHarness::Write(reinterpret_cast<std::uintptr_t>(h.requests[0].data())+0x68,4U);
+    NativeHarness::Write(reinterpret_cast<std::uintptr_t>(h.requests[0].data())+0xCU,3U); // Proven scheduler completion permits renewal.
     CHECK(h.adapter.Check(update)==Readiness::Ready&&h.adapter.Invoke(update)==NativeOutcome::Admitted);
-    CHECK(h.adapter.ActiveCount()==1&&std::count(h.calls.begin(),h.calls.end(),30U)==1&&std::count(h.calls.begin(),h.calls.end(),31U)==1);
+    // A proven scheduler-completed request needs no running-request Cancel.
+    // Drop precisely our old Ref and retain one newly admitted replacement.
+    CHECK(h.adapter.ActiveCount()==1&&h.cancellations.empty()&&
+        std::count(h.calls.begin(),h.calls.end(),31U)==1&&std::count(h.calls.begin(),h.calls.end(),1U)==2);
+    CHECK(*reinterpret_cast<float*>(h.requests[0].data()+0x28U)==9.0F);
     update.opcode=Op::Release;update.movement={};CHECK(h.adapter.Invoke(update)==NativeOutcome::Admitted&&h.adapter.ActiveCount()==0);
+    CHECK(h.cancellations.size()==1&&std::count(h.calls.begin(),h.calls.end(),31U)==2);
 }
 void NativeRouteInitializationOwnership() {
     NativeHarness h;auto move=Move();move.opcode=Op::Submit;move.movement.parts=1;
@@ -787,8 +1101,9 @@ void Native() {
     CHECK(h.adapter.Check(update)==Readiness::Ready&&h.adapter.Invoke(update)==NativeOutcome::Admitted);
     CHECK(h.adapter.IdentifyNavigation(n,primary,navigation)==NavigationOwnership::Ready&&navigation.command.revision==2);
     ++update.parameterRevision;update.movement.after.goal[0]=9;
-    const auto count=h.calls.size();CHECK(h.adapter.Check(update)==Readiness::Waiting&&h.calls.size()==count);
-    h.requests[0][0xB8]&=~0x40U;CHECK(h.adapter.Check(update)==Readiness::Ready);
+    const auto count=h.calls.size();CHECK(h.adapter.Check(update)==Readiness::Ready&&h.calls.size()==count);
+    CHECK(h.adapter.Invoke(update)==NativeOutcome::Admitted&&h.calls.size()==count); // Coalesced without overwriting pending8.
+    CHECK(*reinterpret_cast<float*>(h.requests[0].data()+0x34U)==8.0F);
     auto release=h.current;release.opcode=Op::Release;release.movement={};CHECK(h.adapter.Check(release)==Readiness::Ready);
     auto cancel=release;cancel.opcode=Op::Cancel;CHECK(h.adapter.Invoke(cancel)==NativeOutcome::Admitted);
     CHECK(h.adapter.Invoke(release)==NativeOutcome::Admitted&&h.adapter.ActiveCount()==0);
@@ -826,4 +1141,4 @@ void Native() {
     stance.opcode=Op::Release;stance.mode=0;stance.scalarRetention=3;CHECK(queued.adapter.Invoke(stance)==NativeOutcome::Admitted&&queued.adapter.ActiveCount()==0);
 }
 }
-int main(int argc,char** argv){CHECK(argc==2);Wire(argv[1]);Evidence();HostInputsAreNotReplacedByPhysicalCarrier(1);HostInputsAreNotReplacedByPhysicalCarrier(2);RejectedRouteRetainsNativeLifetime();GuidedInitialTargetWaitsWithoutFactory();GuidedUpdatesOnlyRetainValues();GuidedUpdateWaitsForRetailWithoutRestart();GuidedGoalConsumptionPrecedesStopAndGait();GuidedRejectedAndDiscardedGoalsRemainPendingIntent();GuidedFailureAwaitsNativeSchedulerAndWorker();GuidedRetainedReplacementKeepsIdentity();GuidedContinuationIsBoundedAndAppended();GuidedContinuationIsBoundedAndAppended(2);RetainedArrivalContinuesWithoutNewHostRevision(1);RetainedArrivalContinuesWithoutNewHostRevision(2);ExhaustedThroughWaypointContinues(1);ExhaustedThroughWaypointContinues(2);PhysicalProgressLimitsNativeGoals();ObservedBendFeedsNativeRequest();GoalDependencies();NativeRouteInitializationOwnership();NativePreemption();NativePreemption(movement::Navigation::HostGuided);LatePreemptedUpdate();Native();std::cout<<"AISync Move wire, paced guidance, full evidence, compound native ownership PASS (offline)\n";}
+int main(int argc,char** argv){CHECK(argc==2);Wire(argv[1]);Evidence();PrePassageContinuity();LocalGoalConsumptionPrecedesStop(1);LocalGoalConsumptionPrecedesStop(2);LocalDiscardedGoalRetainsExactHostIntent();LocalPendingGoalCoalescesLatestRevision();LocalContinuousGoalsFinishConsumedParameters();HostInputsAreNotReplacedByPhysicalCarrier(1);HostInputsAreNotReplacedByPhysicalCarrier(2);RejectedRouteRetainsNativeLifetime();GuidedInitialTargetWaitsWithoutFactory();GuidedUpdatesOnlyRetainValues();GuidedUpdateWaitsForRetailWithoutRestart();GuidedGoalConsumptionPrecedesStopAndGait();GuidedRejectedAndDiscardedGoalsRemainPendingIntent();GuidedFailureAwaitsNativeSchedulerAndWorker();GuidedRetainedReplacementKeepsIdentity();GuidedContinuationIsBoundedAndAppended();GuidedContinuationIsBoundedAndAppended(2);RetainedArrivalContinuesWithoutNewHostRevision(1);RetainedArrivalContinuesWithoutNewHostRevision(2);ExhaustedThroughWaypointContinues(1);ExhaustedThroughWaypointContinues(2);PhysicalProgressLimitsNativeGoals();ObservedBendFeedsNativeRequest();GoalDependencies();NativeRouteInitializationOwnership();NativePreemption();NativePreemption(movement::Navigation::HostGuided);LatePreemptedUpdate();Native();std::cout<<"AISync Move wire, paced guidance, full evidence, compound native ownership PASS (offline)\n";}

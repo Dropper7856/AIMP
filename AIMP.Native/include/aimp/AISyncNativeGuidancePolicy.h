@@ -19,6 +19,9 @@ struct Snapshot {
     bool tailExhausted{};
     // Positive reads of N+48/N+49, not merely an absent worker pointer.
     bool routeUpdateQuiet{};
+    // Set only after the entire bounded retained ring was validated. Both
+    // false means unknown/malformed, never proof that cleanup is unnecessary.
+    bool retainedReferencePresent{};
 };
 [[nodiscard]] inline bool SameGoal(const std::array<float,3>& a,const std::array<float,3>& b) noexcept {
     for(std::size_t i=0;i<a.size();++i)

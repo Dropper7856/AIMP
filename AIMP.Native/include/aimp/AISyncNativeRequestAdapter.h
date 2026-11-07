@@ -16,8 +16,9 @@ struct LocalActorBinding {
     bool operator==(const LocalActorBinding&) const noexcept = default;
 };
 // Borrowed synchronous context of an explicit Host adapter invocation.
-// Valid only on the calling thread until Invoke returns. Local guidance and
-// continuations never install it and cannot claim a newer Host operation.
+// Valid only on the calling thread until Invoke returns. Standalone guidance
+// never installs it. A pre-passage continuation temporarily correlates its
+// exact retained Move, with no invented newer Host sequence or operation.
 struct NativeInvocation {
     const transactions::Record* record{};
     LocalActorBinding actor{};
@@ -135,7 +136,8 @@ public:
     // Retained diagnostic: synthetic transition pose placements are disabled.
     [[nodiscard]] std::uint64_t TransitionPlacements() const noexcept { return transitionPlacements_; }
     [[nodiscard]] std::uint64_t LifecycleEvents() const noexcept { return lifecycleEvents_; }
-    [[nodiscard]] transactions::NativeOutcome Invoke(const transactions::Record&) noexcept;
+    [[nodiscard]] transactions::NativeOutcome Invoke(const transactions::Record&,
+        GuidanceAuthority = nullptr, void* authorityContext = nullptr) noexcept;
     [[nodiscard]] NativeRequestStatus Inspect(const transactions::Record&) noexcept;
     [[nodiscard]] std::size_t ActiveCount() const noexcept;
     [[nodiscard]] std::size_t ActiveCount(const transactions::OwnerKey&) const noexcept;
@@ -159,8 +161,9 @@ public:
     // for authoritative Release and fences future Submit/Update. False leaves
     // busy, stale or uncertain work with the caller; never broadens ownership.
     [[nodiscard]] bool RejectNavigation(const NavigationBinding&) noexcept;
-    // Engine-qualified HostGuided waypoint edits through the retail pending
-    // goal setter. HostRoute actions keep their separate strict importer.
+    // Engine-qualified HostGuided waypoint edits and completion of exact
+    // LocalNative goal/parameter deposits through the retail setters.
+    // HostRoute actions keep their separate strict importer.
     void SteerMovements(GuidanceAuthority,void* authorityContext) noexcept;
     [[nodiscard]] bool BeginRetirement(const transactions::Scope&) noexcept;
     [[nodiscard]] RetirementProgress DrainRetirement(RetirementGuard, void* context,
@@ -200,6 +203,7 @@ private:
         bool executedArrivalKnown{};
         movement::Parameters executedParameters{},pendingGuidanceParameters{};
         bool executedParametersKnown{},guidanceGoalPending{};
+        bool localParametersPending{}; // Exact Host goal must be consumed before its stop inputs.
         std::uint32_t executedStopVariant{},pendingGuidanceGait{},pendingGuidanceRevision{},guidanceAppliedRevision{};
         std::uint64_t lastGuidanceEdit{};
         std::uint64_t lastGuidanceContinuation{};
@@ -216,6 +220,10 @@ private:
     [[nodiscard]] transactions::NativeOutcome InvokePinned(const transactions::Record&, const LocalActorBinding&) noexcept;
 
     [[nodiscard]] transactions::NativeOutcome InvokeLifecycle(const transactions::Record&, const LocalActorBinding&) noexcept;
+    // Only the next explicit Host passage21/25 may repair its still-current
+    // Move after local native completion. Unsafe observations skip the repair.
+    [[nodiscard]] bool PreparePassageMovement(const transactions::Record&,const LocalActorBinding&,
+        GuidanceAuthority,void*) noexcept;
     [[nodiscard]] Readiness CheckMovement(const transactions::Record&, const LocalActorBinding&) noexcept;
     [[nodiscard]] Readiness Resources(std::uintptr_t character) noexcept;
     [[nodiscard]] transactions::NativeOutcome InvokeMovement(const transactions::Record&, const LocalActorBinding&) noexcept;
@@ -257,6 +265,10 @@ private:
     void* context_{};
     bool busy_{};
     bool steering_{};
+    // Borrowed only during a synchronous pre-passage continuation. Resolve
+    // rechecks the exact command authority after every native callback.
+    GuidanceAuthority passageRepairAuthority_{};
+    void* passageRepairContext_{};
     std::uint32_t waitReason_{};
     // An admitted Host placement (kind8) moves the Character only when the
     // scheduler runs it. A following Move queried before that frame starts
@@ -300,4 +312,18 @@ struct GuidanceReport {
     std::uint64_t exhaustedTailContinuations{};
 };
 [[nodiscard]] GuidanceReport GuidanceDiagnostics() noexcept;
+enum PassageRepairReason : std::uint32_t {
+    PassageRepairCritical=1U, PassageRepairAmbiguous=2U, PassageRepairNoMove=4U,
+    PassageRepairAuthority=8U, PassageRepairLifetime=16U, PassageRepairUnreadable=32U,
+    PassageRepairActive=64U, PassageRepairWorker=128U, PassageRepairForeignBlock=256U,
+    PassageRepairRetainsBlock=512U, PassageRepairRouteUpdate=1024U, PassageRepairQueue=2048U,
+    PassageRepairRetainedUnknown=4096U, PassageRepairRetainedReplacement=8192U,
+    PassageRepairPartialFailure=16384U
+};
+struct PassageRepairReport {
+    std::uint64_t repaired{},deferred{},failed{};
+    std::uint32_t reasonBits{},status{};
+    std::uint64_t lastMoveCommand{},lastPassageSeq{};
+};
+[[nodiscard]] PassageRepairReport PassageRepairs() noexcept;
 } // namespace aimp::ai_sync::execution

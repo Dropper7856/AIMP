@@ -13,6 +13,9 @@ namespace {
 std::atomic<std::uint64_t> gUpdateRefusals{},gUpdateRefusalCommand{};
 std::atomic<std::uint32_t> gUpdateRefusalBits{},gUpdateRefusalStatus{};
 std::atomic<std::uint64_t> gPlacementHolds{},gPlacementTimeouts{};
+std::atomic<std::uint64_t> gPassageRepairs{},gPassageRepairDeferrals{},gPassageRepairFailures{};
+std::atomic<std::uint32_t> gPassageRepairReasons{},gPassageRepairStatus{UINT32_MAX};
+std::atomic<std::uint64_t> gPassageRepairMove{},gPassageRepairSequence{};
 constexpr std::uint64_t kPlacementHoldMilliseconds=750U;
 thread_local NativeInvocation gNativeInvocation{};
 struct NativeInvocationScope {
@@ -211,6 +214,12 @@ bool NativeRequestAdapter::Resolve(const Record& r, LocalActorBinding& actor) no
     const bool continuation=steering_&&invokingRecord_&&r.scope==invokingRecord_->scope&&
         r.owner==invokingRecord_->owner&&r.commandId==invokingRecord_->commandId&&r.nativeKind==1&&
         r.parameterRevision==invokingRecord_->parameterRevision;
+    if(continuation&&passageRepairAuthority_) {
+        const auto* lease=Find(r);
+        if(!lease||lease->preempted||lease->cancelled||lease->routeRejected||
+            !passageRepairAuthority_(passageRepairContext_,
+                {r.scope,r.owner,r.commandId,lease->actor,r.nativeKind,r.parameterRevision}))return false;
+    }
     const auto resolver=(lifecycle||continuation)&&lifecycleResolver_?lifecycleResolver_:resolve_;
     if (base_ == 0 || permission_ == nullptr || resolve_ == nullptr || (!continuation&&!permission_(context_, r)) ||
         !resolver(context_, r.owner, actor) || !actor.exclusiveExecution || actor.character == 0 || actor.runtimeId == 0) return false;
@@ -342,7 +351,89 @@ Readiness NativeRequestAdapter::Check(const Record& r) noexcept {
     if (ActiveCount() >= kCapacity) return Readiness::Rejected;
     return Resources(actor.character);
 }
-NativeOutcome NativeRequestAdapter::Invoke(const Record& input) noexcept {
+bool NativeRequestAdapter::PreparePassageMovement(const Record& passage,const LocalActorBinding& actor,
+    GuidanceAuthority authority,void* authorityContext) noexcept {
+    if(!authority||passage.opcode!=Op::Submit||
+        (passage.intent.words[0]!=21U&&passage.intent.words[0]!=native_intent::kPassageTraverseContract))return true;
+    gPassageRepairSequence=passage.globalSeq;gPassageRepairMove=0U;
+    gPassageRepairStatus=UINT32_MAX;gPassageRepairReasons=0U;
+    // A running pair/passage is a critical executor, never a missing route.
+    if(MovementExecutionOwned(actor.character)) {
+        gPassageRepairReasons=PassageRepairCritical;++gPassageRepairDeferrals;return true;
+    }
+    Lease* candidate{};
+    for(auto& lease:leases_) {
+        if(!lease.used||lease.secondary||lease.kind!=1U||lease.scope!=passage.scope||lease.owner!=passage.owner||
+            lease.actor!=actor||!lease.actor.creationSerial||
+            lease.movement.navigation!=movement::Navigation::LocalNative||lease.movement.parts!=1U||
+            !lease.admitted||lease.cancelled||lease.preempted||lease.unknown||lease.routeRejected)continue;
+        const RetirementIdentity identity{lease.scope,lease.owner,lease.command,lease.actor,lease.kind,lease.revision};
+        if(!authority(authorityContext,identity)){gPassageRepairReasons.fetch_or(PassageRepairAuthority);continue;}
+        // More than one still-current simple Move has no unambiguous causal
+        // continuation. Preserve the Host passage rather than guess a winner.
+        if(candidate){gPassageRepairReasons.fetch_or(PassageRepairAmbiguous);++gPassageRepairDeferrals;return true;}
+        candidate=&lease;
+    }
+    if(!candidate){gPassageRepairReasons.fetch_or(PassageRepairNoMove);++gPassageRepairDeferrals;return true;}
+    auto& lease=*candidate;
+    gPassageRepairReasons=0U; // Discard reasons from unrelated, noncurrent leases.
+    gPassageRepairMove=lease.command;
+    const RetirementIdentity identity{lease.scope,lease.owner,lease.command,lease.actor,lease.kind,lease.revision};
+    movement::native_guidance::Snapshot native{};
+    if(!NavigationRevalidate(lease)) {
+        gPassageRepairReasons.fetch_or(PassageRepairLifetime);++gPassageRepairDeferrals;return true;
+    }
+    if(!ReadGuidance(lease,native)) {
+        gPassageRepairReasons.fetch_or(PassageRepairUnreadable);++gPassageRepairDeferrals;return true;
+    }
+    gPassageRepairStatus=native.status;
+    if(!movement::native_guidance::SchedulerEnded(native)){gPassageRepairReasons=PassageRepairActive;return true;}
+    std::uint32_t reasons{},queueCount{};
+    if(!native.workerQuiet)reasons|=PassageRepairWorker;
+    if(native.foreignBlock)reasons|=PassageRepairForeignBlock;
+    if(native.retainsBlock)reasons|=PassageRepairRetainsBlock;
+    if(!native.routeUpdateQuiet)reasons|=PassageRepairRouteUpdate;
+    if(!native.retainedReferenceAbsent&&!native.retainedReferencePresent)reasons|=PassageRepairRetainedUnknown;
+    if(native.status==5U&&!native.retainedReferenceAbsent)reasons|=PassageRepairRetainedReplacement;
+    // No active head at all: exact terminal cleanup must never promote or
+    // notify another queued order while preparing this Host passage.
+    if(!Read(actor.character+kScheduler+8U,queueCount)||queueCount!=0U||!GuidanceCanRestart(lease))reasons|=PassageRepairQueue;
+    if(MovementExecutionOwned(actor.character))reasons|=PassageRepairCritical;
+    if(!authority(authorityContext,identity))reasons|=PassageRepairAuthority;
+    if(!NavigationRevalidate(lease))reasons|=PassageRepairLifetime;
+    if(reasons||!movement::native_guidance::Renewable(native)) {
+        gPassageRepairReasons.fetch_or(reasons);
+        ++gPassageRepairDeferrals;return true;
+    }
+    Record frame{};frame.scope=lease.scope;frame.owner=lease.owner;frame.commandId=lease.command;
+    frame.nativeKind=1;frame.parameterRevision=lease.revision;frame.admission=lease.admission;
+    frame.opcode=Op::Update;frame.movement=lease.movement;
+    const auto previousRecord=invokingRecord_;
+    const auto previousSteering=steering_;
+    const auto previousAuthority=passageRepairAuthority_;
+    const auto previousContext=passageRepairContext_;
+    invokingRecord_=&frame;steering_=true;passageRepairAuthority_=authority;passageRepairContext_=authorityContext;
+    // Invoke already pins M's exact live Ref across this entire repair and
+    // the subsequent constructor. Reuse the existing native cleanup/factory,
+    // using only the latest Host goal, gait and stop parameters.
+    bool repaired{};
+    {
+        // Callback correlation must see this Move continuation, never the
+        // outer passage that has not entered its native constructor yet.
+        const NativeInvocationScope movementInvocation(frame,actor);
+        repaired=MovementRevalidate(frame,lease)&&RestartMovement(lease,frame,actor)&&
+            authority(authorityContext,identity)&&MovementRevalidate(frame,lease);
+    }
+    invokingRecord_=previousRecord;steering_=previousSteering;
+    passageRepairAuthority_=previousAuthority;passageRepairContext_=previousContext;
+    if(!repaired) {
+        lease.unknown=true;gPassageRepairReasons.fetch_or(PassageRepairPartialFailure);++gPassageRepairFailures;
+        return false; // A partial native entry cannot safely be dispatched twice.
+    }
+    lease.unknown=false;++gPassageRepairs;
+    return true;
+}
+NativeOutcome NativeRequestAdapter::Invoke(const Record& input,GuidanceAuthority authority,void* authorityContext) noexcept {
     const Record r=input;
     if (Check(r) != Readiness::Ready) {
         TraceCommand(r,0U,NativeOutcome::Rejected);
@@ -376,7 +467,11 @@ NativeOutcome NativeRequestAdapter::Invoke(const Record& input) noexcept {
     if(r.nativeKind==native_intent::kKind) {
         const auto invoke=gIntentInvoke.load(std::memory_order_acquire);
         const character_direct_step_runtime::MovementResourceLease resources(actor.character);
-        if(resources&&invoke)result=invoke(r,actor);
+        if(resources&&invoke) {
+            LocalActorBinding current{};
+            result=PreparePassageMovement(r,actor,authority,authorityContext)&&Resolve(r,current)&&current==actor?
+                invoke(r,actor):NativeOutcome::Unknown;
+        }
         else result=NativeOutcome::Unknown; // Readiness was checked before entry.
         busy_=false;TraceCommand(r,actor.character,result);return result;
     }
@@ -549,5 +644,9 @@ NativeRequestStatus NativeRequestAdapter::Inspect(const Record& r) noexcept {
 UpdateRefusalReport UpdateRefusals() noexcept {
     return {gUpdateRefusals.load(),gUpdateRefusalCommand.load(),gUpdateRefusalBits.load(),gUpdateRefusalStatus.load(),
         gPlacementHolds.load(),gPlacementTimeouts.load()};
+}
+PassageRepairReport PassageRepairs() noexcept {
+    return {gPassageRepairs.load(),gPassageRepairDeferrals.load(),gPassageRepairFailures.load(),
+        gPassageRepairReasons.load(),gPassageRepairStatus.load(),gPassageRepairMove.load(),gPassageRepairSequence.load()};
 }
 } // namespace aimp::ai_sync::execution

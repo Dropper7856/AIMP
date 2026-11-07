@@ -126,7 +126,8 @@ Dependency ExecutionSession::Check(void* context, const Record& operation) {
     }
 }
 NativeOutcome ExecutionSession::Invoke(void* context, const Record& operation) {
-    return static_cast<ExecutionSession*>(context)->native_.Invoke(operation);
+    auto& session=*static_cast<ExecutionSession*>(context);
+    return session.native_.Invoke(operation,&GuidanceCurrent,&session);
 }
 Receipt ExecutionSession::MakeReceipt(const Record& operation, std::uint64_t batchId,
     const ExecutionDisposition& disposition) noexcept {

@@ -244,7 +244,7 @@ struct Actor {
     transactions::Scope capturedExecutionScope{};
     bool capturedExecutionScopeKnown{};
     execution::NativeExecutionAnchor replayedCycle{};
-    // NativeIntent21 completes as an instruction before its native passage
+    // NativeIntent21/25 complete as instructions before their native passage
     // finishes. Keep causal provenance for that exact local cycle/serial.
     std::uint64_t passageSequence{}, passageCommand{};
     ULONGLONG lastExecutionAttempt{};
@@ -6205,10 +6205,12 @@ void __fastcall ControlStanceFallbackDetour(void* cycle,void*) noexcept {
 struct NativeIntentEntry { std::uint32_t entry{},type{},state{},arity{}; };
 // Exact 00d6 wrappers. The scheduler kind5 only reserves the cycle created
 // here; replaying that reservation cannot construct these actions.
-constexpr std::array<NativeIntentEntry,3U> kPassageIntents{{
+constexpr std::array<NativeIntentEntry,4U> kPassageIntents{{
     {0x24A8A0U,0xDBB2A0U,0x4BU,1U}, // borrowed XYZ, retail RET4
     {0x24A9C0U,0xDBB1B8U,0x4DU,0U}, // fixed zero-duration initializer
     {0x24AA50U,0xDBB1B8U,0x4DU,1U}, // authored float duration, retail RET4
+    // 0064A930 RET8 ->004017E0 copies XYZ and a speed-table selector.
+    {0x24A930U,0xDBB360U,0x4CU,2U},
 }};
 NativeIntentEntry NativeIntentContract(const std::uint32_t id) noexcept {
     if(id>=1U&&id<=7U) {
@@ -6219,6 +6221,7 @@ NativeIntentEntry NativeIntentContract(const std::uint32_t id) noexcept {
         const auto& c=kExecutionTransitionContracts[id-8U];return {c.rva,c.typeRva,c.state,c.arity};
     }
     if(id>=21U&&id<=23U)return kPassageIntents[id-21U];
+    if(id==native_intent::kPassageTraverseContract)return kPassageIntents[3U];
     return id==20U?NativeIntentEntry{0x2579F0U,0xEADB58U,0x12U,2U}:NativeIntentEntry{};
 }
 bool NativeIntentActorCurrent(const transactions::Record& record,const execution::LocalActorBinding& binding) noexcept {
@@ -6292,7 +6295,7 @@ bool RetainAuthoritativePassage(const std::uintptr_t character,const std::uintpt
     if(!execution::OrdinaryPassageTransition(requestedState))return false;
     const auto* actor=LiveAuthoritativePassage(character,cycle);
     if(!actor)return false;
-    // Only a real, newer Host invocation may interrupt this live local75.
+    // Only a real, newer Host invocation may interrupt this live local75/76.
     // Local movement continuation never installs this synchronous context.
     const auto invocation=execution::CurrentNativeInvocation();
     const auto* record=invocation.record;
@@ -6388,7 +6391,8 @@ transactions::NativeOutcome InvokeNativeIntent(const transactions::Record& recor
         actor->replayedCycle={record.scope,record.owner,
             {binding.character,binding.runtimeId,gCurrent.nativeGeneration,binding.creationSerial},current,serial};
         actor->passageSequence=actor->passageCommand=0U;
-        if(w[0]==21U&&type==gBase+entry.type&&state==entry.state&&(flags&0x06U)==0U) {
+        if((w[0]==21U||w[0]==native_intent::kPassageTraverseContract)&&
+            type==gBase+entry.type&&state==entry.state&&(flags&0x06U)==0U) {
             actor->passageSequence=record.globalSeq;actor->passageCommand=record.commandId;
         }
         if(LocomotionExitIntent(record))actor->reactionCycle=0U;
@@ -8792,8 +8796,8 @@ __declspec(naked) void PassageBackstageSecondShim() noexcept {
 // cycle. No last-cycle slot, sampled state, or retry timer can create a call.
 std::array<std::atomic<void*>,kExecutionTransitionContracts.size()> gCycleCallOriginal{};
 std::array<void*,kExecutionTransitionContracts.size()> gCycleCallTrampoline{};
-std::array<std::atomic<void*>,3U> gPassageIntentOriginal{};
-std::array<void*,3U> gPassageIntentTrampoline{};
+std::array<std::atomic<void*>,4U> gPassageIntentOriginal{};
+std::array<void*,4U> gPassageIntentTrampoline{};
 std::array<std::atomic<void*>,6U> gSimpleIntentOriginal{};
 std::array<void*,6U> gSimpleIntentTrampoline{};
 std::atomic<void*> gScriptIntentOriginal{};
@@ -8872,11 +8876,15 @@ bool CaptureNativeIntentCall(const std::uint32_t id,const std::uintptr_t cycle,
             } else fail(7U); // No heuristic pointer/value classification.
             w[1]|=static_cast<std::uint32_t>(encoded)<<(4U*i);
         }
-    } else if(id==21U) {
+    } else if(id==21U||id==native_intent::kPassageTraverseContract) {
         w[1]=static_cast<std::uint32_t>(ExecutionArgKind::Vector);
-        // 00401770 ->004013F0 reads XYZ only. The fourth word is padding,
+        // 00401770/004017E0 ->004013F0 read XYZ only. The fourth word is padding,
         // not an input: do not read beyond the Host's twelve-byte carrier.
         if(!crash_guard::TryCopy(w.data()+8U,reinterpret_cast<const void*>(raw[0]),12U))fail(6U);
+        if(id==native_intent::kPassageTraverseContract) {
+            w[1]|=static_cast<std::uint32_t>(ExecutionArgKind::Value)<<4U;
+            w[3]=raw[1];
+        }
     } else if(id==23U) {
         w[1]=static_cast<std::uint32_t>(ExecutionArgKind::Value);w[2]=raw[0];
     } else if(id==20U) {
@@ -8982,6 +8990,17 @@ void __fastcall PassageIdleIntentDetour(void* cycle,void*) noexcept {
         static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(_ReturnAddress())-gBase)));
     original(cycle);
 }
+void __fastcall PassageTraverseIntentDetour(void* cycle,void*,const float* destination,
+    const std::uint32_t selector) noexcept {
+    const auto original=reinterpret_cast<void(__thiscall*)(void*,const float*,std::uint32_t)>(
+        gPassageIntentOriginal[3U].load(std::memory_order_acquire));
+    if(!original)return;
+    const std::uint32_t raw[2]{static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(destination)),selector};
+    static_cast<void>(CaptureNativeIntentCall(native_intent::kPassageTraverseContract,
+        reinterpret_cast<std::uintptr_t>(cycle),raw,
+        static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(_ReturnAddress())-gBase)));
+    original(cycle,destination,selector);
+}
 template<std::size_t... I> bool HookCycleCalls(HookManager& hooks,std::string& error,std::index_sequence<I...>) {
     static const std::array<void*,sizeof...(I)> detours{CycleCallDetour<I>()...};
     for(std::size_t i=0;i<kExecutionTransitionContracts.size();++i) {
@@ -9027,8 +9046,9 @@ bool HookExecutionCycleCalls(HookManager& hooks,std::string& error) {
     for(std::size_t i=0;i<detours.size();++i)
         if(!Hook(hooks,"aisync native zero argument intention",kExecutionTransitions[i].entryRva,detours[i],
             {0x56,0x8B,0xF1,0x8A,0x46,0x1A},&gSimpleIntentTrampoline[i],&gSimpleIntentOriginal[i],error))return false;
-    const std::array<void*,3U> passageDetours{reinterpret_cast<void*>(&PassageIntentDetour<0U>),
-        reinterpret_cast<void*>(&PassageIdleIntentDetour),reinterpret_cast<void*>(&PassageIntentDetour<2U>)};
+    const std::array<void*,4U> passageDetours{reinterpret_cast<void*>(&PassageIntentDetour<0U>),
+        reinterpret_cast<void*>(&PassageIdleIntentDetour),reinterpret_cast<void*>(&PassageIntentDetour<2U>),
+        reinterpret_cast<void*>(&PassageTraverseIntentDetour)};
     for(std::size_t i=0;i<kPassageIntents.size();++i)
         if(!Hook(hooks,"aisync native passage intention",kPassageIntents[i].entry,passageDetours[i],
             {0x6A,0xFF,0x68,0xC1,0x3F,0x12,0x01},&gPassageIntentTrampoline[i],&gPassageIntentOriginal[i],error,0xD23FC1U))return false;
@@ -10804,9 +10824,17 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"physicalTrailGoalSamples",Diagnostics::Unsigned(guidance.physicalTrailSamples),true},
          {"lastLeadMeters",std::to_string(guidance.lastLead),true},
          {"correctiveTeleportsEnabled",Diagnostics::Boolean(false),true}});
-    diagnostics.Log("info","aisync_native_passage","Exact live Host passage75 protects its native cycle. Counts do not certify physical completion.",
+    const auto passageRepairs=execution::PassageRepairs();
+    diagnostics.Log("info","aisync_native_passage","Exact live Host passage75/76 protects its native cycle. Pre-passage repair reasons: 1 critical, 2 ambiguous, 4 no Move, 8 authority, 16 lifetime, 32 unreadable, 64 active, 128 worker, 256 foreign block, 512 retained block, 1024 route update, 2048 queue, 4096 retained ring unknown, 8192 retained status5, 16384 partial failure. Counts do not certify physical completion.",
         {{"localTransitionsHeld",Diagnostics::Unsigned(gPassageTransitionsHeld.load()),true},
-         {"backstageInterruptionsHeld",Diagnostics::Unsigned(gPassageBackstageInterruptionsHeld.load()),true}});
+         {"backstageInterruptionsHeld",Diagnostics::Unsigned(gPassageBackstageInterruptionsHeld.load()),true},
+         {"moveRepairs",Diagnostics::Unsigned(passageRepairs.repaired),true},
+         {"moveRepairDeferred",Diagnostics::Unsigned(passageRepairs.deferred),true},
+         {"moveRepairFailed",Diagnostics::Unsigned(passageRepairs.failed),true},
+         {"moveRepairReasonBits",Diagnostics::Unsigned(passageRepairs.reasonBits),true},
+         {"moveRepairStatus",Diagnostics::Unsigned(passageRepairs.status),true},
+         {"moveRepairCommand",Diagnostics::Unsigned(passageRepairs.lastMoveCommand),true},
+         {"moveRepairPassageSeq",Diagnostics::Unsigned(passageRepairs.lastPassageSeq),true}});
     const auto replacement=route_execution::ReplacementDiagnostics();
     diagnostics.Log("info","aisync_route_replacement","Native replacement: wait1=start area, 2=native boundary busy, 3=compound parts. Counts do not certify visual completion.",
         {{"requested",Diagnostics::Unsigned(replacement.requested),true},

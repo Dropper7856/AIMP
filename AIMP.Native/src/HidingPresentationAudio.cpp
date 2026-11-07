@@ -42,6 +42,7 @@ struct MetadataRow {
     std::uintptr_t lastKey{};
     std::array<char, 96U> name{};
     std::uint64_t observed{}, suppressed{}, reported{}, lastTick{};
+    std::uint64_t thresholdEligible{}, belowThreshold{}, invalidWeight{};
     float weight{}, threshold{};
 };
 std::array<MetadataRow, 64U> gMetadataRows{};
@@ -62,11 +63,11 @@ void ObserveMetadata(std::uintptr_t specification, std::uintptr_t key,
     if (!lock.owns_lock()) { ++gMetadataDropped; return; }
     MetadataRow* selected = &gMetadataRows.front();
     for (auto& row : gMetadataRows) {
-        if (row.observed == 0U || row.eventId == eventId) { selected = &row; break; }
+        if (row.observed == 0U || (row.eventId == eventId && row.lastKey == key)) { selected = &row; break; }
         if (row.lastTick < selected->lastTick) selected = &row;
     }
     auto& row = *selected;
-    if (row.observed == 0U || row.eventId != eventId) {
+    if (row.observed == 0U || row.eventId != eventId || row.lastKey != key) {
         if (row.observed != 0U) ++gMetadataReplaced;
         row = {}; row.eventId = eventId;
         std::uintptr_t name{};
@@ -78,7 +79,13 @@ void ObserveMetadata(std::uintptr_t specification, std::uintptr_t key,
     ++row.observed;
     if (suppressed) ++row.suppressed;
     row.lastKey = key; row.lastTick = GetTickCount64(); row.weight = weight;
-    static_cast<void>(Read(specification + 0x20U, row.threshold));
+    const bool thresholdReadable = Read(specification + 0x20U, row.threshold);
+    // Eligibility is only the retail weight gate, never evidence of a post.
+    // Keep it per emitter key: another actor's final zero-weight sample must
+    // not hide an Alien clip that previously crossed this gate.
+    if (!thresholdReadable || !std::isfinite(weight) || !std::isfinite(row.threshold)) ++row.invalidWeight;
+    else if (!suppressed && weight >= row.threshold) ++row.thresholdEligible;
+    else if (!suppressed) ++row.belowThreshold;
 }
 bool Match(std::uintptr_t base, std::uintptr_t rva, std::initializer_list<std::uint8_t> bytes) noexcept {
     std::array<std::uint8_t, 16U> actual{};
@@ -318,12 +325,15 @@ void LogMetadataDiagnostics(aimp::Diagnostics& diagnostics) {
     }
     for (const auto& row : rows) if (row.observed != 0U)
         diagnostics.Log("info", "native_animation_audio_metadata",
-            "Process-wide retail metadata observations; key is local only. Forwarding does not prove playback or audibility.",
+            "Per-event/emitter retail metadata observations; key is local only. Threshold eligibility and forwarding do not prove playback or audibility.",
             {{"eventId", Diagnostics::Unsigned(row.eventId), true}, {"eventName", row.name.data()},
              {"lastKey", Diagnostics::Pointer(reinterpret_cast<const void*>(row.lastKey))},
              {"observed", Diagnostics::Unsigned(row.observed), true},
              {"forwarded", Diagnostics::Unsigned(row.observed - row.suppressed), true},
              {"suppressed", Diagnostics::Unsigned(row.suppressed), true},
+             {"thresholdEligible", Diagnostics::Unsigned(row.thresholdEligible), true},
+             {"belowThreshold", Diagnostics::Unsigned(row.belowThreshold), true},
+             {"invalidWeight", Diagnostics::Unsigned(row.invalidWeight), true},
              {"weight", std::to_string(row.weight)}, {"threshold", std::to_string(row.threshold)},
              {"sampleTick", Diagnostics::Unsigned(row.lastTick), true},
              {"dropped", Diagnostics::Unsigned(gMetadataDropped.load()), true},

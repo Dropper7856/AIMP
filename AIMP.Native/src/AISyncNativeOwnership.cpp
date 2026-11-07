@@ -19,13 +19,14 @@ bool MatchesNativeExecution(const OwnershipMemory& memory,const NativeExecutionA
 }
 bool IsLiveNativePassage(const OwnershipMemory& memory,const NativeExecutionAnchor& anchor,
     const transactions::Scope& scope,const transactions::OwnerKey& owner,const ActorLifetime& actor) noexcept {
-    if(memory.imageBase<0x10000U||memory.imageBase>0xFFFFFFFFULL-0xDBB2A0U||
+    if(memory.imageBase<0x10000U||memory.imageBase>0xFFFFFFFFULL-0xDBB360U||
         !actor.runtimeId||!actor.nativeGeneration||!MatchesNativeExecution(memory,anchor,scope,owner,actor))return false;
     std::uint32_t cycleOwner{},type{},health{};std::uint8_t state{},flags{},grappled{};
     const auto current=[&]() noexcept {
         return Read(memory,anchor.cycle+4U,cycleOwner)&&cycleOwner==actor.character&&
-            Read(memory,anchor.cycle,type)&&type==memory.imageBase+0xDBB2A0U&&
-            Read(memory,anchor.cycle+0x1AU,state)&&state==0x4BU&&
+            Read(memory,anchor.cycle,type)&&Read(memory,anchor.cycle+0x1AU,state)&&
+            ((type==memory.imageBase+0xDBB2A0U&&state==0x4BU)||
+             (type==memory.imageBase+0xDBB360U&&state==0x4CU))&&
             Read(memory,anchor.cycle+8U,flags)&&(flags&0x06U)==0U&&
             Read(memory,actor.character+0x32CU,health)&&health<3U&&
             Read(memory,actor.character+0x297U,grappled)&&!grappled;

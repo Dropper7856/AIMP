@@ -119,8 +119,8 @@ void ExactNativeExecutionProvenance() {
     m.Put(m.actor.character+0x50U,m.actor.runtimeId+1U);CHECK(!matches());m.Put(m.actor.character+0x50U,m.actor.runtimeId);
     m.failAt=Memory::cycle+0x19U;CHECK(!matches());
 }
-void ExactPassageLifetime() {
-    Memory m;m.actor.creationSerial=11;m.Cycle(0xDBB2A0U,0x4BU);
+void ExactPassageLifetime(std::uint32_t expectedType,std::uint8_t expectedState) {
+    Memory m;m.actor.creationSerial=11;m.Cycle(expectedType,expectedState);
     m.Put(Memory::cycle+8U,std::uint8_t{0x20});
     aimp::ai_sync::transactions::Scope scope{};scope.session[0]=1;scope.authorityEpoch=scope.worldEpoch=scope.consumerEpoch=1;
     const aimp::ai_sync::transactions::OwnerKey owner{1,2,3,4,aimp::ai_sync::transactions::Capability::Movement,5};
@@ -128,8 +128,9 @@ void ExactPassageLifetime() {
     const auto live=[&] {return IsLiveNativePassage({0x400000U,&m,&Memory::Read},anchor,scope,owner,m.actor);};
     CHECK(live());
     // The exact serial and class matter even when the engine reuses its cycle allocation.
-    m.Cycle(0xEABF80U,0x4BU);CHECK(!live());m.Cycle(0xDBB2A0U,0x38U);CHECK(!live());
-    m.Cycle(0xDBB2A0U,0x4BU);m.Put(Memory::cycle+0x19U,std::uint8_t{8});CHECK(!live());
+    m.Cycle(0xEABF80U,expectedState);CHECK(!live());m.Cycle(expectedType,0x38U);CHECK(!live());
+    m.Cycle(expectedType,static_cast<std::uint8_t>(expectedState==0x4BU?0x4CU:0x4BU));CHECK(!live());
+    m.Cycle(expectedType,expectedState);m.Put(Memory::cycle+0x19U,std::uint8_t{8});CHECK(!live());
     m.Put(Memory::cycle+0x19U,std::uint8_t{7});
     for(const auto flags:{0x02U,0x04U,0x06U,0x26U}) {
         m.Put(Memory::cycle+8U,static_cast<std::uint8_t>(flags));CHECK(!live());
@@ -186,6 +187,6 @@ void PassageCausalReplacement() {
 }
 int main() {
     NativeIdleAndCycles();SchedulerAndNavigation();FaultsAndLifetimeChanges();NativeInteractionReplacement();ExactNativeExecutionProvenance();
-    ExactPassageLifetime();PassageCausalReplacement();
+    ExactPassageLifetime(0xDBB2A0U,0x4BU);ExactPassageLifetime(0xDBB360U,0x4CU);PassageCausalReplacement();
     std::cout<<"Native ownership: movement boundaries, exact passage lifetime and causal replacement PASS (modeled reads only).\n";
 }

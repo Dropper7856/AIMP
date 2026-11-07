@@ -16,6 +16,10 @@ inline constexpr std::size_t kBytes = 144;
 // 12/13=opaque R+B4 before/after admission;14..35 reserved zero.
 inline constexpr std::uint32_t kMarkerContract = 24U, kMarkerSchema = 1U,
     kMarkerMaxOrdinal = 1000000U;
+// 0064A930 (RET8) ->004017E0 constructs passage76: XYZ and a speed
+// table selector. Retail callers supply only0 or2; no pointer is serialized.
+// words:0=25,1=0x14,3=selector,8..10=XYZ; all other words zero.
+inline constexpr std::uint32_t kPassageTraverseContract = 25U, kPassageSchema = 0x14U;
 // 0043FC90 copies all three low flag bytes and only bits0/1 of byte+57.
 // The remaining six bits are structure padding, not animation options.
 inline constexpr std::uint32_t kScriptedFlags = 0x03FFFFFFU;
@@ -58,6 +62,12 @@ using CanonicalPayload = std::array<std::uint8_t, kBytes>;
         return w[1] == kMarkerSchema && digest && w[10] > 0 && w[10] <= kMarkerMaxOrdinal &&
             w[11] <= kMarkerMaxOrdinal && w[12] <= 1 && w[13] <= 1 && zero(14, 36);
     }
+    if (id == kPassageTraverseContract)
+        return w[1] == kPassageSchema && w[2] == 0 && (w[3] == 0 || w[3] == 2) &&
+            zero(4, 8) && zero(11, 36) &&
+            std::isfinite(std::bit_cast<float>(w[8])) &&
+            std::isfinite(std::bit_cast<float>(w[9])) &&
+            std::isfinite(std::bit_cast<float>(w[10]));
     if (id < 1 || id > 23 || id == 11 || id == 14 || id == 18 || w[35] != 0)
         return false;
     // 0064A8A0 (RET4) forwards a pointer to00401770, which copies only
