@@ -53,3 +53,5 @@ docs/
 # Markdown stays local except the project README
 *.md
 !/README.md
+
+artifacts/
