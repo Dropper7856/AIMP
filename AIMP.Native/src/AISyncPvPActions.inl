@@ -42,6 +42,7 @@ struct Active final {
     bool used{},entered{},cancelled{},terminalSent{},hostEnded{},moveArrived{},entrySubmitted{},remoteVent{};
     bool presentationStarted{},ownerFinished{};
     std::uint64_t ventProgressAt{};float ventBestDistance{std::numeric_limits<float>::infinity()};
+    bool attackLatched{};std::uint64_t latchedAt{};
 };
 Active active{};
 policy::EdgeGate edges{};
@@ -104,7 +105,8 @@ void LogVent(Diagnostics& diagnostics) {
 }
 // Host attack stages: 1 no AI selection, 2 no selected record, 3 target
 // write fault, 4 query refused, 5 selector unproven, 6 cover ray pending,
-// 7 pair submitted, 8 pair refused, 9 source entered cycle78.
+// 7 pair submitted, 8 pair refused, 9 source entered cycle78, 10 entry
+// attempted after the 400ms ray window.
 struct AttackTelemetry final {
     std::atomic<std::uint64_t> revision{},sequence{},elapsed{},polls{};
     std::atomic<unsigned> stage{},selector{},cycle{};
@@ -123,7 +125,7 @@ void LogAttack(Diagnostics& diagnostics) {
     const auto sequence=attackTelemetry.sequence.load();
     if(!revision || revision==lastRevision || (sequence==lastSequence && now-lastAt<250U))return;
     lastRevision=revision;lastSequence=sequence;lastAt=now;
-    diagnostics.Log("info","alien_attack_progress","Host attack preparation; stage 1 noSelection 2 noRecord 3 targetFault 4 queryRefused 5 selectorUnproven 6 rayPending 7 submitted 8 pairRefused 9 entered.",
+    diagnostics.Log("info","alien_attack_progress","Host attack preparation; stage 1 noSelection 2 noRecord 3 targetFault 4 queryRefused 5 selectorUnproven 6 rayPending 7 submitted 8 pairRefused 9 entered 10 enteredWithRayPending.",
         {{"hostSequence",Diagnostics::Unsigned(sequence),true},
          {"elapsedMs",Diagnostics::Unsigned(attackTelemetry.elapsed.load()),true},
          {"stage",Diagnostics::Unsigned(attackTelemetry.stage.load()),true},
@@ -468,11 +470,26 @@ void ReleaseAttackTarget() noexcept {
     if(active.heldTarget.record && Live(active.context))ap::attack::Release(AttackMemory(),active.heldTarget);
     active.heldTarget={};
 }
+bool AttackQuery(const ap::attack::Memory& memory,const ap::attack::Manager& manager,
+    const std::uintptr_t victim,bool& ready,std::uint32_t& selector) noexcept {
+    AIMP_ACTION_TRY {
+        using Evaluate=std::uint8_t(__thiscall*)(void*,std::uintptr_t,float*);
+        using Choose=std::uint32_t(__thiscall*)(void*,std::uintptr_t,std::uint32_t,std::uint32_t);
+        float heading{};
+        auto* chooser=reinterpret_cast<void*>(manager.address);
+        if(!Native<Evaluate>(ap::attack::kEvaluateRva)(chooser,victim,&heading)){TraceAttack(4U);return true;}
+        const auto chosen=Native<Choose>(ap::attack::kChooseRva)(chooser,victim,1U,15U);
+        if(!ap::attack::Selected(memory,manager,chosen)){TraceAttack(5U,chosen);return true;}
+        selector=chosen;ready=true;return true;
+    } AIMP_ACTION_CATCH {return false;}
+}
 // Explicit-target retail Alien query; no fabricated hit or health write.
 // The donor attack gate uses this same AlienAttackManager, not the separate
-// human/android manager (012CC390, +800 cache). The query and the melee start
-// read the selected AI target record, so the victim is held there (donor
-// SetTargetOf) for the attack and restored when the action ends.
+// human/android manager (012CC390, +800 cache). The query reads the selected
+// AI target record, so the victim is held there (donor SetTargetOf) ONLY for
+// this engine-thread call. 453 kept it held for the whole action: the leased
+// Alien's retail brain (worker thread, not lease-fenced) then started its own
+// kill, which AISync never captures, so the pilot's PC saw no animation.
 bool AttackAvailability(const ap::Context& c,const PairIdentity& victim,std::uintptr_t& chooser,
     bool& ready,std::uint32_t& selector) noexcept {
     ready=false;selector=0U;PairIdentity source{};
@@ -486,19 +503,11 @@ bool AttackAvailability(const ap::Context& c,const PairIdentity& victim,std::uin
     case ap::attack::HoldResult::Held:break;
     case ap::attack::HoldResult::NoSelection:TraceAttack(1U);return true;
     case ap::attack::HoldResult::NoRecord:TraceAttack(2U);return true;
-    default:TraceAttack(3U);return false;
+    default:TraceAttack(3U);ReleaseAttackTarget();return false;
     }
-    AIMP_ACTION_TRY {
-        using Evaluate=std::uint8_t(__thiscall*)(void*,std::uintptr_t,float*);
-        using Choose=std::uint32_t(__thiscall*)(void*,std::uintptr_t,std::uint32_t,std::uint32_t);
-        float heading{};
-        if(!Native<Evaluate>(ap::attack::kEvaluateRva)(reinterpret_cast<void*>(chooser),victim.character,&heading)) {
-            TraceAttack(4U);return true;
-        }
-        const auto chosen=Native<Choose>(ap::attack::kChooseRva)(reinterpret_cast<void*>(chooser),victim.character,1U,15U);
-        if(!ap::attack::Selected(memory,manager,chosen)){TraceAttack(5U,chosen);return true;}
-        selector=chosen;ready=true;return true;
-    } AIMP_ACTION_CATCH {return false;}
+    const bool queried=AttackQuery(memory,manager,victim.character,ready,selector);
+    ReleaseAttackTarget();
+    return queried;
 }
 bool AttackQueryRetired(const std::uintptr_t chooser) noexcept {
     if(!chooser)return true;
@@ -746,13 +755,22 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
             if(!player_hiding::PreparePvPSearch(active.victim.character,c.scope.nativeGeneration)) {
                 Terminal(result,Phase::Rejected,Reason::NotReady);active.cancelled=true;return true;
             }
-            bool ready{};std::uint32_t selector{};
-            if(!AttackAvailability(c,active.victim,active.chooser,ready,selector)) {
-                Terminal(result,Phase::Failed,Reason::NativeUnavailable);active.cancelled=true;return true;
+            // Query once, then latch. 453 re-queried every frame; each query
+            // re-armed the cover ray, so it never retired (stage 6 for 1s).
+            if(!active.attackLatched) {
+                bool ready{};std::uint32_t selector{};
+                if(!AttackAvailability(c,active.victim,active.chooser,ready,selector)) {
+                    Terminal(result,Phase::Failed,Reason::NativeUnavailable);active.cancelled=true;return true;
+                }
+                if(ready){active.attackLatched=true;active.latchedAt=now;active.receipt.selector=selector;}
             }
-            if(ready && !AttackQueryRetired(active.chooser))TraceAttack(6U,selector);
-            if(ready && AttackQueryRetired(active.chooser)) {
-                active.receipt.selector=selector;
+            // Retail ActionMeleeAttack enters without waiting for the ray. Give
+            // it a bounded window to retire, then enter like retail would.
+            const bool retired=active.attackLatched && AttackQueryRetired(active.chooser);
+            if(active.attackLatched && !retired && now-active.latchedAt<400U)TraceAttack(6U,active.receipt.selector);
+            if(active.attackLatched && (retired || now-active.latchedAt>=400U)) {
+                const auto selector=active.receipt.selector;
+                if(!retired)TraceAttack(10U,selector);
                 active.entrySubmitted=true;active.submittedAt=now;
                 if(!EnterPair(c,active.victim,selector)) {
                     TraceAttack(8U,selector);
@@ -767,7 +785,7 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
                 }
                 return false;
             }
-            if(now-active.began>1000U){Terminal(result,Phase::Rejected,Reason::NativeRefused);active.cancelled=true;return true;}
+            if(now-active.began>1500U){Terminal(result,Phase::Rejected,Reason::NativeRefused);active.cancelled=true;return true;}
             return false;
         }
         auto* actor=Find(c.character);

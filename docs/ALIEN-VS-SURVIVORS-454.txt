@@ -1,0 +1,37 @@
+AIMP 454 / protocol 40
+Branch: feature/alien-vs-survivors-main
+
+Kill animation missing on the Alien pilot's PC
+- Test logs 211636 (Host, second PC, victim) and 231633 (Client Alien pilot):
+  attack 1041 reached Preparing, then alien_attack_progress stage 6
+  (selector 6 chosen, cover ray pending) for the whole 1s window, and the
+  action was Rejected(NativeRefused). PvP EnterPair never ran (no stage 7/9).
+- The Host still died: aisync_paired_graph shows a native pair (source
+  cycle 78, victim 79) with peer=0/pairRevision=0. Host counters show
+  pairRegistrationsOnWorkers=1, pairTransitionsOnWorkers=1. With 453
+  holding the victim as the AI target, the leased Alien's retail brain (worker
+  thread, where the lease fence does not apply) started its own
+  ActionMeleeAttack. InteractionDetour/PairedTransitionADetour capture only on
+  the engine thread, so nothing was published. The Client logged no paired
+  graph at all and its piloted Alien never played the kill.
+- Stage 6 cause: the query ran every frame, and each 006F3A30 call re-armed the
+  manager's cover ray, so it never retired.
+
+Correction
+- The victim is held on the selected target record only for the
+  engine-thread 006F3A30/00710C60 query. The previous target is restored in
+  the same call, so the retail brain never sees the victim as its target.
+- The first proven selector is latched; no re-query. The Host waits up to
+  400ms for the ray to retire, then enters like retail ActionMeleeAttack
+  (stage 10 if the ray was still pending). The preparation window is now
+  1.5s.
+- Entry goes through the PvP EnterPair on the engine thread. That path is
+  captured by the AISync paired transaction and replayed on the Client's
+  Alien and victim (ApplyExecutionCarrier -> PumpPairTransactions).
+
+Validation
+- Four native tests pass. Protocol tests were not rerun (version string only).
+- API 0.8.4.454 delivered locally and to DESKTOP-2JNROA0; SHA-256 match.
+  Friend patch: dist/AIMP-API-patch-v454.zip.
+- Not observed in game yet. Check Host alien_attack_progress for stage 7
+  then 9, and an aisync_paired_graph on the Client with nonzero peer.
