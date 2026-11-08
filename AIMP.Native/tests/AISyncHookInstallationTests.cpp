@@ -211,7 +211,8 @@ void TestProductionInstallation(DataImage& image) {
     for(std::size_t i=0;i<pilotMethods.size();++i)
         Require(pilotMethods[i]==(i==0x40CU/4U?base+0x9931C0U:retailMethods[i]),
             "Pilot entry changed a native method beyond THE_PLAYER exclusion geometry");
-    constexpr std::array<std::uintptr_t, 6> sites{0x2579F0U, 0x2556F0U, 0x33433EU,0x287396U,0x2873CAU,0x24A930U};
+    constexpr std::array<std::uintptr_t, 8> sites{0x2579F0U, 0x2556F0U, 0x33433EU,0x287396U,0x2873CAU,0x24A930U,
+        0x032300U,0x608C50U}; // noclip render-room and post-blend seams, including ASLR
     std::array<std::array<std::byte, 16>, sites.size()> original{};
     for (std::size_t i = 0; i < sites.size(); ++i)
         std::memcpy(original[i].data(), reinterpret_cast<const void*>(base + sites[i]), original[i].size());

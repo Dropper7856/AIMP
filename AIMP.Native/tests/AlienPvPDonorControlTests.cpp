@@ -2,6 +2,7 @@
 #include "aimp/CharacterDirectStepRuntime.h"
 #include "aimp/AlienPvPVents.h"
 #include <Windows.h>
+#include "aimp/AlienPvPFreeCamera.h"
 #include <array>
 #include <cstring>
 #include <iostream>
@@ -50,6 +51,16 @@ bool ApplyReplicatedYaw(std::uintptr_t,float,std::string&) noexcept {++genericCa
 }
 int main() {
     using namespace aimp::alien_pvp;
+    using aimp::alien_pvp_local::FlightDirection;
+    const auto level=FlightDirection({0.0F,-0.99F,0.1F},0.0F,1.0F,0.0F,0.0F);
+    Check(level[1]==0.0F && std::abs(level[2]-1.0F)<0.001F,"pitched camera makes W descend");
+    const auto vertical=FlightDirection({0.0F,1.0F,0.0F},1.5707963F,1.0F,0.0F,0.0F);
+    Check(vertical[0]>0.999F && vertical[1]==0.0F,"vertical look loses horizontal heading");
+    const auto diagonal=FlightDirection({1.0F,0.0F,0.0F},0.0F,1.0F,1.0F,1.0F);
+    Check(std::abs(std::hypot(std::hypot(diagonal[0],diagonal[2]),diagonal[1])-1.0F)<0.001F &&
+        diagonal[1]>0.0F && diagonal[2]<0.0F,"flight diagonal is too fast or strafe is reversed");
+    const auto idle=FlightDirection({0.0F,-1.0F,0.0F},0.0F,0.0F,0.0F,0.0F);
+    Check(idle==std::array<float,3>{},"idle camera drifts");
     alignas(16) std::array<std::byte,0x4400> body{};
     alignas(16) std::array<std::byte,0x80> cycle{};
     const auto character=reinterpret_cast<std::uintptr_t>(body.data());

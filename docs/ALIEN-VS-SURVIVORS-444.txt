@@ -1,0 +1,46 @@
+﻿AIMP 444 / protocol 39
+Branch: feature/alien-vs-survivors-main
+
+Reported on 443
+- W/S followed the pitched look vector, changing altitude while navigating.
+- Noclip camera moved independently of the parked technical character; retail
+  rendering still forced that character's room rather than the camera's room.
+- Normal cinematic lighting remained too dark for ventilation navigation.
+
+Changes
+- FlightDirection normalizes the camera heading in XZ. W/S and A/D stay level;
+  Space/Ctrl alone change height. Diagonals retain the same total speed.
+- Reused AI-Playable-Alien photo.cpp::OnCamSubmitLeave after retail CamSubmit:
+  clear RenderRoomForced and RenderNoZoneMatch for this local noclip camera.
+  Retail then resolves the visible zone using camera position. Retain the donor
+  fallback when the active POV is outside the level (zone -1).
+- Reused the donor OnPostBlendLeave output layout. Noclip gets a brightness
+  floor of .25, RGB multipliers of at least 4, and no vignette/grain/motion blur.
+  This changes the freshly blended frame, not level assets or saved settings;
+  retail recomputes the output each frame and normal lighting resumes on exit.
+- Both hooks require the current pilot engine thread, current exact-generation
+  camera binding and local freeCamera flag. Other players' views are unaffected.
+- Technical player and Alien remain at their existing positions. No camera
+  position is replicated as an Alien pose; traversal authority is unchanged.
+- Added the original donor photo.cpp snapshot under third_party for provenance.
+
+Static ABI verification
+- Supplied AI.exe: CamSubmit VA 00432300 has complete 6-byte prefix
+  55 8B EC 83 E4 F0; post-blend VA 00A08C50 starts with push ecx and an
+  8-byte movq from an absolute address. Its 9-byte prefix has no relative
+  instruction; the relocated absolute operand remains valid in a trampoline.
+- Hooks are installed through the existing exact-build HookManager. Production
+  ASLR installation and rollback tests now cover both new entry points.
+
+Validation and delivery
+- Native Release build and .NET API publish passed.
+- 4 targeted native tests passed, including pitched/vertical-heading movement,
+  normalized diagonal speed, idle drift, ASLR hook install and rollback.
+- API copied without deletion to local dist/win-unpacked/resources/api and
+  \\DESKTOP-2JNROA0\Users\Public\Documents\win-unpacked\resources\api.
+- SHA256 equality verified for Launcher, Protocol, NetZ and both UI GFX files.
+  Receipt: artifacts/alien-444/delivery.json.
+- No in-game runtime test was performed here. Confirm room changes, brightness,
+  and return to ordinary lighting on both entering/exiting several vents.
+  The change uses retail visibility-zone resolution; it cannot create geometry
+  outside the loaded level or make the backside of one-sided surfaces visible.

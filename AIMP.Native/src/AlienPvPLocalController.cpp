@@ -7,6 +7,7 @@
 #include "aimp/AlienPvPControlPolicy.h"
 #include "aimp/AlienPvPTechnicalPolicy.h"
 #include "aimp/AlienPvPVents.h"
+#include "aimp/AlienPvPFreeCamera.h"
 
 #include "aimp/CharacterDirectStepRuntime.h"
 #include "aimp/CrashGuard.h"
@@ -62,6 +63,8 @@ std::uintptr_t gCameraBase{};
 std::atomic<DWORD> gPilotThread{};
 void* gFollowTrampoline{};
 void* gWorldTrampoline{};
+void* gSubmitTrampoline{};
+void* gPostBlendTrampoline{};
 std::atomic<std::uint32_t> gCameraGeneration{};
 struct WorldSample {std::atomic<std::uintptr_t> world{};std::atomic<std::uint64_t> at{};std::atomic<std::uint32_t> generation{};};
 std::array<WorldSample,4> gWorlds{};
@@ -410,14 +413,9 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
         const float f=static_cast<float>(Down('W'))-static_cast<float>(Down('S'));
         const float s=static_cast<float>(Down('D'))-static_cast<float>(Down('A'));
         const float up=static_cast<float>(Down(VK_SPACE))-static_cast<float>(Down(VK_CONTROL));
-        const auto& look=gLocal.freeForward;
-        const float horizontal=std::hypot(look[0],look[2]);
-        const float rx=horizontal>0.01F?look[2]/horizontal:std::cos(yaw);
-        const float rz=horizontal>0.01F?-look[0]/horizontal:-std::sin(yaw);
-        std::array<float,3> direction{look[0]*f+rx*s,look[1]*f+up,look[2]*f+rz*s};
-        const float length=std::hypot(std::hypot(direction[0],direction[2]),direction[1]);
-        if(length>0.01F)for(unsigned i=0;i<3;++i)
-            gLocal.freeEye[i]=std::clamp(gLocal.freeEye[i]+direction[i]/length*(Down(VK_SHIFT)?12.0F:5.0F)*dt,-99900.0F,99900.0F);
+        const auto direction=FlightDirection(gLocal.freeForward,yaw,f,s,up);
+        for(unsigned i=0;i<3;++i)
+            gLocal.freeEye[i]=std::clamp(gLocal.freeEye[i]+direction[i]*(Down(VK_SHIFT)?12.0F:5.0F)*dt,-99900.0F,99900.0F);
         // This is a local camera, never an Alien movement/teleport command.
         input.forward=input.strafe=0.0F;
         static_cast<void>(UpdateVentInterface(context,vents));
@@ -543,6 +541,41 @@ void __fastcall FollowDetour(void* self,void*,std::uint32_t a,std::uint32_t b) n
     reinterpret_cast<void(__thiscall*)(void*,std::uint32_t,std::uint32_t)>(gFollowTrampoline)(self,a,b);
     FollowAfter(reinterpret_cast<std::uintptr_t>(self));
 }
+bool NoclipViewCurrent() noexcept {
+    return GetCurrentThreadId()==gPilotThread.load(std::memory_order_acquire) &&
+        gLocal.freeCamera && CameraHookCurrent(gLocal.camera.followBehavior);
+}
+void __fastcall SubmitDetour(void* self,void*) noexcept {
+    reinterpret_cast<void(__thiscall*)(void*)>(gSubmitTrampoline)(self);
+    if(!NoclipViewCurrent() || reinterpret_cast<std::uintptr_t>(self)!=gLocal.camera.manager)return;
+    // Donor photo.cpp::OnCamSubmitLeave. Retail otherwise selects the room
+    // of the parked technical actor. Let the renderer match the camera's
+    // position instead. Outside the level, retain its existing room fallback.
+    std::uintptr_t manager{},pov{};std::uint32_t zone{};
+    if(!Read(gCameraBase+0x01366A00U,manager) || !manager ||
+        !Read(manager+0x8CU,pov) || !pov || !Read(pov+0x330U,zone) || zone==0xFFFFFFFFU)return;
+    static_cast<void>(Write(gCameraBase+0x01358144U,std::uint8_t{0}));
+    static_cast<void>(Write(gCameraBase+0x01358145U,std::uint8_t{0}));
+}
+void __fastcall PostBlendDetour(void* self,void*) noexcept {
+    reinterpret_cast<void(__thiscall*)(void*)>(gPostBlendTrampoline)(self);
+    if(!NoclipViewCurrent())return;
+    // Donor photo.cpp::OnPostBlendLeave: change only this frame's blended
+    // output, never level settings. Retail recalculates these on every call,
+    // so normal lighting resumes on the first frame outside noclip.
+    const auto manager=reinterpret_cast<std::uintptr_t>(self);
+    float brightness{};std::array<float,3> tint{};
+    if(!Read(manager+0x1914U,brightness) || !std::isfinite(brightness) ||
+        !Read(manager+0x1920U,tint))return;
+    for(const auto value:tint)if(!std::isfinite(value))return;
+    brightness=std::max(brightness,0.25F);
+    for(auto& value:tint)value=std::max(value,1.0F)*4.0F;
+    static_cast<void>(Write(manager+0x1914U,brightness));
+    static_cast<void>(Write(manager+0x1920U,tint));
+    // Clean, readable navigation: no vignette, grain, or motion blur.
+    for(const auto offset:{0x1988U,0x19E8U,0x19ECU,0x19B0U,0x19B4U,0x19B8U,0x19D0U,0x19D4U,0x19D8U})
+        static_cast<void>(Write(manager+offset,0.0F));
+}
 void __fastcall WorldDetour(void* self,void*,std::uint32_t a,std::uint32_t b) noexcept {
     const auto generation=gCameraGeneration.load(std::memory_order_acquire);
     if(generation) {
@@ -570,6 +603,25 @@ bool InstallCameraHooks(std::uintptr_t base,HookManager& hooks,std::string& erro
         request.trampolineOut=world?&gWorldTrampoline:&gFollowTrampoline;
         if(!hooks.Install(request,error))return false;
     }
+    // Exact retail entries; neither prefix contains a relative instruction.
+    HookRequest submit;
+    submit.name="alien_noclip_render_room";
+    submit.target=reinterpret_cast<void*>(base+0x00032300U);
+    submit.detour=reinterpret_cast<void*>(&SubmitDetour);
+    submit.patchLength=6U;submit.relocationSafePrefix=true;
+    submit.expected=MaskedBytes{{0x55,0x8B,0xEC,0x83,0xE4,0xF0},"xxxxxx"};
+    submit.trampolineOut=&gSubmitTrampoline;
+    if(!hooks.Install(submit,error))return false;
+    HookRequest post;
+    post.name="alien_noclip_bright_view";
+    post.target=reinterpret_cast<void*>(base+0x00608C50U);
+    post.detour=reinterpret_cast<void*>(&PostBlendDetour);
+    // push ecx; movq xmm0,[absolute address]. The loader relocates that
+    // address, which remains valid in the trampoline (no EIP-relative data).
+    post.patchLength=9U;post.relocationSafePrefix=true;
+    post.expected=MaskedBytes{{0x51,0xF3,0x0F,0x7E,0x05,0,0,0,0},"xxxxx????"};
+    post.trampolineOut=&gPostBlendTrampoline;
+    if(!hooks.Install(post,error))return false;
     return true;
 }
 
