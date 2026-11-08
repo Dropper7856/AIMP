@@ -550,6 +550,8 @@ std::mutex gOutcomeMutex;
 std::atomic<std::uint64_t> gOutcomeCaptured{}, gOutcomeApplied{}, gOutcomeRejected{}, gOutcomeDuplicates{};
 std::atomic<std::uint64_t> gUnboundHostPreparationAborts{}, gUnboundHostPreparationAbortIncomplete{};
 std::atomic<std::uint64_t> gPairRegistrationAccepted{}, gPairRegistrationWorkers{}, gPairTransitionWorkers{};
+std::atomic<std::uint32_t> gPairGateLast{}, gPairGateClass{}, gPairGateRevision{}, gPairGateRefusalSite{};
+std::atomic<std::uint64_t> gPairGateCount{};
 // Client preparation replay rejection reasons (ResolvedClientPreparation).
 std::atomic<std::uint64_t> gPrepRejectSubmission{}, gPrepRejectSource{}, gPrepRejectTerminal{},
     gPrepRejectDefinition{}, gPrepRejectGeometry{}, gPrepRejectFault{}, gPrepHealthOnlyApplied{},
@@ -5524,18 +5526,34 @@ void PumpPairTransactions() noexcept {
         if(pair.used&&!pair.receipt.resourcesReleased&&pair.receipt.phase==interactions::Phase::Interrupted)continue;
         const auto& carrier=pair.used&&!pair.receipt.resourcesReleased&&pair.progress.interactionCommand==pair.key.command?
             pair.progress:actor.received;
-        if(!actor.initialPlacementReady||!PairTransactionCandidate(carrier)||carrier.birth!=actor.remoteBirth||
-            carrier.sessionCookie!=gCurrent.sessionCookie||carrier.worldGeneration!=gCurrent.worldGeneration||
-            carrier.interactionAuthority!=scope.authorityEpoch||
-            !std::equal(scope.session.begin(),scope.session.end(),std::begin(carrier.interactionSession)))continue;
+        // Diagnostics only: name the first gate holding a not-yet-completed
+        // Host pair (AvS 454 pilot never replayed and logged nothing).
+        const bool pending=carrier.interactionPairRevision!=0U&&carrier.interactionPairRevision!=actor.completedPairRevision;
+        const auto gate=[&](std::uint32_t code) noexcept {
+            if(!pending)return;
+            gPairGateLast.store(code,std::memory_order_relaxed);gPairGateClass.store(actor.characterClass,std::memory_order_relaxed);
+            gPairGateRevision.store(carrier.interactionPairRevision,std::memory_order_relaxed);
+            gPairGateCount.fetch_add(1U,std::memory_order_relaxed);
+        };
+        if(!actor.initialPlacementReady){gate(1U);continue;}
+        if(!PairTransactionCandidate(carrier)) {
+            gate(carrier.interactionCommand==0U?2U:carrier.interactionAuthority==0U?3U:carrier.interactionTransition!=1U?4U:5U);
+            continue;
+        }
+        if(carrier.birth!=actor.remoteBirth){gate(6U);continue;}
+        if(carrier.sessionCookie!=gCurrent.sessionCookie||carrier.worldGeneration!=gCurrent.worldGeneration){gate(7U);continue;}
+        if(carrier.interactionAuthority!=scope.authorityEpoch||
+            !std::equal(scope.session.begin(),scope.session.end(),std::begin(carrier.interactionSession))){gate(8U);continue;}
         const interactions::Key key{scope,carrier.interactionCommand};
-        if(pair.used&&pair.key!=key&&!pair.receipt.resourcesReleased)continue;
+        if(pair.used&&pair.key!=key&&!pair.receipt.resourcesReleased){gate(9U);continue;}
         if(pair.used&&pair.key==key&&pair.receipt.resourcesReleased)continue;
         if(!pair.used||pair.key!=key) {
             const auto target=PairTargetForState(carrier);PairIdentity source{},victim{};
-            if(!target||PublishedPairSource(actor.character,source)==kActors||!PublishedPairVictim(target,victim)||
-                !PairVictimMatches(carrier,victim)||!source.creationSerial||!victim.creationSerial||
-                PairReservedCharacter(actor.character)||PairReservedCharacter(target))continue;
+            if(!target){gate(10U);continue;}
+            if(PublishedPairSource(actor.character,source)==kActors){gate(11U);continue;}
+            if(!PublishedPairVictim(target,victim)||!PairVictimMatches(carrier,victim)){gate(12U);continue;}
+            if(!source.creationSerial||!victim.creationSerial){gate(13U);continue;}
+            if(PairReservedCharacter(actor.character)||PairReservedCharacter(target)){gate(14U);continue;}
             pair={};pair.used=true;pair.key=key;pair.source=source;pair.victim=victim;pair.progress=carrier;
             pair.binding.source=LocalPairActor(source);pair.binding.victim=LocalPairActor(victim);
             pair.binding.nativeGeneration=gCurrent.nativeGeneration;
@@ -5548,6 +5566,7 @@ void PumpPairTransactions() noexcept {
         }
         const auto dependency=PairRequestsReadiness(pair);
         if(dependency!=action_correlation::Readiness::Ready) {
+            gate(15U);
             // A missing predecessor may arrive. A refused/retired predecessor
             // cannot: drop this never-entered interaction (it owns nothing
             // native) instead of reserving every following order forever.
@@ -5568,13 +5587,13 @@ void PumpPairTransactions() noexcept {
                 return crash_guard::TryCopy(out,reinterpret_cast<const void*>(at),size);
             }};
             const execution::ActorLifetime lifetime{pair.source.character,pair.source.runtimeId,pair.source.generation,pair.source.creationSerial};
-            if(execution::InspectInteractionBoundary(memory,lifetime)!=execution::OwnershipCheck::Ready)continue;
+            if(execution::InspectInteractionBoundary(memory,lifetime)!=execution::OwnershipCheck::Ready){gate(16U);continue;}
             // Preserve the Host's semantic flag. NativePairAdapter resolves
             // the source definition through AnimatedCharacter and the bone
             // against THIS victim; there is no second local decision here.
             pair.binding.localPairFlagsHigh=interactions::DecodePairPayloadHigh(carrier.interactionPayloadHigh);
         }
-        if(!PublishTransactionOutcome(actor,pair))continue;
+        if(!PublishTransactionOutcome(actor,pair)){gate(17U);continue;}
         // Publish the earned start permission BEFORE callback-capable native
         // registration. Never derive it from an output Receipt being rewritten
         // by Submit/Observe/Inspect. It belongs only to this exact key/binding.
@@ -5582,6 +5601,8 @@ void PumpPairTransactions() noexcept {
         interactions::RefusalSite()=0U;
         const auto admitted=gPairRuntime.Submit(carrier,pair.binding,pair.receipt);
         if(!pair.receipt.pairEntered)pair.startReady=false;
+        gate(pair.receipt.pairEntered?100U:200U+static_cast<std::uint32_t>(admitted));
+        if(pending)gPairGateRefusalSite.store(interactions::RefusalSite(),std::memory_order_relaxed);
         if(pair.receipt.transitionEntered)
             static_cast<void>(pair_retirement::Track(pair.key,pair.receipt.serial,pair.binding,pair.receipt.native));
         if(admitted==interactions::Result::Conflict||admitted==interactions::Result::Unknown||admitted==interactions::Result::Capacity||
@@ -11176,6 +11197,19 @@ Counters DiagnosticsSnapshot() noexcept {
 void LogDiagnostics(Diagnostics& diagnostics) {
     pvp_actions::LogVent(diagnostics);
     pvp_actions::LogAttack(diagnostics);
+    {
+        static std::uint64_t lastGateCount{};
+        const auto count=gPairGateCount.load(std::memory_order_relaxed);
+        if(count!=lastGateCount) {
+            lastGateCount=count;
+            diagnostics.Log("info","aisync_pair_gate","Client pair replay: first gate holding a pending Host pair. 1 placement 2 noCommand 3 noAuthority 4 noTransition 5 notSource 6 birth 7 cookie/world 8 scope 9 otherPair 10 target 11 source 12 victim 13 serial 14 reserved 15 dependency 16 boundary 17 outcome 100 entered 2xx submit result.",
+                {{"gate",Diagnostics::Unsigned(gPairGateLast.load()),true},
+                 {"characterClass",Diagnostics::Unsigned(gPairGateClass.load()),true},
+                 {"pairRevision",Diagnostics::Unsigned(gPairGateRevision.load()),true},
+                 {"refusalSite",Diagnostics::Unsigned(gPairGateRefusalSite.load()),true},
+                 {"count",Diagnostics::Unsigned(count),true}});
+        }
+    }
     static bool movementFailureLogged{};
     if(!movementFailureLogged) {
         const auto f=host_producer::FirstMovementCaptureFailure();

@@ -42,7 +42,7 @@ struct Active final {
     bool used{},entered{},cancelled{},terminalSent{},hostEnded{},moveArrived{},entrySubmitted{},remoteVent{};
     bool presentationStarted{},ownerFinished{};
     std::uint64_t ventProgressAt{};float ventBestDistance{std::numeric_limits<float>::infinity()};
-    bool attackLatched{};std::uint64_t latchedAt{};
+    bool attackLatched{};std::uint64_t latchedAt{},lastPairTrace{};
 };
 Active active{};
 policy::EdgeGate edges{};
@@ -110,6 +110,7 @@ void LogVent(Diagnostics& diagnostics) {
 struct AttackTelemetry final {
     std::atomic<std::uint64_t> revision{},sequence{},elapsed{},polls{};
     std::atomic<unsigned> stage{},selector{},cycle{};
+    std::atomic<unsigned> pairStage{},pairPrepared{},victimState{},victimAcquired{};
 } attackTelemetry;
 void TraceAttack(unsigned stage,unsigned selector=0U) noexcept {
     std::uint8_t state{};bool backstage{};
@@ -119,23 +120,43 @@ void TraceAttack(unsigned stage,unsigned selector=0U) noexcept {
     attackTelemetry.polls.fetch_add(1U,std::memory_order_relaxed);
     attackTelemetry.revision.fetch_add(1U,std::memory_order_release);
 }
+// After entry: source cycle +E0 stage, +E7 prepared, victim (+44) cycle state
+// and +D9 acquired, the same fields AISyncInteraction proves for ownership.
+void TracePair(unsigned stage) noexcept {
+    std::uintptr_t cycle{},victim{},victimCycle{};std::uint32_t pairStage{0xFFFFFFFFU};
+    std::uint8_t prepared{0xFFU},victimState{0xFFU},acquired{0xFFU};
+    if(Read(active.context.character+0x36CU,cycle) && cycle) {
+        static_cast<void>(Read(cycle+0xE0U,pairStage));static_cast<void>(Read(cycle+0xE7U,prepared));
+        if(Read(cycle+0x44U,victim) && victim && Read(victim+0x36CU,victimCycle) && victimCycle) {
+            static_cast<void>(Read(victimCycle+0x1AU,victimState));static_cast<void>(Read(victimCycle+0xD9U,acquired));
+        }
+    }
+    attackTelemetry.pairStage=pairStage;attackTelemetry.pairPrepared=prepared;
+    attackTelemetry.victimState=victimState;attackTelemetry.victimAcquired=acquired;
+    TraceAttack(stage==12U && acquired==1U?11U:stage,active.receipt.selector);
+}
 void LogAttack(Diagnostics& diagnostics) {
     static std::uint64_t lastRevision{},lastSequence{},lastAt{};
     const auto revision=attackTelemetry.revision.load(std::memory_order_acquire),now=GetTickCount64();
     const auto sequence=attackTelemetry.sequence.load();
     if(!revision || revision==lastRevision || (sequence==lastSequence && now-lastAt<250U))return;
     lastRevision=revision;lastSequence=sequence;lastAt=now;
-    diagnostics.Log("info","alien_attack_progress","Host attack preparation; stage 1 noSelection 2 noRecord 3 targetFault 4 queryRefused 5 selectorUnproven 6 rayPending 7 submitted 8 pairRefused 9 entered 10 enteredWithRayPending.",
+    diagnostics.Log("info","alien_attack_progress","Host attack preparation; stage 1 noSelection 2 noRecord 3 targetFault 4 queryRefused 5 selectorUnproven 6 rayPending 7 submitted 8 pairRefused 9 entered 10 enteredWithRayPending 11 pairRunning 12 victimNotAcquired4s.",
         {{"hostSequence",Diagnostics::Unsigned(sequence),true},
          {"elapsedMs",Diagnostics::Unsigned(attackTelemetry.elapsed.load()),true},
          {"stage",Diagnostics::Unsigned(attackTelemetry.stage.load()),true},
          {"selector",Diagnostics::Unsigned(attackTelemetry.selector.load()),true},
          {"cycle",Diagnostics::Unsigned(attackTelemetry.cycle.load()),true},
-         {"polls",Diagnostics::Unsigned(attackTelemetry.polls.load()),true}});
+         {"polls",Diagnostics::Unsigned(attackTelemetry.polls.load()),true},
+         {"pairStage",Diagnostics::Unsigned(attackTelemetry.pairStage.load()),true},
+         {"pairPrepared",Diagnostics::Unsigned(attackTelemetry.pairPrepared.load()),true},
+         {"victimState",Diagnostics::Unsigned(attackTelemetry.victimState.load()),true},
+         {"victimAcquired",Diagnostics::Unsigned(attackTelemetry.victimAcquired.load()),true}});
 }
 #else
 void TraceVent(unsigned=0U) noexcept {}
 void TraceAttack(unsigned,unsigned=0U) noexcept {}
+void TracePair(unsigned) noexcept {}
 #endif
 bool Ordinary(const std::uint8_t state) noexcept {return state==1U || state==55U || state==56U || state==59U;}
 bool Protected(const std::uint8_t state) noexcept {return state==18U || state==75U || state==77U || state==78U || state==79U;}
@@ -465,6 +486,11 @@ ap::attack::Memory AttackMemory() noexcept {
             return crash_guard::TryWrite(reinterpret_cast<void*>(at),in,size);
         }};
 }
+constexpr std::uint64_t kClientAttackWaitMs=6000U;
+bool HoldAttackTarget(const std::uintptr_t victim) noexcept {
+    const ap::attack::Manager manager{active.chooser,0U,0U};
+    return ap::attack::Hold(AttackMemory(),manager,victim,active.heldTarget)==ap::attack::HoldResult::Held;
+}
 // A stale level/lease may have freed the record: drop the hold, never write.
 void ReleaseAttackTarget() noexcept {
     if(active.heldTarget.record && Live(active.context))ap::attack::Release(AttackMemory(),active.heldTarget);
@@ -734,13 +760,16 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
                 static_cast<void>(player_hiding::PreparePvPSearch(active.victim.character,c.scope.nativeGeneration));
             if(state==78U)active.entered=true;
             if((active.entered && !Protected(state)) || (active.hostEnded && !Protected(state)))Clear();
-            else if(now-active.began>policy::kActionTimeoutMs && !Protected(state))Clear();
+            // The pilot's input is held while this receipt is active. If the
+            // replayed pair never reaches this Alien, release it after 6s
+            // instead of freezing the player for the generic 30s.
+            else if(now-active.began>kClientAttackWaitMs && !Protected(state))Clear();
             return false;
         }
         if(active.receipt.phase==Phase::Preparing) {
             if(active.entrySubmitted) {
                 if(state==78U) {
-                    TraceAttack(9U,active.receipt.selector);
+                    TracePair(9U);
                     active.entered=true;result=active.receipt;result.phase=Phase::Started;result.reason=Reason::None;
                     ++result.resolutionRevision;active.receipt=result;return true;
                 }
@@ -771,9 +800,16 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
             if(active.attackLatched && (retired || now-active.latchedAt>=400U)) {
                 const auto selector=active.receipt.selector;
                 if(!retired)TraceAttack(10U,selector);
+                // 454 entered with the target restored: the pair stayed at
+                // stage 0 and never acquired the victim, whereas 453's native
+                // kill (target held) completed. Hold it for the pair's life;
+                // PairSourceBusy fences the retail brain during the pair.
+                if(!HoldAttackTarget(active.victim.character)) {
+                    Terminal(result,Phase::Failed,Reason::NativeUnavailable);active.cancelled=true;return true;
+                }
                 active.entrySubmitted=true;active.submittedAt=now;
                 if(!EnterPair(c,active.victim,selector)) {
-                    TraceAttack(8U,selector);
+                    ReleaseAttackTarget();TraceAttack(8U,selector);
                     Terminal(result,Phase::Failed,Reason::NativeRefused);active.cancelled=true;return true;
                 }
                 TraceAttack(7U,selector);
@@ -787,6 +823,10 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
             }
             if(now-active.began>1500U){Terminal(result,Phase::Rejected,Reason::NativeRefused);active.cancelled=true;return true;}
             return false;
+        }
+        if(now-active.lastPairTrace>=250U) {
+            active.lastPairTrace=now;
+            TracePair(now-active.began>4000U?12U:11U);
         }
         auto* actor=Find(c.character);
         if(actor && !actor->faulted && !actor->duplicate) {
