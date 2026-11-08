@@ -1,0 +1,35 @@
+AIMP 457 / protocol 40
+Branch: feature/alien-vs-survivors-main
+
+456 test (041221 Host/victim, 061218 Client Alien pilot)
+- Action 1139: query refused (stage 4, Alien cycle 59) -> NativeRefused 1.5s.
+- Action 1272: query proven, retail melee armed (stage 13, cycle 1). About
+  2.5s later the Host revoked the Alien epoch and re-granted epoch 2: the
+  protocol journal (AlienActionJournal.Stalled) treats a Preparing action
+  older than 2500ms as stalled, while the native retail window was 3500ms.
+  The revoke cleared the action and released the held target before the
+  retail brain could attack. No stage 9/14 was ever reached.
+- The target was also written only once at arming. In 453 (the only kill
+  that completed) it was rewritten and the query re-run every frame.
+
+Correction
+- Protocol: a Preparing action stalls after 8000ms (Started 35000ms, no
+  resolution yet 2500ms, both unchanged).
+- Native retail window 5000ms (below the 8s protocol limit); pilot receipt
+  safety release 10s.
+- While armed, the Host re-holds the victim on the selected target record
+  every poll, and re-runs the query every 250ms only after its cover ray has
+  retired (never re-arming a pending ray, see 454).
+- Hold: if retail promotes another target record, the previous record is
+  restored before the new one is held.
+- New stages: 16 retail retargeted (selector=count of rewrites), 17 armed
+  query refused.
+
+Validation
+- Four native tests pass. Protocol runner: 161/170; the 9 failures are
+  pre-existing and unrelated (posture/torch wire version 32 vs 40, world
+  public action, WS3 manifest, reset filesystem links, DLL priority, method
+  body length).
+- API 0.8.4.457 delivered locally and to DESKTOP-2JNROA0, SHA-256 equal.
+  Friend patch dist/AIMP-API-patch-v457.zip (Launcher, Protocol, NetZ).
+- Not observed in game.

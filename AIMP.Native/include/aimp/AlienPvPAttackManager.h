@@ -40,6 +40,15 @@ inline bool Selected(const Memory& memory,const Manager& manager,std::uint32_t s
 // has no retail target, so the query always failed (452 NativeRefused). This
 // is the donor's control.cpp::SetTargetOf on the record the query reads.
 struct HeldTarget final {std::uintptr_t record{},previousTarget{};std::uint32_t previousBirth{};std::uintptr_t victim{};};
+// Restores only a record still carrying our victim; a retail retarget wins.
+inline void Release(const Memory& memory,HeldTarget& held) noexcept {
+    std::uintptr_t target{};
+    if(held.record && held.previousTarget!=held.victim && memory.Read(held.record+0x42CU,target) && target==held.victim) {
+        static_cast<void>(memory.Write(held.record+0x42CU,held.previousTarget));
+        static_cast<void>(memory.Write(held.record+0x430U,held.previousBirth));
+    }
+    held={};
+}
 enum class HoldResult : std::uint8_t {Held,NoSelection,NoRecord,Fault};
 inline HoldResult Hold(const Memory& memory,const Manager& manager,std::uintptr_t victim,HeldTarget& held) noexcept {
     std::uintptr_t context{},selection{},record{},target{};std::uint32_t birth{},victimBirth{};
@@ -54,17 +63,11 @@ inline HoldResult Hold(const Memory& memory,const Manager& manager,std::uintptr_
     }
     // Retail may promote another record between polls; keep the first
     // original only for the record we actually changed.
-    if(held.record!=record)held={record,target,birth,victim};
+    if(held.record!=record) {
+        if(held.record)Release(memory,held);
+        held={record,target,birth,victim};
+    }
     if(!memory.Write(record+0x430U,victimBirth) || !memory.Write(record+0x42CU,victim))return HoldResult::Fault;
     return HoldResult::Held;
-}
-// Restores only a record still carrying our victim; a retail retarget wins.
-inline void Release(const Memory& memory,HeldTarget& held) noexcept {
-    std::uintptr_t target{};
-    if(held.record && held.previousTarget!=held.victim && memory.Read(held.record+0x42CU,target) && target==held.victim) {
-        static_cast<void>(memory.Write(held.record+0x42CU,held.previousTarget));
-        static_cast<void>(memory.Write(held.record+0x430U,held.previousBirth));
-    }
-    held={};
 }
 } // namespace aimp::alien_pvp::attack

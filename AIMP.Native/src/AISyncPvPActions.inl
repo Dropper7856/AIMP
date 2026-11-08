@@ -42,7 +42,8 @@ struct Active final {
     bool used{},entered{},cancelled{},terminalSent{},hostEnded{},moveArrived{},entrySubmitted{},remoteVent{};
     bool presentationStarted{},ownerFinished{};
     std::uint64_t ventProgressAt{};float ventBestDistance{std::numeric_limits<float>::infinity()};
-    bool attackLatched{},retailArmed{},presented{};std::uint64_t latchedAt{},lastPairTrace{},armedAt{},presentedAt{};
+    bool attackLatched{},retailArmed{},presented{};std::uint64_t latchedAt{},lastPairTrace{},armedAt{},presentedAt{},lastQuery{};
+    std::uint32_t retargets{};
 };
 Active active{};
 policy::EdgeGate edges{};
@@ -141,7 +142,7 @@ void LogAttack(Diagnostics& diagnostics) {
     const auto sequence=attackTelemetry.sequence.load();
     if(!revision || revision==lastRevision || (sequence==lastSequence && now-lastAt<250U))return;
     lastRevision=revision;lastSequence=sequence;lastAt=now;
-    diagnostics.Log("info","alien_attack_progress","Host attack preparation; stage 1 noSelection 2 noRecord 3 targetFault 4 queryRefused 5 selectorUnproven 6 rayPending 7 submitted 8 pairRefused 9 entered 10 enteredWithRayPending 11 pairRunning 12 victimNotAcquired4s 13 retailArmed 14 retailWindowExpired 15 retailOtherVictim 20 clientPresented 21 clientPresentRefused 22 clientNotEntered 23 clientEntered.",
+    diagnostics.Log("info","alien_attack_progress","Host attack preparation; stage 1 noSelection 2 noRecord 3 targetFault 4 queryRefused 5 selectorUnproven 6 rayPending 7 submitted 8 pairRefused 9 entered 10 enteredWithRayPending 11 pairRunning 12 victimNotAcquired4s 13 retailArmed 14 retailWindowExpired 15 retailOtherVictim 16 retailRetargeted(selector=count) 17 armedQueryRefused 20 clientPresented 21 clientPresentRefused 22 clientNotEntered 23 clientEntered.",
         {{"hostSequence",Diagnostics::Unsigned(sequence),true},
          {"elapsedMs",Diagnostics::Unsigned(attackTelemetry.elapsed.load()),true},
          {"stage",Diagnostics::Unsigned(attackTelemetry.stage.load()),true},
@@ -486,7 +487,8 @@ ap::attack::Memory AttackMemory() noexcept {
             return crash_guard::TryWrite(reinterpret_cast<void*>(at),in,size);
         }};
 }
-constexpr std::uint64_t kClientAttackWaitMs=8000U,kRetailAttackWindowMs=3500U;
+// The retail window stays below the protocol's 8s Preparing stall limit.
+constexpr std::uint64_t kClientAttackWaitMs=10000U,kRetailAttackWindowMs=5000U;
 bool HoldAttackTarget(const std::uintptr_t victim) noexcept {
     const ap::attack::Manager manager{active.chooser,0U,0U};
     return ap::attack::Hold(AttackMemory(),manager,victim,active.heldTarget)==ap::attack::HoldResult::Held;
@@ -795,6 +797,22 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
                 if(now-active.armedAt>kRetailAttackWindowMs) {
                     ReleaseAttackTarget();TraceAttack(14U,active.receipt.selector);
                     Terminal(result,Phase::Rejected,Reason::NativeRefused);active.cancelled=true;return true;
+                }
+                // 453 (the only completed kill) rewrote the target and re-ran
+                // the query every frame. Retail target selection overwrites a
+                // single write, so keep re-holding; refresh the query only once
+                // its cover ray retired, never re-arming a pending one (454).
+                std::uintptr_t current{};
+                if(active.heldTarget.record && Read(active.heldTarget.record+0x42CU,current) &&
+                    current!=active.victim.character)TraceAttack(16U,++active.retargets);
+                if(!HoldAttackTarget(active.victim.character)) {
+                    ReleaseAttackTarget();Terminal(result,Phase::Failed,Reason::NativeUnavailable);active.cancelled=true;return true;
+                }
+                if(now-active.lastQuery>=250U && AttackQueryRetired(active.chooser)) {
+                    active.lastQuery=now;bool ready{};std::uint32_t selector{};
+                    const ap::attack::Manager manager{active.chooser,0U,0U};
+                    static_cast<void>(AttackQuery(AttackMemory(),manager,active.victim.character,ready,selector));
+                    TraceAttack(ready?13U:17U,ready?selector:active.receipt.selector);
                 }
                 return false;
             }
