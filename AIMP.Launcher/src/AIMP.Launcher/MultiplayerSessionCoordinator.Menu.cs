@@ -17,6 +17,7 @@ internal sealed partial class MultiplayerSessionCoordinator
 
     private async Task SendMenuReadyStateAsync()
     {
+        ScheduleSteamMenuResume();
         await _bridge.SendAsync("FRONTEND_STATE", new Dictionary<string, string>
         {
             ["ready"] = _controller.Snapshot.IpcConnected ? "1" : "0"
