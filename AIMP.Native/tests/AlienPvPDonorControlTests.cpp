@@ -5,6 +5,7 @@
 #include "aimp/AlienPvPFreeCamera.h"
 #include "aimp/AlienPvPSpatialPolicy.h"
 #include "aimp/AlienPvPResponsiveStop.h"
+#include "aimp/AlienPvPAttackManager.h"
 #include <array>
 #include <cstring>
 #include <iostream>
@@ -38,6 +39,47 @@ void Queue(aimp::alien_pvp::Frame frame) {
     Check(aimp::alien_pvp::Encode(frame,bytes),"frame encoding failed");
     Check(aimp::alien_pvp::QueueCommand(std::as_bytes(std::span(bytes))),"command rejected");
 }
+void TestAttackManager() {
+    using namespace aimp::alien_pvp::attack;
+    std::array<std::byte,0x8000> fixture{};
+    const auto put=[&](std::uintptr_t address,auto value) {
+        std::memcpy(fixture.data()+address,&value,sizeof(value));
+    };
+    const Memory memory{0x400000U,&fixture,
+        [](void* context,std::uintptr_t address,void* out,std::size_t size) noexcept {
+            const auto& bytes=*static_cast<decltype(fixture)*>(context);
+            if(address>bytes.size() || size>bytes.size()-address)return false;
+            std::memcpy(out,bytes.data()+address,size);return true;
+        }};
+    // Deliberately separate Character and AnimatedCharacter. An android cache
+    // at the Character offset must not be mistaken for the Alien's manager.
+    put(0x100U+0x34B4U,std::uintptr_t{0x6000U});
+    put(0x200U+0x34B4U,std::uintptr_t{0x4000U});
+    put(0x6000U,std::uintptr_t{0x012CC390U});
+    put(0x4000U,std::uintptr_t{0x012CC330U});
+    put(0x4004U,std::uintptr_t{0x5000U});
+    put(0x5128U,std::uintptr_t{0x100U});
+    put(0x41C0U,std::uintptr_t{0x5200U});
+    put(0x5204U,std::uintptr_t{0x5300U});put(0x5208U,std::uint32_t{2U});
+    put(0x5304U,std::uint32_t{0U});put(0x5388U,std::uint32_t{1U});
+    Manager manager{};
+    Check(Resolve(memory,0x100U,0x200U,manager) && manager.address==0x4000U && manager.count==2U,
+        "Alien attack resolves the android cache or wrong character view");
+    Check(!Selected(memory,manager,0U),"unavailable attack became a hit");
+    put(0x4020U,std::uint8_t{6U});
+    Check(!Selected(memory,manager,0U),"geometry alone bypassed native placement");
+    put(0x4020U,std::uint8_t{7U});
+    Check(Selected(memory,manager,0U),"native-proven selector zero was rejected");
+    Check(!Selected(memory,manager,2U),"selector escaped the Alien definition table");
+    put(0x5304U,std::uint32_t{1U});
+    Check(!Selected(memory,manager,0U),"definition identity was not checked");
+    put(0x4000U,std::uintptr_t{0x012CC390U});
+    Check(!Resolve(memory,0x100U,0x200U,manager),"android manager admitted as Alien");
+    put(0x4000U,std::uintptr_t{0x012CC330U});put(0x5208U,std::uint32_t{26U});
+    Check(!Resolve(memory,0x100U,0x200U,manager),"oversized native attack table admitted");
+    put(0x5208U,std::uint32_t{2U});put(0x5128U,std::uintptr_t{0x999U});
+    Check(!Resolve(memory,0x100U,0x200U,manager),"foreign owner's attack manager admitted");
+}
 }
 // These stubs detect any accidental return to the generic NPC carrier. Retail
 // native execution is tested separately in game, not simulated by these tests.
@@ -53,6 +95,7 @@ bool ApplyAIRecoveryTransform(std::uintptr_t character,const float* position,flo
 bool ApplyReplicatedYaw(std::uintptr_t,float,std::string&) noexcept {++genericCalls;return false;}
 }
 int main() {
+    TestAttackManager();
     using namespace aimp::alien_pvp;
     ResponsiveStop responsiveStop;std::array<float,2> stoppedAt{};
     responsiveStop.Begin(1000,10,20);

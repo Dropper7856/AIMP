@@ -423,60 +423,42 @@ bool ResourcesPending() noexcept {
     for(const auto& slot:recoveries)if(slot.used && Live(slot.context))return true;
     return false;
 }
-// Refreshes the retail attack-availability cache for ONE explicit player
-// target. It does not select an AI target, execute the BT or modify health.
-// 006FBCF0 schedules geometric/native availability; 006D65C0 consumes its
-// asynchronous result. Only then may +1C/+24 choose an admitted definition.
+// Explicit-target retail Alien query; no AI target writes or fabricated hit.
+// The donor attack gate uses this same AlienAttackManager, not the separate
+// human/android manager (012CC390, +800 cache).
 bool AttackAvailability(const ap::Context& c,const PairIdentity& victim,std::uintptr_t& chooser,
     bool& ready,std::uint32_t& selector) noexcept {
-    ready=false;selector=0U;
-    std::uintptr_t manager{},table{},context{},owner{};std::uint8_t count{};
-    if(!Live(c) || !PairIdentityLive(victim) || !Read(c.character+0x34B4U,manager) || !manager ||
-        !Read(manager,table) || table!=gBase+0x00ECC390U ||
-        !Read(manager+4U,context) || !context || !Read(context+0x128U,owner) || owner!=c.character ||
-        !Read(manager+0x800U,count) || count==0U || count>25U || (chooser && chooser!=manager))return false;
-    chooser=manager;
-    std::uint32_t pending{},a{},b{};
-    if(!Read(manager+0x20U,pending) || !Read(manager+0x810U,a) || !Read(manager+0x814U,b))return false;
+    ready=false;selector=0U;PairIdentity source{};
+    const ap::attack::Memory memory{gBase,nullptr,
+        [](void*,std::uintptr_t at,void* out,std::size_t size) noexcept {
+            return crash_guard::TryCopy(out,reinterpret_cast<const void*>(at),size);
+        }};
+    ap::attack::Manager manager{};
+    if(!Live(c) || !PairIdentityLive(victim) || PublishedPairSource(c.character,source)==kActors ||
+        !PairIdentityLive(source) || !ap::attack::Resolve(memory,c.character,source.animated,manager) ||
+        (chooser && chooser!=manager.address))return false;
+    chooser=manager.address;
     AIMP_ACTION_TRY {
-        using Poll=std::uint8_t(__thiscall*)(void*);
-        using Evaluate=std::uint8_t(__thiscall*)(void*,std::uintptr_t);
-        using Refresh=void(__thiscall*)(void*,std::uintptr_t);
-        using Check=std::uint8_t(__thiscall*)(void*,std::uint32_t);
+        using Evaluate=std::uint8_t(__thiscall*)(void*,std::uintptr_t,float*);
         using Choose=std::uint32_t(__thiscall*)(void*,std::uintptr_t,std::uint32_t,std::uint32_t);
-        if(pending==1U) {
-            if(!Native<Poll>(0x002D65C0U)(reinterpret_cast<void*>(manager)))return true;
-            // This is the exact bookkeeping after 006D65C0 in 00710DE0,
-            // NOT a forced successful ray/path state. No result bits are set.
-            if(!Write(manager+0x20U,std::uint32_t{0U}))return false;
-        }
-        // Consume completed geometry BEFORE scheduling another query. Calling
-        // 006FBCF0 on every poll would continually restart the asynchronous
-        // check and prevent a stable preparation boundary.
-        if(a==victim.entityA && b==victim.entityB) {
-            Native<Refresh>(0x002F3CA0U)(reinterpret_cast<void*>(manager),victim.character);
-        }
-        if(a!=victim.entityA || b!=victim.entityB ||
-            !Native<Check>(0x002D5BC0U)(reinterpret_cast<void*>(manager),5U)) {
-            Native<Evaluate>(0x002FBCF0U)(reinterpret_cast<void*>(manager),victim.character);
-            if(!Read(manager+0x810U,a) || !Read(manager+0x814U,b) || a!=victim.entityA || b!=victim.entityB)return false;
-            // The next poll must consume a pending probe before choosing.
-            return true;
-        }
-        const auto chosen=Native<Choose>(0x002D63D0U)(reinterpret_cast<void*>(manager),victim.character,1U,15U)&0xFFFFU;
-        std::uint8_t proof{};
-        if(chosen>=count || !Read(manager+0x64U+chosen*0x50U,proof) || (proof&3U)!=3U)return true;
+        float heading{};
+        if(!Native<Evaluate>(ap::attack::kEvaluateRva)(reinterpret_cast<void*>(chooser),victim.character,&heading))return true;
+        const auto chosen=Native<Choose>(ap::attack::kChooseRva)(reinterpret_cast<void*>(chooser),victim.character,1U,15U);
+        if(!ap::attack::Selected(memory,manager,chosen))return true;
         selector=chosen;ready=true;return true;
     } AIMP_ACTION_CATCH {return false;}
 }
 bool AttackQueryRetired(const std::uintptr_t chooser) noexcept {
     if(!chooser)return true;
-    std::uint32_t pending{};if(!Read(chooser+0x20U,pending))return false;
-    if(pending!=1U)return true;
+    std::uintptr_t table{};
+    if(!Read(chooser,table) || table!=gBase+ap::attack::kTableRva)return false;
     AIMP_ACTION_TRY {
-        using Poll=std::uint8_t(__thiscall*)(void*);
-        if(!Native<Poll>(0x002D65C0U)(reinterpret_cast<void*>(chooser)))return false;
-        return Write(chooser+0x20U,std::uint32_t{0U});
+        // Alien cover-ray handle lives at +1CC, not the android +20/+28 probe.
+        // Wait for it to retire before releasing action bookkeeping.
+        using Valid=std::uint8_t(__thiscall*)(void*);
+        using Status=std::uint32_t(__thiscall*)(void*);
+        auto* handle=reinterpret_cast<void*>(chooser+0x1CCU);
+        return !Native<Valid>(0x003EB940U)(handle) || Native<Status>(0x003EB960U)(handle)!=1U;
     } AIMP_ACTION_CATCH {return false;}
 }
 bool SelectVictim(const ap::Context& c,const ap::Frame& command,PairIdentity& victim) noexcept {
@@ -607,9 +589,10 @@ bool Begin(const ap::Context& c,const ap::Frame& command,ap::Frame& result) noex
         if(c.host && (backstage || !Ordinary(state))){Reject(result,Reason::NativeBusy);return true;}
         PairIdentity victim{};
         if(c.host && !SelectVictim(c,command,victim)){Reject(result,Reason::NoTarget);return true;}
+        // Host entity IDs are process-local; peer selects our certified victim.
+        // The paired-animation transport remaps the physical execution itself.
         if(!c.host && (!PublishedPairVictim(ParticipantForPeer(command.targetPeer),victim) ||
-            !PairIdentityLive(victim) || victim.peer!=command.targetPeer || victim.entityA!=command.targetA ||
-            victim.entityB!=command.targetB)) {Reject(result,Reason::NoTarget);return true;}
+            !PairIdentityLive(victim) || victim.peer!=command.targetPeer)) {Reject(result,Reason::NoTarget);return true;}
         active={};active.used=true;active.context=c;active.began=GetTickCount64();active.victim=victim;
         if(c.host) {
             policy::Point target{};

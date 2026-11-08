@@ -9,6 +9,7 @@
 #include "aimp/AlienPvPInputIsolation.h"
 #include "aimp/AlienPvPVentNode.h"
 #include "aimp/AlienPvPActionPolicy.h"
+#include "aimp/AlienPvPAttackManager.h"
 #include "aimp/AlienPvPNativeActionAbi.h"
 #include "aimp/PlayerHidingRuntime.h"
 #include <limits>

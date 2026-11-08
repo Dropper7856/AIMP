@@ -1,6 +1,7 @@
 #include "aimp/AISyncAnimation.h"
 #include "aimp/AISync.h"
 #include "aimp/AlienPvPNativeActionAbi.h"
+#include "aimp/AlienPvPAttackManager.h"
 #include "aimp/AlienPvPVentNode.h"
 #include "aimp/CharacterDirectStepRuntime.h"
 #include "aimp/GameThreadDispatcher.h"
@@ -232,6 +233,11 @@ void TestProductionInstallation(DataImage& image) {
         [](void*,std::uintptr_t at,void* out,std::size_t size) noexcept {
             std::memcpy(out,reinterpret_cast<const void*>(at),size);return true;
         }),"Alien native action ABI rejected the ASLR-rebased installed executable");
+    const auto alienAttackTable=base+aimp::alien_pvp::attack::kTableRva;
+    Require(*reinterpret_cast<const std::uintptr_t*>(alienAttackTable+0x24U)==
+        base+aimp::alien_pvp::attack::kChooseRva &&
+        *reinterpret_cast<const std::uintptr_t*>(alienAttackTable+0x34U)==base+0x002D60F0U,
+        "Alien attack selector/definition slots disagree with the paired-animation adapter");
     Require(aimp::ai_sync::Installed() && hooks.InstalledCount() > characterHooks,
         "Production AISync did not publish readiness");
     for (const auto site : sites)
