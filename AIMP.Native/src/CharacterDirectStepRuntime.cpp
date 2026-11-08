@@ -262,6 +262,8 @@ void* gActivateLocomotionTrampoline{};
 void* gEnterIdleCycleTrampoline{};
 void* gMovementActionPostGaitTrampoline{};
 void* gNpcLocomotionPreTransformTrampoline{};
+void* gNpcLocomotionUpdateTrampoline{};
+std::atomic<std::uint64_t> gNpcLocomotionUpdatesWithoutMovement{};
 
 // Hot-path memory access. Every address used here is either a live object
 // supplied by the retail engine on its own thread, or a pointer previously
@@ -1895,6 +1897,26 @@ bool SubmitStopRequest(
     return controlStopped && cycleStopped && nativeStopped && physicalStopped;
 }
 
+// Retail ActNPCLocomotionCycle update 0066D4B0 copies the owner's movement
+// action smart pointer (+42A8) and reads its +184 with no null check. 458: a
+// remote victim replica kept Move (56) after that action was released while
+// the Host pair dragged it, and the Alien pilot's PC crashed there (C0000005
+// at 0066D4F6). Skipping that frame is strictly safer than retail's fault.
+void __fastcall NpcLocomotionUpdateDetour(void* cycle, void*) noexcept {
+    const auto original = reinterpret_cast<ActivateLocomotionCycleFn>(gNpcLocomotionUpdateTrampoline);
+    if (original == nullptr) return;
+    const auto cycleAddress = reinterpret_cast<std::uintptr_t>(cycle);
+    std::uintptr_t owner = 0U, movement = 0U;
+    if (cycleAddress != 0U &&
+        GuardedReadValue(cycleAddress + kNpcLocomotionCycleOwnerOffset, owner) && owner != 0U &&
+        GuardedReadValue(owner + kMovementActionObjectOffset, movement) && movement == 0U) {
+        // Cycle updates may run on workers: count only, no flight recorder.
+        gNpcLocomotionUpdatesWithoutMovement.fetch_add(1U, std::memory_order_relaxed);
+        return;
+    }
+    original(cycle);
+}
+
 void __fastcall ActivateLocomotionCycleDetour(
     void* cycle,
     void*) noexcept {
@@ -3330,6 +3352,23 @@ bool Install(
             (rollbackError.empty()
                 ? std::string{}
                 : "; rollback: " + rollbackError);
+        return false;
+    }
+
+    HookRequest updateRequest{};
+    updateRequest.name = "npc_locomotion_update_movement_guard";
+    updateRequest.target = reinterpret_cast<void*>(moduleBase + kNativeRvas.npcLocomotionCycleUpdate);
+    updateRequest.detour = reinterpret_cast<void*>(&NpcLocomotionUpdateDetour);
+    // push ebp; mov ebp,esp; and esp,-10h: no relative operands.
+    updateRequest.patchLength = 6U;
+    updateRequest.expected = MaskedBytes{{0x55U, 0x8BU, 0xECU, 0x83U, 0xE4U, 0xF0U}, "xxxxxx"};
+    updateRequest.relocationSafePrefix = true;
+    updateRequest.trampolineOut = &gNpcLocomotionUpdateTrampoline;
+    if (!hooks.Install(updateRequest, error)) {
+        std::string rollbackError;
+        hooks.UninstallFrom(hookCheckpoint, rollbackError);
+        gNpcLocomotionUpdateTrampoline = nullptr;
+        error = "ActNPCLocomotionCycle update movement guard: " + error;
         return false;
     }
 

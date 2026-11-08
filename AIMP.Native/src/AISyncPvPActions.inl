@@ -495,8 +495,9 @@ ap::attack::Memory AttackMemory() noexcept {
             return crash_guard::TryWrite(reinterpret_cast<void*>(at),in,size);
         }};
 }
-// The retail window stays below the protocol's 8s Preparing stall limit.
-constexpr std::uint64_t kClientAttackWaitMs=10000U,kRetailAttackWindowMs=5000U;
+// The retail window stays below the protocol's 14s Preparing stall limit: 458 showed
+// the BT running ~5s to reach the victim before the pair (cycle 78) starts.
+constexpr std::uint64_t kClientAttackWaitMs=16000U,kRetailAttackWindowMs=10000U;
 bool HoldAttackTarget(const std::uintptr_t victim) noexcept {
     const ap::attack::Manager manager{active.chooser,0U,0U};
     return ap::attack::Hold(AttackMemory(),manager,victim,active.heldTarget)==ap::attack::HoldResult::Held;

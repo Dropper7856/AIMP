@@ -60,9 +60,9 @@ public sealed class AlienActionJournal
     public bool CanIssue => _entries.Count<Capacity || _entries.Values.Any(e=>e.Last is {Phase:not (AlienActionPhase.Started or AlienActionPhase.Preparing)});
     public bool Stalled(long now) => _entries.Values.Any(e => {
         if(e.Last is {Phase:not (AlienActionPhase.Preparing or AlienActionPhase.Started)})return false;
-        // Preparing covers the Host's retail melee window (native 5s); a
+        // Preparing covers the Host's retail melee window (native 10s); a
         // shorter limit revoked the whole epoch while the brain was still armed.
-        var limit=e.Last?.Phase switch {AlienActionPhase.Started=>35000L,AlienActionPhase.Preparing=>8000L,_=>2500L};
+        var limit=e.Last?.Phase switch {AlienActionPhase.Started=>35000L,AlienActionPhase.Preparing=>14000L,_=>2500L};
         return now<e.UpdatedAt || now-e.UpdatedAt>limit;
     });
     public bool Issue(AlienControlCommit commit,long now=0)
