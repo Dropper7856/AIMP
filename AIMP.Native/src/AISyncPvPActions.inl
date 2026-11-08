@@ -837,6 +837,18 @@ const ap::ActionHooks hooks{&Begin,&Poll,&Busy,&Cancel,&Recover,&CancelRecovery
 const alien_pvp::ActionHooks& PvPActionHooks() noexcept {return pvp_actions::hooks;}
 void RetirePvPActions() noexcept {pvp_actions::RetirePending();}
 bool InstallPvPDonorVentHooks(HookManager& hooks,std::string& error) {
+    HookRequest locomotion;locomotion.name="alien_donor_responsive_locomotion";
+    locomotion.target=reinterpret_cast<void*>(gBase+0x0004D4F0U);
+    locomotion.detour=reinterpret_cast<void*>(&pvp_actions::PilotLocomotionDetour);
+    locomotion.patchLength=5U;locomotion.relocationSafePrefix=true;
+    locomotion.expected=MaskedBytes{{0x8B,0x11,0x8B,0x41,0x04},"xxxxx"};
+    locomotion.trampolineOut=&pvp_actions::pilotLocomotionOriginal;
+    // Exact donor PrimToIdle thunk, used only after our pilot request retires.
+    std::array<std::uint8_t,5> idle{};
+    if(!Read(gBase+0x0025BEC0U,idle) || idle!=std::array<std::uint8_t,5>{0xE9,0x0B,0xFF,0xFF,0xFF}) {
+        error="Alien donor idle ABI mismatch";return false;
+    }
+    if(!hooks.Install(locomotion,error))return false;
     for(const auto exit:{false,true}) {
         HookRequest request;request.name=exit?"alien_donor_pick_exit":"alien_donor_pick_entry";
         request.target=reinterpret_cast<void*>(gBase+(exit?0x00013310U:0x000132F0U));

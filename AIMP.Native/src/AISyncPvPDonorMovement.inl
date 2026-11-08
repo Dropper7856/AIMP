@@ -8,6 +8,9 @@ struct DonorMovement final {
     ap::Context context{};
     transactions::Record command{};
     bool used{},fault{};
+    ap::ResponsiveStop responsiveStop{};
+    bool pilotMoving{};
+    float pilotYaw{};
 };
 std::array<DonorMovement,4> donorMovements{};
 bool DonorPermission(void* opaque,const transactions::Record& r) noexcept {
@@ -30,6 +33,18 @@ DonorMovement* DonorFor(const ap::Context& c) noexcept {
 bool StopDonor(const ap::Context& c) noexcept {
     auto* d=DonorFor(c);if(!d)return true;
     if(!Live(c) || d->fault)return false; // retain strong Ref on unknown lifetime
+    if(c.localOwner && d->pilotMoving) {
+        std::array<float,3> position{};
+        if(Read(c.character+0x70U,position))d->responsiveStop.Begin(GetTickCount64(),position[0],position[2]);
+        d->pilotMoving=false;
+        // Donor alienSnappy: request zero remaining distance before retiring.
+        // This is only our retained kind9 request, never a vent/pair request.
+        auto stationary=d->command;stationary.opcode=transactions::Op::Update;
+        stationary.stopDistance=0.0F;++stationary.parameterRevision;++stationary.globalSeq;++stationary.ownerSeq;
+        const auto outcome=d->adapter->Invoke(stationary);
+        if(outcome==transactions::NativeOutcome::Unknown){d->fault=true;return false;}
+        d->command=stationary;
+    }
     auto cleanup=d->command;
     cleanup.flags=cleanup.mode=cleanup.gait=0U;
     cleanup.goalX=cleanup.goalY=cleanup.goalZ=cleanup.distance=cleanup.stopDistance=cleanup.aux=0.0F;
@@ -72,6 +87,7 @@ bool DriveDonor(const ap::Context& c,const ap::Frame* input) noexcept {
         if(!d->adapter || !d->adapter->Initialize(c.base,true,&DonorPermission,&DonorResolve,d))return false;
     }
     if(d->fault)return false;
+    d->responsiveStop.Cancel();
     if(!DonorGait(c,input->gait))return false;
     auto& r=d->command;
     r.opcode=d->used?transactions::Op::Update:transactions::Op::Submit;
@@ -86,7 +102,60 @@ bool DriveDonor(const ap::Context& c,const ap::Frame* input) noexcept {
     // A resource check can defer before the factory runs. It created no
     // retained request, so the next fresh input must retry Submit, not Update.
     if(!d->fault && d->adapter->ActiveCount()==0U)d->used=false;
+    if(c.localOwner && outcome==transactions::NativeOutcome::Admitted) {
+        d->pilotMoving=true;d->pilotYaw=r.aux;
+    }
     return outcome==transactions::NativeOutcome::Admitted;
+}
+// Keep SEH inside a scalar-only helper; the caller owns the native resource pin.
+void PilotResponsiveWrite(DonorMovement& d,std::uintptr_t cycle,std::uintptr_t loco,std::uint8_t state) noexcept {
+    const auto& c=d.context;std::uintptr_t owner{};
+    AIMP_ACTION_TRY {
+        if(d.used && d.pilotMoving) {
+            // Donor ApplyFace: update velocity heading after native easing.
+            *reinterpret_cast<float*>(loco+0x1CU)=d.pilotYaw;return;
+        }
+        std::array<float,2> target{};
+        if(!d.responsiveStop.Target(GetTickCount64(),state,true,target))return;
+        if(!d.used && (state==59U || state==55U || state==56U)) {
+            // Donor ToIdle: clear inherited finished bits so a new press starts.
+            *reinterpret_cast<std::uint8_t*>(cycle+8U)&=static_cast<std::uint8_t>(~4U);
+            using Idle=void(__fastcall*)(void*);
+            Native<Idle>(0x0025BEC0U)(reinterpret_cast<void*>(cycle));
+            std::uintptr_t after{};
+            if(Read(c.character+0x36CU,after) && after && Read(after+4U,owner) && owner==c.character)
+                *reinterpret_cast<std::uint8_t*>(after+8U)&=static_cast<std::uint8_t>(~4U);
+            *reinterpret_cast<float*>(loco+0x18U)=0.0F;
+        }
+        std::array<float,3> position{};float yaw{};
+        if(Read(c.character+0x70U,position) && Read(c.character+0x174U,yaw) &&
+            std::abs(position[0]-target[0])+std::abs(position[2]-target[1])>0.003F) {
+            position[0]=target[0];position[2]=target[1];
+            static_cast<void>(character_direct_step_runtime::ApplyAIRecoveryTransform(c.character,position.data(),yaw));
+        }
+    } AIMP_ACTION_CATCH {d.responsiveStop.Cancel();}
+}
+void PilotLocomotionAfter() noexcept {
+    if(!EngineThread())return;
+    for(auto& d:donorMovements) {
+        const auto& c=d.context;
+        if(!c.localOwner || !Live(c) || d.fault || !ap::ControlActive()) {d.responsiveStop.Cancel();continue;}
+        std::uintptr_t cycle{},owner{},loco{};std::uint8_t state{},a{},b{};
+        if(!Read(c.character+0x36CU,cycle) || !cycle || !Read(cycle+4U,owner) || owner!=c.character ||
+            !Read(cycle+0x1AU,state) || !Read(c.character+0x42A8U,loco) || !loco ||
+            !Read(c.character+0x2DAU,a) || !Read(c.character+0x2DBU,b)) {d.responsiveStop.Cancel();continue;}
+        const bool eligible=!a && !b && !ap::VentPending() &&
+            (state==1U || state==55U || state==56U || state==59U);
+        if(!eligible){d.responsiveStop.Cancel();continue;}
+        const character_direct_step_runtime::MovementResourceLease resources(c.character);
+        if(!resources)continue;
+        PilotResponsiveWrite(d,cycle,loco,state);
+    }
+}
+void* pilotLocomotionOriginal{};
+void __fastcall PilotLocomotionDetour(void* self,void*,std::uint32_t index,std::uint32_t delta) noexcept {
+    reinterpret_cast<void(__thiscall*)(void*,std::uint32_t,std::uint32_t)>(pilotLocomotionOriginal)(self,index,delta);
+    PilotLocomotionAfter();
 }
 void DonorDestroyed(std::uintptr_t character,std::uint32_t runtime,std::uint64_t serial,std::uint32_t generation) noexcept {
     for(auto& d:donorMovements) {

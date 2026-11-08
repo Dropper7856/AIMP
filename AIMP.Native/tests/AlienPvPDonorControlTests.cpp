@@ -4,6 +4,7 @@
 #include <Windows.h>
 #include "aimp/AlienPvPFreeCamera.h"
 #include "aimp/AlienPvPSpatialPolicy.h"
+#include "aimp/AlienPvPResponsiveStop.h"
 #include <array>
 #include <cstring>
 #include <iostream>
@@ -53,6 +54,17 @@ bool ApplyReplicatedYaw(std::uintptr_t,float,std::string&) noexcept {++genericCa
 }
 int main() {
     using namespace aimp::alien_pvp;
+    ResponsiveStop responsiveStop;std::array<float,2> stoppedAt{};
+    responsiveStop.Begin(1000,10,20);
+    Check(responsiveStop.Target(1010,59,true,stoppedAt) && stoppedAt==std::array<float,2>{10,20},"stop hold lost release position");
+    responsiveStop.Cancel();
+    Check(!responsiveStop.Target(1020,55,true,stoppedAt),"new input remained pinned to a stopped position");
+    responsiveStop.Begin(1000,10,20);
+    Check(!responsiveStop.Target(3001,59,true,stoppedAt),"stop hold never expires");
+    responsiveStop.Begin(1000,10,20);
+    Check(!responsiveStop.Target(1100,18,false,stoppedAt) && !responsiveStop.Target(1200,1,true,stoppedAt),"stop hold survived a native passage");
+    responsiveStop.Begin(1000,10,20);
+    Check(responsiveStop.Target(1100,1,true,stoppedAt) && !responsiveStop.Target(1251,1,true,stoppedAt),"stop hold persisted after idle convergence");
     Check(spatial::VentStageReady(75,true,true),"stationary backstage75 never completes entry");
     Check(spatial::VentStageReady(77,false,false,true),"replica retained cycle77 blocks completed exit");
     Check(!spatial::VentStageReady(18,false,false,true),"active passage completes replica exit");

@@ -2,7 +2,7 @@
 param(
     [string]$CMakeExe = '',
     [string]$Generator = 'Visual Studio 18 2026',
-    [string]$OutputDirectory = 'artifacts/alien-api-449',
+    [string]$OutputDirectory = 'artifacts/alien-api-450',
     [string]$SecondPcApi = '\\DESKTOP-2JNROA0\Users\Public\Documents\win-unpacked\resources\api',
     [switch]$DeliveryOnly
 )
@@ -59,7 +59,7 @@ try {
         if (!(Test-Path -LiteralPath (Join-Path $api $required) -PathType Leaf)) { throw "Incomplete build artifacts: $required" }
     }
 
-    $delivery = [ordered]@{ builtAtUtc=[DateTime]::UtcNow.ToString('o'); apiVersion='0.8.4.449'; protocol=40; unitTestsRun=$false; localDelivered=$false; secondPcDelivered=$false; hashes=@(); failures=@() }
+    $delivery = [ordered]@{ builtAtUtc=[DateTime]::UtcNow.ToString('o'); apiVersion='0.8.4.450'; protocol=40; unitTestsRun=$false; localDelivered=$false; secondPcDelivered=$false; hashes=@(); failures=@() }
     foreach ($target in @($localApi,$SecondPcApi)) {
         try {
             $delivery.hashes += @(Copy-Api $target)
