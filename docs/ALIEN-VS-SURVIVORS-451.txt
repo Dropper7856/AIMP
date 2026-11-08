@@ -1,0 +1,33 @@
+﻿AIMP 451 / protocol 40
+Branch: feature/alien-vs-survivors-main
+
+450 regression evidence
+- Input/commit stream remains ready with no overflow, stale delivery or fault.
+- Native log copied from the diagnostic NativeLogPath to client-native.jsonl.
+- Kind9 trace: 1,360 Updates admitted; nine Submit/Cancel/Release sets succeed.
+- At sample232952031 the owner releases during starting cycle55 / locomotion8.
+  The next Submit232952921 sees idle cycle1 / locomotion8, fixed position
+  (-34.390179,-21.906767). Repeated admitted updates and restarts leave it there.
+- This matches the new forced-idle conversion stranding an unfinished native
+  startup state. Clearing action finished bits did not restore its locomotor.
+
+Correction
+- Removed the direct PrimToIdle call from the responsiveness hook, along with
+  action flag edits and the direct speed0 write. Retail now completes its own
+  start/stop action and locomotion mode transitions.
+- Removed the unused PrimToIdle ABI check. The post-locomotion hook retains its
+  exact-build signature and installation/rollback checks.
+- Retained local donor heading response, zero remaining distance before releasing
+  the owned kind9 request, and the bounded release-position hold. New movement
+  cancels the hold; vent/pair/backstage conditions still exclude these writes.
+- No changes to vent synchronization or observer animation from449/448.
+
+Verification
+- Build/test/delivery logs are under artifacts/alien-451.
+- Release build succeeded; all four targeted native tests passed.
+- API 0.8.4.451 delivered to local dist and DESKTOP-2JNROA0. SHA-256 matches
+  for Launcher, Protocol, NetZ and both UI bridge assets; no delivery failures.
+- Native tests cover stop-hold release/restart, passage exclusions, idle settling,
+  donor movement boundaries, and exact-build installation/rollback.
+- In-game reproduction is still required. Restart the game to discard the already
+  stranded450 action, then repeat short taps/releases and rapid direction changes.

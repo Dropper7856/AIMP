@@ -108,8 +108,8 @@ bool DriveDonor(const ap::Context& c,const ap::Frame* input) noexcept {
     return outcome==transactions::NativeOutcome::Admitted;
 }
 // Keep SEH inside a scalar-only helper; the caller owns the native resource pin.
-void PilotResponsiveWrite(DonorMovement& d,std::uintptr_t cycle,std::uintptr_t loco,std::uint8_t state) noexcept {
-    const auto& c=d.context;std::uintptr_t owner{};
+void PilotResponsiveWrite(DonorMovement& d,std::uintptr_t loco,std::uint8_t state) noexcept {
+    const auto& c=d.context;
     AIMP_ACTION_TRY {
         if(d.used && d.pilotMoving) {
             // Donor ApplyFace: update velocity heading after native easing.
@@ -117,16 +117,8 @@ void PilotResponsiveWrite(DonorMovement& d,std::uintptr_t cycle,std::uintptr_t l
         }
         std::array<float,2> target{};
         if(!d.responsiveStop.Target(GetTickCount64(),state,true,target))return;
-        if(!d.used && (state==59U || state==55U || state==56U)) {
-            // Donor ToIdle: clear inherited finished bits so a new press starts.
-            *reinterpret_cast<std::uint8_t*>(cycle+8U)&=static_cast<std::uint8_t>(~4U);
-            using Idle=void(__fastcall*)(void*);
-            Native<Idle>(0x0025BEC0U)(reinterpret_cast<void*>(cycle));
-            std::uintptr_t after{};
-            if(Read(c.character+0x36CU,after) && after && Read(after+4U,owner) && owner==c.character)
-                *reinterpret_cast<std::uint8_t*>(after+8U)&=static_cast<std::uint8_t>(~4U);
-            *reinterpret_cast<float*>(loco+0x18U)=0.0F;
-        }
+        // Keep the retail stop/start state machine. Rebuilding its action as
+        // idle can strand locomotion mode8 even with finished bits cleared.
         std::array<float,3> position{};float yaw{};
         if(Read(c.character+0x70U,position) && Read(c.character+0x174U,yaw) &&
             std::abs(position[0]-target[0])+std::abs(position[2]-target[1])>0.003F) {
@@ -149,7 +141,7 @@ void PilotLocomotionAfter() noexcept {
         if(!eligible){d.responsiveStop.Cancel();continue;}
         const character_direct_step_runtime::MovementResourceLease resources(c.character);
         if(!resources)continue;
-        PilotResponsiveWrite(d,cycle,loco,state);
+        PilotResponsiveWrite(d,loco,state);
     }
 }
 void* pilotLocomotionOriginal{};

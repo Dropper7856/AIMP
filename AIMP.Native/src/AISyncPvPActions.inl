@@ -843,11 +843,6 @@ bool InstallPvPDonorVentHooks(HookManager& hooks,std::string& error) {
     locomotion.patchLength=5U;locomotion.relocationSafePrefix=true;
     locomotion.expected=MaskedBytes{{0x8B,0x11,0x8B,0x41,0x04},"xxxxx"};
     locomotion.trampolineOut=&pvp_actions::pilotLocomotionOriginal;
-    // Exact donor PrimToIdle thunk, used only after our pilot request retires.
-    std::array<std::uint8_t,5> idle{};
-    if(!Read(gBase+0x0025BEC0U,idle) || idle!=std::array<std::uint8_t,5>{0xE9,0x0B,0xFF,0xFF,0xFF}) {
-        error="Alien donor idle ABI mismatch";return false;
-    }
     if(!hooks.Install(locomotion,error))return false;
     for(const auto exit:{false,true}) {
         HookRequest request;request.name=exit?"alien_donor_pick_exit":"alien_donor_pick_entry";
