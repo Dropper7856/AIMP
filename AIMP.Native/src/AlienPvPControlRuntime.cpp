@@ -111,7 +111,13 @@ void PublishAction(Frame result,std::uint64_t now) noexcept {
     if(g.context.host && (result.action==Action::EnterVent || result.action==Action::ExitVent))g.ventAuthority=result;
     result.scope=g.context.scope;result.flags=Flags(now);
     result.kind=g.context.host && result.action!=Action::Roar?Kind::Resolution:Kind::ActionResult;
-    if(result.phase==ActionPhase::Started || result.phase==ActionPhase::Completed)result.flags|=ActionApplied;
+    if(result.phase==ActionPhase::Started || result.phase==ActionPhase::Completed) {
+        result.flags|=ActionApplied;
+        // Stationary backstage produces no locomotion step. Its measured pose
+        // must still acknowledge the native action that changed its stage.
+        g.appliedInput=std::max(g.appliedInput,result.sequence);
+        g.appliedHost=std::max(g.appliedHost,result.hostSequence);
+    }
     if(result.reason==ActionReason::NativeUnavailable) {
         result.flags|=UnsupportedAction;gUnsupported.fetch_add(1U,std::memory_order_relaxed);
     }

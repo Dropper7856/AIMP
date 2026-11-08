@@ -131,6 +131,7 @@ internal static class Program
         new("AISync shadow native bridge connection fences", AISyncShadowBridgeTests.ConnectionAndGenerationFencesAsync),
         new("Alien option configuration", AlienOptionTests.ConfigurationAsync),
         new("Alien ventilation selection wire and catalogue",AlienVentTests.TransportAsync),
+        new("Alien ventilation owner stage after replica timeout",AlienVentTests.OwnerStageRecoveryAsync),
         new("Alien option payload defaults", AlienOptionTests.PayloadDefaultsAsync),
         new("Alien option lobby and restart", AlienOptionTests.LobbyRoundRestartAsync),
         new("Voice codec", VoiceTests.CodecAsync),

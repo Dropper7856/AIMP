@@ -1,0 +1,38 @@
+﻿AIMP 446 / protocol 39
+Branch: feature/alien-vs-survivors-main
+
+Diagnostics (445, host/client logs matched with their 2-hour clock offset)
+- Entry935: Started, then Cancelled (NativeBusy).
+- Entry1924: Started, then Failed (Timeout) after five seconds on Host.
+- Exits2537,3768,3932,3989,4099,4312,4804: Host Rejected (WrongStage).
+- The client was backstage, but the Host still considered its replica frontstage.
+  Repeated exit requests therefore never reached native exit execution.
+
+Corrections
+- Host validates owner stage transitions against the Host-approved Started vent
+  selection, as well as Completed. A replica timeout/cancellation no longer
+  prevents the owner from reporting its already-achieved native stage.
+- Started proof expires after 12s for entry / 27s for exit (native traversal
+  windows plus 2s settling). Completed keeps the existing 2s window.
+- Epoch/actor identity, monotonic sequences, native-not-busy, applied Host command,
+  selected portal position (6m horizontal / 5m vertical) and physical bounds
+  remain required. A rejected action creates no transition authorization.
+- No new teleport command or camera position is sent. Existing validated owner
+  pose replication uses native backstage/frontstage setters on the replica only,
+  after its active native resources retire. Actual owner traversal is unchanged.
+- Native Started/Completed receipts now advance applied input/Host order even
+  when the Alien is stationary. Camera flight does not advance locomotion order;
+  previously the stationary pose could predate the action it was reporting.
+- Movement, rendering and brightness corrections from 444/445 remain intact.
+
+Tests
+- Four native tests passed, including stationary applied-action pose regression,
+  donor control, movement boundaries and exact-build installation/rollback.
+- Six targeted .NET tests passed. New authority regression exercises Host entry
+  timeout followed by actual owner backstage, then another exit. It rejects
+  busy, unapproved, wrong-portal, unapplied, duplicate and expired observations.
+- In-game entry/exit across multiple portals still needs confirmation on two PCs.
+
+Delivery
+- Build log and SHA256 delivery receipt: artifacts/alien-446.
+Result: Release API built and copied to both PCs without deletion; Launcher, Protocol, NetZ and both GFX SHA256 values match.

@@ -58,7 +58,7 @@ public sealed class AlienControlAuthority
     private int _rateCount;
     private AlienControlPose? _lastPhysicalPose;
     private AlienActionResolution? _lastVentResolution;
-    private long _physicalAt,_ventAt;
+    private long _physicalAt,_ventAt,_ventDeadline;
     private ulong _observationEpoch,_observationSequence;
     public AlienControlLease? Current {get;private set;}
     public void Begin(Guid session,int generation,ulong owner)
@@ -130,8 +130,20 @@ public sealed class AlienControlAuthority
             resolution.LevelGeneration!=_generation || resolution.AlienPeerId!=_owner ||
             resolution.Epoch!=c.Epoch || resolution.EntityA!=c.EntityA || resolution.EntityB!=c.EntityB)return false;
         if(!_actions.Accept(resolution,now))return false;
-        if(resolution.Phase==AlienActionPhase.Completed && resolution.Action is AlienAction.EnterVent or AlienAction.ExitVent)
-        {_lastVentResolution=resolution;_ventAt=now;}
+        if(resolution.Action is AlienAction.EnterVent or AlienAction.ExitVent)
+        {
+            // A replica can time out after the owner has already traversed.
+            // Authorize the measured transition from our approved Started
+            // selection, rather than requiring both native runs to complete.
+            // Failed/Cancelled keep this bounded proof; Rejected creates none.
+            if(resolution.Phase==AlienActionPhase.Started)
+            {
+                _lastVentResolution=resolution;_ventAt=now;
+                _ventDeadline=now+(resolution.Action==AlienAction.EnterVent?12000:27000);
+            }
+            else if(resolution.Phase==AlienActionPhase.Completed)
+            {_lastVentResolution=resolution;_ventAt=now;_ventDeadline=now+2000;}
+        }
         return true;
     }
     public bool AdmitPose(AlienControlPose pose,long now=0)
@@ -161,7 +173,7 @@ public sealed class AlienControlAuthority
             Math.Abs(pose.Y-old.Y)<=2.0+12.0*dt;
         var vent=_lastVentResolution;
         var transition=vent is not null && vent.Epoch==c.Epoch && vent.HostSequence<=pose.HostSequence &&
-            now>=_ventAt && now-_ventAt<=2000 && pose.Backstage==(vent.Action==AlienAction.EnterVent) &&
+            now>=_ventAt && now<=_ventDeadline && pose.Backstage==(vent.Action==AlienAction.EnterVent) &&
             Math.Sqrt(Math.Pow(pose.X-vent.ResolvedX,2)+Math.Pow(pose.Z-vent.ResolvedZ,2))<=6.0 &&
             Math.Abs(pose.Y-vent.ResolvedY)<=5.0;
         if(!ordinary && !transition)return null;

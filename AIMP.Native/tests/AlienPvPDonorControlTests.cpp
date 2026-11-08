@@ -155,6 +155,16 @@ int main() {
     Check(starts==priorStarts && completions==priorCompletions,"completion bypassed the local settle interval");
     Sleep(330);CaptureLocal(stationary);Pump(context);
     Check(starts==priorStarts+1 && completions==priorCompletions+1,"fast Host completion discarded the local exit start");
+    // A stationary owner still publishes the action's order after entering a
+    // vent; camera flight generates no physical Alien movement to advance it.
+    Sleep(40);CaptureLocal(stationary);Pump(context);
+    bool appliedStationaryAction{};
+    while(TryPopObservation(bytes)) {
+        Frame frame{};Check(Decode(bytes,frame),"invalid stationary observation");
+        if(frame.kind==Kind::Pose && frame.hostSequence==command.hostSequence &&
+            frame.acknowledgedInput==command.sequence)appliedStationaryAction=true;
+    }
+    Check(appliedStationaryAction,"stationary owner pose omitted its applied vent action");
     Reset(true);
     std::cout<<"Donor control, Host placement, selected vent transport and interaction reach passed.\n";
 }
