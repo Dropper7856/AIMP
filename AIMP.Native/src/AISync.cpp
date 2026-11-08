@@ -10672,7 +10672,7 @@ bool ReplicatePvPPose(const alien_pvp::Context& context,const alien_pvp::Frame& 
     std::uintptr_t cycle{};std::uint8_t state{},a{},b{};
     if(!Read(context.character+0x36CU,cycle)||!cycle||!Read(cycle+0x1AU,state)||
         !Read(context.character+0x2DAU,a)||!Read(context.character+0x2DBU,b)||
-        (state!=1U&&state!=55U&&state!=56U&&state!=57U&&state!=59U&&state!=77U))return false;
+        (state!=1U&&state!=55U&&state!=56U&&state!=57U&&state!=59U&&state!=75U&&state!=77U))return false;
     const bool backstage=(pose.flags&alien_pvp::Backstage)!=0U;
     const character_direct_step_runtime::MovementResourceLease resources(context.character);
     if(!resources)return false;

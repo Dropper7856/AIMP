@@ -597,7 +597,7 @@ void Pump(const Context& context) noexcept {
         if(known && backstage)pose.flags|=Backstage;
         if(ActionBusy() || !known || (!OrdinaryCycle(context.character) && !spatial::ManualBackstage(state,backstage,false)))pose.flags|=NativeBusy;
         if(context.localOwner && known && backstage && state==18U && ActionBusy() &&
-            g.ventAuthority.action==Action::ExitVent && g.ventAuthority.phase==ActionPhase::Started)
+            VentAction(g.ventAuthority) && g.ventAuthority.phase==ActionPhase::Started)
             pose.flags|=VentAnimating|NativeBusy;
         if(ReadPose(pose)) {
             pose.flags|=PoseValid;

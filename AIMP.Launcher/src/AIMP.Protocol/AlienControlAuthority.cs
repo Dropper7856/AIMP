@@ -60,6 +60,7 @@ public sealed class AlienControlAuthority
     private int _rateCount;
     private AlienControlPose? _lastPhysicalPose;
     private AlienActionResolution? _lastVentResolution;
+    private bool _ventTransitionConsumed=true;
     private long _physicalAt,_ventAt,_ventDeadline;
     private ulong _observationEpoch,_observationSequence;
     public AlienControlLease? Current {get;private set;}
@@ -137,10 +138,12 @@ public sealed class AlienControlAuthority
             // A replica can time out after the owner has already traversed.
             // Authorize the measured transition from our approved Started
             // selection, rather than requiring both native runs to complete.
-            // Failed/Cancelled keep this bounded proof; Rejected creates none.
+            // Failed/Cancelled keep the unused stage proof; Rejected creates
+            // none. Only animation playback retains a wall-clock deadline.
             if(resolution.Phase==AlienActionPhase.Started)
             {
                 _lastVentResolution=resolution;_ventAt=now;
+                _ventTransitionConsumed=false;
                 _ventDeadline=now+(resolution.Action==AlienAction.EnterVent?12000:27000);
             }
             else if(resolution.Phase==AlienActionPhase.Completed)
@@ -174,22 +177,31 @@ public sealed class AlienControlAuthority
         var ordinary=pose.Backstage==old.Backstage && Math.Sqrt(dx*dx+dz*dz)<=1.0+30.0*dt &&
             Math.Abs(pose.Y-old.Y)<=2.0+12.0*dt;
         var vent=_lastVentResolution;
-        var transition=vent is not null && vent.Epoch==c.Epoch && vent.HostSequence<=pose.HostSequence &&
-            now>=_ventAt && now<=_ventDeadline && pose.Backstage==(vent.Action==AlienAction.EnterVent) &&
+        // A native passage may finish after cancellation was acknowledged.
+        // Retain one unused stage reconciliation at the approved portal until
+        // consumed or superseded. Journal timeout is not physical rollback.
+        var transition=vent is not null && !_ventTransitionConsumed &&
+            pose.Backstage!=old.Backstage && vent.Epoch==c.Epoch && vent.HostSequence<=pose.HostSequence &&
+            now>=_ventAt && pose.Backstage==(vent.Action==AlienAction.EnterVent) &&
             Math.Sqrt(Math.Pow(pose.X-vent.ResolvedX,2)+Math.Pow(pose.Z-vent.ResolvedZ,2))<=6.0 &&
             Math.Abs(pose.Y-vent.ResolvedY)<=5.0;
         if(pose.VentAnimating) {
-            // Only the observed exit passage at the Host-selected portal can
+            // Only an observed passage at the Host-selected portal can
             // bypass the busy-pose fence. No arbitrary animation/placement.
-            if(vent is not {Action:AlienAction.ExitVent,Phase:AlienActionPhase.Started} ||
+            if(vent is not {Phase:AlienActionPhase.Started} ||
                 vent.Epoch!=c.Epoch || vent.HostSequence>pose.HostSequence || now<_ventAt || now>_ventDeadline ||
                 Math.Sqrt(Math.Pow(pose.X-vent.ResolvedX,2)+Math.Pow(pose.Z-vent.ResolvedZ,2))>6.0 ||
                 Math.Abs(pose.Y-vent.ResolvedY)>5.0)return null;
         } else if(!ordinary && !transition)return null;
+        if(!pose.VentAnimating && pose.Backstage!=old.Backstage && transition)_ventTransitionConsumed=true;
         if(_lastPose==ulong.MaxValue)throw new ProtocolException("Alien pose sequence exhausted.");
         _observationSequence=pose.Sequence;
         var accepted=pose with {Sequence=_lastPose+1,OwnerMeasured=true};
         _lastPose=accepted.Sequence;_lastPoseInput=accepted.AcknowledgedInput;_lastPoseHost=accepted.HostSequence;
-        _lastPhysicalPose=accepted;_physicalAt=now;return accepted;
+        // Passage samples drive presentation, not the stable stage baseline.
+        // A failed entry may still return to its original stage; conversely,
+        // its first stable backstage sample must consume the pending proof.
+        if(!pose.VentAnimating){_lastPhysicalPose=accepted;_physicalAt=now;}
+        return accepted;
     }
 }

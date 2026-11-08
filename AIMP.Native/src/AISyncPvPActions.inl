@@ -667,7 +667,7 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
         if(active.cancelled){if(!active.vent)Clear();return false;}
         TraceVent();
         const bool expected=ap::spatial::VentStageReady(state,backstage,active.receipt.action==Action::EnterVent,true);
-        if(expected && !active.vent && (active.receipt.action==Action::EnterVent || active.ownerFinished)) {
+        if(expected && !active.vent && active.ownerFinished) {
             Terminal(result,Phase::Completed,Reason::None);Clear();return true;
         }
         if(now-active.began>(active.receipt.action==Action::EnterVent?12000U:27000U)) {
@@ -792,8 +792,11 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
 #ifndef AIMP_ALIEN_ACTION_TEST
 bool ReplicatePose(const ap::Context& c,const ap::Frame& pose) noexcept {
     if((pose.flags&ap::OwnerMeasured)==0U)return false;
-    if(Same(c) && active.remoteVent && active.receipt.action==Action::ExitVent) {
-        if((pose.flags&(ap::Backstage|ap::NativeBusy))==0U)active.ownerFinished=true;
+    if(Same(c) && active.remoteVent) {
+        const bool entering=active.receipt.action==Action::EnterVent;
+        if((pose.flags&ap::NativeBusy)==0U && ((pose.flags&ap::Backstage)!=0U)==entering)
+            active.ownerFinished=true;
+        if(entering)return ReplicatePvPPose(c,pose);
         if((pose.flags&ap::VentAnimating)!=0U) {
             if(active.presentationStarted || active.cancelled)return false;
             // Trigger the real exit node once the owner is in its exit passage.

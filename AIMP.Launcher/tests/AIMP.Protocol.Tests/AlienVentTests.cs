@@ -2,6 +2,33 @@ namespace AIMP.Protocol.Tests;
 
 internal static class AlienVentTests
 {
+    internal static Task LateCancelledEntryAsync()
+    {
+        var session=Guid.NewGuid();var authority=new AlienControlAuthority();authority.Begin(session,1,2);
+        foreach(var peer in new ulong[]{1,2})
+            AssertEx.True(authority.Observe(new(session,1,peer,2,1,Guid.NewGuid(),11,12,true),1000));
+        var lease=authority.Evaluate(new ulong[]{1,2},1000)!;
+        var body=new AlienControlPose(session,1,2,lease.Epoch,1,0,0,11,12,0,0,0,0,0,0,1,false);
+        AssertEx.True(authority.AdmitPose(body,1000));
+        var intent=new AlienControlIntent(session,2,1,1,0,0,0,0,false,false,AlienAction.EnterVent,lease.Epoch,1,true);
+        var commit=authority.Admit(intent,1100)!;
+        var plan=new AlienActionResolution(session,1,2,lease.Epoch,1,commit.HostSequence,AlienAction.EnterVent,1,
+            AlienActionPhase.Started,AlienActionReason.None,11,12,0,0,0,0,60,0,0,60,4,0);
+        AssertEx.True(authority.AdmitResolution(plan,1200));
+        AssertEx.True(authority.AdmitResolution(plan with {Revision=2,Phase=AlienActionPhase.Cancelled,
+            Reason=AlienActionReason.NativeBusy},11000));
+        var late=body with {Sequence=2,HostSequence=1,AcknowledgedInput=1,X=60,Y=4,Backstage=true};
+        AssertEx.True(authority.AdmitOwnerPose(late with {X=80},26000) is null);
+        AssertEx.True(authority.AdmitOwnerPose(late,27000) is {Backstage:true,OwnerMeasured:true});
+        AssertEx.True(authority.AdmitOwnerPose(late with {Sequence=3,Backstage=false},28000) is null);
+        // A newer authenticated vent selection supersedes the previous proof.
+        var exit=authority.Admit(intent with {Sequence=2,Action=AlienAction.ExitVent,Vent=new(100,0,0)},28100)!;
+        AssertEx.True(authority.AdmitResolution(plan with {InputSequence=2,HostSequence=exit.HostSequence,
+            Action=AlienAction.ExitVent,X=100,ResolvedX=100,ResolvedY=0},28200));
+        var outside=late with {Sequence=4,HostSequence=exit.HostSequence,AcknowledgedInput=2,X=100,Y=0,Backstage=false};
+        AssertEx.True(authority.AdmitOwnerPose(outside,60000) is {Backstage:false,OwnerMeasured:true});
+        return Task.CompletedTask;
+    }
     internal static Task OwnerStageRecoveryAsync()
     {
         var session=Guid.NewGuid();
@@ -21,6 +48,9 @@ internal static class AlienVentTests
         AssertEx.True(authority.AdmitOwnerPose(entered with {NativeBusy=true},1500) is null);
         AssertEx.True(authority.AdmitOwnerPose(entered with {X=80},1500) is null); // wrong portal
         AssertEx.True(authority.AdmitOwnerPose(entered with {HostSequence=0},1500) is null); // not applied
+        AssertEx.True(authority.AdmitOwnerPose(entered with {NativeBusy=true,VentAnimating=true},1600)
+            is {Backstage:true,VentAnimating:true,OwnerMeasured:true});
+        entered=entered with {Sequence=3};
         AssertEx.True(authority.AdmitResolution(started with {Revision=2,Phase=AlienActionPhase.Failed,
             Reason=AlienActionReason.Timeout},6200));
         var accepted=authority.AdmitOwnerPose(entered,6300);
@@ -31,12 +61,12 @@ internal static class AlienVentTests
         var exiting=started with {InputSequence=2,HostSequence=exit.HostSequence,Action=AlienAction.ExitVent,
             X=100,Y=0,Z=0,ResolvedX=100,ResolvedY=0,ResolvedZ=0};
         AssertEx.True(authority.AdmitResolution(exiting,6500));
-        var animating=entered with {Sequence=3,HostSequence=exit.HostSequence,AcknowledgedInput=2,X=100,Y=0,
+        var animating=entered with {Sequence=4,HostSequence=exit.HostSequence,AcknowledgedInput=2,X=100,Y=0,
             NativeBusy=true,VentAnimating=true};
         AssertEx.True(authority.AdmitOwnerPose(animating with {X=120},6550) is null);
         AssertEx.True(authority.AdmitOwnerPose(animating,6600) is {VentAnimating:true,OwnerMeasured:true});
-        var outside=entered with {Sequence=4,HostSequence=exit.HostSequence,AcknowledgedInput=2,X=140,Y=0,Backstage=false};
-        AssertEx.True(authority.AdmitOwnerPose(outside,33501) is null); // expired start proof
+        var outside=entered with {Sequence=5,HostSequence=exit.HostSequence,AcknowledgedInput=2,X=140,Y=0,Backstage=false};
+        AssertEx.True(authority.AdmitOwnerPose(outside,33501) is null); // wrong portal, even after a long delay
         AssertEx.True(authority.AdmitResolution(exiting with {Revision=2,Phase=AlienActionPhase.Completed},33502));
         AssertEx.True(authority.AdmitOwnerPose(outside with {X=100},33503) is {Backstage:false,OwnerMeasured:true});
         return Task.CompletedTask;
