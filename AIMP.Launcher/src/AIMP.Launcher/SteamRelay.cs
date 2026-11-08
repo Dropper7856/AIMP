@@ -43,6 +43,8 @@ internal sealed class SteamRelay : ISteamRelay
     private volatile bool _ready;
     private bool _stopping;
     private volatile bool _pumpExit;
+    private bool _menuEnabled;
+    private int _menuProcessId;
 
     internal SteamRelay(LauncherDiagnostics diagnostics)
     {
@@ -75,9 +77,8 @@ internal sealed class SteamRelay : ISteamRelay
     internal static string FormatAddress(ulong steamId) =>
         AddressPrefix + steamId.ToString(CultureInfo.InvariantCulture);
 
-    /// <summary>Starts the pump thread and attempts Steam initialization.
-    /// Never throws; Steam being closed just leaves the relay unavailable.</summary>
-    public void Start()
+    /// <summary>Starts the worker without initializing Steam before the game menu is ready.</summary>
+    internal void Start()
     {
         lock (_gate)
         {
@@ -87,6 +88,21 @@ internal sealed class SteamRelay : ISteamRelay
             _pump.Start();
         }
         AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
+    }
+
+    public Task<bool> ActivateForMenuAsync(int gameProcessId)
+    {
+        if (gameProcessId <= 0) throw new ArgumentOutOfRangeException(nameof(gameProcessId));
+        Start();
+        return RunOnPumpAsync(() =>
+        {
+            if (_menuEnabled && _menuProcessId == gameProcessId) return _ready;
+            if (_menuEnabled) ShutdownOnPump();
+            _menuEnabled = true;
+            _menuProcessId = gameProcessId;
+            _diagnostics.Log("Steam", $"Game menu ready for PID={gameProcessId}; activating Spacewar relay after Alien: Isolation startup.");
+            return EnsureInitialized(force: true);
+        });
     }
 
     /// <summary>Accepts Steam relay connections and bridges them to the local lobby port.</summary>
@@ -198,7 +214,7 @@ internal sealed class SteamRelay : ISteamRelay
     {
         while (!_pumpExit && _work.TryTake(out var action, _ready ? 1 : 250)) action();
         if (_pumpExit) return;
-        if (!_ready) { EnsureInitialized(force: false); return; }
+        if (!_ready) { if (_menuEnabled) EnsureInitialized(force: false); return; }
         SteamClient.RunCallbacks();
         _hostSocket?.Receive(256);
         RelayTunnel[] tunnels;
@@ -212,6 +228,7 @@ internal sealed class SteamRelay : ISteamRelay
         lock (_gate)
         {
             if (_stopping) return Task.FromException<T>(new ObjectDisposedException(nameof(SteamRelay)));
+            if (_pump is null) return Task.FromException<T>(new InvalidOperationException("Steam relay is waiting for the game menu to be ready."));
             _work.Add(() =>
             {
                 try { completion.TrySetResult(action()); }
@@ -223,6 +240,7 @@ internal sealed class SteamRelay : ISteamRelay
 
     private bool EnsureInitialized(bool force)
     {
+        if (!_menuEnabled) return false;
         if (_ready) return true;
         if (!force && DateTime.UtcNow < _nextInitAttempt) return false;
         _nextInitAttempt = DateTime.UtcNow + InitRetryInterval;
@@ -234,7 +252,12 @@ internal sealed class SteamRelay : ISteamRelay
         catch (Exception exception)
         {
             if (force) _diagnostics.Log("Steam", $"Steam relay unavailable: {exception.Message}");
-            if (SteamClient.IsValid) SteamClient.Shutdown();
+            if (SteamClient.IsValid)
+            {
+                SteamFriends.OnGameRichPresenceJoinRequested -= OnRichPresenceJoinRequested;
+                SteamClient.Shutdown();
+            }
+            _ready = false;
             return false;
         }
         return true;
@@ -245,11 +268,12 @@ internal sealed class SteamRelay : ISteamRelay
         LocalSteamId = SteamClient.SteamId.Value;
         SteamNetworkingUtils.SendBufferSize = SendBufferBytes;
         SteamNetworkingUtils.InitRelayNetworkAccess();
-        SteamFriends.OnGameRichPresenceJoinRequested += (friend, connect) =>
-            RaiseJoin(friend.Name, connect);
+        SteamFriends.OnGameRichPresenceJoinRequested += OnRichPresenceJoinRequested;
         _ready = true;
         _diagnostics.Log("Steam", $"Steam relay ready as {FormatAddress(LocalSteamId)} ({SteamClient.Name}).");
     }
+
+    private void OnRichPresenceJoinRequested(Friend friend, string connect) => RaiseJoin(friend.Name, connect);
 
     private void RaiseJoin(string friendName, string connect)
     {
@@ -302,8 +326,9 @@ internal sealed class SteamRelay : ISteamRelay
         {
             CloseAllTunnels("launcher exit");
             StopHostingOnPump();
-            if (_ready)
+            if (SteamClient.IsValid)
             {
+                SteamFriends.OnGameRichPresenceJoinRequested -= OnRichPresenceJoinRequested;
                 SteamFriends.ClearRichPresence();
                 SteamClient.Shutdown();
             }
@@ -313,6 +338,7 @@ internal sealed class SteamRelay : ISteamRelay
             // Process is exiting; Steam cleans up after us.
         }
         _ready = false;
+        _menuEnabled = false;
     }
 
     private void Track(RelayTunnel tunnel) { lock (_gate) _tunnels.Add(tunnel); }

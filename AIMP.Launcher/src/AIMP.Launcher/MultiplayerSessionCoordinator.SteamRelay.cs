@@ -6,6 +6,7 @@ internal sealed partial class MultiplayerSessionCoordinator
 {
     private readonly ISteamRelay? _steamRelay;
     private bool _steamFrontendReady;
+    private int _steamMenuProcessId;
     private (string Friend, ulong Host)? _pendingSteamInvite;
     private readonly object _steamInviteGate = new();
     private Task _steamInviteTask = Task.CompletedTask;
@@ -14,7 +15,15 @@ internal sealed partial class MultiplayerSessionCoordinator
     {
         if (_steamRelay is null) return;
         _steamRelay.JoinRequested += OnSteamJoinRequested;
-        _steamRelay.Start();
+    }
+
+    private async Task ActivateSteamForReadyMenuAsync()
+    {
+        if (_steamRelay is null || !_steamFrontendReady) return;
+        var runtime = _controller.Snapshot;
+        if (!runtime.IpcConnected || runtime.ProcessId <= 0 || runtime.ProcessId == _steamMenuProcessId) return;
+        await _steamRelay.ActivateForMenuAsync(runtime.ProcessId).ConfigureAwait(false);
+        _steamMenuProcessId = runtime.ProcessId;
     }
 
     private async Task StartSteamHostingAsync(LobbyHost host)
@@ -22,6 +31,7 @@ internal sealed partial class MultiplayerSessionCoordinator
         if (_steamRelay is null) return;
         try
         {
+            await ActivateSteamForReadyMenuAsync().ConfigureAwait(false);
             if (!await _steamRelay.StartHostingAsync(host.BoundPort, "Hosting an AIMP lobby").ConfigureAwait(false))
             {
                 _diagnostics.Log("Steam", "Steam is not running; this lobby is reachable by direct IP only.");
@@ -79,6 +89,7 @@ internal sealed partial class MultiplayerSessionCoordinator
                 await SendStatusAsync($"Invite from {friendName} accepted - open the game's main menu to join automatically").ConfigureAwait(false);
                 return;
             }
+            await ActivateSteamForReadyMenuAsync().ConfigureAwait(false);
             await TryJoinPendingSteamInviteAsync().ConfigureAwait(false);
         }
         finally { _commandGate.Release(); }
@@ -141,6 +152,7 @@ internal sealed partial class MultiplayerSessionCoordinator
         {
             lock (_stateGate)
                 _steamFrontendReady = !_uiGameplayLoaded && _start is null && _controller.Snapshot.IpcConnected;
+            await ActivateSteamForReadyMenuAsync().ConfigureAwait(false);
             await TryJoinPendingSteamInviteAsync().ConfigureAwait(false);
         }
         finally { _commandGate.Release(); }
