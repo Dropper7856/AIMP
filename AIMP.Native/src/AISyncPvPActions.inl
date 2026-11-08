@@ -116,6 +116,10 @@ struct AttackTelemetry final {
     std::atomic<unsigned> pairStage{},pairPrepared{},victimState{},victimAcquired{};
     // Armed-window counters of the current attack (not overwritten by stage).
     std::atomic<unsigned> armedPolls{},flagConsumed{},retargets{},brainMissing{};
+    // Retail ActionMeleeAttack starts/refusals for the armed Alien (probe
+    // 00717D90), last node type, OR of attack-manager availability bytes
+    // +8..+E (bit n = +8+n; +8 ANY, +D any proven) and source/victim +2B4.
+    std::atomic<unsigned> meleeStarts{},meleeRefused{},meleeType{},availability{},sourceFlag2B4{},victimFlag2B4{};
 } attackTelemetry;
 void TraceAttack(unsigned stage,unsigned selector=0U) noexcept {
     std::uint8_t state{};bool backstage{};
@@ -146,7 +150,7 @@ void LogAttack(Diagnostics& diagnostics) {
     const auto sequence=attackTelemetry.sequence.load();
     if(!revision || revision==lastRevision || (sequence==lastSequence && now-lastAt<250U))return;
     lastRevision=revision;lastSequence=sequence;lastAt=now;
-    diagnostics.Log("info","alien_attack_progress","Host attack preparation; stage 1 noSelection 2 noRecord 3 targetFault 4 queryRefused 5 selectorUnproven 6 rayPending 7 submitted 8 pairRefused 9 entered 10 enteredWithRayPending 11 pairRunning 12 victimNotAcquired4s 13 retailArmed 14 retailWindowExpired 15 retailOtherVictim 16 retailRetargeted(selector=count) 17 armedQueryRefused 18 brainTargetUnavailable 19 attackBranchConsumedFlag(selector=count) 20 clientPresented 21 clientPresentRefused 22 clientNotEntered 23 clientEntered.",
+    diagnostics.Log("info","alien_attack_progress","Host attack preparation; stage 1 noSelection 2 noRecord 3 targetFault 4 queryRefused 5 selectorUnproven 6 rayPending 7 submitted 8 pairRefused 9 entered 10 enteredWithRayPending 11 pairRunning 12 victimNotAcquired4s 13 retailArmed 14 retailWindowExpired 15 retailOtherVictim 16 retailRetargeted(selector=count) 17 armedQueryRefused 18 brainTargetUnavailable 19 attackBranchConsumedFlag(selector=count) 24 retailNeverStartedMelee3s 20 clientPresented 21 clientPresentRefused 22 clientNotEntered 23 clientEntered.",
         {{"hostSequence",Diagnostics::Unsigned(sequence),true},
          {"elapsedMs",Diagnostics::Unsigned(attackTelemetry.elapsed.load()),true},
          {"stage",Diagnostics::Unsigned(attackTelemetry.stage.load()),true},
@@ -160,7 +164,13 @@ void LogAttack(Diagnostics& diagnostics) {
          {"armedPolls",Diagnostics::Unsigned(attackTelemetry.armedPolls.load()),true},
          {"flagConsumed",Diagnostics::Unsigned(attackTelemetry.flagConsumed.load()),true},
          {"retargets",Diagnostics::Unsigned(attackTelemetry.retargets.load()),true},
-         {"brainMissing",Diagnostics::Unsigned(attackTelemetry.brainMissing.load()),true}});
+         {"brainMissing",Diagnostics::Unsigned(attackTelemetry.brainMissing.load()),true},
+         {"meleeStarts",Diagnostics::Unsigned(attackTelemetry.meleeStarts.load()),true},
+         {"meleeRefused",Diagnostics::Unsigned(attackTelemetry.meleeRefused.load()),true},
+         {"meleeType",Diagnostics::Unsigned(attackTelemetry.meleeType.load()),true},
+         {"availability",Diagnostics::Unsigned(attackTelemetry.availability.load()),true},
+         {"source2B4",Diagnostics::Unsigned(attackTelemetry.sourceFlag2B4.load()),true},
+         {"victim2B4",Diagnostics::Unsigned(attackTelemetry.victimFlag2B4.load()),true}});
 }
 #else
 void TraceVent(unsigned=0U) noexcept {}
@@ -497,7 +507,7 @@ ap::attack::Memory AttackMemory() noexcept {
 }
 // The retail window stays below the protocol's 14s Preparing stall limit: 458 showed
 // the BT running ~5s to reach the victim before the pair (cycle 78) starts.
-constexpr std::uint64_t kClientAttackWaitMs=16000U,kRetailAttackWindowMs=10000U;
+constexpr std::uint64_t kClientAttackWaitMs=16000U,kRetailAttackWindowMs=10000U,kRetailNoStartMs=3000U;
 bool HoldAttackTarget(const std::uintptr_t victim) noexcept {
     const ap::attack::Manager manager{active.chooser,0U,0U};
     return ap::attack::Hold(AttackMemory(),manager,victim,active.heldTarget)==ap::attack::HoldResult::Held;
@@ -520,6 +530,9 @@ void ReleaseAttackTarget() noexcept {
         if(active.shouldAttackSet)static_cast<void>(SetShouldAttack(false));
     }
     active.heldTarget={};active.brainTarget={};active.shouldAttackSet=false;
+#ifndef AIMP_ALIEN_ACTION_TEST
+    gPvPMeleeWatch.store(0U,std::memory_order_relaxed);
+#endif
 }
 // ActionMeleeAttack 00717D90 reads the target through AnimatedCharacter+34A8
 // ->+10 (donor TargetOf/SetTargetOf). Hold it there too if it is not the
@@ -833,6 +846,25 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
                     active.entered=true;result=active.receipt;result.phase=Phase::Started;result.reason=Reason::None;
                     ++result.resolutionRevision;active.receipt=result;return true;
                 }
+#ifndef AIMP_ALIEN_ACTION_TEST
+                const auto starts=gPvPMeleeStarts.load(std::memory_order_relaxed);
+                attackTelemetry.meleeStarts=starts;attackTelemetry.meleeRefused=gPvPMeleeRefused.load(std::memory_order_relaxed);
+                attackTelemetry.meleeType=gPvPMeleeLastType.load(std::memory_order_relaxed);
+                {
+                    std::array<std::uint8_t,7> bytes{};unsigned mask{};std::uint8_t flag{};
+                    if(active.chooser && crash_guard::TryCopy(bytes.data(),reinterpret_cast<const void*>(active.chooser+8U),bytes.size()))
+                        for(std::size_t i=0;i<bytes.size();++i)if(bytes[i])mask|=1U<<i;
+                    attackTelemetry.availability=attackTelemetry.availability.load()|mask;
+                    if(Read(active.attackAnimated+0x2B4U,flag))attackTelemetry.sourceFlag2B4=flag;
+                    if(Read(active.victim.character+0x2B4U,flag))attackTelemetry.victimFlag2B4=flag;
+                }
+                // The retail BT never even tried ActionMeleeAttack: do not hold
+                // the pilot for the whole window (459: frozen 10s for nothing).
+                if(!starts && now-active.armedAt>kRetailNoStartMs) {
+                    ReleaseAttackTarget();TraceAttack(24U,active.receipt.selector);
+                    Terminal(result,Phase::Rejected,Reason::NativeRefused);active.cancelled=true;return true;
+                }
+#endif
                 if(now-active.armedAt>kRetailAttackWindowMs) {
                     ReleaseAttackTarget();TraceAttack(14U,active.receipt.selector);
                     Terminal(result,Phase::Rejected,Reason::NativeRefused);active.cancelled=true;return true;
@@ -890,6 +922,12 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
                 active.retailArmed=true;active.armedAt=now;
                 attackTelemetry.armedPolls=0U;attackTelemetry.flagConsumed=0U;attackTelemetry.retargets=0U;
                 attackTelemetry.brainMissing=0U;
+                attackTelemetry.meleeStarts=0U;attackTelemetry.meleeRefused=0U;attackTelemetry.meleeType=0xFFU;
+                attackTelemetry.availability=0U;attackTelemetry.sourceFlag2B4=0U;attackTelemetry.victimFlag2B4=0U;
+#ifndef AIMP_ALIEN_ACTION_TEST
+                gPvPMeleeStarts.store(0U,std::memory_order_relaxed);gPvPMeleeRefused.store(0U,std::memory_order_relaxed);
+                gPvPMeleeWatch.store(active.attackAnimated,std::memory_order_relaxed);
+#endif
                 TraceAttack(13U,active.receipt.selector);
                 return false;
             }

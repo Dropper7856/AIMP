@@ -2362,6 +2362,24 @@ std::uint32_t __fastcall RecordEligibilityDetour(void* logical, void*) noexcept 
     return AdaptParticipantEligibility(logical, gRecordEligibilityOwner, gRecordEligibilityTarget,
         gRecordEligibilityChecks, gRecordEligibilityOverrides);
 }
+// PvP left-click probe on retail ActionMeleeAttack start 00717D90
+// (thiscall(node, character, state), RET 8; refusal writes state+4 = 8).
+// Observation only, for the Alien whose melee is armed; may run on workers.
+std::atomic<std::uintptr_t> gPvPMeleeWatch{};
+std::atomic<std::uint32_t> gPvPMeleeStarts{},gPvPMeleeRefused{},gPvPMeleeLastType{};
+void* gPvPMeleeStartTrampoline{};
+std::atomic<void*> gPvPMeleeStartOriginal{};
+void __fastcall PvPMeleeStartDetour(void* node, void*, std::uintptr_t character, std::uintptr_t state) noexcept {
+    using MeleeStart = void(__thiscall*)(void*, std::uintptr_t, std::uintptr_t);
+    const auto original = reinterpret_cast<MeleeStart>(gPvPMeleeStartOriginal.load(std::memory_order_acquire));
+    if (original == nullptr) return;
+    original(node, character, state);
+    if (character == 0U || character != gPvPMeleeWatch.load(std::memory_order_relaxed)) return;
+    gPvPMeleeStarts.fetch_add(1U, std::memory_order_relaxed);
+    std::uint32_t result{}, type{};
+    if (Read(state + 4U, result) && result == 8U) gPvPMeleeRefused.fetch_add(1U, std::memory_order_relaxed);
+    if (Read(reinterpret_cast<std::uintptr_t>(node) + 8U, type)) gPvPMeleeLastType.store(type, std::memory_order_relaxed);
+}
 std::uint8_t __fastcall RecordInvalidDetour(void* context, void*) noexcept {
     const auto original = reinterpret_cast<RecordInvalid>(gRecordInvalidOriginal.load(std::memory_order_acquire));
     if (original == nullptr) return 1U;
@@ -9560,6 +9578,9 @@ bool Install(const std::uintptr_t base, HookManager& hooks, LevelGenerationTrack
         HookParticipantEligibility(hooks, error) &&
         HookParticipantPlayerSemantics(hooks, error) &&
         HookPostDeathMeleeSelection(hooks, error) &&
+        Hook(hooks, "aisync_pvp_melee_start_probe", 0x00317D90U,
+            reinterpret_cast<void*>(&PvPMeleeStartDetour), {0x83,0xEC,0x2C,0x53,0x55,0x56},
+            &gPvPMeleeStartTrampoline, &gPvPMeleeStartOriginal, error) &&
         HookPairedPlayerClassification(hooks, error) &&
         HookBackstageParticipantContext(hooks, error) &&
         Hook(hooks, "aisync_participant_record_validation", 0x002CDB00U,
