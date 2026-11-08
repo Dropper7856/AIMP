@@ -33,6 +33,7 @@ internal sealed class AlienPvPNetworkBridge : IDisposable
     private Guid _receipt;
     private AlienControlLease? _lease;
     private ulong _readySequence;
+    private (ulong Epoch,bool Backstage,bool Busy)? _poseStage;
     private long _dropped,_stale,_inputs,_commits,_poses,_lastSummary,_lastError;
     private int _disposed;
     private readonly HashSet<AlienAction> _unsupported=new();
@@ -305,6 +306,12 @@ internal sealed class AlienPvPNetworkBridge : IDisposable
         }
         else if(f.Kind==AlienPvPNativeKind.Pose && f.Flags.HasFlag(AlienPvPNativeFlags.PoseValid))
         {
+            var stage=(f.Epoch,f.Flags.HasFlag(AlienPvPNativeFlags.Backstage),f.Flags.HasFlag(AlienPvPNativeFlags.NativeBusy));
+            if(_poseStage!=stage)
+            {
+                _poseStage=stage;
+                _log($"Native stage epoch={f.Epoch} backstage={stage.Item2} busy={stage.Item3} appliedHost={f.HostSequence} input={f.AcknowledgedInput} pos=({f.X:F2},{f.Y:F2},{f.Z:F2}).");
+            }
             var pose=new AlienControlPose(b.Session,b.RoundGeneration,b.OwnerPeer,f.Epoch,
                 f.Sequence,f.HostSequence,f.AcknowledgedInput,f.Scope.EntityA,f.Scope.EntityB,
                 f.X,f.Y,f.Z,f.Yaw,f.VelocityX,f.VelocityZ,f.Gait,

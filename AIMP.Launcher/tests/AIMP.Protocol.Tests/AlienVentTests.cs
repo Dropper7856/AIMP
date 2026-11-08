@@ -50,7 +50,12 @@ internal static class AlienVentTests
             Epoch=1,Sequence=4,Flags=AlienPvPNativeFlags.Focused|AlienPvPNativeFlags.VentSelected,
             Action=AlienAction.ExitVent,X=10,Y=22,Z=40};
         AssertEx.Equal(frame,AlienPvPNativeCodec.Decode(AlienPvPNativeCodec.Encode(frame)));
-        AssertEx.Throws<ProtocolException>(()=>AlienPvPNativeCodec.Validate(frame with {Action=AlienAction.EnterVent}));
+        var entry=frame with {Action=AlienAction.EnterVent};
+        AssertEx.Equal(entry,AlienPvPNativeCodec.Decode(AlienPvPNativeCodec.Encode(entry)));
+        var entryIntent=intent with {Action=AlienAction.EnterVent};
+        AlienControlProtocol.Validate(entryIntent);
+        AssertEx.Equal(entryIntent,JsonPayload.Deserialize<AlienControlIntent>(JsonPayload.Serialize(entryIntent)));
+        AssertEx.Throws<ProtocolException>(()=>AlienPvPNativeCodec.Validate(frame with {Action=AlienAction.Attack}));
         AssertEx.Throws<ProtocolException>(()=>AlienPvPNativeCodec.Validate(frame with {Kind=AlienPvPNativeKind.Status}));
         var command=new GameCommandExecutePayload(1,Guid.NewGuid(),2,Guid.NewGuid(),GameCommandNames.AlienPvPVents,
             new Dictionary<string,string>{{"page","63"}});

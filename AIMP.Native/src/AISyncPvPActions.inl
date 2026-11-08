@@ -38,7 +38,7 @@ struct Active final {
     PairIdentity victim{};
     std::uintptr_t chooser{};
     VentSlot* vent{};
-    bool used{},entered{},cancelled{},terminalSent{},hostEnded{},moveArrived{},entrySubmitted{};
+    bool used{},entered{},cancelled{},terminalSent{},hostEnded{},moveArrived{},entrySubmitted{},remoteVent{};
     std::uint64_t ventProgressAt{};float ventBestDistance{std::numeric_limits<float>::infinity()};
 };
 Active active{};
@@ -71,7 +71,7 @@ struct VentTelemetry final {
     std::atomic<float> x{},y{},z{};
 } ventTelemetry;
 void TraceVent(unsigned frameStatus=0U) noexcept {
-    if(!active.used || !active.vent)return;
+    if(!active.used || (active.receipt.action!=Action::EnterVent && active.receipt.action!=Action::ExitVent))return;
     policy::Point body{};std::uint8_t state{};bool backstage{};
     if(!Body(active.context.character,body)||!Cycle(active.context.character,state,backstage))return;
     ventTelemetry.sequence=active.receipt.hostSequence;ventTelemetry.elapsed=GetTickCount64()-active.began;
@@ -110,7 +110,9 @@ bool Quarantined(const ap::Context& c) noexcept {
     for(const auto& slot:ventSlots)if(slot.quarantined && slot.character==c.character && slot.scope==c.scope)return true;
     return false;
 }
-bool Busy(const ap::Context& c) noexcept {return Same(c) || Quarantined(c);}
+// A remote-owner vent receipt owns journal ordering, but no local native
+// movement resource. Its replica must remain available to measured poses.
+bool Busy(const ap::Context& c) noexcept {return (Same(c) && !active.remoteVent) || Quarantined(c);}
 void Reject(ap::Frame& r,Reason reason) noexcept {
     r.phase=Phase::Rejected;r.reason=reason;r.resolutionRevision=1U;
 }
@@ -183,9 +185,11 @@ bool SelectPortal(const ap::Context& c,const ap::Frame& request,ap::Frame& resul
         if(!Read(entries+static_cast<std::uintptr_t>(i)*0x30U+0x28U,descriptor) || !descriptor ||
             !Read(descriptor,vent.entrance) || !policy::Finite(vent.entrance) || !ExitPoint(descriptor,vent.exit))continue;
         if(c.host) {
-            if(!enter && (request.flags&ap::VentSelected)!=0U) {
+            if((request.flags&ap::VentSelected)!=0U) {
                 constexpr float tolerance=policy::kVentMatchTolerance*policy::kVentMatchTolerance;
                 if(policy::DistanceSquared(vent.entrance,{request.x,request.y,request.z})>tolerance)continue;
+                if(enter && !ap::vents::WithinReach({body.x,body.y,body.z},
+                    {vent.entrance.x,vent.entrance.y,vent.entrance.z}))continue;
                 if(found){result.reason=Reason::AmbiguousVent;return false;}
                 best=vent;found=true;continue;
             }
@@ -213,7 +217,7 @@ bool SelectPortal(const ap::Context& c,const ap::Frame& request,ap::Frame& resul
     // Donor vent.cpp::PickGo keeps the retail path-aware choice when it is
     // almost as near as the closest opening. Forcing the nearest point can
     // choose the wrong side of a wall or an inaccessible approach.
-    if(c.host && enter && found) {
+    if(c.host && enter && found && (request.flags&ap::VentSelected)==0U) {
         const auto original=RetailEntry(manager);
         if(original>=entries && (original-entries)%0x30U==0U && (original-entries)/0x30U<count) {
             policy::Vent vent{};std::uintptr_t descriptor{};
@@ -540,6 +544,7 @@ void Cancel(const ap::Context& c,bool living) noexcept {
     }
     active.cancelled=true;
     TraceVent();
+    if(active.remoteVent){Clear();return;}
     if(active.victim.character)player_hiding::FinishPvPSearch(active.victim.character);
     if(active.vent) {
         bool done{};
@@ -623,6 +628,13 @@ bool Begin(const ap::Context& c,const ap::Frame& command,ap::Frame& result) noex
     }
     result.reason=Reason::NoVent;
     if(!SelectPortal(c,command,result)){Reject(result,result.reason);return true;}
+    if(c.host && !c.localOwner) {
+        // The owning player runs the donor traversal. Running another path
+        // on the Host can circle/stall and cancel a successful owner entry.
+        result.phase=Phase::Started;result.reason=Reason::None;
+        active={};active.used=true;active.remoteVent=true;active.context=c;
+        active.receipt=result;active.began=GetTickCount64();TraceVent();return true;
+    }
     auto* slot=FreeVentSlot();
     if(!slot || !StartVent(c,result,*slot)){Reject(result,Reason::NativeUnavailable);return true;}
     result.phase=Phase::Started;result.reason=Reason::None;
@@ -636,6 +648,16 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
     if(!Live(c)){Cancel(c,false);return false;}
     const auto now=GetTickCount64();std::uint8_t state{};bool backstage{};
     if(!Cycle(c.character,state,backstage))return false;
+    if(active.remoteVent) {
+        TraceVent();
+        const bool expected=active.receipt.action==Action::EnterVent?
+            backstage && (Ordinary(state) || state==77U):!backstage && Ordinary(state);
+        if(expected){Terminal(result,Phase::Completed,Reason::None);Clear();return true;}
+        if(now-active.began>(active.receipt.action==Action::EnterVent?12000U:27000U)) {
+            Terminal(result,Phase::Failed,Reason::Timeout);Clear();return true;
+        }
+        return false;
+    }
     if(active.cancelled) {
         if(active.vent){Cancel(c,true);return false;}
         const auto* actor=Find(c.character);

@@ -51,10 +51,10 @@ public static class AlienControlProtocol
             (value.Sprint && value.Sneak) ||
             (!value.Focused && (value.Forward!=0 || value.Strafe!=0 || value.Action!=AlienAction.None)))
             throw new ProtocolException("Alien control contains an invalid actor identity or input.");
-        if(value.Vent is { } vent && (value.Action!=AlienAction.ExitVent || !value.Focused ||
+        if(value.Vent is { } vent && (value.Action is not (AlienAction.ExitVent or AlienAction.EnterVent) || !value.Focused ||
             !float.IsFinite(vent.X) || !float.IsFinite(vent.Y) || !float.IsFinite(vent.Z) ||
             Math.Abs(vent.X)>100000 || Math.Abs(vent.Y)>100000 || Math.Abs(vent.Z)>100000))
-            throw new ProtocolException("Alien vent selection requires a finite exit location.");
+            throw new ProtocolException("Alien vent selection requires a finite portal location.");
     }
 
     public static void Validate(AlienControlCommit? value)

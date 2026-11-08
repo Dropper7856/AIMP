@@ -71,7 +71,7 @@ inline bool Valid(const Frame& f) noexcept {
     if (f.kind!=Kind::Input && f.kind!=Kind::Commit && f.kind!=Kind::ActionResult && f.kind!=Kind::Resolution &&
         f.action!=Action::None) return false;
     if((f.flags&VentSelected) &&
-        ((f.kind!=Kind::Input && f.kind!=Kind::Commit) || f.action!=Action::ExitVent))return false;
+        ((f.kind!=Kind::Input && f.kind!=Kind::Commit) || (f.action!=Action::ExitVent && f.action!=Action::EnterVent)))return false;
     if(f.kind==Kind::Resolution && (f.action==Action::None || f.phase==ActionPhase::None || !f.resolutionRevision))return false;
     if(f.kind==Kind::Resolution) {
         if(f.action==Action::Roar || (f.phase==ActionPhase::Preparing && f.action!=Action::Attack))return false;

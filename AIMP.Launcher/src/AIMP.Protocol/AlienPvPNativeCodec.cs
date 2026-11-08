@@ -73,7 +73,7 @@ public static class AlienPvPNativeCodec
                 && f.Action!=AlienAction.None))
             throw new ProtocolException("Invalid native PvP value or ordering identity.");
         if(f.Flags.HasFlag(AlienPvPNativeFlags.VentSelected) &&
-            (f.Kind is not (AlienPvPNativeKind.Input or AlienPvPNativeKind.Commit) || f.Action!=AlienAction.ExitVent))
+            (f.Kind is not (AlienPvPNativeKind.Input or AlienPvPNativeKind.Commit) || f.Action is not (AlienAction.ExitVent or AlienAction.EnterVent)))
             throw new ProtocolException("Invalid native selected vent action.");
         if(f.Kind==AlienPvPNativeKind.Acknowledge &&
             (f.DeliveryId==0 || f.Sequence!=0 || f.HostSequence!=0 || f.Flags!=0))

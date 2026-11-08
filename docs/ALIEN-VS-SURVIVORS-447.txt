@@ -1,0 +1,46 @@
+﻿AIMP 447 / protocol 39
+Branch: feature/alien-vs-survivors-main
+
+Evidence
+- Entry375 Started on Host 19:09:00 / Client 21:09:00, then Host Cancelled
+  (NativeBusy) at +5s. Exits2865/3701/3740 all rejected WrongStage.
+- The client's native log was still available at the diagnostic's NativeLogPath;
+  copied to artifacts/alien-447/client-native.jsonl. It records the entry Move
+  node finishing at 891ms, cycle55, backstage=false. This is approach completion,
+  not proof of an actual stage transition. No Host native log was accessible.
+- The old model ran independent native paths on Host and owner. Host cancellation
+  could cancel the client's path even when the two instances had diverged.
+- The interaction selected a local opening but EnterVent sent no portal coordinate;
+  the Host could pick a different nearby opening using its own path/position.
+
+Changes
+- For a client-owned Alien, Host validates the real portal and issues Started,
+  but does not start another native Move node. It waits for the measured owner
+  stage to be replicated using the existing native backstage/frontstage setters.
+- This pending Host receipt owns journal order without claiming local movement
+  resources. It does not block owner pose application or restart Host steering.
+- Host completes after observing the expected stable stage. Entry/exit waits
+  remain bounded to 12s/27s. E/Q cancellation and scope revocation still work.
+- Host-owned Alien and the actual owner retain the existing donor native traversal.
+- Entry now carries the exact opening shown by the interaction prompt, through
+  the existing selected-portal coordinates. Host matches its native catalogue,
+  rejects ambiguous matches, and still verifies entry proximity. Selected entry
+  is not replaced by the Host's nearest/path-preferred opening.
+- Native/managed validation accepts selected entry and exit only; attack and
+  non-input frame selections remain invalid. No frame layout or protocol change.
+- Vent native telemetry continues after the Move frame is released. Launcher
+  logs stage/busy changes with applied command order and physical coordinates.
+
+Validation
+- 6 targeted .NET tests passed, including selected-entry wire roundtrip and
+  owner-stage authorization/rejection coverage introduced in 446.
+- 4 targeted native tests passed (donor test rerun after correcting its missing
+  reliable-input acknowledgement). New checks cover selected entry coordinates
+  and measured owner poses while a remote vent receipt is pending, with no
+  competing Host steering. Exact-build install/rollback checks also passed.
+- Tests do not emulate the retail vent animation or verify visual movement.
+  Repeat multiple entry/exit traversals in game on both PCs.
+
+Delivery
+- Build log and delivery SHA256 receipt under artifacts/alien-447.
+Result: Release API delivered to both PCs without deletion. Launcher, Protocol, NetZ and both UI GFX SHA256 values match.

@@ -440,7 +440,12 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
         else if(gLocal.wasBackstage && interact && gLocal.nearbyVent>=0)
             static_cast<void>(GoToVent(static_cast<std::uint32_t>(gLocal.nearbyVent)));
         else if(interact && gLocal.nearbyVent>=0 && !alien_pvp::VentPending()) {
-            input.action=alien_pvp::Action::EnterVent;alien_pvp::CaptureLocal(input);
+            alien_pvp::vents::Point portal{};
+            if(alien_pvp::vents::ReadPoint(vents,static_cast<std::uint32_t>(gLocal.nearbyVent),&VentRead,portal)) {
+                input.action=alien_pvp::Action::EnterVent;input.selectedVent=true;
+                input.ventX=portal[0];input.ventY=portal[1];input.ventZ=portal[2];
+                alien_pvp::CaptureLocal(input);
+            }
         }
     }
     gLocal.enterDown=interact;gLocal.exitDown=exit;

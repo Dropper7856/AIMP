@@ -326,6 +326,8 @@ void ApplyMovement(std::uint64_t now,float dt) noexcept {
         (g.ventAuthority.phase==ActionPhase::Preparing || g.ventAuthority.phase==ActionPhase::Started)) {
         static_cast<void>(StopDonorMovement());static_cast<void>(CancelRecovery());ReleaseCarrier();return;
     }
+    const bool remoteVent=!g.context.localOwner && VentAction(g.ventAuthority) &&
+        g.ventAuthority.phase==ActionPhase::Started;
     if(active && !g.context.localOwner && g.correctionAt && Fresh(now,g.correctionAt,250U) &&
         (g.correction.flags&(PoseValid|OwnerMeasured|NativeBusy))==(PoseValid|OwnerMeasured) &&
         g.context.actions && g.context.actions->replicatePose) {
@@ -340,7 +342,7 @@ void ApplyMovement(std::uint64_t now,float dt) noexcept {
         target.y=body.y+(target.y-body.y)*alpha;
         if(g.context.actions->drive) {
             const auto& input=g.window.Input();
-            static_cast<void>(g.context.actions->drive(g.context,&input));
+            static_cast<void>(g.context.actions->drive(g.context,remoteVent?nullptr:&input));
         }
         if(g.context.actions->replicatePose(g.context,target)) {
             g.appliedInput=g.window.LastInput();g.appliedHost=g.window.LastHost();
@@ -348,6 +350,7 @@ void ApplyMovement(std::uint64_t now,float dt) noexcept {
         }
         return;
     }
+    if(remoteVent){static_cast<void>(StopDonorMovement());ReleaseCarrier();return;}
     std::uint8_t cycle{};bool backstage{};
     const bool stageKnown=NativeStage(g.context.character,cycle,backstage);
     if(fresh && stageKnown && spatial::ManualBackstage(cycle,backstage,false)) {
@@ -510,7 +513,7 @@ void PublishInput(std::uint64_t now) noexcept {
         frame.x=body.x;frame.y=body.y;frame.z=body.z;frame.flags|=PoseValid;
         g.history.Record(frame.sequence,body.x,body.y,body.z);
     }
-    if(queued.selectedVent && queued.action==Action::ExitVent) {
+    if(queued.selectedVent && VentAction(frame)) {
         frame.flags|=VentSelected;frame.x=queued.ventX;frame.y=queued.ventY;frame.z=queued.ventZ;
     }
     Publish(frame,now);gInputs.fetch_add(1U,std::memory_order_relaxed);g.lastInputSent=now;

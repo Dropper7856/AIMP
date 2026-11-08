@@ -10,8 +10,8 @@
 
 namespace {
 int genericCalls{},driveCalls{},stopCalls{},beginCalls{},placements{},recoveryCalls{};
-int starts{},completions{};
-bool stopReady=true,nativeBusy=false;
+int starts{},completions{},replicas{};
+bool stopReady=true,nativeBusy=false,proxyVent=false;
 aimp::alien_pvp::Frame lastIntent{};
 void Check(bool pass,const char* message) {
     if(!pass){std::cerr<<message<<'\n';std::exit(1);}
@@ -25,8 +25,9 @@ bool Begin(const aimp::alien_pvp::Context&,const aimp::alien_pvp::Frame& frame,a
     ++starts;
     ++beginCalls;out=frame;out.phase=aimp::alien_pvp::ActionPhase::Started;
     out.reason=aimp::alien_pvp::ActionReason::None;out.resolutionRevision=1U;
-    nativeBusy=true;return true;
+    nativeBusy=!proxyVent;return true;
 }
+bool Replicate(const aimp::alien_pvp::Context&,const aimp::alien_pvp::Frame&) noexcept {++replicas;return true;}
 bool Busy(const aimp::alien_pvp::Context&) noexcept {return nativeBusy;}
 bool Recover(const aimp::alien_pvp::Context&,const aimp::alien_pvp::Frame*) noexcept {++recoveryCalls;return true;}
 void Cancel(const aimp::alien_pvp::Context& c,bool) noexcept {static_cast<void>(Drive(c,nullptr));nativeBusy=false;}
@@ -115,9 +116,18 @@ int main() {
         Frame frame{};Check(Decode(bytes,frame),"invalid observation");
         if(frame.kind==Kind::Input && frame.action==Action::ExitVent) {
             selectedObserved=(frame.flags&VentSelected)!=0U && frame.x==10 && frame.y==22 && frame.z==40;
+            Frame ack{};ack.scope=context.scope;ack.epoch=frame.epoch;ack.kind=Kind::Acknowledge;ack.deliveryId=frame.deliveryId;Queue(ack);
         }
     }
     Check(selectedObserved,"selected vent coordinates were lost between input capture and publication");
+    selected.action=Action::EnterVent;Sleep(20);CaptureLocal(selected);Pump(context);
+    bool entrySelected{};
+    while(TryPopObservation(bytes)) {
+        Frame frame{};Check(Decode(bytes,frame),"invalid selected entry observation");
+        if(frame.kind==Kind::Input && frame.action==Action::EnterVent)
+            entrySelected=(frame.flags&VentSelected)!=0U && frame.x==10 && frame.y==22 && frame.z==40;
+    }
+    Check(entrySelected,"entry omitted the portal shown by the interaction prompt");
     Check(VentAuthority().phase==ActionPhase::Preparing,"queued travel was shown as completed");
     Check(vents::WithinReach({0,0,0},{0,3,0}),"overhead vent was not interactable");
     Check(!vents::WithinReach({0,0,0},{0,8,0}),"vent on another floor was interactable");
@@ -165,6 +175,18 @@ int main() {
             frame.acknowledgedInput==command.sequence)appliedStationaryAction=true;
     }
     Check(appliedStationaryAction,"stationary owner pose omitted its applied vent action");
+    Reset(true);
+    // Remote vent approval must leave replica pose application available.
+    // It must not restart native steering while waiting for the owning player.
+    context.host=true;context.localOwner=false;proxyVent=true;hooks.replicatePose=&Replicate;
+    Pump(context);Queue(activate);Pump(context);
+    command.sequence=command.hostSequence=1;command.action=Action::EnterVent;
+    command.forward=1;Queue(command);Pump(context);Sleep(330);Pump(context);
+    const auto priorDrive=driveCalls;
+    correction.sequence=1;correction.flags=PoseValid|OwnerMeasured|Backstage;
+    correction.hostSequence=correction.acknowledgedInput=1;Queue(correction);Pump(context);
+    Check(replicas==1,"pending remote vent blocked measured owner stage replication");
+    Check(driveCalls==priorDrive,"pending remote vent restarted the Host's own navigation");
     Reset(true);
     std::cout<<"Donor control, Host placement, selected vent transport and interaction reach passed.\n";
 }
