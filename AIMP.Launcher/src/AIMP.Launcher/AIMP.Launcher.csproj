@@ -12,10 +12,15 @@
   <ItemGroup>
     <InternalsVisibleTo Include="AIMP.Protocol.Tests" />
     <PackageReference Include="CathodeLib" Version="0.12.2" />
+    <PackageReference Include="Facepunch.Steamworks" Version="2.3.3" GeneratePathProperty="true" />
     <ProjectReference Include="..\AIMP.Protocol\AIMP.Protocol.csproj" />
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="Resources\AlienPvP\alien_behavior.apb" LogicalName="AIMP.Launcher.AlienPvP.alien_behavior.apb" />
+    <!-- Facepunch.Steamworks ships steam_api64.dll as legacy package content,
+         which PackageReference does not copy. -->
+    <None Include="$(PkgFacepunch_Steamworks)\content\steam_api64.dll"
+          Link="steam_api64.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Visible="false" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="Resources\UI\*.GFX">

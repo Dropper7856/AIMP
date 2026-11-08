@@ -338,6 +338,7 @@ internal sealed partial class MultiplayerSessionCoordinator
 
     private void OnRoundBridgeConnectionClosed(object? sender, ScaleformBridgeConnectionClosed value)
     {
+        if (value.Channel == "command") _steamFrontendReady = false;
         if (value.Channel != "command" || !value.PeerClosed) return;
         lock (_stateGate)
         {

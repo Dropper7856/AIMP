@@ -4,6 +4,14 @@ internal static class Program
 {
     private static readonly TestCase[] Tests =
     {
+        new("Steam relay bounded receive stream", SteamRelayTests.ReceiveBoundsAsync),
+        new("Steam relay game process environment isolation", SteamRelayTests.EnvironmentAsync),
+        new("Steam relay address validation and shutdown", SteamRelayTests.AddressesAndDisposalAsync),
+        new("Steam relay invitation automatically joins lobby", SteamRelayTests.AutoJoinAsync),
+        new("Steam relay pending invite, failure and independent IP connection", SteamRelayTests.PendingAndFailureAsync),
+        new("Steam relay concurrent invitation handshakes", SteamRelayTests.ConcurrentInvitesAsync),
+        new("Steam relay callback cancellation and shutdown", SteamRelayTests.CallbackShutdownAsync),
+        new("Steam relay Direct Connection rejects Steam addresses", SteamRelayTests.DirectAddressGuardAsync),
         new("Local API origin and loopback policy", LocalApiSecurityTests.AccessPolicyAsync),
         new("Local API HTTP security boundary", LocalApiSecurityTests.HttpBoundaryAsync),
         new("WorldSync bounded dispatch pipeline", WorldDispatchWindowTests.CapacityAndOrderAsync),

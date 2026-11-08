@@ -70,6 +70,7 @@ internal sealed class GameLaunchCoordinator
         };
         // Both lobby roles use this launch path. Pin the permanent WS3 path in
         // the child's environment instead of relying on shell/global inheritance.
+        SteamAppEnvironment.PrepareGameProcess(info);
         info.Environment[WorldSync3LauncherOptions.EmptyCallbackEnvironmentVariable] = "1";
         return info;
     }

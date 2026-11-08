@@ -431,9 +431,11 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         LauncherSettingsStore settingsStore,
         ScaleformBridgeListener bridge,
         PerformanceIsolationState performanceIsolation,
-        GamePreparationService? gamePreparation = null)
+        GamePreparationService? gamePreparation = null,
+        ISteamRelay? steamRelay = null)
     {
         _gamePreparation = gamePreparation;
+        _steamRelay = steamRelay;
         _controller = controller ?? throw new ArgumentNullException(nameof(controller));
         _settingsStore = settingsStore ?? throw new ArgumentNullException(nameof(settingsStore));
         _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
@@ -457,6 +459,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _controller.ItemSyncPickupProduced += OnNativeItemSyncPickupProduced;
         _controller.ItemSyncSpawnProduced += OnNativeItemSyncSpawnProduced;
         _controller.ThrowableProduced += OnNativeThrowableProduced;
+        InitializeSteamRelay();
     }
 
     internal async Task ApplyPerformanceIsolationModuleAsync(
@@ -743,7 +746,9 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _controller.ItemSyncPickupProduced -= OnNativeItemSyncPickupProduced;
         _controller.ItemSyncSpawnProduced -= OnNativeItemSyncSpawnProduced;
         _controller.ThrowableProduced -= OnNativeThrowableProduced;
+        DisposeSteamInvites();
         StopNetworkAsync("Launcher closed").GetAwaiter().GetResult();
+        _steamRelay?.Dispose();
         Task.WhenAll(_missionReportTask, _missionApplyTask,_alienVentPollTask).GetAwaiter().GetResult();
         _commandGate.Dispose();
         _alienPvPOperationGate.Dispose();
@@ -797,7 +802,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             "START_GAME_ACK" => LogOnlyAsync("Start-game UI acknowledgement received."),
             "CHARACTER_SELECTED" => LogCharacterSelectionAsync(message),
             "REFRESH_SERVERS" or "JOIN_SERVER" => HandleBrowserCommandAsync(message),
-            "LEAVE" => StopNetworkAsync("Lobby left from the game UI"),
+            "LEAVE" => LeaveLobbyFromMenuAsync(),
             _ => LogOnlyAsync($"No multiplayer action is attached to {message.Type}.")
         };
 
@@ -816,7 +821,13 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         var source = message.Get("source", "frontend");
         var phase = message.Get("phase", "unknown");
         if (IsGameplaySource(source, phase)) await MarkGameplayUiLoadedAsync(message).ConfigureAwait(false);
-        else await SendFrontendReadyAsync().ConfigureAwait(false);
+        else
+        {
+            await SendFrontendReadyAsync().ConfigureAwait(false);
+            _steamFrontendReady = _controller.Snapshot.IpcConnected;
+            await TryJoinPendingSteamInviteAsync().ConfigureAwait(false);
+        }
+        if (IsGameplaySource(source, phase)) _steamFrontendReady = false;
     }
 
     private static bool IsGameplaySource(string source, string phase) =>
@@ -846,6 +857,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
 
     private async Task CreateLobbyAsync(ScaleformBridgeMessage message)
     {
+        _pendingSteamInvite = null;
         EnsureMenuConnectionAvailable();
         await StopNetworkAsync("Creating a new lobby").ConfigureAwait(false);
         var settings = _settingsStore.Load();
@@ -855,6 +867,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _diagnostics.Log("Multiplayer", $"Lobby hosted on port {host.BoundPort}. Alien enabled={options.AlienEnabled}.");
         await SendMenuLobbyOpenedAsync("host").ConfigureAwait(false);
         await SendStatusAsync("Lobby created").ConfigureAwait(false);
+        await StartSteamHostingAsync(host).ConfigureAwait(false);
     }
 
     private async Task<LobbyHost> StartHostAsync(LobbyHostOptions options)
@@ -927,12 +940,15 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
 
     private async Task JoinDirectAsync()
     {
+        _pendingSteamInvite = null;
         EnsureMenuConnectionAvailable();
         await StopNetworkAsync("Joining a direct lobby").ConfigureAwait(false);
         var settings = _settingsStore.Load();
+        if (SteamRelay.IsSteamAddress(settings.HostAddress))
+            throw new InvalidOperationException("Direct Connection requires an IP address or host name. Accept a Steam invitation to join through Steam.");
         var options = new LobbyClientOptions(settings.HostAddress, settings.Port,
             settings.PlayerId, settings.PlayerName, LobbyCompatibility.Create(settings));
-        var client = await LobbyClient.ConnectAsync(options).ConfigureAwait(false);
+        var client = await LobbyClient.ConnectAsync(options, _lifetime.Token).ConfigureAwait(false);
         await CompleteMenuJoinAsync(client).ConfigureAwait(false);
         await SendMenuLobbyOpenedAsync("client").ConfigureAwait(false);
         await SendStatusAsync($"Connected to {settings.HostAddress}:{settings.Port}")
@@ -4960,10 +4976,11 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         if (client is not null) DetachClient(client);
     }
 
-    private static async Task DisposeNetworkAsync(LobbyHost? host, LobbyClient? client)
+    private async Task DisposeNetworkAsync(LobbyHost? host, LobbyClient? client)
     {
         if (host is not null) await host.DisposeAsync().ConfigureAwait(false);
         if (client is not null) await client.DisposeAsync().ConfigureAwait(false);
+        if (host is not null || client is not null) await StopSteamRelayAsync().ConfigureAwait(false);
     }
 
     private async Task StopRemoteCharactersBestEffortAsync(IEnumerable<uint> characterBases)
