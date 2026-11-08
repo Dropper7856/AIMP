@@ -1,0 +1,50 @@
+AIMP 456 / protocol 40
+Branch: feature/alien-vs-survivors-main
+
+Design change (approved by the user): donor model for left-click kills
+- 455 test (214124 Host/victim, 234120 Client pilot): the Host pair entered,
+  then the Alien fell back to cycle 1 (Idle). Our action stayed Started for
+  30s (NativeBusy). On the Client, aisync_pair_gate was always 1: the
+  piloted Alien never has initialPlacementReady, so AISync pair replay can
+  never drive it. The v417 design (Host EnterPair + AISync replay) was never
+  validated in game ("validation moteur et deux PC requise"), and these tests
+  show it does not work for a player-piloted Alien.
+- The only kill that completed (453) was the retail brain's own
+  ActionMeleeAttack on the Host, with the victim held as AI target.
+- The donor mod (puppet.cpp, MULTIPLAYER.md) sends only the click; each PC
+  runs the Alien's native melee itself.
+
+Host
+- Victim selection and the explicit query 006F3A30/00710C60 are unchanged
+  (target held only during the query, latched once).
+- Once proven, the victim is held on the selected AI target record
+  ("armed", stage 13). The retail brain starts ActionMeleeAttack itself.
+  Without a held target 004128E0 refuses every melee start, so the Alien
+  never attacks without a click.
+- When the source enters cycle 78, the retail selector is read from the
+  source cycle definition (+4C, definition +4) and Started is published
+  (stage 9, or 15 if retail paired another victim). With no entry within
+  3.5s, the target is released and the action is Rejected(NativeRefused)
+  (stage 14).
+- Completion is the source leaving the protected paired cycle. The action no
+  longer waits for AISync outcome evidence, which worker-thread pairs never
+  produce, so the 30s NativeBusy lock is gone.
+- The target is restored when the action clears.
+
+Pilot (Client)
+- When Started arrives, PresentPair stops the donor locomotion and runs the
+  same registration 00254820 + transition 0025C4E0 locally, with the Host's
+  selector, on this Alien and its local victim replica. This is presentation
+  only; death stays Host-authoritative (stages 20/21/22/23).
+- The pilot is released 1.5s after a presentation that never enters cycle 78,
+  and at most 8s after the click.
+
+Removed
+- Host EnterPair (Host-side PvP pair registration through AISync capture).
+
+Validation
+- Four native tests pass. API 0.8.4.456 delivered locally and to
+  DESKTOP-2JNROA0, SHA-256 equal. Friend patch dist/AIMP-API-patch-v456.zip.
+- Not observed in game. Open points: how fast the retail brain starts the
+  melee (453 took a few seconds), and whether the local presentation pair
+  runs on the pilot's victim replica.

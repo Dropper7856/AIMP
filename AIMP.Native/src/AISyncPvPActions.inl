@@ -42,7 +42,7 @@ struct Active final {
     bool used{},entered{},cancelled{},terminalSent{},hostEnded{},moveArrived{},entrySubmitted{},remoteVent{};
     bool presentationStarted{},ownerFinished{};
     std::uint64_t ventProgressAt{};float ventBestDistance{std::numeric_limits<float>::infinity()};
-    bool attackLatched{};std::uint64_t latchedAt{},lastPairTrace{};
+    bool attackLatched{},retailArmed{},presented{};std::uint64_t latchedAt{},lastPairTrace{},armedAt{},presentedAt{};
 };
 Active active{};
 policy::EdgeGate edges{};
@@ -141,7 +141,7 @@ void LogAttack(Diagnostics& diagnostics) {
     const auto sequence=attackTelemetry.sequence.load();
     if(!revision || revision==lastRevision || (sequence==lastSequence && now-lastAt<250U))return;
     lastRevision=revision;lastSequence=sequence;lastAt=now;
-    diagnostics.Log("info","alien_attack_progress","Host attack preparation; stage 1 noSelection 2 noRecord 3 targetFault 4 queryRefused 5 selectorUnproven 6 rayPending 7 submitted 8 pairRefused 9 entered 10 enteredWithRayPending 11 pairRunning 12 victimNotAcquired4s.",
+    diagnostics.Log("info","alien_attack_progress","Host attack preparation; stage 1 noSelection 2 noRecord 3 targetFault 4 queryRefused 5 selectorUnproven 6 rayPending 7 submitted 8 pairRefused 9 entered 10 enteredWithRayPending 11 pairRunning 12 victimNotAcquired4s 13 retailArmed 14 retailWindowExpired 15 retailOtherVictim 20 clientPresented 21 clientPresentRefused 22 clientNotEntered 23 clientEntered.",
         {{"hostSequence",Diagnostics::Unsigned(sequence),true},
          {"elapsedMs",Diagnostics::Unsigned(attackTelemetry.elapsed.load()),true},
          {"stage",Diagnostics::Unsigned(attackTelemetry.stage.load()),true},
@@ -486,7 +486,7 @@ ap::attack::Memory AttackMemory() noexcept {
             return crash_guard::TryWrite(reinterpret_cast<void*>(at),in,size);
         }};
 }
-constexpr std::uint64_t kClientAttackWaitMs=6000U;
+constexpr std::uint64_t kClientAttackWaitMs=8000U,kRetailAttackWindowMs=3500U;
 bool HoldAttackTarget(const std::uintptr_t victim) noexcept {
     const ap::attack::Manager manager{active.chooser,0U,0U};
     return ap::attack::Hold(AttackMemory(),manager,victim,active.heldTarget)==ap::attack::HoldResult::Held;
@@ -572,19 +572,21 @@ bool VictimStillInReach(const ap::Context& c,const PairIdentity& victim,const ap
     const policy::Candidate candidate{victim.peer,target,true,true,false,true};
     return policy::SelectVictim(source,command.yaw,c.scope.ownerPeer,{&candidate,1U})==victim.peer;
 }
-bool EnterPair(const ap::Context& c,const PairIdentity& victim,const std::uint32_t selector) noexcept {
-    transactions::Scope scope{};
-    if(!Live(c) || !PvPLeaseScopeCurrent() || !c.host || !gPvPLease.owned || gPvPLease.releasing ||
-        !host_producer::HostScope(scope) || !HostExecutionScopeQualified(scope,c.scope.nativeGeneration) ||
-        !PairIdentityLive(victim) || PairReservedCharacter(c.character) || PairSourceBusy(c.character))return false;
+// Pilot-side presentation of the Host's retail kill (donor puppet.cpp model).
+// Same registration/transition the AISync Client pair replay uses; AISync's
+// replay cannot drive the locally piloted Alien (455: placement gate 1).
+// Health and death stay Host-authoritative through participant lifecycle.
+bool PresentPair(const ap::Context& c,const PairIdentity& victim,const std::uint32_t selector) noexcept {
+    if(!Live(c) || !PvPLeaseScopeCurrent() || c.host || !c.localOwner || gPvPLease.releasing ||
+        !PairIdentityLive(victim) || PairReservedCharacter(c.character) || PairReservedCharacter(victim.character))return false;
+#ifndef AIMP_ALIEN_ACTION_TEST
+    if(!StopDonor(c))return false;
+#endif
     interactions::Definition definition{};
     if(!animation::ResolvePairDefinition(c.character,gPvPLease.runtimeId,victim.character,victim.runtimeId,selector,definition))return false;
     std::uintptr_t root{},manager{},cycle{};
     if(!Read(gBase+kInteractionManagerGlobalRva,root) || !root || !Read(root,manager) || !manager ||
         !Read(c.character+0x36CU,cycle) || !cycle)return false;
-    // Go through the hooked retail entries: registration captures the typed
-    // pair, preparation captures the real outcome, then clients remap victim
-    // identities through the existing paired-animation transaction runtime.
     AIMP_ACTION_TRY {
         const auto accepted=Native<CharacterInteraction>(0x00254820U)(
             reinterpret_cast<void*>(manager+0x90U),c.scope.entityA,c.scope.entityB,victim.entityA,victim.entityB,
@@ -758,23 +760,41 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
         if(!c.host) {
             if(!active.entered && state!=78U && active.victim.character)
                 static_cast<void>(player_hiding::PreparePvPSearch(active.victim.character,c.scope.nativeGeneration));
-            if(state==78U)active.entered=true;
+            // Donor model (puppet.cpp): each PC runs the Alien's native melee.
+            // The Host's retail kill is authoritative; this Alien only plays
+            // the same pair locally on its victim replica, once the Host has
+            // really entered it (Started carries the retail selector).
+            if(!active.presented && !active.entered && active.receipt.phase==Phase::Started) {
+                active.presented=true;active.presentedAt=now;
+                const bool presented=PresentPair(c,active.victim,active.receipt.selector);
+                TraceAttack(presented?20U:21U,active.receipt.selector);
+                if(!presented){Clear();return false;}
+            }
+            if(state==78U && !active.entered){active.entered=true;TracePair(23U);}
             if((active.entered && !Protected(state)) || (active.hostEnded && !Protected(state)))Clear();
-            // The pilot's input is held while this receipt is active. If the
-            // replayed pair never reaches this Alien, release it after 6s
-            // instead of freezing the player for the generic 30s.
+            else if(active.presented && !active.entered && now-active.presentedAt>1500U && !Protected(state)) {
+                TraceAttack(22U,active.receipt.selector);Clear();
+            }
+            // The pilot's input is held while this receipt is active; never
+            // freeze it for the generic 30s if nothing native happens.
             else if(now-active.began>kClientAttackWaitMs && !Protected(state))Clear();
             return false;
         }
         if(active.receipt.phase==Phase::Preparing) {
-            if(active.entrySubmitted) {
+            if(active.retailArmed) {
+                // The retail brain (worker thread) runs ActionMeleeAttack on
+                // the held target, the only path that completed a kill (453).
                 if(state==78U) {
-                    TracePair(9U);
+                    std::uintptr_t cycle{},definition{},pairVictim{};std::uint32_t index{};
+                    if(Read(c.character+0x36CU,cycle) && cycle && Read(cycle+0x4CU,definition) && definition &&
+                        Read(definition+4U,index) && index<25U)active.receipt.selector=index;
+                    TracePair(Read(cycle+0x44U,pairVictim) && pairVictim==active.victim.character?9U:15U);
                     active.entered=true;result=active.receipt;result.phase=Phase::Started;result.reason=Reason::None;
                     ++result.resolutionRevision;active.receipt=result;return true;
                 }
-                if(now-active.submittedAt>1500U) {
-                    Terminal(result,Phase::Failed,Reason::NativeRefused);active.cancelled=true;return true;
+                if(now-active.armedAt>kRetailAttackWindowMs) {
+                    ReleaseAttackTarget();TraceAttack(14U,active.receipt.selector);
+                    Terminal(result,Phase::Rejected,Reason::NativeRefused);active.cancelled=true;return true;
                 }
                 return false;
             }
@@ -784,8 +804,8 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
             if(!player_hiding::PreparePvPSearch(active.victim.character,c.scope.nativeGeneration)) {
                 Terminal(result,Phase::Rejected,Reason::NotReady);active.cancelled=true;return true;
             }
-            // Query once, then latch. 453 re-queried every frame; each query
-            // re-armed the cover ray, so it never retired (stage 6 for 1s).
+            // One explicit query proves the native attack is available on THIS
+            // victim; latch it instead of re-arming the cover ray every frame.
             if(!active.attackLatched) {
                 bool ready{};std::uint32_t selector{};
                 if(!AttackAvailability(c,active.victim,active.chooser,ready,selector)) {
@@ -793,32 +813,14 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
                 }
                 if(ready){active.attackLatched=true;active.latchedAt=now;active.receipt.selector=selector;}
             }
-            // Retail ActionMeleeAttack enters without waiting for the ray. Give
-            // it a bounded window to retire, then enter like retail would.
-            const bool retired=active.attackLatched && AttackQueryRetired(active.chooser);
-            if(active.attackLatched && !retired && now-active.latchedAt<400U)TraceAttack(6U,active.receipt.selector);
-            if(active.attackLatched && (retired || now-active.latchedAt>=400U)) {
-                const auto selector=active.receipt.selector;
-                if(!retired)TraceAttack(10U,selector);
-                // 454 entered with the target restored: the pair stayed at
-                // stage 0 and never acquired the victim, whereas 453's native
-                // kill (target held) completed. Hold it for the pair's life;
-                // PairSourceBusy fences the retail brain during the pair.
+            if(active.attackLatched) {
+                // Arm the retail melee: the victim becomes the AI target until
+                // the action clears. Without a held target 004128E0 refuses
+                // every melee start, so the brain never attacks unprompted.
                 if(!HoldAttackTarget(active.victim.character)) {
                     Terminal(result,Phase::Failed,Reason::NativeUnavailable);active.cancelled=true;return true;
                 }
-                active.entrySubmitted=true;active.submittedAt=now;
-                if(!EnterPair(c,active.victim,selector)) {
-                    ReleaseAttackTarget();TraceAttack(8U,selector);
-                    Terminal(result,Phase::Failed,Reason::NativeRefused);active.cancelled=true;return true;
-                }
-                TraceAttack(7U,selector);
-                // A successful registration/void transition call is not proof
-                // of entry. Publish Started only after observing source cycle78.
-                if(Cycle(c.character,state,backstage) && state==78U) {
-                    active.entered=true;result=active.receipt;result.phase=Phase::Started;result.reason=Reason::None;
-                    ++result.resolutionRevision;active.receipt=result;return true;
-                }
+                active.retailArmed=true;active.armedAt=now;TraceAttack(13U,active.receipt.selector);
                 return false;
             }
             if(now-active.began>1500U){Terminal(result,Phase::Rejected,Reason::NativeRefused);active.cancelled=true;return true;}
@@ -828,14 +830,10 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
             active.lastPairTrace=now;
             TracePair(now-active.began>4000U?12U:11U);
         }
-        auto* actor=Find(c.character);
-        if(actor && !actor->faulted && !actor->duplicate) {
-            CaptureOutcome(*actor);CaptureInteractionCycle(*actor);Publish(*actor);
-            // Completion follows the native pair's source-end evidence, not HP
-            // zero or elapsed time. The victim death flow remains independent.
-            if(!Protected(state) && (actor->desired.outcome.flags&OutcomeSourceEnded)!=0U) {
-                Terminal(result,Phase::Completed,Reason::None);Clear();return true;
-            }
+        // Retail-owned pair: AISync does not capture worker registrations, so
+        // completion is the source leaving the protected paired cycle.
+        if(active.entered && !Protected(state)) {
+            Terminal(result,Phase::Completed,Reason::None);Clear();return true;
         }
         if(now-active.began>policy::kActionTimeoutMs && !active.terminalSent) {
             Terminal(result,Phase::Failed,Reason::Timeout);active.cancelled=true;return true;
