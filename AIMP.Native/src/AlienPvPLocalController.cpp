@@ -654,8 +654,11 @@ bool Drives(const std::uintptr_t character,const std::uint32_t generation) noexc
         gLocal.generation==generation && gLocal.camera.bound &&
         gLocal.visualReady && alien_pvp_input::Installed();
 }
+std::atomic<std::uintptr_t> gListenerCharacter{};
+std::uintptr_t ListenerCharacter() noexcept {return gListenerCharacter.load(std::memory_order_acquire);}
 void Reset(const bool sameCameraWorld,const bool certifiedLivingCharacter) noexcept {
     gCameraGeneration.store(0U,std::memory_order_release);
+    gListenerCharacter.store(0U,std::memory_order_release);
     // The controller does not release AISync's exclusive lease: only the lease
     // owner does that after the certified request boundary is idle.
     alien_pvp_input::SetActive(false);
@@ -672,6 +675,9 @@ void Reset(const bool sameCameraWorld,const bool certifiedLivingCharacter) noexc
 }
 void Pump(const Context& context) noexcept {
     gPilotThread.store(GetCurrentThreadId(),std::memory_order_release);
+    // Donor camera.cpp OnSoundListenerEnter: while the pilot drives the Alien's
+    // camera, the room/audio listener follows the Alien (one frame behind).
+    gListenerCharacter.store(Drives(gLocal.character,gLocal.generation)?gLocal.character:0U,std::memory_order_release);
     const bool current=context.exclusiveLease && context.moduleBase!=0U &&
         context.alien!=0U && context.technicalPlayer!=0U &&
         context.nativeGeneration!=0U && context.localPeer!=0U &&

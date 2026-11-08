@@ -533,7 +533,7 @@ void ReleaseAttackTarget() noexcept {
     active.heldTarget={};active.brainTarget={};active.shouldAttackSet=false;
 #ifndef AIMP_ALIEN_ACTION_TEST
     gPvPMeleeWatch.store(0U,std::memory_order_relaxed);
-    gPvPMeleeArmedCharacter.store(0U,std::memory_order_release);
+    DisarmPvPBrain();
 #endif
 }
 // ActionMeleeAttack 00717D90 reads the target through AnimatedCharacter+34A8
@@ -845,6 +845,13 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
                     if(Read(c.character+0x36CU,cycle) && cycle && Read(cycle+0x4CU,definition) && definition &&
                         Read(definition+4U,index) && index<25U)active.receipt.selector=index;
                     TracePair(Read(cycle+0x44U,pairVictim) && pairVictim==active.victim.character?9U:15U);
+#ifndef AIMP_ALIEN_ACTION_TEST
+                    // The pair is native now (PairSourceBusy fences it). Return the
+                    // decision slice to the PvP fence at once: 462 kept it open
+                    // while the action stayed Started, the pilot's donor movement
+                    // resumed, and the Host crashed in 00712D70 again.
+                    DisarmPvPBrain();
+#endif
                     active.entered=true;result=active.receipt;result.phase=Phase::Started;result.reason=Reason::None;
                     ++result.resolutionRevision;active.receipt=result;return true;
                 }
@@ -944,7 +951,7 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
 #ifndef AIMP_ALIEN_ACTION_TEST
                 gPvPMeleeStarts.store(0U,std::memory_order_relaxed);gPvPMeleeRefused.store(0U,std::memory_order_relaxed);
                 gPvPMeleeWatch.store(active.attackAnimated,std::memory_order_relaxed);
-                gPvPMeleeArmedCharacter.store(c.character,std::memory_order_release);
+                ArmPvPBrain(c.character,now+kRetailAttackWindowMs+500U);
 #endif
                 TraceAttack(13U,active.receipt.selector);
                 return false;
@@ -1058,7 +1065,23 @@ const ap::ActionHooks hooks{&Begin,&Poll,&Busy,&Cancel,&Recover,&CancelRecovery
 } // namespace pvp_actions
 const alien_pvp::ActionHooks& PvPActionHooks() noexcept {return pvp_actions::hooks;}
 void RetirePvPActions() noexcept {pvp_actions::RetirePending();}
+// Donor camera.cpp: the audio listener transform comes from FUN_00689230
+// (lea eax,[ecx+50]; ret 4), called at 006BE31F with ecx = player+3F0. While
+// the local pilot drives the Alien, return the Alien's transform instead, so
+// its footsteps, roars and kill audio are heard from the Alien's position.
+std::uintptr_t __fastcall ListenerTransformDetour(std::uintptr_t animation,void*,std::uint32_t) noexcept {
+    const auto alien=alien_pvp_local::ListenerCharacter();
+    return (alien?alien+0x3F0U:animation)+0x50U;
+}
 bool InstallPvPDonorVentHooks(HookManager& hooks,std::string& error) {
+    if(!MatchRetailBytes(0x00289230U,{0x8D,0x41,0x50,0xC2,0x04,0x00})) {
+        error="alien pilot audio listener: FUN_00689230 bytes mismatch";return false;
+    }
+    CallRedirectRequest listener;listener.name="alien_pilot_audio_listener";
+    listener.callSite=reinterpret_cast<void*>(gBase+0x002BE31FU);
+    listener.expectedTarget=reinterpret_cast<void*>(gBase+0x00289230U);
+    listener.detour=reinterpret_cast<void*>(&ListenerTransformDetour);
+    if(!hooks.InstallCallRedirect(listener,error))return false;
     HookRequest locomotion;locomotion.name="alien_donor_responsive_locomotion";
     locomotion.target=reinterpret_cast<void*>(gBase+0x0004D4F0U);
     locomotion.detour=reinterpret_cast<void*>(&pvp_actions::PilotLocomotionDetour);

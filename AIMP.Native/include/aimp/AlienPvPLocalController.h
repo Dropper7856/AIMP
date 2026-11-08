@@ -35,5 +35,8 @@ void Pump(const Context& context) noexcept;
 // targets but must never touch an incarnation which may have been recycled.
 void Reset(bool sameCameraWorld, bool certifiedLivingCharacter = false) noexcept;
 [[nodiscard]] bool Drives(std::uintptr_t character, std::uint32_t nativeGeneration) noexcept;
+// The Alien whose camera the local pilot currently drives (0 otherwise),
+// published by Pump for the audio thread's listener redirect.
+[[nodiscard]] std::uintptr_t ListenerCharacter() noexcept;
 
 } // namespace aimp::alien_pvp_local

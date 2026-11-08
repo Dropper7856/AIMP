@@ -2372,8 +2372,24 @@ std::atomic<std::uintptr_t> gPvPMeleeWatch{};
 // showed the fenced engine-thread updates kept availability at 0 and the BT
 // never started ActionMeleeAttack; only worker-thread updates (458) could.
 std::atomic<std::uintptr_t> gPvPMeleeArmedCharacter{};
+// 462: a round ended while the kill was Started, the exemption was never
+// cleared and the next level's Alien reused the same address: its pilot-driven
+// tree then ran unfenced on the engine thread and crashed in 00712D70. The
+// exemption is therefore bounded by a deadline and cleared on lease loss.
+std::atomic<std::uint64_t> gPvPMeleeArmedUntil{};
+void ArmPvPBrain(const std::uintptr_t character, const std::uint64_t until) noexcept {
+    gPvPMeleeArmedUntil.store(until, std::memory_order_relaxed);
+    gPvPMeleeArmedCharacter.store(character, std::memory_order_release);
+}
+void DisarmPvPBrain() noexcept {
+    gPvPMeleeArmedCharacter.store(0U, std::memory_order_release);
+    gPvPMeleeArmedUntil.store(0U, std::memory_order_relaxed);
+}
 bool PvPBrainArmed(const std::uintptr_t character) noexcept {
-    return character != 0U && character == gPvPMeleeArmedCharacter.load(std::memory_order_acquire);
+    if (character == 0U || character != gPvPMeleeArmedCharacter.load(std::memory_order_acquire)) return false;
+    if (GetTickCount64() <= gPvPMeleeArmedUntil.load(std::memory_order_relaxed)) return true;
+    DisarmPvPBrain();
+    return false;
 }
 std::atomic<std::uint32_t> gPvPArmedBrainFaults{};
 std::atomic<std::uint32_t> gPvPMeleeStarts{},gPvPMeleeRefused{},gPvPMeleeLastType{};
@@ -7551,7 +7567,7 @@ void SampleParticipantPerception(Actor& actor, const std::uintptr_t manager, con
 bool ArmedManagerUpdate(ManagerUpdate original, void* manager, std::uint32_t previousTime, float delta) noexcept {
     __try {original(manager, previousTime, delta); return true;}
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        gPvPMeleeArmedCharacter.store(0U, std::memory_order_release);
+        DisarmPvPBrain();
         gPvPArmedBrainFaults.fetch_add(1U, std::memory_order_relaxed);
         return false;
     }
@@ -10581,6 +10597,7 @@ bool PvPCharacterFenced(const std::uintptr_t character) noexcept {
 }
 void ForgetPvPLease(const std::uintptr_t destroyedCharacter) noexcept {
     if (destroyedCharacter != 0U && gPvPLease.ticket.character != destroyedCharacter) return;
+    DisarmPvPBrain();
     gPvPTechnicalPeer.store(0U,std::memory_order_release);
     // Partial input/camera installation must also be undone, not only Drives().
     alien_pvp_local::Reset(gGenerations!=nullptr &&

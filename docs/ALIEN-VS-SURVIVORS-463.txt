@@ -1,0 +1,38 @@
+AIMP 463 / protocol 40
+Branch: feature/alien-vs-survivors-main
+
+462 test (052505 Host/victim, 072508 Client Alien pilot)
+- First complete left-click kill on both PCs. Host: Preparing then Started in
+  the same second (retail melee entered cycle 78). Pilot: Started received;
+  PresentPair entered cycle 78 after 375ms (stage 23). The round ended (Alien
+  win).
+- The Host crashed about 80s later in the NEXT round (generation 7), with the
+  same signature as 461: EIP=0, 007342A0 -> 0072B880(1) -> 00712E20 ->
+  00712D70. The action had stayed Started when the round ended, so
+  gPvPMeleeArmedCharacter was never cleared. The new level's Alien reused the
+  same address, and its pilot-driven tree ran unfenced on the engine thread.
+- The pilot reported no Alien sounds, even footsteps. The events fire
+  (native_animation_audio_metadata, suppressed=0), but the audio listener
+  stayed on the hidden technical player. The donor moves the listener to the
+  Alien (camera.cpp OnSoundListenerEnter); AIMP had not ported that.
+
+Changes
+- Brain exemption: ArmPvPBrain(character, deadline = window + 0.5s) and
+  DisarmPvPBrain(). PvPBrainArmed expires itself after the deadline. Disarmed
+  on pair entry (stage 9/15, the native pair is fenced by PairSourceBusy), on
+  target release, on an SEH fault, and in ForgetPvPLease.
+- New call redirect alien_pilot_audio_listener at 006BE31F (target
+  FUN_00689230 = lea eax,[ecx+50]; ret 4, verified). While
+  alien_pvp_local::ListenerCharacter() is set (the pilot drives the Alien
+  camera, published by Pump, cleared by Reset), the listener transform comes
+  from Alien+3F0+50. Otherwise retail is unchanged.
+
+Known open point
+- The pilot said the kill animation "did not play out very well" on the
+  Alien's side. Likely cause: remote replication keeps driving the victim
+  replica during the local pair. Not changed yet.
+
+Validation
+- Four native tests pass. API 0.8.4.463 delivered locally and to
+  DESKTOP-2JNROA0, SHA-256 equal. Friend patch dist/AIMP-API-patch-v463.zip.
+- Not observed in game.
