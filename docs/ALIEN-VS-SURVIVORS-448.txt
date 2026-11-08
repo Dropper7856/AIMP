@@ -1,0 +1,43 @@
+﻿AIMP 448 / protocol 40
+Branch: feature/alien-vs-survivors-main
+
+Evidence from 447
+- Client exits1239/3509/7989 complete in native code at cycle1, backstage=false.
+- Host observes backstage=false but leaves the remote exit Started. User cancellation
+  later closes the receipt, unblocks local noclip and reveals the final replica.
+- Successful entries646/2941/7352 reach backstage at cycle75 with a finished Move
+  frame, yet local entry times out at10s because only ordinary/77 were accepted.
+- Client native log copied from diagnostic NativeLogPath to client-native.jsonl.
+
+Completion fixes
+- Stationary backstage75 is a valid completed entry, matching ManualBackstage.
+- Remote exit completion also accepts a retained stationary backstage cycle
+  (57/75/77) once the actual stage has become frontstage. Active passage18 and
+  paired cycles remain excluded. Owner exit still requires ordinary frontstage.
+- A local completed vent updates its matching local pending state immediately.
+  Camera restoration no longer depends on a later Host terminal receipt.
+
+Observer exit animation
+- Owner native cycle18 during an approved ExitVent emits VentAnimating on its
+  measured pose (still backstage and native-busy). Ordinary busy poses stay fenced.
+- Host validates this signal against its current Started exit, exact actor/epoch,
+  applied command order, time window, and selected portal endpoint bounds.
+- Validated poses carry the signal to replicas. Each replica starts the existing
+  retail exit Move node once, at the approved opening, instead of independently
+  navigating across the hidden level. The owner keeps sole control of traversal.
+- Native node updates, portal selection, visibility/animation and resource retirement
+  use existing donor adapters. No manually fabricated clip or stage bit writes.
+- A replica's running passage owns its transform until retirement; later poses
+  cannot overwrite it. Host completion waits for both owner finish evidence and
+  replica retirement/stable stage. Cancel/revoke retires presentation resources.
+- Protocol40 fences old peers that do not understand the new pose flag/JSON field.
+  Local frame size remains200bytes. Both PCs must restart using the new API.
+
+Validation
+- Targeted tests and delivery receipts are in artifacts/alien-448.
+- Tests cover stationary-cycle predicates, local camera unblocking, flag encoding,
+  bounded animation admission, busy-pose fencing, and installed native ABI hooks.
+- Native animation timing/visibility still requires an actual two-PC test. This
+  reuses local native playback after an observed signal; it does not phase-lock
+  renderer frames across machines.
+Results: native Release/API publish succeeded; 4 native and 6 .NET targeted tests passed. Updated API delivered without deletion to both PCs; Launcher, Protocol, NetZ and both GFX SHA256 values match.

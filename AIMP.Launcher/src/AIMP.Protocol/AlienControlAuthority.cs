@@ -10,7 +10,8 @@ public sealed record AlienControlLease(Guid SessionId,int LevelGeneration,ulong 
     ulong Epoch,uint EntityA,uint EntityB,bool Active,IReadOnlyList<AlienControlBinding> Bindings);
 public sealed record AlienControlPose(Guid SessionId,int LevelGeneration,ulong AlienPeerId,
     ulong Epoch,ulong Sequence,ulong HostSequence,ulong AcknowledgedInput,uint EntityA,uint EntityB,
-    float X,float Y,float Z,float Yaw,float VelocityX,float VelocityZ,uint Gait,bool NativeBusy,bool Backstage=false,bool OwnerMeasured=false);
+    float X,float Y,float Z,float Yaw,float VelocityX,float VelocityZ,uint Gait,bool NativeBusy,bool Backstage=false,bool OwnerMeasured=false,
+    bool VentAnimating=false);
 
 public static class AlienControlAuthorityValidation
 {
@@ -36,6 +37,7 @@ public static class AlienControlAuthorityValidation
             throw new ProtocolException("Invalid Alien pose identity.");
         foreach(var v in new[]{p.X,p.Y,p.Z,p.Yaw,p.VelocityX,p.VelocityZ})
             if(!float.IsFinite(v))throw new ProtocolException("Non-finite Alien pose.");
+        if(p.VentAnimating && (!p.NativeBusy || !p.Backstage))throw new ProtocolException("Invalid Alien vent animation stage.");
         if(Math.Abs(p.X)>100000 || Math.Abs(p.Y)>100000 || Math.Abs(p.Z)>100000 ||
             Math.Abs(p.Yaw)>MathF.PI+0.00001F ||
             Math.Sqrt((double)p.VelocityX*p.VelocityX+(double)p.VelocityZ*p.VelocityZ)>30.01)
@@ -162,7 +164,7 @@ public sealed class AlienControlAuthority
         AlienControlAuthorityValidation.Validate(pose);
         if(Current is not {Active:true} c || pose.SessionId!=_session || pose.LevelGeneration!=_generation ||
             pose.AlienPeerId!=_owner || pose.Epoch!=c.Epoch || pose.EntityA!=c.EntityA || pose.EntityB!=c.EntityB ||
-            pose.NativeBusy || pose.HostSequence>_hostSequence || pose.AcknowledgedInput>_lastInput ||
+            (pose.NativeBusy && !pose.VentAnimating) || pose.HostSequence>_hostSequence || pose.AcknowledgedInput>_lastInput ||
             pose.HostSequence<_lastPoseHost || pose.AcknowledgedInput<_lastPoseInput ||
             _lastPhysicalPose is not { } old || old.Epoch!=c.Epoch || now<_physicalAt)return null;
         if(_observationEpoch!=c.Epoch){_observationEpoch=c.Epoch;_observationSequence=0;}
@@ -176,7 +178,14 @@ public sealed class AlienControlAuthority
             now>=_ventAt && now<=_ventDeadline && pose.Backstage==(vent.Action==AlienAction.EnterVent) &&
             Math.Sqrt(Math.Pow(pose.X-vent.ResolvedX,2)+Math.Pow(pose.Z-vent.ResolvedZ,2))<=6.0 &&
             Math.Abs(pose.Y-vent.ResolvedY)<=5.0;
-        if(!ordinary && !transition)return null;
+        if(pose.VentAnimating) {
+            // Only the observed exit passage at the Host-selected portal can
+            // bypass the busy-pose fence. No arbitrary animation/placement.
+            if(vent is not {Action:AlienAction.ExitVent,Phase:AlienActionPhase.Started} ||
+                vent.Epoch!=c.Epoch || vent.HostSequence>pose.HostSequence || now<_ventAt || now>_ventDeadline ||
+                Math.Sqrt(Math.Pow(pose.X-vent.ResolvedX,2)+Math.Pow(pose.Z-vent.ResolvedZ,2))>6.0 ||
+                Math.Abs(pose.Y-vent.ResolvedY)>5.0)return null;
+        } else if(!ordinary && !transition)return null;
         if(_lastPose==ulong.MaxValue)throw new ProtocolException("Alien pose sequence exhausted.");
         _observationSequence=pose.Sequence;
         var accepted=pose with {Sequence=_lastPose+1,OwnerMeasured=true};

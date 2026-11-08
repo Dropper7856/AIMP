@@ -3,6 +3,7 @@
 #include "aimp/AlienPvPVents.h"
 #include <Windows.h>
 #include "aimp/AlienPvPFreeCamera.h"
+#include "aimp/AlienPvPSpatialPolicy.h"
 #include <array>
 #include <cstring>
 #include <iostream>
@@ -21,7 +22,7 @@ bool Drive(const aimp::alien_pvp::Context&,const aimp::alien_pvp::Frame* frame) 
     ++driveCalls;lastIntent=*frame;return true;
 }
 bool Begin(const aimp::alien_pvp::Context&,const aimp::alien_pvp::Frame& frame,aimp::alien_pvp::Frame& out) noexcept {
-    if(frame.phase==aimp::alien_pvp::ActionPhase::Completed){++completions;out=frame;return true;}
+    if(frame.phase==aimp::alien_pvp::ActionPhase::Completed){++completions;nativeBusy=false;out=frame;return true;}
     ++starts;
     ++beginCalls;out=frame;out.phase=aimp::alien_pvp::ActionPhase::Started;
     out.reason=aimp::alien_pvp::ActionReason::None;out.resolutionRevision=1U;
@@ -52,6 +53,10 @@ bool ApplyReplicatedYaw(std::uintptr_t,float,std::string&) noexcept {++genericCa
 }
 int main() {
     using namespace aimp::alien_pvp;
+    Check(spatial::VentStageReady(75,true,true),"stationary backstage75 never completes entry");
+    Check(spatial::VentStageReady(77,false,false,true),"replica retained cycle77 blocks completed exit");
+    Check(!spatial::VentStageReady(18,false,false,true),"active passage completes replica exit");
+    Check(!spatial::VentStageReady(77,false,false),"owner exit completes from a stale backstage cycle");
     using aimp::alien_pvp_local::FlightDirection;
     const auto level=FlightDirection({0.0F,-0.99F,0.1F},0.0F,1.0F,0.0F,0.0F);
     Check(level[1]==0.0F && std::abs(level[2]-1.0F)<0.001F,"pitched camera makes W descend");
@@ -175,6 +180,7 @@ int main() {
             frame.acknowledgedInput==command.sequence)appliedStationaryAction=true;
     }
     Check(appliedStationaryAction,"stationary owner pose omitted its applied vent action");
+    Check(!VentPending(),"local completed exit kept camera noclip pending Host acknowledgement");
     Reset(true);
     // Remote vent approval must leave replica pose application available.
     // It must not restart native steering while waiting for the owning player.
@@ -187,6 +193,10 @@ int main() {
     correction.hostSequence=correction.acknowledgedInput=1;Queue(correction);Pump(context);
     Check(replicas==1,"pending remote vent blocked measured owner stage replication");
     Check(driveCalls==priorDrive,"pending remote vent restarted the Host's own navigation");
+    correction.sequence=2;correction.flags|=NativeBusy|VentAnimating;Queue(correction);Pump(context);
+    Check(replicas==2,"authenticated exit animation was blocked by the busy-pose fence");
+    correction.sequence=3;correction.flags&=~VentAnimating;Queue(correction);Pump(context);
+    Check(replicas==2,"ordinary busy pose bypassed the animation-only fence");
     Reset(true);
     std::cout<<"Donor control, Host placement, selected vent transport and interaction reach passed.\n";
 }

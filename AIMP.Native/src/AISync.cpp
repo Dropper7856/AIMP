@@ -1,6 +1,7 @@
 #include <intrin.h>
 #include "aimp/AISync.h"
 #include "aimp/AlienPvPLocalController.h"
+#include "aimp/AlienPvPSpatialPolicy.h"
 #include "aimp/AlienPvPControlRuntime.h"
 #include "aimp/AlienPvPControlPolicy.h"
 #include "aimp/AlienPvPVents.h"

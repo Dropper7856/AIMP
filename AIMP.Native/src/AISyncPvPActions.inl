@@ -39,6 +39,7 @@ struct Active final {
     std::uintptr_t chooser{};
     VentSlot* vent{};
     bool used{},entered{},cancelled{},terminalSent{},hostEnded{},moveArrived{},entrySubmitted{},remoteVent{};
+    bool presentationStarted{},ownerFinished{};
     std::uint64_t ventProgressAt{};float ventBestDistance{std::numeric_limits<float>::infinity()};
 };
 Active active{};
@@ -544,7 +545,7 @@ void Cancel(const ap::Context& c,bool living) noexcept {
     }
     active.cancelled=true;
     TraceVent();
-    if(active.remoteVent){Clear();return;}
+    if(active.remoteVent && !active.vent){Clear();return;}
     if(active.victim.character)player_hiding::FinishPvPSearch(active.victim.character);
     if(active.vent) {
         bool done{};
@@ -628,7 +629,7 @@ bool Begin(const ap::Context& c,const ap::Frame& command,ap::Frame& result) noex
     }
     result.reason=Reason::NoVent;
     if(!SelectPortal(c,command,result)){Reject(result,result.reason);return true;}
-    if(c.host && !c.localOwner) {
+    if(!c.localOwner) {
         // The owning player runs the donor traversal. Running another path
         // on the Host can circle/stall and cancel a successful owner entry.
         result.phase=Phase::Started;result.reason=Reason::None;
@@ -649,12 +650,28 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
     const auto now=GetTickCount64();std::uint8_t state{};bool backstage{};
     if(!Cycle(c.character,state,backstage))return false;
     if(active.remoteVent) {
+        if(active.vent) {
+            int presentation{};
+            if(!StepVent(c,*active.vent,active.receipt,presentation)) {
+                active.vent->quarantined=true;Terminal(result,Phase::Failed,Reason::Fault);Clear();return true;
+            }
+            if(presentation!=0 || active.cancelled) {
+                bool done{};
+                if(!FinishVent(c,*active.vent,presentation==2 || active.cancelled,done)) {
+                    active.vent->quarantined=true;Terminal(result,Phase::Failed,Reason::Fault);Clear();return true;
+                }
+                if(done)active.vent=nullptr;
+            }
+            if(!Cycle(c.character,state,backstage))return false;
+        }
+        if(active.cancelled){if(!active.vent)Clear();return false;}
         TraceVent();
-        const bool expected=active.receipt.action==Action::EnterVent?
-            backstage && (Ordinary(state) || state==77U):!backstage && Ordinary(state);
-        if(expected){Terminal(result,Phase::Completed,Reason::None);Clear();return true;}
+        const bool expected=ap::spatial::VentStageReady(state,backstage,active.receipt.action==Action::EnterVent,true);
+        if(expected && !active.vent && (active.receipt.action==Action::EnterVent || active.ownerFinished)) {
+            Terminal(result,Phase::Completed,Reason::None);Clear();return true;
+        }
         if(now-active.began>(active.receipt.action==Action::EnterVent?12000U:27000U)) {
-            Terminal(result,Phase::Failed,Reason::Timeout);Clear();return true;
+            Terminal(result,Phase::Failed,Reason::Timeout);Cancel(c,true);return true;
         }
         return false;
     }
@@ -748,8 +765,7 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
         if(!Cycle(c.character,state,backstage))return false;
     }
     if(state==18U || state==75U || state==77U)active.entered=true;
-    const bool expected=active.receipt.action==Action::EnterVent?
-        backstage && (Ordinary(state) || state==77U):!backstage && Ordinary(state);
+    const bool expected=ap::spatial::VentStageReady(state,backstage,active.receipt.action==Action::EnterVent);
     if(nativeResult==1 && expected) {
         Terminal(result,Phase::Completed,Reason::None);
         Clear();return true;
@@ -773,6 +789,28 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
     }
     return false;
 }
+#ifndef AIMP_ALIEN_ACTION_TEST
+bool ReplicatePose(const ap::Context& c,const ap::Frame& pose) noexcept {
+    if((pose.flags&ap::OwnerMeasured)==0U)return false;
+    if(Same(c) && active.remoteVent && active.receipt.action==Action::ExitVent) {
+        if((pose.flags&(ap::Backstage|ap::NativeBusy))==0U)active.ownerFinished=true;
+        if((pose.flags&ap::VentAnimating)!=0U) {
+            if(active.presentationStarted || active.cancelled)return false;
+            // Trigger the real exit node once the owner is in its exit passage.
+            // Start at the approved opening, avoiding a second hidden path.
+            if(!Live(c) || !StopDonor(c) || !CancelRecovery(c,true))return false;
+            auto* slot=FreeVentSlot();if(!slot)return false;
+            const float opening[]{active.receipt.x,active.receipt.y,active.receipt.z};
+            if(!character_direct_step_runtime::ApplyAIRecoveryTransform(c.character,opening,pose.yaw))return false;
+            if(!StartVent(c,active.receipt,*slot))return false;
+            active.vent=slot;active.presentationStarted=true;return true;
+        }
+        if(active.vent)return false; // the native passage owns placement
+    }
+    if((pose.flags&ap::VentAnimating)!=0U)return false;
+    return ReplicatePvPPose(c,pose);
+}
+#endif
 void RetirePending() noexcept {
 #ifndef AIMP_ALIEN_ACTION_TEST
     if(gPvPLease.releasing)for(auto& d:donorMovements)if(d.used && Live(d.context))
@@ -785,7 +823,7 @@ void RetirePending() noexcept {
 }
 const ap::ActionHooks hooks{&Begin,&Poll,&Busy,&Cancel,&Recover,&CancelRecovery
 #ifndef AIMP_ALIEN_ACTION_TEST
-    ,&DriveDonor,&ReplicatePvPPose,&InterruptVent
+    ,&DriveDonor,&ReplicatePose,&InterruptVent
 #else
     ,nullptr,nullptr,&InterruptVent
 #endif

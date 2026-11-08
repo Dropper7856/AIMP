@@ -31,10 +31,14 @@ internal static class AlienVentTests
         var exiting=started with {InputSequence=2,HostSequence=exit.HostSequence,Action=AlienAction.ExitVent,
             X=100,Y=0,Z=0,ResolvedX=100,ResolvedY=0,ResolvedZ=0};
         AssertEx.True(authority.AdmitResolution(exiting,6500));
-        var outside=entered with {Sequence=3,HostSequence=exit.HostSequence,AcknowledgedInput=2,X=100,Y=0,Backstage=false};
+        var animating=entered with {Sequence=3,HostSequence=exit.HostSequence,AcknowledgedInput=2,X=100,Y=0,
+            NativeBusy=true,VentAnimating=true};
+        AssertEx.True(authority.AdmitOwnerPose(animating with {X=120},6550) is null);
+        AssertEx.True(authority.AdmitOwnerPose(animating,6600) is {VentAnimating:true,OwnerMeasured:true});
+        var outside=entered with {Sequence=4,HostSequence=exit.HostSequence,AcknowledgedInput=2,X=140,Y=0,Backstage=false};
         AssertEx.True(authority.AdmitOwnerPose(outside,33501) is null); // expired start proof
         AssertEx.True(authority.AdmitResolution(exiting with {Revision=2,Phase=AlienActionPhase.Completed},33502));
-        AssertEx.True(authority.AdmitOwnerPose(outside,33503) is {Backstage:false,OwnerMeasured:true});
+        AssertEx.True(authority.AdmitOwnerPose(outside with {X=100},33503) is {Backstage:false,OwnerMeasured:true});
         return Task.CompletedTask;
     }
     internal static Task TransportAsync()
@@ -57,6 +61,10 @@ internal static class AlienVentTests
         AssertEx.Equal(entryIntent,JsonPayload.Deserialize<AlienControlIntent>(JsonPayload.Serialize(entryIntent)));
         AssertEx.Throws<ProtocolException>(()=>AlienPvPNativeCodec.Validate(frame with {Action=AlienAction.Attack}));
         AssertEx.Throws<ProtocolException>(()=>AlienPvPNativeCodec.Validate(frame with {Kind=AlienPvPNativeKind.Status}));
+        var animation=frame with {Kind=AlienPvPNativeKind.Pose,Action=AlienAction.None,
+            Flags=AlienPvPNativeFlags.PoseValid|AlienPvPNativeFlags.Backstage|AlienPvPNativeFlags.NativeBusy|AlienPvPNativeFlags.VentAnimating};
+        AssertEx.Equal(animation,AlienPvPNativeCodec.Decode(AlienPvPNativeCodec.Encode(animation)));
+        AssertEx.Throws<ProtocolException>(()=>AlienPvPNativeCodec.Validate(animation with {Flags=animation.Flags & ~AlienPvPNativeFlags.NativeBusy}));
         var command=new GameCommandExecutePayload(1,Guid.NewGuid(),2,Guid.NewGuid(),GameCommandNames.AlienPvPVents,
             new Dictionary<string,string>{{"page","63"}});
         ModelValidation.Validate(command);

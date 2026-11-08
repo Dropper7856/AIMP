@@ -109,6 +109,9 @@ void ReleaseCarrier() noexcept {
 }
 void PublishAction(Frame result,std::uint64_t now) noexcept {
     if(g.context.host && (result.action==Action::EnterVent || result.action==Action::ExitVent))g.ventAuthority=result;
+    if(g.context.localOwner && result.phase==ActionPhase::Completed &&
+        (result.action==Action::EnterVent || result.action==Action::ExitVent) &&
+        result.hostSequence==g.ventAuthority.hostSequence)g.ventAuthority=result;
     result.scope=g.context.scope;result.flags=Flags(now);
     result.kind=g.context.host && result.action!=Action::Roar?Kind::Resolution:Kind::ActionResult;
     if(result.phase==ActionPhase::Started || result.phase==ActionPhase::Completed) {
@@ -329,7 +332,8 @@ void ApplyMovement(std::uint64_t now,float dt) noexcept {
     const bool remoteVent=!g.context.localOwner && VentAction(g.ventAuthority) &&
         g.ventAuthority.phase==ActionPhase::Started;
     if(active && !g.context.localOwner && g.correctionAt && Fresh(now,g.correctionAt,250U) &&
-        (g.correction.flags&(PoseValid|OwnerMeasured|NativeBusy))==(PoseValid|OwnerMeasured) &&
+        (g.correction.flags&(PoseValid|OwnerMeasured))==(PoseValid|OwnerMeasured) &&
+        ((g.correction.flags&NativeBusy)==0U || (g.correction.flags&VentAnimating)!=0U) &&
         g.context.actions && g.context.actions->replicatePose) {
         Frame body{};if(!ReadPose(body))return;
         auto target=g.correction;
@@ -592,6 +596,9 @@ void Pump(const Context& context) noexcept {
         const bool known=NativeStage(context.character,state,backstage);
         if(known && backstage)pose.flags|=Backstage;
         if(ActionBusy() || !known || (!OrdinaryCycle(context.character) && !spatial::ManualBackstage(state,backstage,false)))pose.flags|=NativeBusy;
+        if(context.localOwner && known && backstage && state==18U && ActionBusy() &&
+            g.ventAuthority.action==Action::ExitVent && g.ventAuthority.phase==ActionPhase::Started)
+            pose.flags|=VentAnimating|NativeBusy;
         if(ReadPose(pose)) {
             pose.flags|=PoseValid;
             if(g.hadPose && g.lastPose && now>g.lastPose && now-g.lastPose<=200U) {

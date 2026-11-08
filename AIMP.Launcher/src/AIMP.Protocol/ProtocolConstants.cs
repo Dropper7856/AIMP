@@ -2,7 +2,7 @@ namespace AIMP.Protocol;
 
 public static class ProtocolConstants
 {
-    public const ushort Version = 39;
+    public const ushort Version = 40;
     public const int HeaderSize = 22;
     public const int MaximumPayloadSize = 1024 * 1024;
     public const int MaximumDiscoveryPayloadSize = 4096;

@@ -18,9 +18,10 @@ enum class Kind : std::uint16_t {
 enum Flag : std::uint32_t {
     Bound=1U, LocalOwner=2U, PilotReady=4U, Focused=8U, Host=16U,
     Moving=32U, NativeBusy=64U, Active=128U, Expired=256U,
-    UnsupportedAction=512U, PoseValid=1024U, ActionApplied=2048U, Backstage=4096U, VentSelected=8192U, OwnerMeasured=16384U
+    UnsupportedAction=512U, PoseValid=1024U, ActionApplied=2048U, Backstage=4096U, VentSelected=8192U, OwnerMeasured=16384U,
+    VentAnimating=32768U
 };
-inline constexpr std::uint32_t kKnownFlags=32767U;
+inline constexpr std::uint32_t kKnownFlags=65535U;
 enum class Action : std::uint32_t { None, Attack, EnterVent, ExitVent, Roar, CancelVent };
 enum class ActionPhase : std::uint32_t { None, Started, Completed, Rejected, Failed, Cancelled, Preparing };
 enum class ActionReason : std::uint32_t { None, NativeBusy, Cooldown, NoTarget, NotReady,
@@ -64,6 +65,8 @@ inline bool Valid(const Frame& f) noexcept {
         std::abs(f.resolvedX)>100000.0F || std::abs(f.resolvedY)>100000.0F || std::abs(f.resolvedZ)>100000.0F ||
         static_cast<unsigned>(f.phase)>6U || static_cast<unsigned>(f.reason)>13U) return false;
     if (f.kind!=Kind::Status && !f.epoch) return false;
+    if((f.flags&VentAnimating) && ((f.kind!=Kind::Pose && f.kind!=Kind::Correction) ||
+        (f.flags&(PoseValid|Backstage|NativeBusy))!=(PoseValid|Backstage|NativeBusy)))return false;
     if (f.kind==Kind::Acknowledge && (!f.deliveryId || f.sequence || f.hostSequence || f.flags)) return false;
     if ((f.kind==Kind::Input || f.kind==Kind::Commit || f.kind==Kind::Pose ||
         f.kind==Kind::Correction || f.kind==Kind::ActionResult || f.kind==Kind::Resolution) && !f.sequence) return false;

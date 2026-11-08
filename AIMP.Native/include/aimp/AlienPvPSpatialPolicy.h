@@ -13,6 +13,14 @@ inline bool Backstage(unsigned char a,unsigned char b) noexcept {return a!=0U ||
 inline bool ManualBackstage(unsigned char cycle,bool backstage,bool actionBusy) noexcept {
     return backstage && !actionBusy && (cycle==1U || cycle==55U || cycle==56U || cycle==59U || cycle==75U || cycle==77U);
 }
+inline bool VentStageReady(unsigned char cycle,bool backstage,bool entering,bool replica=false) noexcept {
+    if(backstage!=entering)return false;
+    if(entering)return ManualBackstage(cycle,true,false);
+    // A replica's native visibility setter can retain its stationary backstage
+    // cycle after frontstage has been restored. It is not an active passage.
+    return cycle==1U || cycle==55U || cycle==56U || cycle==59U ||
+        (replica && (cycle==57U || cycle==75U || cycle==77U));
+}
 // Donor vent.cpp::BackstageMoveTick. Physical backstage translation is NOT
 // normal locomotion and is never used to synthesize a vent entry/exit.
 inline bool BackstageStep(float forward,float side,float yaw,unsigned gait,float dt,

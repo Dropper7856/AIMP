@@ -315,7 +315,8 @@ internal sealed class AlienPvPNetworkBridge : IDisposable
             var pose=new AlienControlPose(b.Session,b.RoundGeneration,b.OwnerPeer,f.Epoch,
                 f.Sequence,f.HostSequence,f.AcknowledgedInput,f.Scope.EntityA,f.Scope.EntityB,
                 f.X,f.Y,f.Z,f.Yaw,f.VelocityX,f.VelocityZ,f.Gait,
-                f.Flags.HasFlag(AlienPvPNativeFlags.NativeBusy),f.Flags.HasFlag(AlienPvPNativeFlags.Backstage));
+                f.Flags.HasFlag(AlienPvPNativeFlags.NativeBusy),f.Flags.HasFlag(AlienPvPNativeFlags.Backstage),
+                VentAnimating:f.Flags.HasFlag(AlienPvPNativeFlags.VentAnimating));
             if(b.Host is not null && f.Flags.HasFlag(AlienPvPNativeFlags.Host))
                 await b.Host.PublishHostAlienPoseAsync(pose,token).ConfigureAwait(false);
             else if(b.Client is not null && b.OwnerPeer==b.LocalPeer && f.Flags.HasFlag(AlienPvPNativeFlags.LocalOwner))
@@ -384,6 +385,7 @@ internal sealed class AlienPvPNetworkBridge : IDisposable
             Epoch=pose.Epoch,Sequence=pose.Sequence,HostSequence=pose.HostSequence,AcknowledgedInput=pose.AcknowledgedInput,
             Flags=AlienPvPNativeFlags.PoseValid|(pose.NativeBusy?AlienPvPNativeFlags.NativeBusy:AlienPvPNativeFlags.None)|
                 (pose.Backstage?AlienPvPNativeFlags.Backstage:AlienPvPNativeFlags.None)|
+                (pose.VentAnimating?AlienPvPNativeFlags.VentAnimating:AlienPvPNativeFlags.None)|
                 (pose.OwnerMeasured?AlienPvPNativeFlags.OwnerMeasured:AlienPvPNativeFlags.None),
             X=pose.X,Y=pose.Y,Z=pose.Z,Yaw=pose.Yaw,VelocityX=pose.VelocityX,VelocityZ=pose.VelocityZ,Gait=pose.Gait},token).ConfigureAwait(false);
         ++_poses;
