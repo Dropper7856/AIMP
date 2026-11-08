@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.25)
 
+# AIMP uses no vcpkg dependencies. Apply this to every generated project,
+# including tests, so machine-wide vcpkg integration does not invoke pwsh.
+list(APPEND CMAKE_VS_GLOBALS "VcpkgEnabled=false" "VcpkgApplocalDeps=false")
+
 project(AIMP.Native VERSION 0.11.0 LANGUAGES CXX)
 
 if(NOT MSVC)
