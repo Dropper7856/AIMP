@@ -1,7 +1,13 @@
 # Steam relay hosting (unofficial)
 
 This branch lets players host and join **through Steam's relay network**, so the
-host does not need port forwarding, a VPN or a tool like Porthole.
+host does not need port forwarding, a VPN or a tool like Porthole. It also adds an
+in-game **Friends** page (join friends, accept invites), an **Invite Friends** page
+inside every lobby, and fills the in-game **Server Browser** with Steam lobbies.
+
+**Steam is an extra way to connect, not a replacement.** A hosted lobby still listens
+on its normal TCP port, so port forwarding, direct IP and **Direct Connection** work
+exactly as before.
 
 It uses Steamworks with app ID **480 (Spacewar)**, Valve's public test app. Every
 Steam account can use it for free. The launcher activates Spacewar only after
@@ -16,15 +22,69 @@ The lobby protocol is unchanged. Only the transport underneath it changes:
 
 - **Host:** when you create a lobby, the launcher still listens on its normal TCP
   port, **and** accepts Steam relay connections, bridging each one to that port on
-  `127.0.0.1`. It also sets Steam rich presence so friends see **Join Game**.
+  `127.0.0.1`. It also sets Steam rich presence so friends see **Join Game**, and
+  creates a Steam lobby (the "advert") with the visibility you picked, which is what
+  the server browser lists and what in-game invites point to.
 - **Client:** accepting a Steam invite or selecting **Join Game** opens a Steam
   connection and a one-shot loopback TCP listener. The normal lobby client
-  completes its compatibility checks and opens the lobby automatically.
+  completes its compatibility checks and opens the lobby automatically. Joining
+  from the server browser, a friend or an in-game invite does the same after
+  joining the Steam lobby, and always connects to the Steam-verified lobby owner.
 - **Direct Connection** continues to use only the saved IP/hostname and port.
-  Steam invitations never overwrite these settings.
+  Steam invitations never overwrite these settings, and `steam:` addresses are
+  refused there.
 
-Code: `AIMP.Launcher/src/AIMP.Launcher/SteamRelay.cs` (transport) and
-`MultiplayerSessionCoordinator.SteamRelay.cs` (host/join wiring).
+Code: `AIMP.Launcher/src/AIMP.Launcher/SteamRelay.cs` (transport),
+`SteamRelay.Lobbies.cs` (Steam lobbies, friends, invites, rich presence),
+`MultiplayerSessionCoordinator.SteamRelay.cs` (host/join wiring) and
+`MultiplayerSessionCoordinator.SteamLobbies.cs` (browser, friends and invite commands).
+Menu: `Resources/UI/Source/NEWFRONTENDMENU/frontend/*.as`, compiled into
+`Resources/UI/NEWFRONTENDMENU.GFX` (see "Rebuilding the menu").
+
+## In-game menu
+
+**Multiplayer → Create Server → Visibility** (default **Private**):
+
+| Visibility | Who sees it in the Server Browser | How others join |
+| --- | --- | --- |
+| Private | Nobody | Nobody: it is a solo lobby (see below) |
+| Friends Only | Your Steam friends | Steam friends only: browser, Friends page, invite, Join Game |
+| Public | Everyone running this build | Anyone: browser, Friends page, invite, Join Game |
+
+**Private = solo.** The lobby has a single slot (you), so **Start Game** works right
+away without waiting for anyone. It is not advertised on Steam, does not accept Steam
+relay connections, and a direct-IP join is refused with "The lobby is full". Match
+Type is hidden and the lobby is always Co-op (Alien vs Survivors needs 2+ players).
+WorldSync is skipped for solo rounds. To play with others, create a Friends Only or
+Public lobby.
+
+SteamIDs are public, so for Friends Only the host's relay only accepts connections from
+the host's Steam friends (others are rejected and logged as
+`Rejected Steam relay peer ...`). At most 16 relay connections are accepted at once.
+Direct IP / port forwarding is not limited by this setting: anyone who can reach your
+forwarded port can still connect, exactly as before.
+
+**Multiplayer → Join Server** (Server Browser): lists up to 8 Steam lobbies (public
+ones plus your friends' Friends Only lobbies). The last column says `Public`,
+`Friend`, `In game` or `Other version`; the last two can't be joined. **Filter**
+switches between All / Campaign / Survival and refreshes the list.
+
+**Multiplayer → Friends**: your online Steam friends, those hosting a lobby you can
+join first. At the top, **Accept Invite: <name>** rows show in-game invites you received
+(they expire after 30 minutes). Pick a friend and **Join Their Lobby** (only enabled
+when that friend hosts a Friends Only / Public lobby). Inviting is not done here.
+
+**Invite Friends** (inside the lobby page, for the host and for joined players): lists
+your online Steam friends; pick one to send an invite to the lobby you are in. It is
+hidden in a Private (solo) lobby. With a Steam lobby the friend gets an in-game
+**Accept Invite** row plus a Steam chat invite; a player who joined through a Steam
+**Join Game** / invite (no Steam lobby) sends a Steam game invite with the host's
+address instead, which joins automatically when accepted. For a Friends Only lobby the
+invited friend must also be the host's Steam friend.
+
+When an invite arrives you get a notification; accept it under Friends. An invite
+accepted in the Steam client (chat / overlay) joins automatically when the main menu
+is open and you are not in a lobby; otherwise it waits under Friends.
 
 ## Requirements
 
@@ -53,15 +113,18 @@ Account details shows "Steam ID".
 **Host (player A)**
 
 1. Start Steam, then the AI-MP launcher, then the game from the launcher.
-2. Multiplayer → create a lobby. The status line shows
-   `Lobby created - friends can join with steam:<A's id>`.
-3. In the Steam friends list right-click B →
-   **Invite to Game**.
+2. Multiplayer → Create Server → set **Visibility** to **Friends Only** or **Public**
+   (Private is solo), then **Create Lobby**. The status line shows
+   `Lobby created (listed for friends) - Invite Friends or share steam:<A's id>`.
+3. In the lobby page → **Invite Friends** → pick B. (Or in the Steam friends list
+   right-click B → **Invite to Game**.)
 
 **Joiner (player B)**
 
 1. Start Steam, the AI-MP launcher and the game.
-2. Accept A's invite or click A → **Join Game** in the friends list.
+2. Any of: Multiplayer → Friends → **Accept Invite: A**; Multiplayer → Friends → A →
+   **Join Their Lobby**; Multiplayer → Join Server → pick A's lobby; accept A's
+   invite in Steam or click A → **Join Game** in the Steam friends list.
 3. The launcher joins A's lobby automatically and opens the lobby screen.
    No Direct Connection action is needed. If the game frontend is not ready,
    the invitation waits until the main menu becomes ready. Start the game from
@@ -74,19 +137,46 @@ Account details shows "Steam ID".
 - Both see each other in the lobby; ready up and start a round; move, pick items up,
   use voice chat.
 - Launcher logs (`%LOCALAPPDATA%\AIMP\logs`) should show `[Steam]` lines:
-  host: `Steam relay peer <B> connected; bridging to lobby port 28015.`;
-  joiner: `Steam relay connected to steam:<A>.`
-- Leaving the lobby logs `Relay tunnel ... closed` on both sides.
+  host: `Steam lobby <id> created (Friends)`, `Invited B ...`,
+  `Steam relay peer <B> connected; bridging to lobby port 28015.`;
+  joiner: `Lobby invite from A`, `Joined Steam lobby <id>; host is steam:<A>.`,
+  `Steam relay connected to steam:<A>.`
+- `Server browser: N AIMP lobbies found` and `Friends page: N online friend(s)` are
+  logged each time those pages refresh.
+- Leaving the lobby logs `Left Steam lobby` and `Relay tunnel ... closed` on both sides.
+- Solo check: create a **Private** lobby and press **Start Game** right away; the
+  round should load without waiting, and dying should return you to the lobby.
 
 ## Troubleshooting
 
 | Symptom | Cause / fix |
 | --- | --- |
 | `Steam relay unavailable` in log | Steam not running or not signed in when the game menu became ready. Start Steam; the launcher retries every 10 s after menu activation. |
+| Friends page says "No friends online" | Steam is not running/signed in, or none of your friends are online. |
+| Friend's lobby isn't in the browser | It is Private (solo, nobody can join), the friend runs a different build, or the game already started. |
+| No **Invite Friends** in the lobby | The lobby is Private (solo). Create a Friends Only or Public lobby. |
+| `The lobby is full` when joining | The host created a Private (solo) lobby. Ask them to create a Friends Only or Public lobby. |
+| `That lobby runs a different AIMP version` | Both players need the same build. |
+| Host log: `Rejected Steam relay peer ...: not a Steam friend` | The lobby is Friends Only and that player isn't the host's Steam friend. Add them as a friend or make the lobby Public. |
+| Log: `Rejected a command connection that is not from the game` | Something other than the game (for example a web page) tried to send commands to the launcher's UI bridge. It was ignored. |
 | `Could not reach steam:... through Steam relay` | Host has no lobby open, host is not running this build, or wrong ID. |
 | `That Steam ID is your own account` | Both PCs use the same Steam account; use two accounts. |
 | Join Game in friends list launches Spacewar | The joiner's launcher was not open. Open the launcher first, then click Join Game. |
 | Works by IP but not by Steam | Check both installs have `steam_api64.dll` and `Facepunch.Steamworks.Win64.dll` in `resources\api`. |
+
+## Rebuilding the menu
+
+The `.as` files are the menu scripts; the game loads the compiled `NEWFRONTENDMENU.GFX`.
+Compile them with JPEXS FFDec, then keep only the compiled bytecode (FFDec's rewritten
+display list must never be shipped):
+
+```
+ffdec-cli -importScript Resources\UI\NEWFRONTENDMENU.GFX compiled.GFX <dir containing scripts\frontend\*.as>
+node tools/ui/merge-frontend-bytecode.cjs Resources\UI\NEWFRONTENDMENU.GFX compiled.GFX Resources\UI\NEWFRONTENDMENU.GFX
+```
+
+FFDec warns about an unreadable `PlaceObject2` tag; the shipped file has it too and the
+merge step keeps it as-is.
 
 ## Limitations
 
@@ -132,3 +222,20 @@ Account details shows "Steam ID".
   gameplay suppression and a worker that cannot initialize Steam before a menu.
 - Both PCs require build 465. Actual Steam presence priority and invitation
   routing with both games open require another in-game test.
+
+## Friends page, server browser, Invite Friends and solo lobbies (on build 465)
+
+- Ported from `AIMPSteamWork-1.06_F` on top of build 465 without changing its
+  transport, deferred Spacewar activation or automatic invite joining.
+- Steam lobbies, the friends list and in-game invites live in `SteamRelay.Lobbies.cs`
+  behind `ISteamLobbies`; the coordinator falls back to the plain relay when a relay
+  has no lobby support (the Steam tests' fake), so build 465's tests are unchanged.
+- Hardening: the UI bridge drops connections whose first line is HTTP or binary
+  (web pages could otherwise send menu commands to 127.0.0.1:12345); Friends Only
+  relays accept only the host's Steam friends; at most 16 relay connections.
+- New tests: UI bridge rejects browser traffic / accepts game traffic, solo lobby
+  starts alone / rejects joins, multiplayer lobby still needs a client. The managed
+  suite reports 180/186; the 6 failures are the same as on unmodified build 465
+  (MissionSync frontier and catalog barrier, Protocol models, WS3, native DLL
+  priority, launcher body length; no new body-length entries).
+- Not yet tested in-game or with a second Steam account.

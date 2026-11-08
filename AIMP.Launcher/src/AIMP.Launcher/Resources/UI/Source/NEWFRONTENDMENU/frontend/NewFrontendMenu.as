@@ -136,6 +136,8 @@ package frontend
       private var _serverMaxPlayersItem:MenuItemOptionOptionStepper;
       
       private var _serverVisibilityItem:MenuItemOptionOptionStepper;
+
+      private var _mpCreatedVisibility:String = "";
       
       private var _serverStartItem:MenuItemExpandable;
       
@@ -148,6 +150,26 @@ package frontend
       private var _serverCampaignItem:MenuItemExpandable;
       
       private var _serverSurvivalItem:MenuItemExpandable;
+
+      // Steam lobbies: server browser rows (the first three are the original rows).
+      private static const SERVER_ROW_COUNT:int = 8;
+      private static const INVITE_ROW_COUNT:int = 6;
+      private static const FRIEND_ROW_COUNT:int = 24;
+      private var _serverRows:Array;
+      private var _friendsItem:MenuItemExpandable;
+      private var _friendsRefreshItem:MenuItem;
+      private var _friendsEmptyItem:MenuItem;
+      private var _inviteRows:Array;
+      private var _friendRows:Array;
+      private var _friendActionsItem:MenuItemExpandable;
+      private var _hostInviteItem:MenuItemExpandable;
+      private var _clientInviteItem:MenuItemExpandable;
+      private var _hostInviteRows:Array;
+      private var _clientInviteRows:Array;
+      private var _friendJoinItem:MenuItemExpandable;
+      private var _mpSelectedFriendId:String = "";
+      private var _mpSelectedFriendName:String = "";
+      private var _mpSelectedFriendCanJoin:Boolean = false;
       
       private var _hostLobbyStatusItem:MenuItem;
       
@@ -497,6 +519,8 @@ package frontend
          this._mpBridge.onConfig = this.mpBridgeConfigHandler;
          this._mpBridge.onLobbyOpened = this.mpBridgeLobbyOpenedHandler;
          this._mpBridge.onLobbyReturn = this.mpBridgeLobbyReturnHandler;
+         this._mpBridge.onFriendList = this.mpBridgeFriendListHandler;
+         this._mpBridge.onInviteReceived = this.mpBridgeInviteReceivedHandler;
          this._playGameItem = new MenuItemExpandable("AI_UI_FRONTEND_PLAY_GAME");
          this._extrasItem = new MenuItemExpandable("AI_UI_FRONTEND_EXTRAS");
          this._storeItem = new MenuItem("AI_UI_FRONTEND_STORE",this.storeHandler);
@@ -523,7 +547,8 @@ package frontend
          this._serverAlienItem = new MenuItemOptionOptionStepper("Alien",["1","0"],["Enabled","Disabled"]);
          this._serverAlienItem.selectedIndex = 0;
          this._serverMaxPlayersItem = new MenuItemOptionOptionStepper("Max Players",[2,3,4],["2 Players","3 Players","4 Players"],this.serverMaxPlayersChangedHandler);
-         this._serverVisibilityItem = new MenuItemOptionOptionStepper("Visibility",["public","private"],["Public","Private"],this.serverVisibilityChangedHandler);
+         this._serverVisibilityItem = new MenuItemOptionOptionStepper("Visibility",["private","friends","public"],["Private","Friends Only","Public"],this.serverVisibilityChangedHandler);
+         this._serverVisibilityItem.selectedIndex = 0;
          this._serverStartItem = new MenuItemExpandable("Create Lobby");
          this._serverStartItem.addEventListener(MenuItemEvent.ITEM_PRESS,this.startServerHandler,false,0,true);
          this._serverRefreshItem = new MenuItem("Refresh List",this.refreshServersHandler);
@@ -540,6 +565,46 @@ package frontend
          this._serverSurvivalItem.addEventListener(MenuItemEvent.ITEM_PRESS,this.joinServerEntryHandler,false,0,true);
          this._serverSurvivalItem.data = "";
          this._serverSurvivalItem.enabled = false;
+         this._serverRows = [this._serverLanItem,this._serverCampaignItem,this._serverSurvivalItem];
+         while(this._serverRows.length < SERVER_ROW_COUNT)
+         {
+            var extraServerRow:MenuItemExpandable = new MenuItemExpandable("No lobby");
+            extraServerRow.addEventListener(MenuItemEvent.ITEM_PRESS,this.joinServerEntryHandler,false,0,true);
+            extraServerRow.data = "";
+            extraServerRow.enabled = false;
+            this._serverRows.push(extraServerRow);
+         }
+         this._friendsItem = new MenuItemExpandable("Friends");
+         this._friendsItem.addEventListener(MenuItemEvent.ITEM_PRESS,this.friendsPressedHandler,false,0,true);
+         this._friendsRefreshItem = new MenuItem("Refresh Friends",this.refreshFriendsHandler);
+         this._friendsEmptyItem = new MenuItem("No friends online");
+         this._friendsEmptyItem.enabled = false;
+         this._friendActionsItem = new MenuItemExpandable("Friend");
+         this._friendActionsItem.visible = false;
+         this._hostInviteItem = this.createInviteFriendsItem();
+         this._clientInviteItem = this.createInviteFriendsItem();
+         this._hostInviteRows = this.createInviteFriendRows();
+         this._clientInviteRows = this.createInviteFriendRows();
+         this._friendJoinItem = new MenuItemExpandable("Join Their Lobby");
+         this._friendJoinItem.addEventListener(MenuItemEvent.ITEM_PRESS,this.joinFriendHandler,false,0,true);
+         this._inviteRows = [];
+         while(this._inviteRows.length < INVITE_ROW_COUNT)
+         {
+            var inviteRow:MenuItemExpandable = new MenuItemExpandable("Invite");
+            inviteRow.addEventListener(MenuItemEvent.ITEM_PRESS,this.acceptInviteHandler,false,0,true);
+            inviteRow.data = "";
+            inviteRow.visible = false;
+            this._inviteRows.push(inviteRow);
+         }
+         this._friendRows = [];
+         while(this._friendRows.length < FRIEND_ROW_COUNT)
+         {
+            var friendRow:MenuItemExpandable = new MenuItemExpandable("Friend");
+            friendRow.addEventListener(MenuItemEvent.ITEM_PRESS,this.friendRowPressedHandler,false,0,true);
+            friendRow.data = null;
+            friendRow.visible = false;
+            this._friendRows.push(friendRow);
+         }
          this._hostLobbyStatusItem = new MenuItem("Status: Waiting for players");
          this._hostLobbyPlayer1Item = new MenuItem("1  Owner    You    Ready",this.mpAssignAlienHandler);
          this._hostLobbyPlayer2Item = new MenuItem("2  Empty",this.mpAssignAlienHandler);
@@ -624,6 +689,7 @@ package frontend
          this._multiplayerItem.page.addItem(this._mpResumeLobbyItem);
          this._multiplayerItem.page.addItem(this._createServerItem);
          this._multiplayerItem.page.addItem(this._joinServerItem);
+         this._multiplayerItem.page.addItem(this._friendsItem);
          this._multiplayerItem.page.addItem(this._directIpJoinItem);
          this._createServerItem.page.title = "Create Server";
          this._createServerItem.page.addItem(this._serverNameItem);
@@ -641,6 +707,12 @@ package frontend
          this._joinServerItem.page.addItem(this._serverLanItem);
          this._joinServerItem.page.addItem(this._serverCampaignItem);
          this._joinServerItem.page.addItem(this._serverSurvivalItem);
+         var serverRowIndex:int = 3;
+         while(serverRowIndex < this._serverRows.length)
+         {
+            this._joinServerItem.page.addItem(this._serverRows[serverRowIndex]);
+            serverRowIndex++;
+         }
          this._serverStartItem.page.title = "Lobby";
          this._serverStartItem.page.addItem(this._hostLobbyStatusItem);
          this._serverStartItem.page.addItem(this._hostLobbyPlayer1Item);
@@ -651,6 +723,7 @@ package frontend
          this._serverStartItem.page.addItem(this._hostLobbyKick3Item);
          this._serverStartItem.page.addItem(this._hostLobbyKick4Item);
          this._serverStartItem.page.addItem(this._hostLobbyStartGameItem);
+         this._serverStartItem.page.addItem(this._hostInviteItem);
          this._serverStartItem.page.addItem(this._hostLobbyLeaveItem);
          this._serverLanItem.page.title = "Lobby";
          this._serverLanItem.page.addItem(this._clientLobbyStatusItem);
@@ -659,10 +732,12 @@ package frontend
          this._serverLanItem.page.addItem(this._clientLobbyPlayer3Item);
          this._serverLanItem.page.addItem(this._clientLobbyPlayer4Item);
          this._serverLanItem.page.addItem(this._clientLobbyReadyItem);
+         this._serverLanItem.page.addItem(this._clientInviteItem);
          this._serverLanItem.page.addItem(this._clientLobbyLeaveItem);
          this._serverCampaignItem.subPage = this._serverLanItem.page;
          this._serverSurvivalItem.subPage = this._serverLanItem.page;
          this._directIpJoinItem.subPage = this._serverLanItem.page;
+         this.buildSteamPages();
          this.updateServerMapVisibility();
          this._onlineCampaignItem.page.addItem(this._startOnlineGameItem);
          this._onlineCampaignItem.page.addItem(this._continueOnlineGameItem);
@@ -1000,11 +1075,229 @@ package frontend
       
       private function serverVisibilityChangedHandler(param1:MenuItemEvent) : void
       {
+         this.updateServerMapVisibility();
+         this.refreshNetworkMenuRenderers();
       }
       
       private function serverFilterChangedHandler(param1:MenuItemEvent) : void
       {
          this.applyServerFilter(String(this._serverFilterItem.selectedItem));
+         if(this._mpLauncherReady && this._mpLobbyRole == "")
+         {
+            this._mpBridge.refreshServers(String(this._serverFilterItem.selectedItem));
+         }
+      }
+
+      // ---- Steam friends page ----
+
+      private function buildSteamPages() : void
+      {
+         var index:int = 3;
+         while(index < this._serverRows.length)
+         {
+            var serverRow:MenuItemExpandable = this._serverRows[index];
+            serverRow.subPage = this._serverLanItem.page;
+            serverRow.name = "No lobby";
+            index++;
+         }
+         this._friendsItem.page.title = "Friends";
+         this._friendsItem.page.addItem(this._friendsRefreshItem);
+         index = 0;
+         while(index < this._inviteRows.length)
+         {
+            var inviteRow:MenuItemExpandable = this._inviteRows[index];
+            inviteRow.subPage = this._serverLanItem.page;
+            inviteRow.name = "Invite";
+            this._friendsItem.page.addItem(inviteRow);
+            index++;
+         }
+         this._friendsItem.page.addItem(this._friendsEmptyItem);
+         index = 0;
+         while(index < this._friendRows.length)
+         {
+            var friendRow:MenuItemExpandable = this._friendRows[index];
+            friendRow.subPage = this._friendActionsItem.page;
+            friendRow.name = "Friend";
+            this._friendsItem.page.addItem(friendRow);
+            index++;
+         }
+         // Hidden owner of the shared per-friend page, so Back returns to Friends.
+         this._friendsItem.page.addItem(this._friendActionsItem);
+         this._friendActionsItem.page.title = "Friend";
+         this._friendActionsItem.page.addItem(this._friendJoinItem);
+         this.buildInviteFriendsPage(this._hostInviteItem,this._hostInviteRows);
+         this.buildInviteFriendsPage(this._clientInviteItem,this._clientInviteRows);
+         this._friendJoinItem.subPage = this._serverLanItem.page;
+         this._friendJoinItem.name = "Join Their Lobby";
+      }
+
+      private function friendsPressedHandler(param1:MenuItemEvent) : void
+      {
+         this.requestFriendList();
+      }
+
+      private function refreshFriendsHandler(param1:MenuItemEvent) : void
+      {
+         this.requestFriendList();
+      }
+
+      private function requestFriendList() : void
+      {
+         if(!this._mpLauncherReady) return;
+         this.show_network_notification("Refreshing friends");
+         this._mpBridge.refreshFriends();
+      }
+
+      private function mpBridgeFriendListHandler(friends:Array, invites:Array) : void
+      {
+         var index:int = 0;
+         while(index < this._inviteRows.length)
+         {
+            var inviteRow:MenuItem = this._inviteRows[index];
+            if(index < invites.length)
+            {
+               inviteRow.name = "Accept Invite: " + String(invites[index].name);
+               inviteRow.description = "Join the lobby " + String(invites[index].name) + " invited you to";
+               inviteRow.data = String(invites[index].from);
+               inviteRow.visible = true;
+            }
+            else
+            {
+               inviteRow.data = "";
+               inviteRow.visible = false;
+            }
+            index++;
+         }
+         index = 0;
+         while(index < this._friendRows.length)
+         {
+            var friendRow:MenuItem = this._friendRows[index];
+            if(index < friends.length)
+            {
+               var friend:Object = friends[index];
+               friendRow.name = String(friend.name) + " | " + String(friend.status);
+               friendRow.description = friend.join == "1" ? "Hosting a lobby - press to join" : "Not hosting a lobby you can join. Invite friends from inside your lobby";
+               friendRow.data = friend;
+               friendRow.visible = true;
+            }
+            else
+            {
+               friendRow.data = null;
+               friendRow.visible = false;
+            }
+            index++;
+         }
+         this._friendsEmptyItem.visible = friends.length == 0;
+         this.fillInviteFriendRows(this._hostInviteRows,friends);
+         this.fillInviteFriendRows(this._clientInviteRows,friends);
+         this.mpUpdateControls();
+      }
+
+      private function mpBridgeInviteReceivedHandler(from:String, fromName:String) : void
+      {
+         // The launcher also sends a STATUS notification; just refresh the invite rows.
+         if(this._mpLauncherReady) this._mpBridge.refreshFriends();
+      }
+
+      private function friendRowPressedHandler(param1:MenuItemEvent) : void
+      {
+         var friend:Object = param1 != null && param1.item != null ? param1.item.data : null;
+         if(friend == null) return;
+         this._mpSelectedFriendId = String(friend.id);
+         this._mpSelectedFriendName = String(friend.name);
+         this._mpSelectedFriendCanJoin = friend.join == "1";
+         this._friendActionsItem.page.title = this._mpSelectedFriendName;
+         this.mpUpdateControls();
+      }
+
+      // ---- Invite Friends (inside the host and client lobby pages) ----
+
+      private function createInviteFriendsItem() : MenuItemExpandable
+      {
+         var item:MenuItemExpandable = new MenuItemExpandable("Invite Friends");
+         item.addEventListener(MenuItemEvent.ITEM_PRESS,this.friendsPressedHandler,false,0,true);
+         return item;
+      }
+
+      private function createInviteFriendRows() : Array
+      {
+         var rows:Array = [];
+         while(rows.length < FRIEND_ROW_COUNT)
+         {
+            var row:MenuItem = new MenuItem("Friend",this.inviteFriendRowHandler);
+            row.data = null;
+            row.visible = false;
+            rows.push(row);
+         }
+         return rows;
+      }
+
+      private function buildInviteFriendsPage(item:MenuItemExpandable, rows:Array) : void
+      {
+         item.page.title = "Invite Friends";
+         var refresh:MenuItem = new MenuItem("Refresh Friends",this.refreshFriendsHandler);
+         refresh.description = "Reload your online Steam friends";
+         item.page.addItem(refresh);
+         var index:int = 0;
+         while(index < rows.length)
+         {
+            item.page.addItem(rows[index]);
+            index++;
+         }
+      }
+
+      private function fillInviteFriendRows(rows:Array, friends:Array) : void
+      {
+         var index:int = 0;
+         while(index < rows.length)
+         {
+            var row:MenuItem = rows[index];
+            if(index < friends.length)
+            {
+               row.name = "Invite " + String(friends[index].name) + " | " + String(friends[index].status);
+               row.description = "Send " + String(friends[index].name) + " a Steam invite to this lobby";
+               row.data = String(friends[index].id);
+               row.enabled = true;
+               row.visible = true;
+            }
+            else if(index == 0)
+            {
+               row.name = "No friends online";
+               row.description = "Open Steam and sign in to see your friends";
+               row.data = null;
+               row.enabled = false;
+               row.visible = true;
+            }
+            else
+            {
+               row.data = null;
+               row.visible = false;
+            }
+            index++;
+         }
+      }
+
+      private function inviteFriendRowHandler(param1:MenuItemEvent) : void
+      {
+         var friendId:String = param1 != null && param1.item != null && param1.item.data != null ? String(param1.item.data) : "";
+         if(!this._mpLauncherReady || friendId.length == 0 || this._mpLobbyRole == "") return;
+         this.show_network_notification("Sending invite");
+         this._mpBridge.inviteFriend(friendId);
+      }
+
+      private function joinFriendHandler(param1:MenuItemEvent) : void
+      {
+         if(this._mpSelectedFriendId == "" || !this.mpBeginCommand("join")) return;
+         this.show_network_notification("Joining " + this._mpSelectedFriendName);
+         this._mpBridge.joinFriend(this._mpSelectedFriendId);
+      }
+
+      private function acceptInviteHandler(param1:MenuItemEvent) : void
+      {
+         var from:String = param1 != null && param1.item != null && param1.item.data != null ? String(param1.item.data) : "";
+         if(from.length == 0 || !this.mpBeginCommand("join")) return;
+         this.show_network_notification("Accepting invite");
+         this._mpBridge.acceptInvite(from);
       }
       
       private function refreshServersHandler(param1:MenuItemEvent) : void
@@ -1048,8 +1341,16 @@ package frontend
       private function startServerHandler(param1:MenuItemEvent) : void
       {
          if(!this.mpBeginCommand("create")) return;
-         this.show_network_notification("Creating lobby");
-         this._mpBridge.createLobby(String(this._serverModeItem.selectedItem),int(this._serverMaxPlayersItem.selectedItem),String(this._serverVisibilityItem.selectedItem),this.getSelectedSurvivorMapId(),this.getSelectedSurvivorMapName(),String(this._serverAlienItem.selectedItem) != "0" || String(this._serverPvPItem.selectedItem) == "pvp",String(this._serverPvPItem.selectedItem) == "pvp" && String(this._serverModeItem.selectedItem) != "campaign");
+         this._mpCreatedVisibility = String(this._serverVisibilityItem.selectedItem);
+         this.show_network_notification(this._mpCreatedVisibility == "private" ? "Creating solo lobby" : "Creating lobby");
+         var pvp:Boolean = this.serverPvPSelected();
+         this._mpBridge.createLobby(String(this._serverModeItem.selectedItem),int(this._serverMaxPlayersItem.selectedItem),String(this._serverVisibilityItem.selectedItem),this.getSelectedSurvivorMapId(),this.getSelectedSurvivorMapName(),String(this._serverAlienItem.selectedItem) != "0" || pvp,pvp);
+      }
+
+      // Alien vs Survivors needs 2+ players, so a Private (solo) lobby is always Co-op.
+      private function serverPvPSelected() : Boolean
+      {
+         return String(this._serverPvPItem.selectedItem) == "pvp" && String(this._serverModeItem.selectedItem) != "campaign" && String(this._serverVisibilityItem.selectedItem) != "private";
       }
       
       private function readyChangedHandler(param1:MenuItemEvent) : void
@@ -1252,6 +1553,19 @@ package frontend
          this._hostLobbyPlayer3Item.enabled = idle && this._mpLobbyRole == "host" && this._mpAlienVsSurvivors && String(this._hostLobbyPlayer3Item.data).length > 0;
          this._hostLobbyPlayer4Item.enabled = idle && this._mpLobbyRole == "host" && this._mpAlienVsSurvivors && String(this._hostLobbyPlayer4Item.data).length > 0;
          this._serverRefreshItem.enabled = idle && outsideLobby;
+         this._friendsItem.enabled = this._mpLauncherReady;
+         this._friendsRefreshItem.enabled = this._mpLauncherReady;
+         // Invites are sent only from inside a lobby; a Private (solo) lobby has no slot to invite into.
+         this._hostInviteItem.visible = this._mpCreatedVisibility != "private";
+         this._hostInviteItem.enabled = this._mpLauncherReady && this._mpLobbyRole == "host";
+         this._clientInviteItem.enabled = this._mpLauncherReady && this._mpLobbyRole == "client";
+         this._friendJoinItem.enabled = idle && outsideLobby && this._mpSelectedFriendCanJoin;
+         var inviteIndex:int = 0;
+         while(inviteIndex < this._inviteRows.length)
+         {
+            MenuItem(this._inviteRows[inviteIndex]).enabled = idle && outsideLobby;
+            inviteIndex++;
+         }
          this._mpResumeLobbyItem.visible = !outsideLobby;
          this._mpResumeLobbyItem.enabled = idle;
          this._hostLobbyStartGameItem.enabled = idle && this._mpLobbyRole == "host" && this._mpCanStart;
@@ -1310,13 +1624,16 @@ package frontend
       
       private function mpBridgeServerListHandler(param1:Array) : void
       {
-         this.updateServerRow(this._serverLanItem,param1.length > 0 ? param1[0] : null,0);
-         this.updateServerRow(this._serverCampaignItem,param1.length > 1 ? param1[1] : null,1);
-         this.updateServerRow(this._serverSurvivalItem,param1.length > 2 ? param1[2] : null,2);
-         this.show_network_notification("Server list updated");
+         var index:int = 0;
+         while(index < this._serverRows.length)
+         {
+            this.updateServerRow(this._serverRows[index],index < param1.length ? param1[index] : null,index);
+            index++;
+         }
+         this.show_network_notification(param1.length > 0 ? "Server list updated" : "No lobbies found");
          this.refreshNetworkMenuRenderers();
       }
-      
+
       private function updateServerRow(row:Object, server:Object, rowIndex:int) : void
       {
          if(row == null)
@@ -1325,11 +1642,13 @@ package frontend
          }
          if(server == null)
          {
-            row.name = "No lobby";
+            row.name = rowIndex == 0 ? "No lobbies found" : "No lobby";
             row.enabled = false;
             row.data = "";
+            row.visible = rowIndex == 0;
             return;
          }
+         row.visible = true;
          var serverName:String = String(getObjectString(server,"name","Server"));
          var serverMode:String = String(getObjectString(server,"mode","Survival"));
          var serverPlayers:String = String(getObjectString(server,"players","1"));
@@ -1341,7 +1660,7 @@ package frontend
          var serverPing:String = String(getObjectString(server,"ping","LAN"));
          var serverMap:String = String(getObjectString(server,"mapName","Auto Map"));
          row.name = serverName + " | " + serverMode + " | " + serverMap + " | " + serverPlayers + " | " + serverPing;
-         row.enabled = true;
+         row.enabled = getObjectString(server,"locked","0") != "1";
          row.data = getObjectString(server,"id","");
       }
       
@@ -1570,7 +1889,8 @@ package frontend
          if(this._serverMapItem != null && this._serverModeItem != null)
          {
             this._serverModeItem.visible = this._developerMode;
-            this._serverPvPItem.visible = String(this._serverModeItem.selectedItem) != "campaign";
+            // Private lobbies are solo, so Match Type (Alien vs Survivors) is hidden and Co-op is used.
+            this._serverPvPItem.visible = String(this._serverModeItem.selectedItem) != "campaign" && (this._serverVisibilityItem == null || String(this._serverVisibilityItem.selectedItem) != "private");
             this._serverAlienItem.visible = String(this._serverPvPItem.selectedItem) != "pvp" || !this._serverPvPItem.visible;
             this._serverMapItem.visible = this._developerMode;
             this._serverMapItem.name = String(this._serverModeItem.selectedItem) == "campaign" ? "Campaign Level" : "Survivor Map";
@@ -1879,11 +2199,16 @@ package frontend
          this._mpPendingStartGame = false;
       }
       
+      // The launcher filters lobbies by mode; rows without a lobby stay hidden.
       private function applyServerFilter(param1:String) : void
       {
-         this._serverLanItem.visible = param1 == "all" || param1 == "campaign";
-         this._serverCampaignItem.visible = param1 == "all" || param1 == "campaign";
-         this._serverSurvivalItem.visible = param1 == "all" || param1 == "survival";
+         var index:int = 0;
+         while(index < this._serverRows.length)
+         {
+            var row:MenuItem = this._serverRows[index];
+            row.visible = index == 0 || (row.data != null && String(row.data).length > 0);
+            index++;
+         }
       }
       
       private function twoTeamsNoviceDifficultyHandler(param1:MenuItemEvent) : void
@@ -2146,7 +2471,13 @@ package frontend
          this._mementoMoriOnItem.visualsName = "MementoMoriDiagram";
          this._multiplayerItem.description = this._mpLauncherReady ? "Play Alien: Isolation with friends" : "Waiting for the launcher to be ready";
          this._createServerItem.description = "Configure a new server";
-         this._joinServerItem.description = "Browse available servers";
+         this._joinServerItem.description = "Browse public and friends' lobbies on Steam";
+         this._friendsItem.description = "Accept invites and join friends' lobbies (invite friends from inside a lobby)";
+         this._friendsRefreshItem.description = "Reload your online Steam friends and invites";
+         this._friendsEmptyItem.description = "Open Steam and sign in to see your friends";
+         this._hostInviteItem.description = "Send your online Steam friends an invite to this lobby";
+         this._clientInviteItem.description = "Send your online Steam friends an invite to this lobby";
+         this._friendJoinItem.description = "Join the lobby this friend is hosting";
          this._directIpJoinItem.description = "Connect directly to the Host IP and Port configured in the launcher";
          this._serverNameItem.description = "Change your player name in launcher settings";
          this._serverNameItem.enabled = false;
@@ -2156,13 +2487,16 @@ package frontend
          this._serverMapItem.descriptions = this._survivorMapDescriptions;
          this._serverAlienItem.descriptions = ["Normal Alien behavior","Disable the Alien to explore and test this level"];
          this._serverMaxPlayersItem.descriptions = ["Two player MVP","Three players experimental","Four players experimental"];
-         this._serverVisibilityItem.descriptions = ["Visible in server list","Requires password or invite"];
+         this._serverVisibilityItem.descriptions = ["Solo - start right away, nobody else can join","Shown in your Steam friends' server browser","Shown in everyone's server browser"];
          this._serverStartItem.description = "Create lobby and wait for players";
          this._serverRefreshItem.description = "Refresh the server list";
          this._serverFilterItem.descriptions = ["Show every server","Show campaign servers","Show survival servers"];
-         this._serverLanItem.description = "Available lobby";
-         this._serverCampaignItem.description = "Available lobby";
-         this._serverSurvivalItem.description = "Available lobby";
+         var rowIndex:int = 0;
+         while(rowIndex < this._serverRows.length)
+         {
+            MenuItem(this._serverRows[rowIndex]).description = "Steam lobby - press to join";
+            rowIndex++;
+         }
          this._hostLobbyStatusItem.description = "Waiting for players and level verification";
          this._hostLobbyStatusItem.enabled = false;
          this._hostLobbyPlayer1Item.enabled = false;
@@ -2205,10 +2539,10 @@ package frontend
          this._selectLevelItem.visible = true;
          this.updateServerMapVisibility();
          this._playGameItem.visible = false;
-         this._joinServerItem.visible = false;
+         this._joinServerItem.visible = true;
          this._serverModeItem.visible = this._developerMode;
          this._serverMaxPlayersItem.visible = false;
-         this._serverVisibilityItem.visible = false;
+         this._serverVisibilityItem.visible = true;
          this.mpUpdateControls();
          this._extrasItem.visible = true;
          this._storeItem.visible = true;
