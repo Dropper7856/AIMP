@@ -1,0 +1,25 @@
+AIMP 445 / protocol 39
+Branch: feature/alien-vs-survivors-main
+
+Reported regression
+- User sees a white screen with build 444 when attempting ventilation noclip.
+- Diagnostics identify Launcher 0.8.4.444 / Native 0.11.4.444. The snapshot was
+  collected after disconnection; it contains no measured post-process values.
+- Build 444 forced each RGB tint multiplier to at least four and a .25
+  brightness floor. These aggressive overrides likely clipped the image.
+
+Correction
+- Removed all overrides of RGB tint/exposure. Retail values remain intact.
+- Reduced the noclip brightness floor from .25 to .015 (over 16 times lower).
+- Kept noclip suppression of grain, vignette, and motion blur.
+- Kept 444 horizontal WASD translation and camera-based visibility-zone selection.
+- Scope remains the possessed local Alien's free camera only. Normal lighting
+  resumes through the original post-process blend once free camera ends.
+
+Validation
+- See build.log, native-tests.log and delivery.json under artifacts/alien-445.
+- Visual correctness and readability still require an in-game test. No screenshot
+  or live render was available to measure the corrected image.
+
+Results: native Release and API publish succeeded; four targeted native tests passed.
+Both API destinations delivered successfully; Launcher/Protocol/NetZ SHA256 match.

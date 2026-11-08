@@ -564,14 +564,13 @@ void __fastcall PostBlendDetour(void* self,void*) noexcept {
     // output, never level settings. Retail recalculates these on every call,
     // so normal lighting resumes on the first frame outside noclip.
     const auto manager=reinterpret_cast<std::uintptr_t>(self);
-    float brightness{};std::array<float,3> tint{};
-    if(!Read(manager+0x1914U,brightness) || !std::isfinite(brightness) ||
-        !Read(manager+0x1920U,tint))return;
-    for(const auto value:tint)if(!std::isfinite(value))return;
-    brightness=std::max(brightness,0.25F);
-    for(auto& value:tint)value=std::max(value,1.0F)*4.0F;
+    float brightness{};
+    if(!Read(manager+0x1914U,brightness) || !std::isfinite(brightness))return;
+    // Preserve the level's RGB/exposure. A forced minimum RGB multiplier of
+    // four plus .25 brightness clipped the whole image to white in build 444.
+    // Only lift very dark output slightly; never multiply the color channels.
+    brightness=std::max(brightness,0.015F);
     static_cast<void>(Write(manager+0x1914U,brightness));
-    static_cast<void>(Write(manager+0x1920U,tint));
     // Clean, readable navigation: no vignette, grain, or motion blur.
     for(const auto offset:{0x1988U,0x19E8U,0x19ECU,0x19B0U,0x19B4U,0x19B8U,0x19D0U,0x19D4U,0x19D8U})
         static_cast<void>(Write(manager+offset,0.0F));
