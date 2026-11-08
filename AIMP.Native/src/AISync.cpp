@@ -2375,6 +2375,7 @@ std::atomic<std::uintptr_t> gPvPMeleeArmedCharacter{};
 bool PvPBrainArmed(const std::uintptr_t character) noexcept {
     return character != 0U && character == gPvPMeleeArmedCharacter.load(std::memory_order_acquire);
 }
+std::atomic<std::uint32_t> gPvPArmedBrainFaults{};
 std::atomic<std::uint32_t> gPvPMeleeStarts{},gPvPMeleeRefused{},gPvPMeleeLastType{};
 void* gPvPMeleeStartTrampoline{};
 std::atomic<void*> gPvPMeleeStartOriginal{};
@@ -7544,6 +7545,17 @@ void SampleParticipantPerception(Actor& actor, const std::uintptr_t manager, con
     gParticipantProbeWrite.store(write + 1U, std::memory_order_release);
     gParticipantPerceptionSamples.fetch_add(1U, std::memory_order_relaxed);
 }
+// 461 crashed the Host once inside the engine-thread tree execution of the
+// armed Alien (null call in 00712D70). Contain a fault, disarm and let the
+// action expire instead of terminating the game.
+bool ArmedManagerUpdate(ManagerUpdate original, void* manager, std::uint32_t previousTime, float delta) noexcept {
+    __try {original(manager, previousTime, delta); return true;}
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        gPvPMeleeArmedCharacter.store(0U, std::memory_order_release);
+        gPvPArmedBrainFaults.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+}
 void __fastcall UpdateDetour(void* manager, void*, std::uint32_t previousTime, float delta) noexcept {
     const auto original = reinterpret_cast<ManagerUpdate>(gUpdateOriginal.load(std::memory_order_acquire));
     if (original == nullptr) return;
@@ -7581,7 +7593,10 @@ void __fastcall UpdateDetour(void* manager, void*, std::uint32_t previousTime, f
     // A single selected retail Alien must never run its autonomous decision
     // branch while the PvP native lease is fencing or owned. Preserve the
     // manager's retail housekeeping exactly as we do for PlayerSync proxies.
-    if (PvPCharacterFenced(c) && PvPBrainArmed(c)) { callOriginal(); return; }
+    if (PvPCharacterFenced(c) && PvPBrainArmed(c)) {
+        static_cast<void>(ArmedManagerUpdate(original, manager, previousTime, delta));
+        return;
+    }
     if (PvPCharacterFenced(c)) {
         Actor pvpProxy{};
         pvpProxy.character = c;

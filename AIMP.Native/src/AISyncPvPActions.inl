@@ -119,7 +119,7 @@ struct AttackTelemetry final {
     // Retail ActionMeleeAttack starts/refusals for the armed Alien (probe
     // 00717D90), last node type, OR of attack-manager availability bytes
     // +8..+E (bit n = +8+n; +8 ANY, +D any proven) and source/victim +2B4.
-    std::atomic<unsigned> meleeStarts{},meleeRefused{},meleeType{},availability{},sourceFlag2B4{},victimFlag2B4{};
+    std::atomic<unsigned> meleeStarts{},meleeRefused{},meleeType{},availability{},sourceFlag2B4{},victimFlag2B4{},brainFaults{};
 } attackTelemetry;
 void TraceAttack(unsigned stage,unsigned selector=0U) noexcept {
     std::uint8_t state{};bool backstage{};
@@ -170,7 +170,8 @@ void LogAttack(Diagnostics& diagnostics) {
          {"meleeType",Diagnostics::Unsigned(attackTelemetry.meleeType.load()),true},
          {"availability",Diagnostics::Unsigned(attackTelemetry.availability.load()),true},
          {"source2B4",Diagnostics::Unsigned(attackTelemetry.sourceFlag2B4.load()),true},
-         {"victim2B4",Diagnostics::Unsigned(attackTelemetry.victimFlag2B4.load()),true}});
+         {"victim2B4",Diagnostics::Unsigned(attackTelemetry.victimFlag2B4.load()),true},
+         {"brainFaults",Diagnostics::Unsigned(attackTelemetry.brainFaults.load()),true}});
 }
 #else
 void TraceVent(unsigned=0U) noexcept {}
@@ -877,6 +878,11 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
                 // after each try, so a cleared flag proves the branch ran. Our own
                 // query is not re-run: it would re-arm the branch's cover ray.
                 attackTelemetry.armedPolls.fetch_add(1U,std::memory_order_relaxed);
+#ifndef AIMP_ALIEN_ACTION_TEST
+                if(DonorFor(c))static_cast<void>(StopDonor(c));
+                static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(c.character));
+                attackTelemetry.brainFaults=gPvPArmedBrainFaults.load(std::memory_order_relaxed);
+#endif
                 std::uint8_t should{};
                 if(active.shouldAttackSet && Read(active.attackAnimated+kShouldAttackFlag,should) && !should) {
                     attackTelemetry.flagConsumed=++active.flagConsumed;TraceAttack(19U,active.flagConsumed);
@@ -920,6 +926,16 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
                 if(!HoldAttackTarget(active.victim.character)) {
                     Terminal(result,Phase::Failed,Reason::NativeUnavailable);active.cancelled=true;return true;
                 }
+#ifndef AIMP_ALIEN_ACTION_TEST
+                // The retail brain must own the Alien for the armed window: no
+                // donor kind9 request left in its tree (461 crashed with one
+                // still retiring), and no direct-step idle hold, which blocks
+                // the BT's own run to the victim (459/460 stayed in place).
+                if(!StopDonor(c)) {
+                    ReleaseAttackTarget();Terminal(result,Phase::Failed,Reason::NativeBusy);active.cancelled=true;return true;
+                }
+                static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(c.character));
+#endif
                 active.retailArmed=true;active.armedAt=now;
                 attackTelemetry.armedPolls=0U;attackTelemetry.flagConsumed=0U;attackTelemetry.retargets=0U;
                 attackTelemetry.brainMissing=0U;
