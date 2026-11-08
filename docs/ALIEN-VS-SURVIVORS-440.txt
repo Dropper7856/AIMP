@@ -1,0 +1,57 @@
+﻿AIMP 440 / protocol 39
+Branch: feature/alien-vs-survivors-main
+
+Observed in supplied diagnostics
+- Host 163428: action148 EnterVent Started at16:33:28, Failed Timeout at
+  16:33:58. Client183425 receives the same Host failure and retires locally.
+- Attack535 is refused NativeBusy during that interval. Later attack2040 is
+  refused NoTarget, consistent with the traversal finally releasing ownership.
+- Steering/commit traffic continues, with stale=0, overflow=0 and fault=False.
+  These logs establish a pending native traversal, not a transport disconnect.
+  They do not contain detailed portal approach/cycle samples.
+
+Changes
+- Donor vent.cpp::VentTick settle interval: stop local steering as soon as a
+  vent request is pending; retire donor movement/recovery and leave300ms before
+  starting the native traversal on each machine.
+- Donor vent.cpp::PickGo preference: retain the retail portal candidate when
+  within the same admission reach and near the closest opening. Pin that exact
+  host selection for client execution; selected map exits remain immutable.
+- Donor ActVentSmart/VentTick cancellation: E/Q or WASD (after400ms) requests
+  cancellation. A new authenticated/ordered CancelVent intent reaches the Host,
+  which rejects an unstarted traversal or cancels the original active action.
+  Cancellation preserves the original action sequence/selection/revision;
+  CancelVent itself does not occupy an unfinished action-journal slot.
+- Native cancellation polls retained resources before Shutdown/destruction.
+  No forced Idle, fake backstage bits or completion is introduced.
+- Lack of entry approach progress for5s outside a protected passage triggers native
+  cancellation. Distant exits may take a detour; they retain the donor25s
+  window. Overall entry/exit windows follow the donor10s/25s limits.
+- Added alien_vent_progress diagnostic samples: host/client, command sequence,
+  elapsed time, phase, native cycle, frame result, backstage and position.
+  Native pointers stay engine-thread only; the logging worker reads atomics.
+- HUD explains cancellation while traversal is pending. Build439 original maps,
+  mouse navigation, player markers and owner pose replication are preserved.
+- Protocol39 adds CancelVent intent5. Both PCs must restart together.
+
+Static ABI inspection
+- Retained shipped AI.exe disassembled offline with Capstone. 0070A7C0 and
+  0070A5E0 take character/frame on the stack and return with ret8. The vent
+  Shutdown0040FBC0 uses the node in ECX, calls0070AF80 and releases the vent lock.
+- Cancel's typedef now explicitly describes its stdcall contract; no change to
+  native cancellation arguments. This typing cleanup is not a proven cause of
+  the supplied circling behavior.
+- Detailed artifact: artifacts/alien-440/vent-abi.txt.
+
+Verification
+- No unit tests created or executed.
+- AS3 compiled; final GFX re-export confirms cancellation hints and retains the
+  original map loader and Go To Here command. Only DoABC bytecode transplanted;
+  original Scaleform visual tags and opaque tail preserved.
+- Build/delivery outcome is recorded in artifacts/alien-440/build-final.log and
+  artifacts/alien-440/delivery.json. Win32 Release and .NET publishes succeeded;
+  API was delivered on both PCs with equal SHA-256 for Launcher/Protocol/NetZ
+  and both UI GFX files. Source GFX also matches both delivered copies.
+  No Electron rebuild or destination-only deletion.
+- Actual in-game approach, cancellation and navigation need a fresh two-PC run.
+  No claim that entry in every original vent was verified in-game.

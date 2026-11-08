@@ -57,7 +57,7 @@ public static class AlienPvPNativeCodec
         if(s.NativeGeneration==0 || s.WorldGeneration==0 || s.Cookie==0 || s.OwnerPeer==0 ||
             s.Incarnation==0 || (s.EntityA==0 && s.EntityB==0) ||
             (ushort)f.Kind is <1 or >10 || ((uint)f.Flags & ~32767U)!=0 ||
-            f.Gait>3 || (byte)f.Action>4 || (uint)f.Phase>6 || (uint)f.Reason>13)
+            f.Gait>3 || (byte)f.Action>5 || (uint)f.Phase>6 || (uint)f.Reason>13)
             throw new ProtocolException("Invalid native PvP identity or kind.");
         foreach(var v in new[]{f.Forward,f.Strafe,f.Yaw,f.Pitch,f.X,f.Y,f.Z,f.VelocityX,f.VelocityZ,f.ResolvedX,f.ResolvedY,f.ResolvedZ})
             if(!float.IsFinite(v))throw new ProtocolException("Non-finite native PvP scalar.");
@@ -135,7 +135,7 @@ public static class AlienPvPNativeCodec
             Phase=(AlienActionPhase)U32(b,180),ResolutionRevision=U64(b,184),DeliveryId=U64(b,192)
         };
         // The network enum is a byte, but the IPC action is a full u32.
-        if(U32(b,88)>4)throw new ProtocolException("Invalid native action width.");
+        if(U32(b,88)>5)throw new ProtocolException("Invalid native action width.");
         Validate(f);return f;
     }
 }

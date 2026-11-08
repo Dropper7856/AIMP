@@ -32,7 +32,7 @@ public:
         if(!active_ || frame.epoch!=epoch_ || frame.epoch<=revoked_)return false;
         if(frame.kind==Kind::Commit) {
             if(frame.hostSequence<=lastHost_ || frame.sequence<=lastInput_)return false;
-            if(frame.action!=Action::None && frame.action!=Action::Roar) {
+            if(frame.action!=Action::None && frame.action!=Action::Roar && frame.action!=Action::CancelVent) {
                 ActionEntry* slot{};
                 for(auto& entry:actions_) {
                     if(!entry.command.hostSequence){slot=&entry;break;}

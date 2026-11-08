@@ -39,6 +39,7 @@ struct Active final {
     std::uintptr_t chooser{};
     VentSlot* vent{};
     bool used{},entered{},cancelled{},terminalSent{},hostEnded{},moveArrived{},entrySubmitted{};
+    std::uint64_t ventProgressAt{};float ventBestDistance{std::numeric_limits<float>::infinity()};
 };
 Active active{};
 policy::EdgeGate edges{};
@@ -62,6 +63,46 @@ bool Cycle(const std::uintptr_t character,std::uint8_t& state,bool& backstage) n
         !Read(cycle+0x1AU,state) || !Read(character+0x2DAU,hidden) || !Read(character+0x2DBU,withdrawn))return false;
     backstage=hidden!=0U || withdrawn!=0U;return true;
 }
+#ifndef AIMP_ALIEN_ACTION_TEST
+struct VentTelemetry final {
+    std::atomic<std::uint64_t> revision{},sequence{},elapsed{};
+    std::atomic<unsigned> action{},phase{},cycle{},frameStatus{};
+    std::atomic<bool> host{},backstage{},cancelling{};
+    std::atomic<float> x{},y{},z{};
+} ventTelemetry;
+void TraceVent(unsigned frameStatus=0U) noexcept {
+    if(!active.used || !active.vent)return;
+    policy::Point body{};std::uint8_t state{};bool backstage{};
+    if(!Body(active.context.character,body)||!Cycle(active.context.character,state,backstage))return;
+    ventTelemetry.sequence=active.receipt.hostSequence;ventTelemetry.elapsed=GetTickCount64()-active.began;
+    ventTelemetry.action=static_cast<unsigned>(active.receipt.action);ventTelemetry.phase=static_cast<unsigned>(active.receipt.phase);
+    ventTelemetry.cycle=state;ventTelemetry.frameStatus=frameStatus;ventTelemetry.host=active.context.host;
+    ventTelemetry.backstage=backstage;ventTelemetry.cancelling=active.cancelled;
+    ventTelemetry.x=body.x;ventTelemetry.y=body.y;ventTelemetry.z=body.z;
+    ventTelemetry.revision.fetch_add(1U,std::memory_order_release);
+}
+void LogVent(Diagnostics& diagnostics) {
+    static std::uint64_t lastRevision{},lastAt{};
+    const auto revision=ventTelemetry.revision.load(std::memory_order_acquire),now=GetTickCount64();
+    if(!revision || revision==lastRevision || now-lastAt<1000U)return;
+    lastRevision=revision;lastAt=now;
+    diagnostics.Log("info","alien_vent_progress","Engine-thread vent observations; frameResult 0 pending, 1 arrived, 2 refused.",
+        {{"host",Diagnostics::Boolean(ventTelemetry.host.load()),true},
+         {"hostSequence",Diagnostics::Unsigned(ventTelemetry.sequence.load()),true},
+         {"elapsedMs",Diagnostics::Unsigned(ventTelemetry.elapsed.load()),true},
+         {"action",Diagnostics::Unsigned(ventTelemetry.action.load()),true},
+         {"phase",Diagnostics::Unsigned(ventTelemetry.phase.load()),true},
+         {"cycle",Diagnostics::Unsigned(ventTelemetry.cycle.load()),true},
+         {"frameResult",Diagnostics::Unsigned(ventTelemetry.frameStatus.load()),true},
+         {"backstage",Diagnostics::Boolean(ventTelemetry.backstage.load()),true},
+         {"cancelling",Diagnostics::Boolean(ventTelemetry.cancelling.load()),true},
+         {"x",std::to_string(ventTelemetry.x.load()),true},
+         {"y",std::to_string(ventTelemetry.y.load()),true},
+         {"z",std::to_string(ventTelemetry.z.load()),true}});
+}
+#else
+void TraceVent(unsigned=0U) noexcept {}
+#endif
 bool Ordinary(const std::uint8_t state) noexcept {return state==1U || state==55U || state==56U || state==59U;}
 bool Protected(const std::uint8_t state) noexcept {return state==18U || state==75U || state==77U || state==78U || state==79U;}
 bool Same(const ap::Context& c) noexcept {return active.used && c.character==active.context.character && c.scope==active.context.scope;}
@@ -123,6 +164,12 @@ std::uintptr_t __fastcall PickExitDetour(void* manager,void*,int reason) noexcep
     if(selected)return selected;
     return reinterpret_cast<std::uintptr_t(__thiscall*)(void*,int)>(ventExitOriginal)(manager,reason);
 }
+std::uintptr_t RetailEntry(std::uintptr_t manager) noexcept {
+    if(!ventEnterOriginal)return 0;
+    AIMP_ACTION_TRY {
+        return reinterpret_cast<std::uintptr_t(__thiscall*)(void*,int)>(ventEnterOriginal)(reinterpret_cast<void*>(manager),0);
+    } AIMP_ACTION_CATCH {return 0;}
+}
 bool SelectPortal(const ap::Context& c,const ap::Frame& request,ap::Frame& result) noexcept {
     std::uintptr_t withdraw{},manager{},entries{};std::uint32_t count{};
     if(!Read(c.character+0x34F0U,withdraw) || !withdraw || !Read(withdraw+0x24U,manager) || !manager ||
@@ -161,6 +208,20 @@ bool SelectPortal(const ap::Context& c,const ap::Frame& request,ap::Frame& resul
             if(policy::DistanceSquared(entrance,vent.entrance)>e || policy::DistanceSquared(exit,vent.exit)>e)continue;
             if(found){result.reason=Reason::AmbiguousVent;return false;}
             best=vent;found=true;
+        }
+    }
+    // Donor vent.cpp::PickGo keeps the retail path-aware choice when it is
+    // almost as near as the closest opening. Forcing the nearest point can
+    // choose the wrong side of a wall or an inaccessible approach.
+    if(c.host && enter && found) {
+        const auto original=RetailEntry(manager);
+        if(original>=entries && (original-entries)%0x30U==0U && (original-entries)/0x30U<count) {
+            policy::Vent vent{};std::uintptr_t descriptor{};
+            vent.localIndex=static_cast<std::uint32_t>((original-entries)/0x30U);
+            if(Read(original+0x28U,descriptor) && descriptor && Read(descriptor,vent.entrance) &&
+                policy::Finite(vent.entrance) && ExitPoint(descriptor,vent.exit) &&
+                ap::vents::WithinReach({body.x,body.y,body.z},{vent.entrance.x,vent.entrance.y,vent.entrance.z}) &&
+                std::sqrt(policy::DistanceSquared(body,vent.entrance))<=std::sqrt(bestDistance)+3.0F)best=vent;
         }
     }
     std::uintptr_t current{},table{};std::uint32_t size{};
@@ -228,10 +289,11 @@ bool FinishVent(const ap::Context& c,VentSlot& slot,bool cancel,bool& done) noex
     if(!VentFrameLive(c,slot))return false;
     AIMP_ACTION_TRY {
         using Two=void(__thiscall*)(void*,std::uintptr_t,std::uintptr_t);
+        using RequestCancel=void(__stdcall*)(std::uintptr_t,std::uintptr_t);
         using PollCancel=std::uint32_t(__stdcall*)(std::uintptr_t,std::uintptr_t);
         using Destroy=void*(__thiscall*)(void*,std::uint32_t);
         if(cancel && !slot.cancelling) {
-            Native<Two>(0x0030A7C0U)(slot.node.data(),c.character,slot.frame);
+            Native<RequestCancel>(0x0030A7C0U)(c.character,slot.frame);
             slot.cancelling=true;
         }
         // Retail node Update uses 0070A5E0 while frame status is 7. A
@@ -466,6 +528,7 @@ void Clear() noexcept {
 void Terminal(ap::Frame& result,Phase phase,Reason reason) noexcept {
     result=active.receipt;result.phase=phase;result.reason=reason;++result.resolutionRevision;
     active.receipt=result;active.terminalSent=true;
+    TraceVent();
 }
 void Cancel(const ap::Context& c,bool living) noexcept {
     static_cast<void>(StopDonor(c));
@@ -476,6 +539,7 @@ void Cancel(const ap::Context& c,bool living) noexcept {
         Clear();return;
     }
     active.cancelled=true;
+    TraceVent();
     if(active.victim.character)player_hiding::FinishPvPSearch(active.victim.character);
     if(active.vent) {
         bool done{};
@@ -491,6 +555,12 @@ void Cancel(const ap::Context& c,bool living) noexcept {
     // A registered pair belongs to the existing native retirement path. Never
     // force Idle/zero a cycle or mark a death complete on cancellation.
     if(!active.entrySubmitted && !active.entered && AttackQueryRetired(active.chooser))Clear();
+}
+bool InterruptVent(const ap::Context& c,ap::Frame& result) noexcept {
+    if(!Same(c) || active.terminalSent ||
+        (active.receipt.action!=Action::EnterVent && active.receipt.action!=Action::ExitVent))return false;
+    Terminal(result,Phase::Cancelled,Reason::NativeBusy);
+    Cancel(c,true);return true;
 }
 bool Begin(const ap::Context& c,const ap::Frame& command,ap::Frame& result) noexcept {
     result=command;result.resolutionRevision=1U;
@@ -557,6 +627,8 @@ bool Begin(const ap::Context& c,const ap::Frame& command,ap::Frame& result) noex
     if(!slot || !StartVent(c,result,*slot)){Reject(result,Reason::NativeUnavailable);return true;}
     result.phase=Phase::Started;result.reason=Reason::None;
     active={};active.used=true;active.context=c;active.receipt=result;active.vent=slot;active.began=GetTickCount64();
+    active.ventProgressAt=active.began;
+    TraceVent();
     return true;
 }
 bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
@@ -641,6 +713,7 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
         active.vent->quarantined=true;Terminal(result,Phase::Failed,Reason::Fault);Clear();return true;
     }
     if(nativeResult==1)active.moveArrived=true;
+    TraceVent(static_cast<unsigned>(nativeResult));
     // Retail shuts down a finished node immediately, releasing its request
     // and vent-manager lock. Waiting for the stage change while retaining
     // that lock can stall the transition. Stage confirmation remains separate.
@@ -659,7 +732,20 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
         Terminal(result,Phase::Completed,Reason::None);
         Clear();return true;
     }
-    if(nativeResult==2 || now-active.began>policy::kActionTimeoutMs) {
+    // Reuse the donor's bounded traversal windows. A close entry that circles
+    // without getting nearer is cancelled instead of capturing input for 30s.
+    policy::Point body{};
+    if(!active.moveArrived && Body(c.character,body)) {
+        const policy::Point goal=active.receipt.action==Action::EnterVent?
+            policy::Point{active.receipt.x,active.receipt.y,active.receipt.z}:
+            policy::Point{active.receipt.resolvedX,active.receipt.resolvedY,active.receipt.resolvedZ};
+        const float distance=std::sqrt(policy::DistanceSquared(body,goal));
+        if(distance+0.25F<active.ventBestDistance) {active.ventBestDistance=distance;active.ventProgressAt=now;}
+    }
+    const auto traversalLimit=active.receipt.action==Action::EnterVent?10000U:25000U;
+    const bool stalled=active.receipt.action==Action::EnterVent && !Protected(state) &&
+        !active.moveArrived && now-active.ventProgressAt>5000U;
+    if(nativeResult==2 || stalled || now-active.began>traversalLimit) {
         Terminal(result,Phase::Failed,nativeResult==2?Reason::NativeRefused:Reason::Timeout);
         Cancel(c,true);return true;
     }
@@ -677,7 +763,9 @@ void RetirePending() noexcept {
 }
 const ap::ActionHooks hooks{&Begin,&Poll,&Busy,&Cancel,&Recover,&CancelRecovery
 #ifndef AIMP_ALIEN_ACTION_TEST
-    ,&DriveDonor,&ReplicatePvPPose
+    ,&DriveDonor,&ReplicatePvPPose,&InterruptVent
+#else
+    ,nullptr,nullptr,&InterruptVent
 #endif
 };
 #undef AIMP_ACTION_TRY

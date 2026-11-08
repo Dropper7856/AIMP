@@ -19,5 +19,6 @@ struct ActionHooks final {
     // Null intent retires it before a vent, pair, recovery or lease release.
     bool (*drive)(const Context&,const Frame* intent) noexcept{};
     bool (*replicatePose)(const Context&,const Frame&) noexcept{};
+    bool (*interruptVent)(const Context&,Frame&) noexcept{};
 };
 } // namespace aimp::alien_pvp

@@ -11,6 +11,7 @@ public enum AlienAction : byte
     EnterVent = 2,
     ExitVent = 3,
     Roar = 4,
+    CancelVent = 5,
 }
 
 public sealed record AlienVentDestination(float X,float Y,float Z);
@@ -46,7 +47,7 @@ public static class AlienControlProtocol
             !float.IsFinite(value.Strafe) || value.Strafe is < -1F or > 1F ||
             !float.IsFinite(value.Yaw) || value.Yaw is < -180F or > 180F ||
             !float.IsFinite(value.Pitch) || value.Pitch is < -90F or > 90F ||
-            (byte)value.Action > (byte)AlienAction.Roar ||
+            (byte)value.Action > (byte)AlienAction.CancelVent ||
             (value.Sprint && value.Sneak) ||
             (!value.Focused && (value.Forward!=0 || value.Strafe!=0 || value.Action!=AlienAction.None)))
             throw new ProtocolException("Alien control contains an invalid actor identity or input.");

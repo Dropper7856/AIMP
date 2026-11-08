@@ -48,6 +48,7 @@ struct LocalState final {
     bool moving{},visualReady{},middleDown{};
     bool attackDown{}, enterDown{}, exitDown{}, roarDown{};
     bool ventMapOpen{},wasBackstage{},ventLeft{},ventRight{},ventConfirm{};
+    bool ventWasPending{},ventCancelSent{};std::uint64_t ventPendingAt{};
     int nearbyVent{-1},selectedVent{-1};
     float cameraDistance{3.0F},cameraHeight{2.0F},cameraSide{0.5F};
     bool duct{};unsigned ductRun{};std::uint64_t ductAt{};
@@ -356,6 +357,12 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
     if (now==gLocal.lastFrameMs) return;
     gLocal.lastFrameMs=now;
     const bool focused=InputAllowed(context.moduleBase);
+    const auto authority=alien_pvp::VentAuthority();
+    const bool pendingVent=(authority.action==alien_pvp::Action::EnterVent || authority.action==alien_pvp::Action::ExitVent) &&
+        (authority.phase==alien_pvp::ActionPhase::Preparing || authority.phase==alien_pvp::ActionPhase::Started);
+    if(pendingVent && !gLocal.ventWasPending){gLocal.ventPendingAt=now;gLocal.ventCancelSent=false;}
+    if(!pendingVent)gLocal.ventCancelSent=false;
+    gLocal.ventWasPending=pendingVent;
     alien_pvp::vents::Table vents{};
     const bool haveVents=UpdateVentInterface(context,vents);
     const auto wheel=alien_pvp_input::TakeCameraWheel();
@@ -371,7 +378,7 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
     }
     gLocal.middleDown=middle;
     int forward=0,side=0;
-    if (focused && gLocal.camera.bound && !gLocal.ventMapOpen) {
+    if (focused && gLocal.camera.bound && !gLocal.ventMapOpen && !pendingVent) {
         forward=static_cast<int>(Down('W'))-static_cast<int>(Down('S'));
         side=static_cast<int>(Down('D'))-static_cast<int>(Down('A'));
     }
@@ -394,8 +401,15 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
         previous=pressed;
     };
     const bool interact=focused && Down('E'),exit=focused && Down('Q');
+    const bool cancelKey=(interact && !gLocal.enterDown) || (exit && !gLocal.exitDown);
+    const bool cancelMove=focused && pendingVent && now-gLocal.ventPendingAt>=400U &&
+        (Down('W')||Down('A')||Down('S')||Down('D'));
+    if(pendingVent && !gLocal.ventCancelSent && (cancelKey||cancelMove)) {
+        input.action=alien_pvp::Action::CancelVent;alien_pvp::CaptureLocal(input);gLocal.ventCancelSent=true;
+    }
     if((interact && !gLocal.enterDown) || (exit && !gLocal.exitDown)) {
-        if(gLocal.wasBackstage)gLocal.ventMapOpen=!gLocal.ventMapOpen;
+        if(pendingVent) { /* Host resolves cancellation of the original traversal. */ }
+        else if(gLocal.wasBackstage)gLocal.ventMapOpen=!gLocal.ventMapOpen;
         else if(interact && gLocal.nearbyVent>=0 && !alien_pvp::VentPending()) {
             input.action=alien_pvp::Action::EnterVent;alien_pvp::CaptureLocal(input);
         }

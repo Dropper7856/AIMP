@@ -28,6 +28,7 @@ struct State final {
     Frame correction{},lastObserved{},ventAuthority{};
     bool moving{},hadPose{},ownsSlot{},expired{},recovering{},hasDeferredAction{},aligned{};
     Frame deferredAction{};std::uint64_t deferredActionAt{};
+    std::uint64_t ventSettleSequence{},ventSettleAt{};
     float correctionX{},correctionZ{};bool predictionCorrection{};
 };
 State g{}; // certified engine thread only
@@ -124,9 +125,35 @@ bool CancelRecovery() noexcept {
 bool StopDonorMovement() noexcept {
     return !g.context.actions || !g.context.actions->drive || g.context.actions->drive(g.context,nullptr);
 }
+bool VentAction(const Frame& frame) noexcept {
+    return frame.action==Action::EnterVent || frame.action==Action::ExitVent;
+}
+bool SettleVent(const Frame& frame,std::uint64_t now) noexcept {
+    if(!VentAction(frame))return false;
+    if(g.ventSettleSequence!=frame.hostSequence) {
+        g.ventSettleSequence=frame.hostSequence;g.ventSettleAt=now;
+    }
+    // Donor vent.cpp::VentTick closes both gates for 300ms after the key.
+    // Releasing a kind9 Ref alone does not settle the locomotor that frame.
+    if(now-g.ventSettleAt>=300U)return false;
+    if(!g.hasDeferredAction)g.deferredActionAt=now;
+    g.deferredAction=frame;g.hasDeferredAction=true;
+    static_cast<void>(StopDonorMovement());static_cast<void>(CancelRecovery());
+    ReleaseCarrier();return true;
+}
 void ApplyAction(const Frame& command,std::uint64_t now) noexcept {
     if(command.action==Action::None || (command.flags&Focused)==0U)return;
     Frame result=command;result.resolutionRevision=1U;
+    if(command.action==Action::CancelVent) {
+        if(!g.context.host)return;
+        if(g.hasDeferredAction && VentAction(g.deferredAction)) {
+            result=g.deferredAction;g.hasDeferredAction=false;
+            result.phase=ActionPhase::Rejected;result.reason=ActionReason::NativeBusy;
+            result.resolutionRevision=1U;PublishAction(result,now);
+        } else if(g.context.actions && g.context.actions->interruptVent &&
+            g.context.actions->interruptVent(g.context,result))PublishAction(result,now);
+        return;
+    }
     if(command.action==Action::Roar) {
         result.phase=ActionPhase::Rejected;result.reason=ActionReason::NativeBusy;
         if((!g.lastRoar || now-g.lastRoar>=2000U) && !ActionBusy() && OrdinaryCycle(g.context.character) && Roar()) {
@@ -138,6 +165,7 @@ void ApplyAction(const Frame& command,std::uint64_t now) noexcept {
     // Attack execution is carried by the existing typed AISync pair stream;
     // vent execution waits for the Host-selected real portal resolution.
     if(!g.context.host)return;
+    if(!ActionBusy() && SettleVent(command,now))return;
     if(!StopDonorMovement() || !CancelRecovery()) {
         if(!g.hasDeferredAction) {g.deferredAction=command;g.deferredActionAt=now;g.hasDeferredAction=true;}
         else if(g.deferredAction.hostSequence!=command.hostSequence) {
@@ -155,6 +183,7 @@ void ApplyAction(const Frame& command,std::uint64_t now) noexcept {
 void ApplyResolution(const Frame& plan,std::uint64_t now) noexcept {
     if(g.context.host)return;
     if(plan.action==Action::EnterVent || plan.action==Action::ExitVent)g.ventAuthority=plan;
+    if(plan.phase==ActionPhase::Started && !ActionBusy() && SettleVent(plan,now))return;
     if((!StopDonorMovement() || !CancelRecovery()) && (plan.phase==ActionPhase::Preparing || plan.phase==ActionPhase::Started)) {
         if(!g.hasDeferredAction || g.deferredAction.hostSequence==plan.hostSequence) {
             if(!g.hasDeferredAction)g.deferredActionAt=now;
@@ -219,6 +248,7 @@ void Drain(std::uint64_t now) noexcept {
         }
         if(f.kind==Kind::Activate && previousEpoch!=f.epoch) {
             g.inputSequence=g.poseSequence=g.appliedInput=g.appliedHost=0U;
+            g.ventSettleSequence=g.ventSettleAt=0U;
             g.history.Clear();g.lastInputSent=0U;g.lastAckAt=now;g.predictionCorrection=false;
             g.correction={};g.correctionAt=0U;g.lastObserved={};g.hadPose=false;g.lastPose=0U;
             g.actionRead=g.actionCount=0U;g.local.action=Action::None;g.hasDeferredAction=false;
@@ -271,6 +301,10 @@ void ApplyMovement(std::uint64_t now,float dt) noexcept {
         active && g.context.pilotReady && Fresh(now,g.capturedAt,150U) &&
             Fresh(now,g.lastAckAt,kAuthorityTimeoutMs) : g.window.InputFresh(now);
     if(ActionBusy() || g.hasDeferredAction) {static_cast<void>(StopDonorMovement());static_cast<void>(CancelRecovery());ReleaseCarrier();return;}
+    if(g.context.localOwner && VentAction(g.ventAuthority) &&
+        (g.ventAuthority.phase==ActionPhase::Preparing || g.ventAuthority.phase==ActionPhase::Started)) {
+        static_cast<void>(StopDonorMovement());static_cast<void>(CancelRecovery());ReleaseCarrier();return;
+    }
     if(active && !g.context.localOwner && g.correctionAt && Fresh(now,g.correctionAt,250U) &&
         (g.correction.flags&(PoseValid|OwnerMeasured|NativeBusy))==(PoseValid|OwnerMeasured) &&
         g.context.actions && g.context.actions->replicatePose) {

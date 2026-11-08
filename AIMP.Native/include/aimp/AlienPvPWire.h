@@ -21,7 +21,7 @@ enum Flag : std::uint32_t {
     UnsupportedAction=512U, PoseValid=1024U, ActionApplied=2048U, Backstage=4096U, VentSelected=8192U, OwnerMeasured=16384U
 };
 inline constexpr std::uint32_t kKnownFlags=32767U;
-enum class Action : std::uint32_t { None, Attack, EnterVent, ExitVent, Roar };
+enum class Action : std::uint32_t { None, Attack, EnterVent, ExitVent, Roar, CancelVent };
 enum class ActionPhase : std::uint32_t { None, Started, Completed, Rejected, Failed, Cancelled, Preparing };
 enum class ActionReason : std::uint32_t { None, NativeBusy, Cooldown, NoTarget, NotReady,
     NativeUnavailable, NativeRefused, NoVent, AmbiguousVent, WrongStage, Stale, Timeout, Fault, Occluded };
@@ -54,7 +54,7 @@ inline bool Valid(const Scope& s) noexcept {
 inline bool Valid(const Frame& f) noexcept {
     if (!Valid(f.scope) || static_cast<unsigned>(f.kind)<1U ||
         static_cast<unsigned>(f.kind)>10U || (f.flags&~kKnownFlags) || f.gait>3U ||
-        static_cast<unsigned>(f.action)>4U) return false;
+        static_cast<unsigned>(f.action)>5U) return false;
     for (const auto v:{f.forward,f.strafe,f.yaw,f.pitch,f.x,f.y,f.z,f.velocityX,f.velocityZ,f.resolvedX,f.resolvedY,f.resolvedZ})
         if (!std::isfinite(v)) return false;
     if (std::abs(f.forward)>1.0F || std::abs(f.strafe)>1.0F ||

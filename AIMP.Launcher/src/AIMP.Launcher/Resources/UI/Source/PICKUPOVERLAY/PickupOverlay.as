@@ -155,7 +155,7 @@ package
             if(values.length != 4 || id < 0 || id >= count || !isFinite(Number(values[1])) || !isFinite(Number(values[2])) || !isFinite(Number(values[3])))continue;
             this.aimp_vent_points[String(id)] = [id,Number(values[1]),Number(values[2]),Number(values[3])];
          }
-         if(this.aimp_loading_layer != null || this.aimp_round_end_layer != null || (!open && nearby < 0 && !backstage))
+         if(this.aimp_loading_layer != null || this.aimp_round_end_layer != null || (!open && nearby < 0 && !backstage && !pending))
          { this.aimp_hide_vents();return; }
          if(!open)
          {
@@ -163,7 +163,7 @@ package
             this.aimp_vent_layer.mouseEnabled = false;this.aimp_vent_layer.mouseChildren = false;
             this.aimp_vent_layer.graphics.beginFill(0,0.8);this.aimp_vent_layer.graphics.drawRect(width * 0.2,height * 0.82,width * 0.6,52);
             this.aimp_vent_layer.graphics.endFill();
-            this.aimp_vent_layer.addChild(this.aimp_vent_text(backstage ? 'Press "E" to choose a ventilation exit' : 'Press "E" to enter ventilation',22,width * 0.2,height * 0.82 + 10,width * 0.6));return;
+            this.aimp_vent_layer.addChild(this.aimp_vent_text(pending ? "Entering ventilation... E / Q or WASD: cancel" : backstage ? 'Press "E" to choose a ventilation exit' : 'Press "E" to enter ventilation',22,width * 0.2,height * 0.82 + 10,width * 0.6));return;
          }
          if(this.aimp_map_view == null)
          {
@@ -270,7 +270,7 @@ package
          this.aimp_map_legend.text = legend;
          for each(var entry:Object in colors)
          { var format:TextFormat = new TextFormat();format.color = entry.color;this.aimp_map_legend.setTextFormat(format,entry.start,entry.end); }
-         this.aimp_map_status.text = this.aimp_map_asset + "   |   Vent " + String(this.aimp_map_selected + 1) + "   |   " + loaded + "/" + count + " openings   |   " + (pending ? "Travel in progress..." : "Select a vent, then Go To Here");
+         this.aimp_map_status.text = this.aimp_map_asset + "   |   Vent " + String(this.aimp_map_selected + 1) + "   |   " + loaded + "/" + count + " openings   |   " + (pending ? "Travel in progress... E / Q or WASD: cancel" : "Select a vent, then Go To Here");
       }
 
       public var pickup_cursor_mc:MovieClip;
