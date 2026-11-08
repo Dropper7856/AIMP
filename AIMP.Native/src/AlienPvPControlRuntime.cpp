@@ -509,6 +509,10 @@ void CaptureLocal(const LocalInput& input) noexcept {
     g.local.action=Action::None;
 }
 Frame VentAuthority() noexcept {return g.ventAuthority;}
+bool ControlActive() noexcept {
+    return g.context.owned && g.context.localOwner && g.aligned && !g.deliveryFault &&
+        g.window.ActiveAt(GetTickCount64());
+}
 bool VentPending() noexcept {
     return ActionBusy() || g.hasDeferredAction || g.ventAuthority.phase==ActionPhase::Preparing ||
         g.ventAuthority.phase==ActionPhase::Started;

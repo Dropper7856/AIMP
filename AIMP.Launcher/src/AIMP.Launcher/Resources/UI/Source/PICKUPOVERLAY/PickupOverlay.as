@@ -133,6 +133,7 @@ package
          var scope:String = this.aimp_get_bridge_value(line,"scope");
          var count:int = int(this.aimp_get_bridge_value(line,"count"));
          var open:Boolean = this.aimp_get_bridge_value(line,"open") == "1";
+         var controlReady:Boolean = this.aimp_get_bridge_value(line,"controlReady") == "1";
          var backstage:Boolean = this.aimp_get_bridge_value(line,"backstage") == "1";
          var nearby:int = int(this.aimp_get_bridge_value(line,"nearby"));
          var pending:Boolean = this.aimp_get_bridge_value(line,"pending") == "1";
@@ -155,15 +156,15 @@ package
             if(values.length != 4 || id < 0 || id >= count || !isFinite(Number(values[1])) || !isFinite(Number(values[2])) || !isFinite(Number(values[3])))continue;
             this.aimp_vent_points[String(id)] = [id,Number(values[1]),Number(values[2]),Number(values[3])];
          }
-         if(this.aimp_loading_layer != null || this.aimp_round_end_layer != null || (!open && nearby < 0 && !backstage && !pending))
+         if(this.aimp_loading_layer != null || this.aimp_round_end_layer != null || (controlReady && !open && nearby < 0 && !backstage && !pending))
          { this.aimp_hide_vents();return; }
-         if(!open)
+         if(!open || !controlReady)
          {
             this.aimp_hide_vents();this.aimp_vent_layer = new Sprite();addChild(this.aimp_vent_layer);
             this.aimp_vent_layer.mouseEnabled = false;this.aimp_vent_layer.mouseChildren = false;
             this.aimp_vent_layer.graphics.beginFill(0,0.8);this.aimp_vent_layer.graphics.drawRect(width * 0.2,height * 0.82,width * 0.6,52);
             this.aimp_vent_layer.graphics.endFill();
-            this.aimp_vent_layer.addChild(this.aimp_vent_text(pending ? "Entering ventilation... E / Q or WASD: cancel" : backstage ? 'Press "E" to choose a ventilation exit' : 'Press "E" to enter ventilation',22,width * 0.2,height * 0.82 + 10,width * 0.6));return;
+            this.aimp_vent_layer.addChild(this.aimp_vent_text(!controlReady ? "Waiting for Alien control authorization from Host..." : pending ? "Entering ventilation... E / Q or WASD: cancel" : backstage ? 'Press "E" to choose a ventilation exit' : 'Press "E" to enter ventilation',22,width * 0.2,height * 0.82 + 10,width * 0.6));return;
          }
          if(this.aimp_map_view == null)
          {

@@ -628,7 +628,9 @@ struct AlienPvPNativeLease final {
     std::uint64_t sessionCookie{}, ownerPeer{};
     std::uint32_t nativeGeneration{}, worldGeneration{}, entityA{}, entityB{}, runtimeId{};
     std::uint32_t boundaryOffset{}, boundaryValue{};
+    std::uint32_t retainedKind{},retainedStatus{},retainedRetired{};
     bool fenced{}, drained{}, owned{}, navigationDrainEntered{}, releasing{};
+    bool retainedDrainFault{};
 };
 AlienPvPNativeLease gPvPLease{};
 bool PvPCharacterFenced(std::uintptr_t character) noexcept;
@@ -10537,6 +10539,8 @@ AlienPvPLeaseStatus PvPStatus(const AlienPvPLeasePhase phase) noexcept {
     status.worldGeneration=gPvPLease.worldGeneration;
     status.boundaryOffset=gPvPLease.boundaryOffset;
     status.boundaryValue=gPvPLease.boundaryValue;
+    status.retainedKind=gPvPLease.retainedKind;status.retainedStatus=gPvPLease.retainedStatus;
+    status.retainedRetired=gPvPLease.retainedRetired;
     status.isLocalOwner=gPvPLease.ownerPeer!=0U &&
         gPvPLease.ownerPeer==gCurrent.localPeer;
     status.localPilotReady=status.isLocalOwner &&
@@ -10594,7 +10598,63 @@ bool PvPTryClearDrainedNavigation(Actor& actor,
     if (!ResetDrainedNavigation(navigation) || !current()) return false;
     if (!ClearDrainedNavigation(navigation,false) || !current()) return false;
     if (!ClearDrainedNavigation(navigation,true) || !current()) return false;
+    // A completed drain may be repeated if a late native result repopulates
+    // history. A partial/faulted drain keeps this fence and cannot be retried.
+    gPvPLease.navigationDrainEntered=false;
     return true;
+}
+
+bool PvPRetireTerminalRequest(std::uintptr_t scheduler,std::uintptr_t request,std::uintptr_t control) noexcept {
+    struct Ref {std::uintptr_t object,control;} ref{request,control};
+    __try {
+        // Pin independently of the scheduler list: native cancellation and
+        // collection may release its last list Ref. Use the retail Ref dtor.
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(control+4U));
+        reinterpret_cast<void(__thiscall*)(void*)>(gBase+0x00283DB0U)(reinterpret_cast<void*>(request));
+        if(*reinterpret_cast<const std::uint8_t*>(request+0x18U)!=0U)return false;
+        // 006838D0 returns early for status5 (replaced). 00683470 performs
+        // the missing retained-list removal once Cancel cleared retention.
+        reinterpret_cast<void(__thiscall*)(void*,void*)>(gBase+0x00283470U)(reinterpret_cast<void*>(scheduler),&ref);
+        const bool retired=*reinterpret_cast<const std::uint32_t*>(request+0xCU)==6U;
+        reinterpret_cast<void(__thiscall*)(void*)>(gBase+0x0000D770U)(&ref);
+        return retired;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+}
+bool PvPTryRetireRetainedMovement(Actor& actor) noexcept {
+    if(!gPvPLease.drained || gPvPLease.owned || gPvPLease.retainedDrainFault ||
+        !PvPLeaseScopeCurrent() || !PvPLeaseLiveIdentity() ||
+        PairSourceBusy(actor.character) || !UnownedCleanupAllowed(actor))return false;
+    const auto scheduler=actor.character+0x2CD0U;
+    // Exact unhooked collector body; no vtable-only inference about requests.
+    std::array<std::uint8_t,8> code{};
+    if(!Read(gBase+0x00283470U,code) || code!=std::array<std::uint8_t,8>{0x53,0x8B,0x5C,0x24,0x08,0x56,0x8B,0x33})return false;
+    for(unsigned budget=0;budget<64U;++budget) {
+        std::uintptr_t owner{},sentinel{},node{},previous{},request{},control{},type{},requestOwner{},requestControl{};
+        std::uint32_t active{},count{},kind{},state{},strong{};
+        if(!PvPLeaseLiveIdentity() || !Read(scheduler,owner) || owner!=actor.character ||
+            !Read(scheduler+8U,active) || active || !Read(scheduler+0x14U,count) || count>64U)return false;
+        if(!count)return true;
+        if(!Read(scheduler+0x10U,sentinel)||!sentinel||!Read(sentinel,node)||!node||node==sentinel||
+            !Read(node+4U,previous)||previous!=sentinel||!Read(node+8U,request)||!request||
+            !Read(node+12U,control)||!control||!Read(control+4U,strong)||!strong||strong>=0x100000U||
+            !Read(request+4U,requestControl)||requestControl!=control||
+            !Read(request,type)||!Read(request+0x14U,requestOwner)||requestOwner!=scheduler||
+            !Read(request+0x10U,kind)||!Read(request+0xCU,state))return false;
+        gPvPLease.retainedKind=kind;gPvPLease.retainedStatus=state;
+        std::uintptr_t expected{};
+        switch(kind) {
+        case 1U:expected=0xEB1A70U;break;case 2U:expected=0xEB1A60U;break;
+        case 3U:expected=0xEB1A50U;break;case 4U:expected=0xEB19CCU;break;
+        case 7U:expected=0xEB19BCU;break;case 9U:expected=0xEB19ACU;break;
+        default:return false; // No action, placement, pair or scheduler-mode request.
+        }
+        if(type!=gBase+expected || state<3U || state>5U)return false;
+        if(!PvPRetireTerminalRequest(scheduler,request,control)) {
+            gPvPLease.retainedDrainFault=true;return false;
+        }
+        ++gPvPLease.retainedRetired;
+    }
+    return false;
 }
 
 // Host-validated owner observations update only the exact possessed replica.
@@ -10641,6 +10701,10 @@ bool PvPTryDrain(AlienPvPLeaseStatus& status) noexcept {
     if (!actor || actor->duplicate || actor->faulted || actor->runtimeId != gPvPLease.runtimeId) {
         gPvPLease.owned=false;
         status=PvPStatus(AlienPvPLeasePhase::AwaitingRetirement); return false;
+    }
+    if(gPvPLease.retainedDrainFault) {
+        status=PvPStatus(AlienPvPLeasePhase::Draining);
+        status.waitReason="retained-request-retirement-fault";return false;
     }
     if (gPvPLease.owned && !gPvPLease.releasing &&
         (alien_pvp_local::Drives(actor->character,gPvPLease.nativeGeneration) ||
@@ -10691,6 +10755,13 @@ bool PvPTryDrain(AlienPvPLeaseStatus& status) noexcept {
     if (!resources) { status=PvPStatus(AlienPvPLeasePhase::Draining); return false; }
     failure={};
     auto check=execution::InspectAlienPossessionBoundary(memory,lifetime,true,&failure);
+    // A finished retained request can also hold locomotion state56 open.
+    // The non-quiet cycle proof above allows retiring its request, but the
+    // final quiet proof still waits for the cycle to finish natively.
+    if(check==Check::Waiting && (failure.offset==0x2CE4U ||
+        (failure.offset==0x36CU && failure.value==56U)) && PvPTryRetireRetainedMovement(*actor)) {
+        failure={};check=execution::InspectAlienPossessionBoundary(memory,lifetime,true,&failure);
+    }
     if (check == Check::Waiting && PvPTryClearDrainedNavigation(*actor,failure)) {
         failure={};
         check=execution::InspectAlienPossessionBoundary(memory,lifetime,true,&failure);
@@ -10699,6 +10770,9 @@ bool PvPTryDrain(AlienPvPLeaseStatus& status) noexcept {
     if (check != Check::Ready) {
         gPvPLease.owned=false;
         status=PvPStatus(AlienPvPLeasePhase::Draining);
+        status.waitReason=gPvPLease.retainedDrainFault?"retained-request-retirement-fault":
+            failure.offset==0x2CE4U?"initial-retained-request":
+            failure.offset>=0x10000U?"initial-navigation-retirement":"initial-scheduler-retirement";
         return false;
     }
     gPvPLease.owned=true;
@@ -10874,7 +10948,8 @@ bool SnapshotAlienVents(std::uint32_t page,std::string& json,int goTo,std::uint6
         ",\"y\":"+std::to_string(body[1])+",\"z\":"+std::to_string(body[2])+
         ",\"action\":"+std::to_string(static_cast<unsigned>(authority.action))+
         ",\"phase\":"+std::to_string(static_cast<unsigned>(authority.phase))+
-        ",\"pending\":"+(alien_pvp::VentPending()?"true":"false")+",\"vents\":[";
+        ",\"pending\":"+(alien_pvp::VentPending()?"true":"false")+
+        ",\"controlReady\":"+(alien_pvp::ControlActive()?"true":"false")+",\"vents\":[";
     bool comma{};
     for(auto i=page*64U;i<std::min(table.count,(page+1U)*64U);++i) {
         alien_pvp::vents::Point point{};

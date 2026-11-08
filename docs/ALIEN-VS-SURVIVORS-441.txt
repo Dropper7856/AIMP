@@ -1,0 +1,51 @@
+﻿AIMP 441 / protocol 39
+Branch: feature/alien-vs-survivors-main
+
+Observed in supplied build440 diagnostics
+- Client19:05:04 owns its local Alien, with isolated input, bound camera and
+  hidden technical Amanda. From19:05:02 to19:05:32 it reports epoch0,
+  ready=False and input=commit=pose=0. No vent or movement command started.
+- Host never becomes Owned. Initial navigation/cycle retirement is followed
+  by a persistent Character+2CE4 retained scheduler count1 from17:05:20 onward.
+- Latest host motion trace: neutral cycle EAD858/state1, headKind0, movement
+  mode0, navigation worker0, routeNodes0 and historyNodes20. This is a control
+  readiness barrier, not missing WASD polling or an active vent action.
+- The archives do not expose the retained request's kind/status. Exact cause
+  of its retention cannot be established from these archives alone.
+
+Changes
+- Initial PvP handoff now examines retained terminal locomotion requests when
+  the scheduler has no active requests. Identity, exact native vtable/kind,
+  scheduler owner, weak/strong control, native cycle, world and incarnation
+  must match. Only kinds1/2/3/4/7/9 and terminal states3..5 are admitted.
+- Native Cancel clears retention; native00683470 removes the scheduler's
+  retained-list Ref and reaches status6. This includes replaced status5,
+  for which006838D0 returns before removing retention. A separately pinned Ref
+  survives list removal and is released through the retail Ref destructor.
+- No scheduler counts, list links, cycle bits or poses are manually cleared.
+  No active passage, pair, action, placement or scheduler-mode request is
+  cancelled by this helper. The final ordinary quiescence proof is unchanged.
+- A terminal retained request can also be retired during the non-quiet state56
+  drain; readiness still waits for that cycle to finish natively.
+- A fully successful navigation cleanup can run again after a late result
+  repopulates history. An incomplete/faulted cleanup remains fenced.
+- Native retirement faults block readiness; kind/status/retired count and
+  specific waiting reasons are included in lease diagnostics.
+- Alien HUD now says it is waiting for Host control authorization until the
+  native epoch is active and the local body has received initial alignment.
+  Vent mouse mode likewise waits for control activation. Other players do not
+  receive the Alien HUD. Existing movement/vent cancellation and maps retained.
+- Product441; public protocol remains39, with no new network message.
+
+Evidence and verification
+- Offline inspection of retained AI.exe.c and Capstone disassembly of supplied
+  AI.exe. 00683470 is ECX scheduler/stack Ref and RET4; 00683DB0 and0040D770
+  receive ECX only and RET. Collector prologue is checked before native use.
+  This is ordinary shell/static evidence, not REA execution evidence.
+- Artifact: artifacts/alien-441/retained-request-abi.txt.
+- AS3 compiled; shipped GFX re-export confirms controlReady waiting display
+  and existing map/Go To Here functions. Original visual tags/tail preserved.
+- No unit tests created or executed. In-game recovery is not verified here.
+- Final build log: artifacts/alien-441/build-final.log.
+  Final delivery receipt: artifacts/alien-441/delivery.json.
+- Win32 Release and .NET publishes succeeded; API delivered on both PCs. SHA-256 equality verified for Launcher/Protocol/NetZ and both UI GFX files. Source GFX matches both copies. No Electron rebuild or destination-only deletion.

@@ -415,7 +415,7 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
         }
     }
     gLocal.enterDown=interact;gLocal.exitDown=exit;
-    alien_pvp_input::SetMapMode(gLocal.ventMapOpen && focused);
+    alien_pvp_input::SetMapMode(gLocal.ventMapOpen && focused && alien_pvp::ControlActive());
     const bool left=focused && Down(VK_LEFT),right=focused && Down(VK_RIGHT),confirm=focused && Down(VK_RETURN);
     if(gLocal.ventMapOpen && haveVents) {
         const int direction=right&&!gLocal.ventRight?1:(left&&!gLocal.ventLeft?-1:0);

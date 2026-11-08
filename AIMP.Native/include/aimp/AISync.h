@@ -393,6 +393,7 @@ struct AlienPvPLeaseStatus final {
     std::uint64_t ownerPeer{};
     std::uint32_t entityA{}, entityB{}, runtimeId{}, nativeGeneration{}, worldGeneration{};
     std::uint32_t boundaryOffset{}, boundaryValue{};
+    std::uint32_t retainedKind{},retainedStatus{},retainedRetired{};
     bool isLocalOwner{}, localPilotReady{};
     bool pilotInputIsolated{}, pilotCameraBound{}, pilotTechnicalHidden{}, pilotMoving{};
     const char* waitReason{"none"}; // static local diagnostic text, never a wire pointer

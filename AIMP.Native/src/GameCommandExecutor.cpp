@@ -4203,6 +4203,9 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteAlienPvPBind(const std::u
         " runtimeId="+std::to_string(status.runtimeId)+
         " boundaryOffset="+std::to_string(status.boundaryOffset)+
         " boundaryValue="+std::to_string(status.boundaryValue)+
+        " retainedKind="+std::to_string(status.retainedKind)+
+        " retainedStatus="+std::to_string(status.retainedStatus)+
+        " retainedRetired="+std::to_string(status.retainedRetired)+
         " localOwner="+std::to_string(status.isLocalOwner?1:0)+
         " localPilotReady="+std::to_string(status.localPilotReady?1:0)+
         " pilotInputIsolated="+std::to_string(status.pilotInputIsolated?1:0)+

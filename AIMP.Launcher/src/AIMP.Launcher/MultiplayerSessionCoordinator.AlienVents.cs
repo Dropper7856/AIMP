@@ -79,6 +79,7 @@ internal sealed partial class MultiplayerSessionCoordinator
             await _bridge.SendAsync("ALIEN_VENTS",new Dictionary<string,string>
             {
                 ["active"]="1",["scope"]=scope,["count"]=count.ToString(CultureInfo.InvariantCulture),
+                ["controlReady"]=root.GetProperty("controlReady").GetBoolean()?"1":"0",
                 ["nearby"]=root.GetProperty("nearby").GetInt32().ToString(CultureInfo.InvariantCulture),
                 ["selected"]=root.GetProperty("selected").GetInt32().ToString(CultureInfo.InvariantCulture),
                 ["open"]=root.GetProperty("open").GetBoolean()?"1":"0",

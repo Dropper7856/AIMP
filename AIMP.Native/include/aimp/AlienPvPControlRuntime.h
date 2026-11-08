@@ -28,6 +28,7 @@ bool Owns(std::uintptr_t character,std::uint32_t generation) noexcept;
 bool MovingNow() noexcept;
 Frame VentAuthority() noexcept;
 bool VentPending() noexcept;
+bool ControlActive() noexcept;
 // Worker-thread calls. Queues hold copied frames, never native resources.
 bool QueueCommand(std::span<const std::byte> bytes) noexcept;
 bool TryPopObservation(std::array<std::uint8_t,kWireBytes>& bytes) noexcept;
