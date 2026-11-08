@@ -42,8 +42,10 @@ struct Active final {
     bool used{},entered{},cancelled{},terminalSent{},hostEnded{},moveArrived{},entrySubmitted{},remoteVent{};
     bool presentationStarted{},ownerFinished{};
     std::uint64_t ventProgressAt{};float ventBestDistance{std::numeric_limits<float>::infinity()};
-    bool attackLatched{},retailArmed{},presented{};std::uint64_t latchedAt{},lastPairTrace{},armedAt{},presentedAt{},lastQuery{};
-    std::uint32_t retargets{};
+    bool attackLatched{},retailArmed{},presented{};std::uint64_t latchedAt{},lastPairTrace{},armedAt{},presentedAt{};
+    std::uint32_t retargets{},flagConsumed{};
+    std::uintptr_t attackAnimated{};bool shouldAttackSet{};
+    ap::attack::HeldTarget brainTarget{};
 };
 Active active{};
 policy::EdgeGate edges{};
@@ -112,6 +114,8 @@ struct AttackTelemetry final {
     std::atomic<std::uint64_t> revision{},sequence{},elapsed{},polls{};
     std::atomic<unsigned> stage{},selector{},cycle{};
     std::atomic<unsigned> pairStage{},pairPrepared{},victimState{},victimAcquired{};
+    // Armed-window counters of the current attack (not overwritten by stage).
+    std::atomic<unsigned> armedPolls{},flagConsumed{},retargets{},brainMissing{};
 } attackTelemetry;
 void TraceAttack(unsigned stage,unsigned selector=0U) noexcept {
     std::uint8_t state{};bool backstage{};
@@ -142,7 +146,7 @@ void LogAttack(Diagnostics& diagnostics) {
     const auto sequence=attackTelemetry.sequence.load();
     if(!revision || revision==lastRevision || (sequence==lastSequence && now-lastAt<250U))return;
     lastRevision=revision;lastSequence=sequence;lastAt=now;
-    diagnostics.Log("info","alien_attack_progress","Host attack preparation; stage 1 noSelection 2 noRecord 3 targetFault 4 queryRefused 5 selectorUnproven 6 rayPending 7 submitted 8 pairRefused 9 entered 10 enteredWithRayPending 11 pairRunning 12 victimNotAcquired4s 13 retailArmed 14 retailWindowExpired 15 retailOtherVictim 16 retailRetargeted(selector=count) 17 armedQueryRefused 20 clientPresented 21 clientPresentRefused 22 clientNotEntered 23 clientEntered.",
+    diagnostics.Log("info","alien_attack_progress","Host attack preparation; stage 1 noSelection 2 noRecord 3 targetFault 4 queryRefused 5 selectorUnproven 6 rayPending 7 submitted 8 pairRefused 9 entered 10 enteredWithRayPending 11 pairRunning 12 victimNotAcquired4s 13 retailArmed 14 retailWindowExpired 15 retailOtherVictim 16 retailRetargeted(selector=count) 17 armedQueryRefused 18 brainTargetUnavailable 19 attackBranchConsumedFlag(selector=count) 20 clientPresented 21 clientPresentRefused 22 clientNotEntered 23 clientEntered.",
         {{"hostSequence",Diagnostics::Unsigned(sequence),true},
          {"elapsedMs",Diagnostics::Unsigned(attackTelemetry.elapsed.load()),true},
          {"stage",Diagnostics::Unsigned(attackTelemetry.stage.load()),true},
@@ -152,7 +156,11 @@ void LogAttack(Diagnostics& diagnostics) {
          {"pairStage",Diagnostics::Unsigned(attackTelemetry.pairStage.load()),true},
          {"pairPrepared",Diagnostics::Unsigned(attackTelemetry.pairPrepared.load()),true},
          {"victimState",Diagnostics::Unsigned(attackTelemetry.victimState.load()),true},
-         {"victimAcquired",Diagnostics::Unsigned(attackTelemetry.victimAcquired.load()),true}});
+         {"victimAcquired",Diagnostics::Unsigned(attackTelemetry.victimAcquired.load()),true},
+         {"armedPolls",Diagnostics::Unsigned(attackTelemetry.armedPolls.load()),true},
+         {"flagConsumed",Diagnostics::Unsigned(attackTelemetry.flagConsumed.load()),true},
+         {"retargets",Diagnostics::Unsigned(attackTelemetry.retargets.load()),true},
+         {"brainMissing",Diagnostics::Unsigned(attackTelemetry.brainMissing.load()),true}});
 }
 #else
 void TraceVent(unsigned=0U) noexcept {}
@@ -493,10 +501,40 @@ bool HoldAttackTarget(const std::uintptr_t victim) noexcept {
     const ap::attack::Manager manager{active.chooser,0U,0U};
     return ap::attack::Hold(AttackMemory(),manager,victim,active.heldTarget)==ap::attack::HoldResult::Held;
 }
+// Retail alien_behave runs ATTACK_CORE_BRANCH (ConditionHasMeleeAttackAvailable
+// OrIsAttacking -> ActionMeleeAttack) only while the logic character flag
+// SHOULD_ATTACK (5) is set: byte AnimatedCharacter+423C+flag, written by
+// 00785B10. The branch clears it after one try, so it is raised every poll.
+constexpr std::uintptr_t kShouldAttackFlag=0x423CU+5U;
+bool SetShouldAttack(const bool on) noexcept {
+    if(!active.attackAnimated)return false;
+    const std::uint8_t value=on?1U:0U;
+    return crash_guard::TryWrite(reinterpret_cast<void*>(active.attackAnimated+kShouldAttackFlag),&value,sizeof(value));
+}
 // A stale level/lease may have freed the record: drop the hold, never write.
 void ReleaseAttackTarget() noexcept {
-    if(active.heldTarget.record && Live(active.context))ap::attack::Release(AttackMemory(),active.heldTarget);
-    active.heldTarget={};
+    if(Live(active.context)) {
+        if(active.heldTarget.record)ap::attack::Release(AttackMemory(),active.heldTarget);
+        if(active.brainTarget.record)ap::attack::Release(AttackMemory(),active.brainTarget);
+        if(active.shouldAttackSet)static_cast<void>(SetShouldAttack(false));
+    }
+    active.heldTarget={};active.brainTarget={};active.shouldAttackSet=false;
+}
+// ActionMeleeAttack 00717D90 reads the target through AnimatedCharacter+34A8
+// ->+10 (donor TargetOf/SetTargetOf). Hold it there too if it is not the
+// record the attack manager query reads.
+bool HoldBrainTarget(const std::uintptr_t victim) noexcept {
+    std::uintptr_t brain{},record{},target{};std::uint32_t birth{},victimBirth{};
+    if(!Read(active.attackAnimated+0x34A8U,brain) || !brain || !Read(brain+0x10U,record) || !record)return false;
+    if(record==active.heldTarget.record)return true;
+    if(!Read(record+0x42CU,target) || !Read(record+0x430U,birth) || !Read(victim+0x50U,victimBirth))return false;
+    if(active.brainTarget.record!=record) {
+        if(active.brainTarget.record)ap::attack::Release(AttackMemory(),active.brainTarget);
+        active.brainTarget={record,target,birth,victim};
+    }
+    if(target==victim && birth==victimBirth)return true;
+    return crash_guard::TryWrite(reinterpret_cast<void*>(record+0x430U),&victimBirth,sizeof(victimBirth)) &&
+        crash_guard::TryWrite(reinterpret_cast<void*>(record+0x42CU),&victim,sizeof(victim));
 }
 bool AttackQuery(const ap::attack::Memory& memory,const ap::attack::Manager& manager,
     const std::uintptr_t victim,bool& ready,std::uint32_t& selector) noexcept {
@@ -526,7 +564,7 @@ bool AttackAvailability(const ap::Context& c,const PairIdentity& victim,std::uin
     if(!Live(c) || !PairIdentityLive(victim) || PublishedPairSource(c.character,source)==kActors ||
         !PairIdentityLive(source) || !ap::attack::Resolve(memory,c.character,source.animated,manager) ||
         (chooser && chooser!=manager.address))return false;
-    chooser=manager.address;
+    chooser=manager.address;active.attackAnimated=source.animated;
     switch(ap::attack::Hold(memory,manager,victim.character,active.heldTarget)) {
     case ap::attack::HoldResult::Held:break;
     case ap::attack::HoldResult::NoSelection:TraceAttack(1U);return true;
@@ -798,21 +836,31 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
                     ReleaseAttackTarget();TraceAttack(14U,active.receipt.selector);
                     Terminal(result,Phase::Rejected,Reason::NativeRefused);active.cancelled=true;return true;
                 }
-                // 453 (the only completed kill) rewrote the target and re-ran
-                // the query every frame. Retail target selection overwrites a
-                // single write, so keep re-holding; refresh the query only once
-                // its cover ray retired, never re-arming a pending one (454).
+                // Raise SHOULD_ATTACK so retail alien_behave enters ATTACK_CORE_BRANCH
+                // (its own HasMeleeAttackAvailable query, then ActionMeleeAttack),
+                // and keep the victim on both target records: retail target
+                // selection overwrites a single write. The branch clears the flag
+                // after each try, so a cleared flag proves the branch ran. Our own
+                // query is not re-run: it would re-arm the branch's cover ray.
+                attackTelemetry.armedPolls.fetch_add(1U,std::memory_order_relaxed);
+                std::uint8_t should{};
+                if(active.shouldAttackSet && Read(active.attackAnimated+kShouldAttackFlag,should) && !should) {
+                    attackTelemetry.flagConsumed=++active.flagConsumed;TraceAttack(19U,active.flagConsumed);
+                }
+                if(!SetShouldAttack(true)) {
+                    ReleaseAttackTarget();Terminal(result,Phase::Failed,Reason::NativeUnavailable);active.cancelled=true;return true;
+                }
+                active.shouldAttackSet=true;
                 std::uintptr_t current{};
                 if(active.heldTarget.record && Read(active.heldTarget.record+0x42CU,current) &&
-                    current!=active.victim.character)TraceAttack(16U,++active.retargets);
+                    current!=active.victim.character) {
+                    attackTelemetry.retargets=++active.retargets;TraceAttack(16U,active.retargets);
+                }
                 if(!HoldAttackTarget(active.victim.character)) {
                     ReleaseAttackTarget();Terminal(result,Phase::Failed,Reason::NativeUnavailable);active.cancelled=true;return true;
                 }
-                if(now-active.lastQuery>=250U && AttackQueryRetired(active.chooser)) {
-                    active.lastQuery=now;bool ready{};std::uint32_t selector{};
-                    const ap::attack::Manager manager{active.chooser,0U,0U};
-                    static_cast<void>(AttackQuery(AttackMemory(),manager,active.victim.character,ready,selector));
-                    TraceAttack(ready?13U:17U,ready?selector:active.receipt.selector);
+                if(!HoldBrainTarget(active.victim.character)) {
+                    attackTelemetry.brainMissing.fetch_add(1U,std::memory_order_relaxed);TraceAttack(18U,active.receipt.selector);
                 }
                 return false;
             }
@@ -838,7 +886,10 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
                 if(!HoldAttackTarget(active.victim.character)) {
                     Terminal(result,Phase::Failed,Reason::NativeUnavailable);active.cancelled=true;return true;
                 }
-                active.retailArmed=true;active.armedAt=now;TraceAttack(13U,active.receipt.selector);
+                active.retailArmed=true;active.armedAt=now;
+                attackTelemetry.armedPolls=0U;attackTelemetry.flagConsumed=0U;attackTelemetry.retargets=0U;
+                attackTelemetry.brainMissing=0U;
+                TraceAttack(13U,active.receipt.selector);
                 return false;
             }
             if(now-active.began>1500U){Terminal(result,Phase::Rejected,Reason::NativeRefused);active.cancelled=true;return true;}
