@@ -532,6 +532,7 @@ void ReleaseAttackTarget() noexcept {
     active.heldTarget={};active.brainTarget={};active.shouldAttackSet=false;
 #ifndef AIMP_ALIEN_ACTION_TEST
     gPvPMeleeWatch.store(0U,std::memory_order_relaxed);
+    gPvPMeleeArmedCharacter.store(0U,std::memory_order_release);
 #endif
 }
 // ActionMeleeAttack 00717D90 reads the target through AnimatedCharacter+34A8
@@ -927,6 +928,7 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
 #ifndef AIMP_ALIEN_ACTION_TEST
                 gPvPMeleeStarts.store(0U,std::memory_order_relaxed);gPvPMeleeRefused.store(0U,std::memory_order_relaxed);
                 gPvPMeleeWatch.store(active.attackAnimated,std::memory_order_relaxed);
+                gPvPMeleeArmedCharacter.store(c.character,std::memory_order_release);
 #endif
                 TraceAttack(13U,active.receipt.selector);
                 return false;

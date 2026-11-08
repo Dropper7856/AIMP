@@ -2366,6 +2366,15 @@ std::uint32_t __fastcall RecordEligibilityDetour(void* logical, void*) noexcept 
 // (thiscall(node, character, state), RET 8; refusal writes state+4 = 8).
 // Observation only, for the Alien whose melee is armed; may run on workers.
 std::atomic<std::uintptr_t> gPvPMeleeWatch{};
+// The leased Alien whose left-click melee is armed. Only its retail decision
+// slice (manager branch, prepass, coordinator) leaves the PvP brain fence for
+// the armed window; capture, publication and pilot input stay fenced. 460
+// showed the fenced engine-thread updates kept availability at 0 and the BT
+// never started ActionMeleeAttack; only worker-thread updates (458) could.
+std::atomic<std::uintptr_t> gPvPMeleeArmedCharacter{};
+bool PvPBrainArmed(const std::uintptr_t character) noexcept {
+    return character != 0U && character == gPvPMeleeArmedCharacter.load(std::memory_order_acquire);
+}
 std::atomic<std::uint32_t> gPvPMeleeStarts{},gPvPMeleeRefused{},gPvPMeleeLastType{};
 void* gPvPMeleeStartTrampoline{};
 std::atomic<void*> gPvPMeleeStartOriginal{};
@@ -7572,6 +7581,7 @@ void __fastcall UpdateDetour(void* manager, void*, std::uint32_t previousTime, f
     // A single selected retail Alien must never run its autonomous decision
     // branch while the PvP native lease is fencing or owned. Preserve the
     // manager's retail housekeeping exactly as we do for PlayerSync proxies.
+    if (PvPCharacterFenced(c) && PvPBrainArmed(c)) { callOriginal(); return; }
     if (PvPCharacterFenced(c)) {
         Actor pvpProxy{};
         pvpProxy.character = c;
@@ -7679,7 +7689,7 @@ void __fastcall PrepassDetour(void* context, void*) noexcept {
         Read(manager + 0x128U, owner)) {
         if (PairSourceBusy(owner)) return;
         if (PlayerRepresentation(owner)) return;
-        if (EngineThread() && PvPCharacterFenced(owner)) return;
+        if (EngineThread() && PvPCharacterFenced(owner) && !PvPBrainArmed(owner)) return;
         if (Client() && Eligible(owner, type)) return;
     }
     const auto original = reinterpret_cast<void(__thiscall*)(void*)>(gPrepassOriginal.load());
@@ -7706,7 +7716,7 @@ void __fastcall CoordinatorDetour(void* tree, void*, std::uint32_t execute) noex
     if (Read(reinterpret_cast<std::uintptr_t>(tree) + 0xCU, owner)) {
         if (PairSourceBusy(owner)) return;
         if (PlayerRepresentation(owner)) return;
-        if (EngineThread() && PvPCharacterFenced(owner)) return;
+        if (EngineThread() && PvPCharacterFenced(owner) && !PvPBrainArmed(owner)) return;
         if (Client() && Eligible(owner, type)) return;
     }
     if (original == nullptr) return;

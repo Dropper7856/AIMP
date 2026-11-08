@@ -1,0 +1,31 @@
+AIMP 461 / protocol 40
+Branch: feature/alien-vs-survivors-main
+
+460 test (050546 Host/victim, 070550 Client Alien pilot)
+- Three armed attacks, all stage 24 (no ActionMeleeAttack start within 3s):
+  meleeStarts=0, flagConsumed=0. Availability stayed 0 on the first two;
+  the third reached 34 (manager +9 and +D, i.e. "any proven"), yet the BT still
+  never entered ATTACK_CORE. source2B4/victim2B4 = 0.
+
+Cause
+- The leased Alien is fenced by PvPCharacterFenced, but only on the engine
+  thread. On the engine thread:
+  - UpdateDetour runs the manager with a blocked proxy, so BypassBranch skips
+    the retail decision slice;
+  - PrepassDetour and CoordinatorDetour return early.
+  On worker threads none of this applies. So the retail BT (and the attack
+  manager availability update) only runs when a brain update lands on a
+  worker. That is why 458 killed once and 459/460 never did.
+
+Change
+- gPvPMeleeArmedCharacter is set when the Host arms a left-click melee and
+  cleared when the target hold is released. For that character only:
+  - UpdateDetour calls retail directly (no blocked proxy);
+  - PrepassDetour and CoordinatorDetour no longer return early.
+  Capture, publication, pilot input and every other PvPCharacterFenced use stay
+  fenced. During the pair, PairSourceBusy still applies.
+
+Validation
+- Four native tests pass. API 0.8.4.461 delivered locally and to
+  DESKTOP-2JNROA0, SHA-256 equal. Friend patch dist/AIMP-API-patch-v461.zip.
+- Not observed in game.
