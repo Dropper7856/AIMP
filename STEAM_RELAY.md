@@ -4,8 +4,11 @@ This branch lets players host and join **through Steam's relay network**, so the
 host does not need port forwarding, a VPN or a tool like Porthole.
 
 It uses Steamworks with app ID **480 (Spacewar)**, Valve's public test app. Every
-Steam account can use it for free; while the launcher is open Steam shows you as
-"playing Spacewar".
+Steam account can use it for free. The launcher activates Spacewar only after
+Alien: Isolation's frontend and native runtime report that the menu is ready.
+When the game is relaunched, the Steam client API is reinitialized at the new
+process's ready menu. Steam's displayed game and real invitation routing still
+need to be checked together during two-account testing.
 
 ## How it works
 
@@ -79,7 +82,7 @@ Account details shows "Steam ID".
 
 | Symptom | Cause / fix |
 | --- | --- |
-| `Steam relay unavailable` in log | Steam not running or not signed in when the launcher started. Start Steam; the launcher retries every 10 s. |
+| `Steam relay unavailable` in log | Steam not running or not signed in when the game menu became ready. Start Steam; the launcher retries every 10 s after menu activation. |
 | `Could not reach steam:... through Steam relay` | Host has no lobby open, host is not running this build, or wrong ID. |
 | `That Steam ID is your own account` | Both PCs use the same Steam account; use two accounts. |
 | Join Game in friends list launches Spacewar | The joiner's launcher was not open. Open the launcher first, then click Join Game. |
@@ -114,3 +117,18 @@ Account details shows "Steam ID".
   and both Steam dependencies.
 - Live Steam invitation acceptance, actual Valve transport, game UI transitions,
   and a complete two-account game round still require manual in-game validation.
+
+## Build 465: activate Spacewar at the ready game menu
+
+- Opening the desktop launcher no longer initializes Steam immediately.
+- The first native-ready frontend HELLO or MENU_STATE activates Spacewar after
+  AI.exe has started. Repeated menu heartbeats keep the existing Steam session.
+- A new game PID reinitializes Steam at its ready menu, even when the launcher
+  remains open between game launches. Gameplay updates do not activate Steam.
+- Logs include `Game menu ready for PID=...; activating Spacewar relay after
+  Alien: Isolation startup.` followed by the initialization result.
+- Eleven Steam tests plus the posture/torch wire tests pass (13 total). New
+  coverage checks deferred activation, repeat heartbeats, a new game process,
+  gameplay suppression and a worker that cannot initialize Steam before a menu.
+- Both PCs require build 465. Actual Steam presence priority and invitation
+  routing with both games open require another in-game test.

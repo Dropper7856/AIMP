@@ -825,6 +825,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         {
             await SendFrontendReadyAsync().ConfigureAwait(false);
             _steamFrontendReady = _controller.Snapshot.IpcConnected;
+            await ActivateSteamForReadyMenuAsync().ConfigureAwait(false);
             await TryJoinPendingSteamInviteAsync().ConfigureAwait(false);
         }
         if (IsGameplaySource(source, phase)) _steamFrontendReady = false;

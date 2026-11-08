@@ -176,6 +176,46 @@ internal static class SteamRelayTests
         AssertEx.True(fixture.Get<LobbyClient?>("_client") is null);
     }
 
+    internal static async Task MenuActivationAsync()
+    {
+        using var fixture = new Fixture();
+        var hello = new ScaleformBridgeMessage("HELLO", new Dictionary<string, string>());
+        AssertEx.Equal(0, fixture.Relay.MenuProcesses.Count, "Opening the launcher must not activate Spacewar.");
+        await fixture.CallAsync("HandleHelloAsync", hello);
+        AssertEx.Equal(0, fixture.Relay.MenuProcesses.Count, "An unready native runtime must not activate Spacewar.");
+        fixture.Ready(101, false);
+        await fixture.CallAsync("HandleHelloAsync", hello);
+        AssertEx.SequenceEqual(new[] { 101 }, fixture.Relay.MenuProcesses);
+        await fixture.CallAsync("ResumeSteamInvitesFromMenuAsync");
+        await fixture.CallAsync("HandleHelloAsync", hello);
+        AssertEx.SequenceEqual(new[] { 101 }, fixture.Relay.MenuProcesses, "Menu heartbeats must not restart Steam.");
+        fixture.Ready(202, false);
+        await fixture.CallAsync("ResumeSteamInvitesFromMenuAsync");
+        AssertEx.SequenceEqual(new[] { 101, 202 }, fixture.Relay.MenuProcesses,
+            "A new game process must reactivate Spacewar after its menu is ready.");
+    }
+
+    internal static async Task GameplayDoesNotActivateAsync()
+    {
+        using var fixture = new Fixture();
+        fixture.Ready(101, false);
+        typeof(MultiplayerSessionCoordinator).GetField("_uiGameplayLoaded", Private)!.SetValue(fixture.Coordinator, true);
+        await fixture.CallAsync("ResumeSteamInvitesFromMenuAsync");
+        AssertEx.Equal(0, fixture.Relay.MenuProcesses.Count, "Gameplay must not trigger a new Steam activation.");
+    }
+
+    internal static async Task WorkerWaitsForMenuAsync()
+    {
+        using var directory = new TemporaryDirectory();
+        using var diagnostics = new LauncherDiagnostics(directory.Combine("logs"));
+        using var relay = new SteamRelay(diagnostics);
+        await AssertEx.ThrowsAsync<InvalidOperationException>(() => relay.StartHostingAsync(28015, "too early").WaitAsync(TimeSpan.FromSeconds(2)));
+        relay.Start();
+        AssertEx.False(await relay.StartHostingAsync(28015, "still too early").WaitAsync(TimeSpan.FromSeconds(2)));
+        AssertEx.False(relay.IsReady);
+        AssertEx.Equal(0UL, relay.LocalSteamId);
+    }
+
     private sealed class FakeRelay : ISteamRelay
     {
         public event Action<string, string>? JoinRequested;
@@ -186,8 +226,13 @@ internal static class SteamRelayTests
         internal TaskCompletionSource? Delay;
         internal readonly TaskCompletionSource Entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal bool Disposed;
+        internal readonly List<int> MenuProcesses = new();
         internal void Raise(string friend, string address) => JoinRequested?.Invoke(friend, address);
-        public void Start() { }
+        public Task<bool> ActivateForMenuAsync(int gameProcessId)
+        {
+            MenuProcesses.Add(gameProcessId);
+            return Task.FromResult(true);
+        }
         public Task<bool> StartHostingAsync(int port, string status) => Task.FromResult(true);
         public Task StopHostingAsync() => Task.CompletedTask;
         public async Task<int> OpenClientTunnelAsync(ulong host, CancellationToken token)
@@ -226,14 +271,14 @@ internal static class SteamRelayTests
 
         internal LobbyHost Host() => new(new LobbyHostOptions("Steam test", "Ripley", Guid.NewGuid(),
             0, 4, "TestLevel", LobbyCompatibility.Create(Settings.Load())));
-        internal void Ready()
+        internal void Ready(int processId = 123, bool frontendReady = true)
         {
             typeof(NativeRuntimeController).GetField("_snapshot", Private)!.SetValue(_controller,
-                NativeRuntimeSnapshot.Empty with { IpcConnected = true });
-            typeof(MultiplayerSessionCoordinator).GetField("_steamFrontendReady", Private)!.SetValue(Coordinator, true);
+                NativeRuntimeSnapshot.Empty with { IpcConnected = true, ProcessId = processId });
+            typeof(MultiplayerSessionCoordinator).GetField("_steamFrontendReady", Private)!.SetValue(Coordinator, frontendReady);
         }
         internal T Get<T>(string field) => (T)typeof(MultiplayerSessionCoordinator).GetField(field, Private)!.GetValue(Coordinator)!;
-        internal Task CallAsync(string method) => (Task)typeof(MultiplayerSessionCoordinator).GetMethod(method, Private)!.Invoke(Coordinator, null)!;
+        internal Task CallAsync(string method, params object[] arguments) => (Task)typeof(MultiplayerSessionCoordinator).GetMethod(method, Private)!.Invoke(Coordinator, arguments)!;
         public void Dispose()
         {
             Coordinator.Dispose();
