@@ -37,6 +37,7 @@ struct Active final {
     std::uint64_t began{},lastStep{},submittedAt{};
     PairIdentity victim{};
     std::uintptr_t chooser{};
+    ap::attack::HeldTarget heldTarget{};
     VentSlot* vent{};
     bool used{},entered{},cancelled{},terminalSent{},hostEnded{},moveArrived{},entrySubmitted{},remoteVent{};
     bool presentationStarted{},ownerFinished{};
@@ -101,8 +102,38 @@ void LogVent(Diagnostics& diagnostics) {
          {"y",std::to_string(ventTelemetry.y.load()),true},
          {"z",std::to_string(ventTelemetry.z.load()),true}});
 }
+// Host attack stages: 1 no AI selection, 2 no selected record, 3 target
+// write fault, 4 query refused, 5 selector unproven, 6 cover ray pending,
+// 7 pair submitted, 8 pair refused, 9 source entered cycle78.
+struct AttackTelemetry final {
+    std::atomic<std::uint64_t> revision{},sequence{},elapsed{},polls{};
+    std::atomic<unsigned> stage{},selector{},cycle{};
+} attackTelemetry;
+void TraceAttack(unsigned stage,unsigned selector=0U) noexcept {
+    std::uint8_t state{};bool backstage{};
+    if(!Cycle(active.context.character,state,backstage))state=0xFFU;
+    attackTelemetry.sequence=active.receipt.hostSequence;attackTelemetry.elapsed=GetTickCount64()-active.began;
+    attackTelemetry.stage=stage;attackTelemetry.selector=selector;attackTelemetry.cycle=state;
+    attackTelemetry.polls.fetch_add(1U,std::memory_order_relaxed);
+    attackTelemetry.revision.fetch_add(1U,std::memory_order_release);
+}
+void LogAttack(Diagnostics& diagnostics) {
+    static std::uint64_t lastRevision{},lastSequence{},lastAt{};
+    const auto revision=attackTelemetry.revision.load(std::memory_order_acquire),now=GetTickCount64();
+    const auto sequence=attackTelemetry.sequence.load();
+    if(!revision || revision==lastRevision || (sequence==lastSequence && now-lastAt<250U))return;
+    lastRevision=revision;lastSequence=sequence;lastAt=now;
+    diagnostics.Log("info","alien_attack_progress","Host attack preparation; stage 1 noSelection 2 noRecord 3 targetFault 4 queryRefused 5 selectorUnproven 6 rayPending 7 submitted 8 pairRefused 9 entered.",
+        {{"hostSequence",Diagnostics::Unsigned(sequence),true},
+         {"elapsedMs",Diagnostics::Unsigned(attackTelemetry.elapsed.load()),true},
+         {"stage",Diagnostics::Unsigned(attackTelemetry.stage.load()),true},
+         {"selector",Diagnostics::Unsigned(attackTelemetry.selector.load()),true},
+         {"cycle",Diagnostics::Unsigned(attackTelemetry.cycle.load()),true},
+         {"polls",Diagnostics::Unsigned(attackTelemetry.polls.load()),true}});
+}
 #else
 void TraceVent(unsigned=0U) noexcept {}
+void TraceAttack(unsigned,unsigned=0U) noexcept {}
 #endif
 bool Ordinary(const std::uint8_t state) noexcept {return state==1U || state==55U || state==56U || state==59U;}
 bool Protected(const std::uint8_t state) noexcept {return state==18U || state==75U || state==77U || state==78U || state==79U;}
@@ -423,28 +454,49 @@ bool ResourcesPending() noexcept {
     for(const auto& slot:recoveries)if(slot.used && Live(slot.context))return true;
     return false;
 }
-// Explicit-target retail Alien query; no AI target writes or fabricated hit.
+ap::attack::Memory AttackMemory() noexcept {
+    return {gBase,nullptr,
+        [](void*,std::uintptr_t at,void* out,std::size_t size) noexcept {
+            return crash_guard::TryCopy(out,reinterpret_cast<const void*>(at),size);
+        },
+        [](void*,std::uintptr_t at,const void* in,std::size_t size) noexcept {
+            return crash_guard::TryWrite(reinterpret_cast<void*>(at),in,size);
+        }};
+}
+// A stale level/lease may have freed the record: drop the hold, never write.
+void ReleaseAttackTarget() noexcept {
+    if(active.heldTarget.record && Live(active.context))ap::attack::Release(AttackMemory(),active.heldTarget);
+    active.heldTarget={};
+}
+// Explicit-target retail Alien query; no fabricated hit or health write.
 // The donor attack gate uses this same AlienAttackManager, not the separate
-// human/android manager (012CC390, +800 cache).
+// human/android manager (012CC390, +800 cache). The query and the melee start
+// read the selected AI target record, so the victim is held there (donor
+// SetTargetOf) for the attack and restored when the action ends.
 bool AttackAvailability(const ap::Context& c,const PairIdentity& victim,std::uintptr_t& chooser,
     bool& ready,std::uint32_t& selector) noexcept {
     ready=false;selector=0U;PairIdentity source{};
-    const ap::attack::Memory memory{gBase,nullptr,
-        [](void*,std::uintptr_t at,void* out,std::size_t size) noexcept {
-            return crash_guard::TryCopy(out,reinterpret_cast<const void*>(at),size);
-        }};
+    const auto memory=AttackMemory();
     ap::attack::Manager manager{};
     if(!Live(c) || !PairIdentityLive(victim) || PublishedPairSource(c.character,source)==kActors ||
         !PairIdentityLive(source) || !ap::attack::Resolve(memory,c.character,source.animated,manager) ||
         (chooser && chooser!=manager.address))return false;
     chooser=manager.address;
+    switch(ap::attack::Hold(memory,manager,victim.character,active.heldTarget)) {
+    case ap::attack::HoldResult::Held:break;
+    case ap::attack::HoldResult::NoSelection:TraceAttack(1U);return true;
+    case ap::attack::HoldResult::NoRecord:TraceAttack(2U);return true;
+    default:TraceAttack(3U);return false;
+    }
     AIMP_ACTION_TRY {
         using Evaluate=std::uint8_t(__thiscall*)(void*,std::uintptr_t,float*);
         using Choose=std::uint32_t(__thiscall*)(void*,std::uintptr_t,std::uint32_t,std::uint32_t);
         float heading{};
-        if(!Native<Evaluate>(ap::attack::kEvaluateRva)(reinterpret_cast<void*>(chooser),victim.character,&heading))return true;
+        if(!Native<Evaluate>(ap::attack::kEvaluateRva)(reinterpret_cast<void*>(chooser),victim.character,&heading)) {
+            TraceAttack(4U);return true;
+        }
         const auto chosen=Native<Choose>(ap::attack::kChooseRva)(reinterpret_cast<void*>(chooser),victim.character,1U,15U);
-        if(!ap::attack::Selected(memory,manager,chosen))return true;
+        if(!ap::attack::Selected(memory,manager,chosen)){TraceAttack(5U,chosen);return true;}
         selector=chosen;ready=true;return true;
     } AIMP_ACTION_CATCH {return false;}
 }
@@ -510,6 +562,7 @@ bool EnterPair(const ap::Context& c,const PairIdentity& victim,const std::uint32
 }
 void Clear() noexcept {
     if(active.victim.character)player_hiding::FinishPvPSearch(active.victim.character);
+    ReleaseAttackTarget();
     active={};
 }
 void Terminal(ap::Frame& result,Phase phase,Reason reason) noexcept {
@@ -678,6 +731,7 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
         if(active.receipt.phase==Phase::Preparing) {
             if(active.entrySubmitted) {
                 if(state==78U) {
+                    TraceAttack(9U,active.receipt.selector);
                     active.entered=true;result=active.receipt;result.phase=Phase::Started;result.reason=Reason::None;
                     ++result.resolutionRevision;active.receipt=result;return true;
                 }
@@ -696,12 +750,15 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
             if(!AttackAvailability(c,active.victim,active.chooser,ready,selector)) {
                 Terminal(result,Phase::Failed,Reason::NativeUnavailable);active.cancelled=true;return true;
             }
+            if(ready && !AttackQueryRetired(active.chooser))TraceAttack(6U,selector);
             if(ready && AttackQueryRetired(active.chooser)) {
                 active.receipt.selector=selector;
                 active.entrySubmitted=true;active.submittedAt=now;
                 if(!EnterPair(c,active.victim,selector)) {
+                    TraceAttack(8U,selector);
                     Terminal(result,Phase::Failed,Reason::NativeRefused);active.cancelled=true;return true;
                 }
+                TraceAttack(7U,selector);
                 // A successful registration/void transition call is not proof
                 // of entry. Publish Started only after observing source cycle78.
                 if(Cycle(c.character,state,backstage) && state==78U) {

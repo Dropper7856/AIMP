@@ -80,6 +80,47 @@ void TestAttackManager() {
     put(0x5208U,std::uint32_t{2U});put(0x5128U,std::uintptr_t{0x999U});
     Check(!Resolve(memory,0x100U,0x200U,manager),"foreign owner's attack manager admitted");
 }
+void TestAttackTargetHold() {
+    using namespace aimp::alien_pvp::attack;
+    std::array<std::byte,0x8000> fixture{};
+    const auto put=[&](std::uintptr_t address,auto value) {
+        std::memcpy(fixture.data()+address,&value,sizeof(value));
+    };
+    const auto get=[&](std::uintptr_t address) {
+        std::uint32_t value{};std::memcpy(&value,fixture.data()+address,sizeof(value));return value;
+    };
+    const Memory memory{0x400000U,&fixture,
+        [](void* context,std::uintptr_t address,void* out,std::size_t size) noexcept {
+            const auto& bytes=*static_cast<decltype(fixture)*>(context);
+            if(address>bytes.size() || size>bytes.size()-address)return false;
+            std::memcpy(out,bytes.data()+address,size);return true;
+        },
+        [](void* context,std::uintptr_t address,const void* in,std::size_t size) noexcept {
+            auto& bytes=*static_cast<decltype(fixture)*>(context);
+            if(address>bytes.size() || size>bytes.size()-address)return false;
+            std::memcpy(bytes.data()+address,in,size);return true;
+        }};
+    // 004128E0 path: manager+4 -> context+C8 -> selection+10 -> record.
+    const Manager manager{0x4000U,0x5300U,2U};
+    put(0x4004U,std::uintptr_t{0x5000U});
+    HeldTarget held{};
+    Check(Hold(memory,manager,0x7000U,held)==HoldResult::NoSelection,"missing AI selection was not reported");
+    put(0x50C8U,std::uintptr_t{0x5800U});
+    Check(Hold(memory,manager,0x7000U,held)==HoldResult::NoRecord,"missing selected record was fabricated");
+    put(0x5810U,std::uintptr_t{0x6000U});
+    put(0x6000U+0x42CU,std::uintptr_t{0x7400U});put(0x6000U+0x430U,std::uint32_t{11U});
+    put(0x7050U,std::uint32_t{42U});
+    Check(Hold(memory,manager,0x7000U,held)==HoldResult::Held && get(0x642CU)==0x7000U && get(0x6430U)==42U,
+        "victim and birth were not held on the queried record");
+    Check(Hold(memory,manager,0x7000U,held)==HoldResult::Held && held.previousTarget==0x7400U &&
+        held.previousBirth==11U,"repeat hold lost the original retail target");
+    Release(memory,held);
+    Check(get(0x642CU)==0x7400U && get(0x6430U)==11U && held.record==0U,"original retail target was not restored");
+    Check(Hold(memory,manager,0x7000U,held)==HoldResult::Held,"second hold failed");
+    put(0x6000U+0x42CU,std::uintptr_t{0x7800U});
+    Release(memory,held);
+    Check(get(0x642CU)==0x7800U,"release overwrote a later retail retarget");
+}
 }
 // These stubs detect any accidental return to the generic NPC carrier. Retail
 // native execution is tested separately in game, not simulated by these tests.
@@ -96,6 +137,7 @@ bool ApplyReplicatedYaw(std::uintptr_t,float,std::string&) noexcept {++genericCa
 }
 int main() {
     TestAttackManager();
+    TestAttackTargetHold();
     using namespace aimp::alien_pvp;
     ResponsiveStop responsiveStop;std::array<float,2> stoppedAt{};
     responsiveStop.Begin(1000,10,20);

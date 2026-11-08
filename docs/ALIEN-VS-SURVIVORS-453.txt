@@ -1,0 +1,41 @@
+AIMP 453 / protocol 40
+Branch: feature/alien-vs-survivors-main
+
+Left-click player attacks (follow-up to 452)
+- Test logs 204945 (Host, second PC) and 224942 (Client Alien pilot): 452
+  fixed victim mapping; both PCs now reach Preparing with target
+  peer9675177984498178131. Each attack then ended after ~1s with
+  Rejected(NativeRefused): the native availability never became ready.
+- Ghidra (AI.exe 00d6 project): the Alien query 006F3A30 obtains its target
+  via 004128E0 on [[manager+4]+C8]. It requires the selected AI target record
+  (+10) to hold the victim at +42C and its birth *(victim+50) at +430
+  (FUN_00783B00). ActionMeleeAttack 00717D90 has the same check. A
+  player-piloted Alien has no such retail target, so the query always
+  returned 0.
+- The donor mod solves exactly this with control.cpp::SetTargetOf, writing
+  the selected record's +42C/+430 during the attack window.
+- 00710C60 ABI re-verified with Capstone: three stack arguments, RET 0Ch.
+  006FB450 recomputes eligibility bits 0..2 itself.
+
+Correction
+- The Host holds the victim on the record the query reads, only while an
+  attack is Preparing. When the action is cleared, the original target/birth
+  is restored if the record still carries our victim (a retail retarget
+  wins). If the lease is stale, the hold is dropped without writing.
+- No health, success flag or position write. Selector proof, reach,
+  cooldown and pair transport are unchanged.
+- New native event alien_attack_progress (Host) records the last stage:
+  1 no AI selection, 2 no selected record, 3 target write fault,
+  4 query refused, 5 selector unproven, 6 cover ray pending,
+  7 pair submitted, 8 pair refused, 9 source entered cycle 78.
+
+Validation
+- Four native tests pass, including the new target hold/restore fixture.
+  It caught an aggregate-ordering bug before release.
+- Protocol/launcher code unchanged except the version string; protocol tests
+  were not rerun.
+- API 0.8.4.453 delivered locally and to DESKTOP-2JNROA0; SHA-256 match for
+  Launcher, Protocol, NetZ and the UI assets. Friend patch:
+  dist/AIMP-API-patch-v453.zip (Launcher, Protocol, NetZ).
+- No in-game kill was observed during implementation. If attacks still fail,
+  the alien_attack_progress stage in the Host diagnostics names the blocker.

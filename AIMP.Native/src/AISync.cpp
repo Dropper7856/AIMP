@@ -11175,6 +11175,7 @@ Counters DiagnosticsSnapshot() noexcept {
 }
 void LogDiagnostics(Diagnostics& diagnostics) {
     pvp_actions::LogVent(diagnostics);
+    pvp_actions::LogAttack(diagnostics);
     static bool movementFailureLogged{};
     if(!movementFailureLogged) {
         const auto f=host_producer::FirstMovementCaptureFailure();
