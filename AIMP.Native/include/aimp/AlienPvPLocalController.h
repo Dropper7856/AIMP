@@ -24,7 +24,7 @@ struct Readiness final {
     bool inputIsolated{}, cameraBound{}, technicalHidden{}, moving{};
 };
 [[nodiscard]] Readiness Snapshot() noexcept;
-struct VentInterface {bool open{},backstage{};int nearby{-1},selected{-1};};
+struct VentInterface {bool open{},backstage{};int nearby{-1},selected{-1};bool freeCamera{};};
 [[nodiscard]] VentInterface VentSnapshot() noexcept;
 bool GoToVent(std::uint32_t index) noexcept;
 void Pump(const Context& context) noexcept;

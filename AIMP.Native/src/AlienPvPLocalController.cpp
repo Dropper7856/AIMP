@@ -53,6 +53,8 @@ struct LocalState final {
     float cameraDistance{3.0F},cameraHeight{2.0F},cameraSide{0.5F};
     bool duct{};unsigned ductRun{};std::uint64_t ductAt{};
     float collisionScale{1.0F};
+    bool freeCamera{},eyeKnown{};
+    std::array<float,3> freeEye{},lastEye{},freeForward{0.0F,0.0F,1.0F};
     std::uint64_t lastFrameMs{}, nextCameraAttemptMs{}, nextInputAttemptMs{};
 };
 LocalState gLocal{}; // certified game thread only
@@ -335,18 +337,27 @@ bool VentRead(std::uintptr_t at,void* out,std::size_t size) noexcept {
 }
 bool UpdateVentInterface(const Context& context,alien_pvp::vents::Table& table) noexcept {
     const bool backstage=IsBackstage(context.alien);
-    if(backstage && !gLocal.wasBackstage)gLocal.ventMapOpen=true;
-    if(!backstage && !alien_pvp::VentPending())gLocal.ventMapOpen=false;
+    gLocal.ventMapOpen=false;
+    if(backstage && !gLocal.freeCamera) {
+        gLocal.freeEye=gLocal.lastEye;
+        if(!gLocal.eyeKnown && !Read(context.alien+0x70U,gLocal.freeEye))return false;
+        gLocal.freeCamera=true;
+    }
+    if(!backstage && !alien_pvp::VentPending())gLocal.freeCamera=false;
     gLocal.wasBackstage=backstage;gLocal.nearbyVent=-1;
     if(!alien_pvp::vents::ReadTable(context.alien,&VentRead,table))return false;
     alien_pvp::vents::Point body{};float best=100000.0F,nearest=100000.0F;int closest=-1;
     if(!Read(context.alien+0x70U,body))return false;
+    if(gLocal.freeCamera)body=gLocal.freeEye;
     for(std::uint32_t i=0;i<table.count;++i) {
         alien_pvp::vents::Point point{};
         if(!alien_pvp::vents::ReadPoint(table,i,&VentRead,point))continue;
         const float distance=std::hypot(point[0]-body[0],point[2]-body[2])+std::abs(point[1]-body[1])*0.7F;
         if(distance<nearest){nearest=distance;closest=static_cast<int>(i);}
-        if(alien_pvp::vents::WithinReach(body,point) && distance<best){best=distance;gLocal.nearbyVent=static_cast<int>(i);}
+        const bool reachable=gLocal.freeCamera?
+            std::hypot(std::hypot(point[0]-body[0],point[2]-body[2]),point[1]-body[1])<=3.0F:
+            alien_pvp::vents::WithinReach(body,point);
+        if(reachable && distance<best){best=distance;gLocal.nearbyVent=static_cast<int>(i);}
     }
     alien_pvp::vents::Point selected{};
     if(gLocal.selectedVent<0 || !alien_pvp::vents::ReadPoint(table,static_cast<std::uint32_t>(gLocal.selectedVent),&VentRead,selected))
@@ -355,6 +366,8 @@ bool UpdateVentInterface(const Context& context,alien_pvp::vents::Table& table) 
 }
 void TickInput(const Context& context,const std::uint64_t now) noexcept {
     if (now==gLocal.lastFrameMs) return;
+    const float dt=gLocal.lastFrameMs && now>=gLocal.lastFrameMs?
+        std::min(0.05F,static_cast<float>(now-gLocal.lastFrameMs)/1000.0F):0.016F;
     gLocal.lastFrameMs=now;
     const bool focused=InputAllowed(context.moduleBase);
     const auto authority=alien_pvp::VentAuthority();
@@ -365,9 +378,10 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
     gLocal.ventWasPending=pendingVent;
     alien_pvp::vents::Table vents{};
     const bool haveVents=UpdateVentInterface(context,vents);
+    static_cast<void>(haveVents);
     const auto wheel=alien_pvp_input::TakeCameraWheel();
     const bool middle=focused && Down(VK_MBUTTON);
-    if(focused && gLocal.camera.bound && !gLocal.camera.firstPerson && !gLocal.ventMapOpen) {
+    if(focused && gLocal.camera.bound && !gLocal.camera.firstPerson && !gLocal.freeCamera) {
         if(middle && !gLocal.middleDown) {
             gLocal.cameraDistance=3.0F;gLocal.cameraHeight=2.0F;gLocal.cameraSide=0.5F;
         }
@@ -378,7 +392,7 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
     }
     gLocal.middleDown=middle;
     int forward=0,side=0;
-    if (focused && gLocal.camera.bound && !gLocal.ventMapOpen && !pendingVent) {
+    if (focused && gLocal.camera.bound && !gLocal.freeCamera && !pendingVent) {
         forward=static_cast<int>(Down('W'))-static_cast<int>(Down('S'));
         side=static_cast<int>(Down('D'))-static_cast<int>(Down('A'));
     }
@@ -392,6 +406,22 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
     alien_pvp::LocalInput input{};
     input.forward=static_cast<float>(forward);input.strafe=static_cast<float>(side);
     input.yaw=alien_pvp::WrapYaw(yaw);input.gait=gait;input.focused=focused;
+    if(gLocal.freeCamera && focused && alien_pvp::ControlActive()) {
+        const float f=static_cast<float>(Down('W'))-static_cast<float>(Down('S'));
+        const float s=static_cast<float>(Down('D'))-static_cast<float>(Down('A'));
+        const float up=static_cast<float>(Down(VK_SPACE))-static_cast<float>(Down(VK_CONTROL));
+        const auto& look=gLocal.freeForward;
+        const float horizontal=std::hypot(look[0],look[2]);
+        const float rx=horizontal>0.01F?look[2]/horizontal:std::cos(yaw);
+        const float rz=horizontal>0.01F?-look[0]/horizontal:-std::sin(yaw);
+        std::array<float,3> direction{look[0]*f+rx*s,look[1]*f+up,look[2]*f+rz*s};
+        const float length=std::hypot(std::hypot(direction[0],direction[2]),direction[1]);
+        if(length>0.01F)for(unsigned i=0;i<3;++i)
+            gLocal.freeEye[i]=std::clamp(gLocal.freeEye[i]+direction[i]/length*(Down(VK_SHIFT)?12.0F:5.0F)*dt,-99900.0F,99900.0F);
+        // This is a local camera, never an Alien movement/teleport command.
+        input.forward=input.strafe=0.0F;
+        static_cast<void>(UpdateVentInterface(context,vents));
+    }
     // Edges are queued independently of movement; holding a button does not
     // repeat a vent/attack command every frame. Native adapters explicitly
     // execute host-authorized native actions. No fabricated health effect.
@@ -402,42 +432,22 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
     };
     const bool interact=focused && Down('E'),exit=focused && Down('Q');
     const bool cancelKey=(interact && !gLocal.enterDown) || (exit && !gLocal.exitDown);
-    const bool cancelMove=focused && pendingVent && now-gLocal.ventPendingAt>=400U &&
+    const bool cancelMove=focused && !gLocal.freeCamera && pendingVent && now-gLocal.ventPendingAt>=400U &&
         (Down('W')||Down('A')||Down('S')||Down('D'));
     if(pendingVent && !gLocal.ventCancelSent && (cancelKey||cancelMove)) {
         input.action=alien_pvp::Action::CancelVent;alien_pvp::CaptureLocal(input);gLocal.ventCancelSent=true;
     }
     if((interact && !gLocal.enterDown) || (exit && !gLocal.exitDown)) {
         if(pendingVent) { /* Host resolves cancellation of the original traversal. */ }
-        else if(gLocal.wasBackstage)gLocal.ventMapOpen=!gLocal.ventMapOpen;
+        else if(gLocal.wasBackstage && interact && gLocal.nearbyVent>=0)
+            static_cast<void>(GoToVent(static_cast<std::uint32_t>(gLocal.nearbyVent)));
         else if(interact && gLocal.nearbyVent>=0 && !alien_pvp::VentPending()) {
             input.action=alien_pvp::Action::EnterVent;alien_pvp::CaptureLocal(input);
         }
     }
     gLocal.enterDown=interact;gLocal.exitDown=exit;
-    alien_pvp_input::SetMapMode(gLocal.ventMapOpen && focused && alien_pvp::ControlActive());
-    const bool left=focused && Down(VK_LEFT),right=focused && Down(VK_RIGHT),confirm=focused && Down(VK_RETURN);
-    if(gLocal.ventMapOpen && haveVents) {
-        const int direction=right&&!gLocal.ventRight?1:(left&&!gLocal.ventLeft?-1:0);
-        if(direction && vents.count)for(std::uint32_t step=0;step<vents.count;++step) {
-            gLocal.selectedVent=(gLocal.selectedVent+direction+static_cast<int>(vents.count))%static_cast<int>(vents.count);
-            alien_pvp::vents::Point point{};
-            if(alien_pvp::vents::ReadPoint(vents,static_cast<std::uint32_t>(gLocal.selectedVent),&VentRead,point))break;
-        }
-        const bool pending=alien_pvp::VentPending();
-        if(confirm && !gLocal.ventConfirm && gLocal.selectedVent>=0 && !pending) {
-            alien_pvp::vents::Point point{};
-            if(alien_pvp::vents::ReadPoint(vents,static_cast<std::uint32_t>(gLocal.selectedVent),&VentRead,point)) {
-                input.forward=input.strafe=0;input.action=alien_pvp::Action::ExitVent;input.selectedVent=true;
-                input.ventX=point[0];input.ventY=point[1];input.ventZ=point[2];alien_pvp::CaptureLocal(input);
-                // Stay on the selector until the native exit really reaches
-                // frontstage. A queued/refused request is not a camera mode.
-            }
-        }
-    }
-    gLocal.ventLeft=left;gLocal.ventRight=right;gLocal.ventConfirm=confirm;
-    if(gLocal.ventMapOpen)input.forward=input.strafe=0;
-    if(!gLocal.ventMapOpen) {
+    alien_pvp_input::SetMapMode(false);
+    if(!gLocal.freeCamera && !pendingVent) {
         edge(VK_LBUTTON,gLocal.attackDown,alien_pvp::Action::Attack);
         edge('G',gLocal.roarDown,alien_pvp::Action::Roar);
     } else {gLocal.attackDown=Down(VK_LBUTTON);gLocal.roarDown=Down('G');}
@@ -460,7 +470,7 @@ void FollowBefore(std::uintptr_t behavior) noexcept {
     if(!CameraHookCurrent(behavior))return;
     // Donor OnFollowUpdateEnter: backstage actors do not tick the engine's
     // follow camera. Use the living technical actor to compute the orbit.
-    const auto target=IsBackstage(gLocal.character)?gLocal.camera.technical:gLocal.character;
+    const auto target=gLocal.freeCamera?gLocal.camera.technical:gLocal.character;
     std::uintptr_t current{},child{};
     if(Read(gLocal.camera.follow+0x148U,current) && current!=target)
         static_cast<void>(RetargetCamera(gCameraBase,gLocal.camera.follow,target));
@@ -472,19 +482,22 @@ void FollowAfter(std::uintptr_t behavior) noexcept {
     if(!CameraHookCurrent(behavior))return;
     std::array<float,3> body{},base{},position{};
     if(!Read(gLocal.character+0x70U,body) || !Read(behavior+0x1C0U,base) || !Read(behavior+0x1CU,position))return;
-    if(IsBackstage(gLocal.character)) {
-        // Donor BackstageCamera: translate the engine's computed orbit.
-        std::array<float,3> out{};
-        for(unsigned i=0;i<3;++i)out[i]=body[i]+position[i]-base[i];
-        static_cast<void>(Write(behavior+0x1C0U,body));static_cast<void>(Write(behavior+0x1CU,out));
+    if(gLocal.freeCamera) {
+        const float length=std::hypot(std::hypot(base[0]-position[0],base[2]-position[2]),base[1]-position[1]);
+        if(length>0.01F)for(unsigned i=0;i<3;++i)gLocal.freeForward[i]=(base[i]-position[i])/length;
+        const auto out=gLocal.freeEye;
+        std::array<float,3> target{};
+        for(unsigned i=0;i<3;++i)target[i]=out[i]+gLocal.freeForward[i]*5.0F;
+        static_cast<void>(Write(behavior+0x1C0U,target));static_cast<void>(Write(behavior+0x1CU,out));
         std::uintptr_t camera{};
         if(Read(behavior+0x34U,camera) && camera) {
             for(auto offset:{0x14U,0x3CU,0x64U})static_cast<void>(Write(camera+offset,out));
-            body[1]+=1.3F;static_cast<void>(Write(camera+0x10CU,body));
+            static_cast<void>(Write(camera+0x10CU,target));
             static_cast<void>(Write(camera+0x153U,std::uint8_t{1}));
         }
         return;
     }
+    gLocal.lastEye=position;gLocal.eyeKnown=true;
     const auto now=GetTickCount64();const auto generation=gCameraGeneration.load(std::memory_order_acquire);
     std::uintptr_t world{};
     // Select the donor's world containing the actor's floor; samples from a
@@ -565,14 +578,15 @@ Readiness Snapshot() noexcept {
         gLocal.visualReady,gLocal.moving};
 }
 VentInterface VentSnapshot() noexcept {
-    return {gLocal.ventMapOpen,gLocal.wasBackstage,gLocal.nearbyVent,gLocal.selectedVent};
+    return {false,gLocal.wasBackstage,gLocal.nearbyVent,gLocal.selectedVent,gLocal.freeCamera};
 }
 bool GoToVent(std::uint32_t index) noexcept {
-    if(!gLocal.ventMapOpen || !gLocal.wasBackstage || alien_pvp::VentPending() ||
+    if(!gLocal.freeCamera || !gLocal.wasBackstage || alien_pvp::VentPending() || !alien_pvp::ControlActive() ||
         !gLocal.camera.bound || !InputAllowed(gCameraBase))return false;
     alien_pvp::vents::Table table{};alien_pvp::vents::Point point{};
     if(!alien_pvp::vents::ReadTable(gLocal.character,&VentRead,table) ||
         !alien_pvp::vents::ReadPoint(table,index,&VentRead,point))return false;
+    if(std::hypot(std::hypot(point[0]-gLocal.freeEye[0],point[2]-gLocal.freeEye[2]),point[1]-gLocal.freeEye[1])>3.0F)return false;
     gLocal.selectedVent=static_cast<int>(index);
     alien_pvp::LocalInput input{};input.focused=true;
     input.action=alien_pvp::Action::ExitVent;input.selectedVent=true;

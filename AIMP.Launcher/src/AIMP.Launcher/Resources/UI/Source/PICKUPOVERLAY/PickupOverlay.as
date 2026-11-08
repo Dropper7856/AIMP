@@ -13,352 +13,50 @@ package
    public class PickupOverlay extends MovieClip
    {
       private var aimp_vent_layer:Sprite;
-      private var aimp_vent_scope:String = "";
-      private var aimp_vent_points:Object = {};
       private var aimp_vent_at:int = 0;
-      private var aimp_map_view:Sprite;
-      private var aimp_map_pan:Sprite;
-      private var aimp_map_marks:Sprite;
-      private var aimp_map_loader:Loader;
-      private var aimp_map_movie:MovieClip;
-      private var aimp_map_cursor:Sprite;
-      private var aimp_map_status:TextField;
-      private var aimp_map_legend:TextField;
-      private var aimp_map_floors:Array = [];
-      private var aimp_map_projection:Array = [];
-      private var aimp_map_floor:int = 0;
-      private var aimp_map_asset:String = "";
-      private var aimp_map_selected:int = -1;
-      private var aimp_map_native_selected:int = -1;
-      private var aimp_map_origin:Point = new Point();
-      private var aimp_map_down:Boolean = false;
-      private var aimp_map_drag:Boolean = false;
-      private var aimp_map_mouse:Point = new Point();
-      private var aimp_map_press:Point = new Point();
-      private var aimp_map_go_at:int = -2000;
-      private var aimp_map_schematic:Boolean = false;
-      private var aimp_map_schematic_bounds:Array = [0,0,1];
-      private var aimp_map_schematic_levels:Array = [];
-      private var aimp_map_schematic_count:int = -1;
-      private var aimp_map_failed_asset:String = "";
-      private var aimp_map_previous:TextField;
-      private var aimp_map_next:TextField;
 
       private function aimp_hide_vents() : void
       {
-         if(this.aimp_map_loader != null)
-         {
-            this.aimp_map_loader.contentLoaderInfo.removeEventListener(Event.COMPLETE,this.aimp_map_loaded);
-            this.aimp_map_loader.contentLoaderInfo.removeEventListener(IOErrorEvent.IO_ERROR,this.aimp_map_failed);
-            try { this.aimp_map_loader.close(); } catch(ignore:Error) {}
-            try { this.aimp_map_loader.unload(); } catch(ignore2:Error) {}
-         }
          if(this.aimp_vent_layer != null && this.aimp_vent_layer.parent != null)
             this.aimp_vent_layer.parent.removeChild(this.aimp_vent_layer);
-         this.aimp_vent_layer = null;this.aimp_map_view = null;this.aimp_map_pan = null;
-         this.aimp_map_loader = null;this.aimp_map_movie = null;this.aimp_map_asset = "";
-         this.aimp_map_down = false;this.aimp_map_drag = false;
-         this.aimp_map_schematic = false;this.aimp_map_schematic_count = -1;
-         this.aimp_map_schematic_levels = [];this.aimp_map_failed_asset = "";
-      }
-
-      private function aimp_vent_text(text:String, size:int, x:Number, y:Number, width:Number) : TextField
-      {
-         var field:TextField = this.aimp_create_round_end_text(text,size,width,y);
-         field.x = x;return field;
-      }
-
-      private function aimp_map_failed(event:IOErrorEvent) : void
-      {
-         if(this.aimp_map_loader == null || event.currentTarget != this.aimp_map_loader.contentLoaderInfo) return;
-         this.aimp_map_failed_asset = this.aimp_map_asset;
-         this.aimp_map_use_schematic();
-      }
-
-      private function aimp_map_use_schematic() : void
-      {
-         if(this.aimp_map_schematic) return;
-         if(this.aimp_map_loader != null)
-         {
-            this.aimp_map_loader.contentLoaderInfo.removeEventListener(Event.COMPLETE,this.aimp_map_loaded);
-            this.aimp_map_loader.contentLoaderInfo.removeEventListener(IOErrorEvent.IO_ERROR,this.aimp_map_failed);
-            try { this.aimp_map_loader.close(); } catch(ignore:Error) {}
-            try { this.aimp_map_loader.unload(); } catch(ignore2:Error) {}
-            if(this.aimp_map_loader.parent != null) this.aimp_map_loader.parent.removeChild(this.aimp_map_loader);
-         }
-         this.aimp_map_loader = null;this.aimp_map_movie = null;this.aimp_map_asset = "";
-         this.aimp_map_schematic = true;this.aimp_map_schematic_count = -1;
-         this.aimp_map_floor = 0;this.aimp_map_origin = new Point();
-      }
-
-      private function aimp_map_prepare_schematic(bodyY:Number) : void
-      {
-         var minX:Number = Infinity;var maxX:Number = -Infinity;
-         var minZ:Number = Infinity;var maxZ:Number = -Infinity;
-         var elevations:Array = [];var point:Array;var key:String;var loaded:int = 0;
-         for(key in this.aimp_vent_points)
-         {
-            point = this.aimp_vent_points[key];loaded++;
-            minX = Math.min(minX,point[1]);maxX = Math.max(maxX,point[1]);
-            minZ = Math.min(minZ,point[3]);maxZ = Math.max(maxZ,point[3]);elevations.push(Number(point[2]));
-         }
-         if(loaded == this.aimp_map_schematic_count) return;
-         this.aimp_map_schematic_count = loaded;
-         if(loaded == 0) { minX = minZ = -5;maxX = maxZ = 5; }
-         this.aimp_map_schematic_bounds = [(minX + maxX) / 2,(minZ + maxZ) / 2,
-            Math.min(900 / Math.max(10,maxX - minX + 6),480 / Math.max(10,maxZ - minZ + 6))];
-         elevations.sort(Array.NUMERIC);this.aimp_map_schematic_levels = [];
-         for each(var elevation:Number in elevations)
-            if(this.aimp_map_schematic_levels.length == 0 || elevation - Number(this.aimp_map_schematic_levels[this.aimp_map_schematic_levels.length - 1]) > 2.5)
-               this.aimp_map_schematic_levels.push(elevation);
-         var best:Number = Infinity;this.aimp_map_floor = 0;
-         for(var i:int = 0;i < this.aimp_map_schematic_levels.length;i++)
-            if(Math.abs(Number(this.aimp_map_schematic_levels[i]) - bodyY) < best)
-            { best = Math.abs(Number(this.aimp_map_schematic_levels[i]) - bodyY);this.aimp_map_floor = i; }
-         this.aimp_map_reset();
-      }
-
-      private function aimp_map_loaded(event:Event) : void
-      {
-         if(this.aimp_map_loader == null || event.currentTarget != this.aimp_map_loader.contentLoaderInfo) return;
-         this.aimp_map_movie = this.aimp_map_loader.content as MovieClip;
-         if(this.aimp_map_movie == null) return;
-         try { this.aimp_map_movie.gotoAndStop(this.aimp_map_asset); } catch(ignore:Error) { this.aimp_map_movie.stop(); }
-         var start:DisplayObject = this.aimp_map_movie.getChildByName("startmarker_mc");
-         this.aimp_map_origin = start != null ? new Point(start.x,start.y) : new Point();
-         if(start != null) start.visible = false;
-         var finish:DisplayObject = this.aimp_map_movie.getChildByName("endmarker_mc");
-         if(finish != null) finish.visible = false;
-         this.aimp_map_reset();
-      }
-
-      private function aimp_map_reset() : void
-      {
-         if(this.aimp_map_pan == null || this.aimp_map_view == null) return;
-         var area:Rectangle = this.aimp_map_view.scrollRect;
-         var scale:Number = Math.min(area.width / 1040,area.height / 620);
-         this.aimp_map_pan.scaleX = this.aimp_map_pan.scaleY = scale;
-         this.aimp_map_pan.x = area.width / 2 - (this.aimp_map_origin.x + 480) * scale;
-         this.aimp_map_pan.y = area.height / 2 - (this.aimp_map_origin.y + 270) * scale;
-      }
-
-      private function aimp_map_load_floor() : void
-      {
-         if(this.aimp_map_schematic) return;
-         if(this.aimp_map_pan == null || this.aimp_map_floors.length == 0) return;
-         var asset:String = String(this.aimp_map_floors[this.aimp_map_floor]);
-         if(asset == this.aimp_map_asset) return;
-         if(!/^[a-zA-Z0-9_]{1,95}$/.test(asset)) return;
-         if(this.aimp_map_loader != null)
-         {
-            this.aimp_map_loader.contentLoaderInfo.removeEventListener(Event.COMPLETE,this.aimp_map_loaded);
-            this.aimp_map_loader.contentLoaderInfo.removeEventListener(IOErrorEvent.IO_ERROR,this.aimp_map_failed);
-            try { this.aimp_map_loader.close(); } catch(ignore:Error) {}
-            try { this.aimp_map_loader.unload(); } catch(ignore2:Error) {}
-            if(this.aimp_map_loader.parent != null) this.aimp_map_loader.parent.removeChild(this.aimp_map_loader);
-         }
-         this.aimp_map_asset = asset;this.aimp_map_movie = null;
-         this.aimp_map_loader = new Loader();
-         this.aimp_map_loader.contentLoaderInfo.addEventListener(Event.COMPLETE,this.aimp_map_loaded,false,0,true);
-         this.aimp_map_loader.contentLoaderInfo.addEventListener(IOErrorEvent.IO_ERROR,this.aimp_map_failed,false,0,true);
-         this.aimp_map_pan.addChildAt(this.aimp_map_loader,0);
-         // Same path and Loader as the retail Map.LoadMap; no redistributed game assets.
-         try { this.aimp_map_loader.load(new URLRequest("maps/" + asset + ".swf")); }
-         catch(error:Error) { this.aimp_map_failed_asset = asset;this.aimp_map_use_schematic(); }
-      }
-
-      private function aimp_map_project(x:Number, y:Number, z:Number) : Point
-      {
-         if(this.aimp_map_schematic)
-            return new Point(480 + (x - Number(this.aimp_map_schematic_bounds[0])) * Number(this.aimp_map_schematic_bounds[2]),
-               270 - (z - Number(this.aimp_map_schematic_bounds[1])) * Number(this.aimp_map_schematic_bounds[2]));
-         var m:Array = this.aimp_map_projection;
-         var dx:Number = x - Number(m[0]);var dy:Number = y - Number(m[1]);var dz:Number = z - Number(m[2]);
-         return new Point(this.aimp_map_origin.x + 960 * (1 - (dx * Number(m[6]) + dy * Number(m[7]) + dz * Number(m[8])) / Number(m[9])),
-            this.aimp_map_origin.y + 540 * (1 - (dx * Number(m[3]) + dy * Number(m[4]) + dz * Number(m[5])) / Number(m[10])));
-      }
-
-      private function aimp_map_dot(point:Point, color:uint, radius:Number, alpha:Number = 1) : void
-      {
-         var marker:Sprite = new Sprite();marker.x = point.x;marker.y = point.y;
-         marker.graphics.beginFill(color,alpha);
-         marker.graphics.drawCircle(0,0,radius / this.aimp_map_pan.scaleX);
-         marker.graphics.endFill();this.aimp_map_marks.addChild(marker);
+         this.aimp_vent_layer = null;
       }
 
       private function aimp_update_vents(line:String) : void
       {
-         var scope:String = this.aimp_get_bridge_value(line,"scope");
-         var count:int = int(this.aimp_get_bridge_value(line,"count"));
-         var open:Boolean = this.aimp_get_bridge_value(line,"open") == "1";
-         var controlReady:Boolean = this.aimp_get_bridge_value(line,"controlReady") == "1";
-         var backstage:Boolean = this.aimp_get_bridge_value(line,"backstage") == "1";
-         var nearby:int = int(this.aimp_get_bridge_value(line,"nearby"));
+         this.aimp_hide_vents();this.aimp_vent_at = getTimer();
+         if(this.aimp_get_bridge_value(line,"active") != "1" || this.aimp_loading_layer != null || this.aimp_round_end_layer != null) return;
+         var ready:Boolean = this.aimp_get_bridge_value(line,"controlReady") == "1";
+         var free:Boolean = this.aimp_get_bridge_value(line,"freeCamera") == "1";
          var pending:Boolean = this.aimp_get_bridge_value(line,"pending") == "1";
+         var nearby:int = int(this.aimp_get_bridge_value(line,"nearby"));
+         var phase:int = int(this.aimp_get_bridge_value(line,"phase"));
+         var action:int = int(this.aimp_get_bridge_value(line,"action"));
+         if(ready && !free && !pending && nearby < 0) return;
          var width:Number = stage != null ? stage.stageWidth : 1280;
          var height:Number = stage != null ? stage.stageHeight : 720;
-         var row:String;var values:Array;var point:Array;var key:String;var id:int;var p:Point;
-         this.aimp_vent_at = getTimer();
-         if(this.aimp_get_bridge_value(line,"active") != "1" || scope == "" || count < 0 || count > 4096)
+         var text:String = "Waiting for Alien control authorization from Host...";
+         var help:String = "";
+         if(ready)
          {
-            this.aimp_hide_vents();this.aimp_vent_scope = "";this.aimp_vent_points = {};return;
+            if(pending) text = action == 3 ? "Exiting ventilation... E / Q: cancel" : "Entering ventilation... E / Q: cancel";
+            else if(free) text = nearby >= 0 ? 'Press "E" to exit ventilation here' : "Move close to a ventilation opening to exit";
+            else text = 'Press "E" to enter ventilation';
+            if(free) help = "Mouse: look | WASD: fly | Space / Ctrl: up / down | Shift: faster";
+            else if(phase == 3 || phase == 4) help = "Ventilation unavailable. Move closer and try again.";
          }
-         if(scope != this.aimp_vent_scope)
+         this.aimp_vent_layer = new Sprite();this.aimp_vent_layer.mouseEnabled = false;this.aimp_vent_layer.mouseChildren = false;
+         this.aimp_vent_layer.graphics.beginFill(0,0.82);
+         this.aimp_vent_layer.graphics.drawRect(width * 0.12,height * 0.80,width * 0.76,help == "" ? 52 : 84);
+         this.aimp_vent_layer.graphics.endFill();
+         var prompt:TextField = this.aimp_create_round_end_text(text,22,width * 0.76,height * 0.80 + 10);prompt.x = width * 0.12;
+         this.aimp_vent_layer.addChild(prompt);
+         if(help != "")
          {
-            this.aimp_hide_vents();this.aimp_vent_scope = scope;this.aimp_vent_points = {};
-            this.aimp_map_floor = 0;this.aimp_map_selected = -1;this.aimp_map_native_selected = -1;
+            var hint:TextField = this.aimp_create_round_end_text(help,16,width * 0.76,height * 0.80 + 45);hint.x = width * 0.12;
+            this.aimp_vent_layer.addChild(hint);
          }
-         for each(row in this.aimp_get_bridge_value(line,"points").split(";"))
-         {
-            values = row.split(",");id = int(values[0]);
-            if(values.length != 4 || id < 0 || id >= count || !isFinite(Number(values[1])) || !isFinite(Number(values[2])) || !isFinite(Number(values[3])))continue;
-            this.aimp_vent_points[String(id)] = [id,Number(values[1]),Number(values[2]),Number(values[3])];
-         }
-         if(this.aimp_loading_layer != null || this.aimp_round_end_layer != null || (controlReady && !open && nearby < 0 && !backstage && !pending))
-         { this.aimp_hide_vents();return; }
-         if(!open || !controlReady)
-         {
-            this.aimp_hide_vents();this.aimp_vent_layer = new Sprite();addChild(this.aimp_vent_layer);
-            this.aimp_vent_layer.mouseEnabled = false;this.aimp_vent_layer.mouseChildren = false;
-            this.aimp_vent_layer.graphics.beginFill(0,0.8);this.aimp_vent_layer.graphics.drawRect(width * 0.2,height * 0.82,width * 0.6,52);
-            this.aimp_vent_layer.graphics.endFill();
-            this.aimp_vent_layer.addChild(this.aimp_vent_text(!controlReady ? "Waiting for Alien control authorization from Host..." : pending ? "Entering ventilation... E / Q or WASD: cancel" : backstage ? 'Press "E" to choose a ventilation exit' : 'Press "E" to enter ventilation',22,width * 0.2,height * 0.82 + 10,width * 0.6));return;
-         }
-         if(this.aimp_map_view == null)
-         {
-            this.aimp_hide_vents();this.aimp_vent_layer = new Sprite();addChild(this.aimp_vent_layer);
-            this.aimp_vent_layer.mouseEnabled = false;this.aimp_vent_layer.mouseChildren = false;
-            this.aimp_vent_layer.graphics.beginFill(0x061116,1);this.aimp_vent_layer.graphics.drawRect(0,0,width,height);this.aimp_vent_layer.graphics.endFill();
-            this.aimp_vent_layer.addChild(this.aimp_vent_text("VENTILATION MAP",30,30,16,width - 60));
-            this.aimp_map_status = this.aimp_vent_text("Loading original game map...",18,30,58,width - 60);this.aimp_vent_layer.addChild(this.aimp_map_status);
-            this.aimp_map_view = new Sprite();this.aimp_map_view.x = 30;this.aimp_map_view.y = 100;
-            this.aimp_map_view.scrollRect = new Rectangle(0,0,width - 60,height - 225);this.aimp_vent_layer.addChild(this.aimp_map_view);
-            this.aimp_map_pan = new Sprite();this.aimp_map_view.addChild(this.aimp_map_pan);
-            this.aimp_map_marks = new Sprite();this.aimp_map_pan.addChild(this.aimp_map_marks);
-            this.aimp_map_legend = this.aimp_vent_text("",16,30,height - 120,width - 60);this.aimp_vent_layer.addChild(this.aimp_map_legend);
-            this.aimp_map_previous = this.aimp_vent_text("[ Previous floor ]",18,30,height - 76,160);this.aimp_vent_layer.addChild(this.aimp_map_previous);
-            this.aimp_map_next = this.aimp_vent_text("[ Next floor ]",18,190,height - 76,160);this.aimp_vent_layer.addChild(this.aimp_map_next);
-            this.aimp_vent_layer.addChild(this.aimp_vent_text("[ Reset view ]",18,350,height - 76,180));
-            this.aimp_vent_layer.addChild(this.aimp_vent_text("[ Go To Here ]",24,width - 250,height - 78,220));
-            this.aimp_vent_layer.addChild(this.aimp_vent_text("Drag: move map   |   Wheel: zoom   |   Click: select vent   |   E: close",16,30,height - 40,width - 60));
-            this.aimp_map_cursor = new Sprite();this.aimp_map_cursor.graphics.lineStyle(2,0xFFFFFF);
-            this.aimp_map_cursor.graphics.moveTo(0,15);this.aimp_map_cursor.graphics.lineTo(0,0);this.aimp_map_cursor.graphics.lineTo(12,10);
-            this.aimp_vent_layer.addChild(this.aimp_map_cursor);
-         }
-         var maps:String = this.aimp_get_bridge_value(line,"maps");
-         this.aimp_map_floors = maps == "" ? [] : maps.split(",");
-         this.aimp_map_projection = this.aimp_get_bridge_value(line,"projection").split(",");
-         var original:Boolean = this.aimp_map_projection.length == 11 && this.aimp_map_floors.length > 0;
-         if(original && this.aimp_map_failed_asset != "" && this.aimp_map_floors.indexOf(this.aimp_map_failed_asset) >= 0) original = false;
-         if(!original)
-         {
-            this.aimp_map_use_schematic();this.aimp_map_prepare_schematic(Number(this.aimp_get_bridge_value(line,"y")));
-            this.aimp_map_floors = this.aimp_map_schematic_levels;
-         }
-         else
-         {
-            if(this.aimp_map_schematic) { this.aimp_map_schematic = false;this.aimp_map_floor = 0; }
-            this.aimp_map_floor %= this.aimp_map_floors.length;this.aimp_map_load_floor();
-         }
-         this.aimp_map_previous.text = this.aimp_map_schematic ? "[ Lower vents ]" : "[ Previous floor ]";
-         this.aimp_map_next.text = this.aimp_map_schematic ? "[ Higher vents ]" : "[ Next floor ]";
-         var selected:int = int(this.aimp_get_bridge_value(line,"selected"));
-         if(selected != this.aimp_map_native_selected)
-         { this.aimp_map_selected = selected;this.aimp_map_native_selected = selected; }
-         var mouse:Point = new Point(Number(this.aimp_get_bridge_value(line,"mx")) * width / 960,Number(this.aimp_get_bridge_value(line,"my")) * height / 540);
-         this.aimp_map_cursor.x = mouse.x;this.aimp_map_cursor.y = mouse.y;
-         var down:Boolean = this.aimp_get_bridge_value(line,"down") == "1";
-         var inside:Boolean = mouse.x >= 30 && mouse.x < width - 30 && mouse.y >= 100 && mouse.y < height - 125;
-         if(down && !this.aimp_map_down)
-         { this.aimp_map_press = mouse.clone();this.aimp_map_drag = false; }
-         if(down && this.aimp_map_down && this.aimp_map_press.y >= 100 && this.aimp_map_press.y < height - 125)
-         {
-            if(Point.distance(mouse,this.aimp_map_press) > 5) this.aimp_map_drag = true;
-            if(this.aimp_map_drag)
-            { this.aimp_map_pan.x += mouse.x - this.aimp_map_mouse.x;this.aimp_map_pan.y += mouse.y - this.aimp_map_mouse.y; }
-         }
-         var wheel:Number = Number(this.aimp_get_bridge_value(line,"wheel"));
-         if(wheel != 0 && inside)
-         {
-            var old:Number = this.aimp_map_pan.scaleX;
-            var zoom:Number = Math.max(0.2,Math.min(8,old * Math.pow(1.2,wheel / 120)));
-            this.aimp_map_pan.x = mouse.x - 30 - (mouse.x - 30 - this.aimp_map_pan.x) * zoom / old;
-            this.aimp_map_pan.y = mouse.y - 100 - (mouse.y - 100 - this.aimp_map_pan.y) * zoom / old;
-            this.aimp_map_pan.scaleX = this.aimp_map_pan.scaleY = zoom;
-         }
-         var clicked:Boolean = this.aimp_get_bridge_value(line,"click") == "1";
-         if(clicked && !this.aimp_map_down && !down) { this.aimp_map_press = mouse.clone();this.aimp_map_drag = false; }
-         if(!down && (this.aimp_map_down || clicked) && !this.aimp_map_drag && Point.distance(mouse,this.aimp_map_press) < 8)
-         {
-            if(inside && (this.aimp_map_movie != null || this.aimp_map_schematic))
-            {
-               var best:Number = 18;var distance:Number;
-               for(key in this.aimp_vent_points)
-               {
-                  point = this.aimp_vent_points[key];p = this.aimp_map_project(point[1],point[2],point[3]);
-                  p.x = 30 + this.aimp_map_pan.x + p.x * this.aimp_map_pan.scaleX;
-                  p.y = 100 + this.aimp_map_pan.y + p.y * this.aimp_map_pan.scaleY;
-                  distance = Point.distance(mouse,p);
-                  if(distance < best) { best = distance;this.aimp_map_selected = int(point[0]); }
-               }
-            }
-            else if(mouse.y >= height - 82 && mouse.y < height - 45)
-            {
-               if(mouse.x >= width - 250 && this.aimp_map_selected >= 0 && !pending && getTimer() - this.aimp_map_go_at > 1000)
-               {
-                  this.aimp_map_go_at = getTimer();
-                  this.aimp_send_bridge_message("ALIEN_VENT_GO|source=pickup_overlay|phase=gameplay|scope=" + this.aimp_encode_bridge_value(this.aimp_vent_scope) + "|vent=" + this.aimp_map_selected);
-               }
-               else if(mouse.x < 190 && this.aimp_map_floors.length > 0) { this.aimp_map_floor = (this.aimp_map_floor + this.aimp_map_floors.length - 1) % this.aimp_map_floors.length;this.aimp_map_load_floor(); }
-               else if(mouse.x < 350 && this.aimp_map_floors.length > 0) { this.aimp_map_floor = (this.aimp_map_floor + 1) % this.aimp_map_floors.length;this.aimp_map_load_floor(); }
-               else if(mouse.x < 530) this.aimp_map_reset();
-            }
-         }
-         this.aimp_map_down = down;this.aimp_map_mouse = mouse;
-         this.aimp_map_marks.graphics.clear();
-         while(this.aimp_map_marks.numChildren > 0) this.aimp_map_marks.removeChildAt(0);
-         if(this.aimp_map_movie == null && !this.aimp_map_schematic) return;
-         var floorY:Number = Number(this.aimp_get_bridge_value(line,"y"));
-         if(this.aimp_vent_points[String(this.aimp_map_selected)] != null) floorY = this.aimp_vent_points[String(this.aimp_map_selected)][2];
-         if(this.aimp_map_schematic && this.aimp_map_schematic_levels.length > 0) floorY = Number(this.aimp_map_schematic_levels[this.aimp_map_floor]);
-         if(this.aimp_map_schematic)
-         {
-            this.aimp_map_marks.graphics.lineStyle(1 / this.aimp_map_pan.scaleX,0x19353D,0.8);
-            for(var gx:Number = 0;gx <= 960;gx += 60)
-            { this.aimp_map_marks.graphics.moveTo(gx,0);this.aimp_map_marks.graphics.lineTo(gx,540); }
-            for(var gy:Number = 0;gy <= 540;gy += 60)
-            { this.aimp_map_marks.graphics.moveTo(0,gy);this.aimp_map_marks.graphics.lineTo(960,gy); }
-         }
-         var loaded:int = 0;
-         for(key in this.aimp_vent_points)
-         {
-            point = this.aimp_vent_points[key];loaded++;
-            p = this.aimp_map_project(point[1],point[2],point[3]);
-            this.aimp_map_dot(p,int(point[0]) == this.aimp_map_selected ? 0xF3C96A : 0x79E9DF,int(point[0]) == this.aimp_map_selected ? 8 : 4,int(point[0]) == this.aimp_map_selected || Math.abs(Number(point[2]) - floorY) <= 2.5 ? 1 : 0.35);
-            if(int(point[0]) == this.aimp_map_selected)
-            {
-               var label:TextField = this.aimp_vent_text("Vent " + String(int(point[0]) + 1) + "  " + Number(point[2]).toFixed(1) + " m",14,0,0,180);
-               label.scaleX = label.scaleY = 1 / this.aimp_map_pan.scaleX;
-               label.x = p.x - 90 / this.aimp_map_pan.scaleX;label.y = p.y - 30 / this.aimp_map_pan.scaleX;
-               this.aimp_map_marks.addChild(label);
-            }
-         }
-         this.aimp_map_dot(this.aimp_map_project(Number(this.aimp_get_bridge_value(line,"x")),Number(this.aimp_get_bridge_value(line,"y")),Number(this.aimp_get_bridge_value(line,"z"))),0xFFFFFF,7);
-         var legend:String = "White: Alien   |   Cyan: vents   |   Gold: selected   |   Players: ";
-         var colors:Array = [];
-         for each(row in this.aimp_get_bridge_value(line,"players").split(";"))
-         {
-            values = row.split(",");if(values.length != 6)continue;
-            var color:uint = uint(parseInt(String(values[1]),16));
-            this.aimp_map_dot(this.aimp_map_project(Number(values[2]),Number(values[3]),Number(values[4])),color,6);
-            var name:String = decodeURIComponent(String(values[5]));
-            colors.push({start:legend.length,end:legend.length + name.length,color:color});legend += name + "   ";
-         }
-         this.aimp_map_legend.text = legend;
-         for each(var entry:Object in colors)
-         { var format:TextFormat = new TextFormat();format.color = entry.color;this.aimp_map_legend.setTextFormat(format,entry.start,entry.end); }
-         var background:String = this.aimp_map_schematic ? "VENT LOCATIONS - no original floor plan   |   Height " + floorY.toFixed(1) + " m (dim: other heights)" : this.aimp_map_asset;
-         this.aimp_map_status.text = background + "   |   Vent " + String(this.aimp_map_selected + 1) + "   |   " + loaded + "/" + count + " openings   |   " + (pending ? "Travel in progress... E / Q or WASD: cancel" : "Select a vent, then Go To Here");
+         addChild(this.aimp_vent_layer);
       }
 
       public var pickup_cursor_mc:MovieClip;

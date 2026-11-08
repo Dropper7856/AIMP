@@ -25,7 +25,8 @@ struct State final {
     std::array<LocalInput,8> actions{};std::size_t actionRead{},actionCount{};
     std::uint64_t inputSequence{},poseSequence{},lastInputSent{},lastStatus{},lastPose{},lastTick{},lastAckAt{},lastRoar{};
     std::uint64_t appliedInput{},appliedHost{},correctionAt{};
-    Frame correction{},lastObserved{},ventAuthority{};
+    Frame correction{},lastObserved{},ventAuthority{},deferredTerminal{};
+    bool hasDeferredTerminal{};
     bool moving{},hadPose{},ownsSlot{},expired{},recovering{},hasDeferredAction{},aligned{};
     Frame deferredAction{};std::uint64_t deferredActionAt{};
     std::uint64_t ventSettleSequence{},ventSettleAt{};
@@ -183,6 +184,15 @@ void ApplyAction(const Frame& command,std::uint64_t now) noexcept {
 void ApplyResolution(const Frame& plan,std::uint64_t now) noexcept {
     if(g.context.host)return;
     if(plan.action==Action::EnterVent || plan.action==Action::ExitVent)g.ventAuthority=plan;
+    // Host may finish a short exit within our 300ms settling interval. Its
+    // Completed receipt must not discard the queued local Started operation.
+    if(VentAction(plan) && plan.phase==ActionPhase::Completed && g.hasDeferredAction &&
+        g.deferredAction.kind==Kind::Resolution && g.deferredAction.phase==ActionPhase::Started &&
+        g.deferredAction.hostSequence==plan.hostSequence) {
+        g.deferredTerminal=plan;g.hasDeferredTerminal=true;return;
+    }
+    if(plan.phase==ActionPhase::Rejected || plan.phase==ActionPhase::Failed || plan.phase==ActionPhase::Cancelled)
+        g.hasDeferredTerminal=false;
     if(plan.phase==ActionPhase::Started && !ActionBusy() && SettleVent(plan,now))return;
     if((!StopDonorMovement() || !CancelRecovery()) && (plan.phase==ActionPhase::Preparing || plan.phase==ActionPhase::Started)) {
         if(!g.hasDeferredAction || g.deferredAction.hostSequence==plan.hostSequence) {
@@ -196,13 +206,18 @@ void ApplyResolution(const Frame& plan,std::uint64_t now) noexcept {
     Frame receipt=plan;
     if(g.context.actions && g.context.actions->begin && g.context.actions->begin(g.context,plan,receipt))
         PublishAction(receipt,now);
+    if(plan.phase==ActionPhase::Started && !g.hasDeferredAction && g.hasDeferredTerminal &&
+        g.deferredTerminal.hostSequence==plan.hostSequence) {
+        const auto terminal=g.deferredTerminal;g.hasDeferredTerminal=false;
+        ApplyResolution(terminal,now);
+    }
 }
 void PollAction(std::uint64_t now) noexcept {
     if(g.hasDeferredAction) {
         if(!g.window.ActiveAt(now) || !Fresh(now,g.deferredActionAt,1500U)) {
             Frame failed=g.deferredAction;failed.phase=ActionPhase::Rejected;failed.reason=ActionReason::NativeBusy;
             failed.resolutionRevision=std::max(std::uint64_t{1},failed.resolutionRevision+1U);
-            g.hasDeferredAction=false;PublishAction(failed,now);
+            g.hasDeferredAction=false;g.hasDeferredTerminal=false;PublishAction(failed,now);
         } else if(StopDonorMovement() && CancelRecovery()) {
             const auto pending=g.deferredAction;g.hasDeferredAction=false;
             if(pending.kind==Kind::Resolution)ApplyResolution(pending,now);else ApplyAction(pending,now);
@@ -242,7 +257,7 @@ void Drain(std::uint64_t now) noexcept {
         if(!g.window.Accept(value.frame,value.at,now)) {
             gRejected.fetch_add(1U,std::memory_order_relaxed);continue;
         }
-        if(f.kind==Kind::Stop){g.deliveryFault=false;g.hasDeferredAction=false;}
+        if(f.kind==Kind::Stop){g.deliveryFault=false;g.hasDeferredAction=false;g.hasDeferredTerminal=false;}
         if(f.kind==Kind::Stop || (f.kind==Kind::Activate && previousEpoch!=f.epoch)) {
             if(g.context.actions && g.context.actions->cancel)g.context.actions->cancel(g.context,true);
         }
@@ -251,7 +266,7 @@ void Drain(std::uint64_t now) noexcept {
             g.ventSettleSequence=g.ventSettleAt=0U;
             g.history.Clear();g.lastInputSent=0U;g.lastAckAt=now;g.predictionCorrection=false;
             g.correction={};g.correctionAt=0U;g.lastObserved={};g.hadPose=false;g.lastPose=0U;
-            g.actionRead=g.actionCount=0U;g.local.action=Action::None;g.hasDeferredAction=false;
+            g.actionRead=g.actionCount=0U;g.local.action=Action::None;g.hasDeferredAction=false;g.hasDeferredTerminal=false;
         } else if(f.kind==Kind::Commit) {
             gCommits.fetch_add(1U,std::memory_order_relaxed);g.lastAckAt=value.at;
             ApplyAction(f,now);

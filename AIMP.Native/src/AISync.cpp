@@ -10944,7 +10944,7 @@ bool SnapshotAlienVents(std::uint32_t page,std::string& json,int goTo,std::uint6
         std::to_string(gPvPLease.worldGeneration)+":"+std::to_string(gPvPLease.ticket.serial)+"\",\"page\":"+
         std::to_string(page)+",\"count\":"+std::to_string(table.count)+",\"nearby\":"+std::to_string(ui.nearby)+
         ",\"selected\":"+std::to_string(ui.selected)+",\"open\":"+(ui.open?"true":"false")+
-        ",\"backstage\":"+(ui.backstage?"true":"false")+",\"x\":"+std::to_string(body[0])+
+        ",\"backstage\":"+(ui.backstage?"true":"false")+",\"freeCamera\":"+(ui.freeCamera?"true":"false")+",\"x\":"+std::to_string(body[0])+
         ",\"y\":"+std::to_string(body[1])+",\"z\":"+std::to_string(body[2])+
         ",\"action\":"+std::to_string(static_cast<unsigned>(authority.action))+
         ",\"phase\":"+std::to_string(static_cast<unsigned>(authority.phase))+
@@ -10958,33 +10958,7 @@ bool SnapshotAlienVents(std::uint32_t page,std::string& json,int goTo,std::uint6
         comma=true;
         json+="["+std::to_string(i)+","+std::to_string(point[0])+","+std::to_string(point[1])+","+std::to_string(point[2])+"]";
     }
-    json+="],\"maps\":[";
-    // Retail UI configuration used by FUN_00773xxx/FUN_0080bc70. Read only;
-    // original floor movies stay in UI.PAK and are loaded by Scaleform.
-    std::uintptr_t globals{},manager{},config{};std::array<float,11> projection{};
-    bool valid=Read(gBase+0x012F0C88U,globals)&&globals&&Read(globals+0x44U,manager)&&manager&&
-        Read(manager+0xBBCU,config)&&config&&Read(config+0x18U,projection);
-    for(const auto value:projection)valid=valid&&std::isfinite(value)&&std::abs(value)<100000.0F;
-    valid=valid&&std::abs(projection[9])>0.01F&&std::abs(projection[10])>0.01F;
-    comma=false;
-    if(valid)for(unsigned floor=0;floor<6;++floor) {
-        std::uintptr_t name{};if(!Read(config+floor*4U,name)||!name)continue;
-        std::string asset;bool safe=false;
-        for(unsigned n=0;n<95;++n) {
-            char c{};if(!Read(name+n,c))break;
-            if(!c){safe=!asset.empty();break;}
-            if(!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_'))break;
-            asset+=c;
-        }
-        if(!safe)continue;
-        if(comma)json+=",";comma=true;json+="\""+asset+"\"";
-    }
-    json+="],\"projection\":[";
-    if(valid)for(unsigned n=0;n<projection.size();++n){if(n)json+=",";json+=std::to_string(projection[n]);}
-    const auto pointer=alien_pvp_input::TakeMapPointer();
-    json+="],\"mx\":"+std::to_string(pointer.x)+",\"my\":"+std::to_string(pointer.y)+
-        ",\"wheel\":"+std::to_string(pointer.wheel)+",\"down\":"+(pointer.down?"true":"false")+
-        ",\"click\":"+(pointer.clicked?"true":"false")+"}";return true;
+    json+="]}";return true;
 }
 
 bool ProbeAlienPvPCandidate(AlienPvPProbe& result) noexcept {

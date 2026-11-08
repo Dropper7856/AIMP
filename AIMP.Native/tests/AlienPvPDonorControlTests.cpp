@@ -9,6 +9,7 @@
 
 namespace {
 int genericCalls{},driveCalls{},stopCalls{},beginCalls{},placements{},recoveryCalls{};
+int starts{},completions{};
 bool stopReady=true,nativeBusy=false;
 aimp::alien_pvp::Frame lastIntent{};
 void Check(bool pass,const char* message) {
@@ -19,6 +20,8 @@ bool Drive(const aimp::alien_pvp::Context&,const aimp::alien_pvp::Frame* frame) 
     ++driveCalls;lastIntent=*frame;return true;
 }
 bool Begin(const aimp::alien_pvp::Context&,const aimp::alien_pvp::Frame& frame,aimp::alien_pvp::Frame& out) noexcept {
+    if(frame.phase==aimp::alien_pvp::ActionPhase::Completed){++completions;out=frame;return true;}
+    ++starts;
     ++beginCalls;out=frame;out.phase=aimp::alien_pvp::ActionPhase::Started;
     out.reason=aimp::alien_pvp::ActionReason::None;out.resolutionRevision=1U;
     nativeBusy=true;return true;
@@ -69,7 +72,7 @@ int main() {
     stopReady=false;command.sequence=command.hostSequence=3;command.action=Action::EnterVent;
     Queue(command);Pump(context);
     Check(beginCalls==0,"vent started before movement retirement");
-    stopReady=true;Pump(context);
+    stopReady=true;Sleep(330);Pump(context);
     Check(beginCalls==1,"deferred vent did not start after retirement");
     Check(VentAuthority().phase==ActionPhase::Started,"Host vent progress was not exposed to the selector");
     const auto duringAction=driveCalls;Pump(context);
@@ -126,6 +129,21 @@ int main() {
     Check(placements==beforeBackstagePlacement+1,"backstage placement repeated");
     CaptureLocal(movement);Pump(context);
     Check(placements>beforeBackstagePlacement+1 && MovingNow(),"backstage movement remained gated after placement");
+    Reset(true);
+    // Reproduce diagnostics4696: Host Started and Completed arrive together,
+    // before the Client's native settling interval has expired.
+    context.host=false;context.localOwner=true;
+    Pump(context);Queue(activate);Pump(context);
+    command.sequence=command.hostSequence=1;command.action=Action::ExitVent;
+    command.forward=command.strafe=0.0F;Queue(command);
+    Frame resolution=command;resolution.kind=Kind::Resolution;
+    resolution.phase=ActionPhase::Started;resolution.resolutionRevision=1;
+    const int priorStarts=starts,priorCompletions=completions;
+    Queue(resolution);resolution.phase=ActionPhase::Completed;resolution.resolutionRevision=2;Queue(resolution);
+    Pump(context);
+    Check(starts==priorStarts && completions==priorCompletions,"completion bypassed the local settle interval");
+    Sleep(330);CaptureLocal(stationary);Pump(context);
+    Check(starts==priorStarts+1 && completions==priorCompletions+1,"fast Host completion discarded the local exit start");
     Reset(true);
     std::cout<<"Donor control, Host placement, selected vent transport and interaction reach passed.\n";
 }

@@ -1,0 +1,51 @@
+AIMP 443 / protocol 39
+Branch: feature/alien-vs-survivors-main
+
+Diagnostics
+- Entry failures/timeouts are present, and exits2263/3717 complete locally
+  several seconds after their Host completion. Exit4696 is different: Host
+  Started and Completed arrive in the same second; there is no local Started.
+  Subsequent ExitVent requests are consistently rejected WrongStage.
+- The Client's 300ms vent settling queues Started. The previous Completed path
+  cleared that queued action, then reported completion without starting it.
+- Removed menu's ALIEN_VENT_GO path also reports Invalid Alien vent catalogue
+  page. HUD input no longer uses that path or depends on paged point validation.
+
+New interaction
+- Removed the full-screen menu, original-map/fallback loaders, mouse selection,
+  player map markers, Go To Here UI and its launcher command route.
+- Native free camera activates only for the possessed local Alien backstage.
+  It begins at the last known frontstage camera position. Mouse keeps retail
+  look/orbit orientation; WASD flies along that view, Space/Ctrl moves vertically,
+  Shift increases speed. Movement is normalized and timestep/coordinates bounded.
+- Follow-camera translation is overridden after the native update; collision
+  correction is skipped in this mode. Only camera coordinates move. The actual
+  Alien/technical player is not teleported to the camera or sent to peers as
+  the camera position. Local backstage Alien WASD movement is suppressed.
+- Within3m of a real native portal the HUD shows:
+  Press "E" to exit ventilation here
+  E pins that portal's real coordinates in the existing Host-authorized action.
+  Host selection, native path/animation and resource retirement remain intact.
+  E/Q cancels a pending traversal; flying the camera does not cancel it.
+- Entry remains Press "E" to enter ventilation. No map menu appears. Camera
+  returns to the Alien after actual native frontstage restoration and retirement.
+- HUD polling is now a small interaction/status payload. It no longer validates
+  or transmits map points, projection, player markers or mouse pointer events.
+  Native map configuration/pointer harvesting is removed from that query.
+
+Ordering correction
+- A Completed receipt arriving while the matching local Started is settling
+  is retained separately. Started runs first, then Completed is delivered to
+  the local native adapter. Host completion still does not fabricate a local
+  stage or bypass native resource retirement. Stop/new epoch clears both queues.
+
+Verification
+- Native targeted tests4/4 passed; .NET protocol/Alien targeted tests5/5 passed.
+- Donor-control regression reproduces same-batch Host Started/Completed during
+  the local300ms settle interval and checks the local start is preserved.
+  Existing donor test now accounts for the actual300ms settle requirement.
+- AS3 compiled; final shipped GFX re-export contains the exit prompt/free-flight
+  hints and no Go To Here/menu implementation. Original visual tags/tail kept.
+- Logs: artifacts/alien-443/. Delivery receipt: artifacts/alien-443/delivery.json.
+- Camera feel, rendering and repeated two-PC vent exits require in-game testing.
+- Win32 Release and .NET publishes succeeded. API delivered to both PCs; SHA-256 equality verified for Launcher/Protocol/NetZ and both UI GFX files. No Electron rebuild or destination-only deletion.

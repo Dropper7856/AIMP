@@ -793,7 +793,6 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             "JOIN_DIRECT_IP" => JoinDirectAsync(),
             "READY" => SetReadyAsync(message.Get("ready", "0") == "1"),
             "SET_ALIEN_ROLE" => SetAlienRoleAsync(message),
-            "ALIEN_VENT_GO" => GoToAlienVentAsync(message),
             "START_GAME" => StartGameAsync(message),
             "START_GAME_ACK" => LogOnlyAsync("Start-game UI acknowledgement received."),
             "CHARACTER_SELECTED" => LogCharacterSelectionAsync(message),
