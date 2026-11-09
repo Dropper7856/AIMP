@@ -1,4 +1,5 @@
 #include "aimp/PlayerHidingRuntime.h"
+#include "aimp/PlayerHidingPresentationRuntime.h"
 #include "aimp/AISync.h"
 #include "aimp/AnimationSyncRuntime.h"
 #include "aimp/CharacterIncarnation.h"
