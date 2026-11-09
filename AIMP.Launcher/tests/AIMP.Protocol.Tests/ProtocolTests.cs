@@ -142,7 +142,7 @@ internal static class ProtocolTests
                 new uint[] { 0x11223344U, 0x55667788U }, WorldManifestRuntimeIdentity.RootInstanceBaseId));
 
         AssertWorldManifestV5RoundTrip(worldEntityId);
-        foreach (var raw in new ushort[] { 16, 17, 18, 28, 29, 111, 112, 113, 114, 124, 125, 126, 127 })
+        foreach (var raw in new ushort[] { 16, 17, 18, 28, 29, 111, 112, 113, 114, 124, 125, 126, 127, 158 })
             AssertEx.True(Enum.IsDefined(typeof(MessageType), raw));
         AssertEx.False(Enum.IsDefined(typeof(MessageType), (ushort)30));
         AssertEx.False(Enum.IsDefined(typeof(MessageType), (ushort)131));

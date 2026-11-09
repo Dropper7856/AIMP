@@ -29,7 +29,7 @@ internal sealed partial class MultiplayerSessionCoordinator
         {
             if (_cinematicPollRunning || now < _nextCinematicPollUtc ||
                 _start is not { } current || LevelGameMode(current.Level)!="Campaign" ||
-                !_localGameplayReady || (_host is null && _client is null) ||
+                (_host is null && _client is null) ||
                 !runtime.IpcConnected || !runtime.EngineThreadReady ||
                 _missionNativeGeneration != runtime.LevelGeneration ||
                 !_missionConfigured.Task.IsCompletedSuccessfully) return;

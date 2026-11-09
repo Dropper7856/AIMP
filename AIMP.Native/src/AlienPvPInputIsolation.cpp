@@ -303,7 +303,9 @@ bool ConfigureCinematic(bool enabled,bool host) noexcept {
     const auto module=reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
     if (!EnsureInstalled(module)) return false;
     gCinematicRole.store(host?1:2,std::memory_order_release);
-    gCinematicHeartbeatUntil.store(0U,std::memory_order_release);
+    // Cover the short interval between MissionSync activation and the first
+    // Launcher poll, without allowing a disconnected client to stay blocked.
+    gCinematicHeartbeatUntil.store(GetTickCount64()+1500U,std::memory_order_release);
     gCinematicLeaseUntil.store(0U,std::memory_order_release);
     gCinematicEnterSince=gCinematicLastHostEdge=0U;gCinematicPrompted=false;
     return true;
