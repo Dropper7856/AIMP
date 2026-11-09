@@ -950,6 +950,8 @@ bool DecodeGameCommand(
             command->stringValue == "WORLD_STATE_DISCOVERY_STATUS" ||
             command->stringValue == "ALIEN_PVP_PROBE" ||
             command->stringValue == "ALIEN_PVP_RELEASE" ||
+            command->stringValue == "CINEMATIC_SYNC_STATUS" ||
+            command->stringValue == "CINEMATIC_SYNC_SKIP" ||
             command->stringValue == "RETURN_TO_FRONTEND") {
             if (!arguments->objectValue.empty()) return false;
             output.command = command->stringValue;

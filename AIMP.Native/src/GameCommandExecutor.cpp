@@ -7,6 +7,7 @@
 #include "aimp/AnimationSyncRuntime.h"
 #include "aimp/HidingDoorPresentation.h"
 #include "aimp/MissionSync.h"
+#include "aimp/AlienPvPInputIsolation.h"
 
 #include "aimp/BuildProfile.h"
 #include "aimp/CaptureCatalog.h"
@@ -1554,6 +1555,8 @@ bool GameCommandExecutor::CanExecute(const std::string_view command) const noexc
         return item_sync::Installed();
     }
     if (command == "MISSION_SYNC_CONFIG" || command == "MISSION_SYNC_APPLY") return worldRegistry_ != nullptr;
+    if (command == "CINEMATIC_SYNC_STATUS" || command == "CINEMATIC_SYNC_SKIP")
+        return alien_pvp_input::Installed();
     if (command == "WORLD_REGISTRY_PROBE" ||
         command == "WORLD_MANIFEST_LOAD" ||
         command == "WORLD_NET_PROBE") {

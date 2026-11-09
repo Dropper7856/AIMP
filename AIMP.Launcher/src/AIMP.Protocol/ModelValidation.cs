@@ -919,7 +919,9 @@ public static class ModelValidation
             || string.Equals(
                 value.Command,
                 GameCommandNames.ReturnToFrontend,
-                StringComparison.Ordinal))
+                StringComparison.Ordinal)
+            || value.Command is GameCommandNames.CinematicSyncStatus
+                or GameCommandNames.CinematicSyncSkip)
         {
             if (value.Arguments.Count != 0)
                 throw new ProtocolException($"{value.Command} parameters are invalid.");

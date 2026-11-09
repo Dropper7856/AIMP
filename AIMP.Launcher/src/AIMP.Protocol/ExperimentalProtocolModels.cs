@@ -179,6 +179,8 @@ public static class GameCommandNames
     public const string ItemSyncSpawn = "ITEM_SYNC_SPAWN";
     public const string MissionSyncConfigure = "MISSION_SYNC_CONFIG";
     public const string MissionSyncApply = "MISSION_SYNC_APPLY";
+    public const string CinematicSyncStatus = "CINEMATIC_SYNC_STATUS";
+    public const string CinematicSyncSkip = "CINEMATIC_SYNC_SKIP";
 
     public static readonly IReadOnlySet<string> All = new HashSet<string>(
         new[]
@@ -212,7 +214,9 @@ public static class GameCommandNames
             ItemSyncApply,
             ItemSyncSpawn,
             MissionSyncConfigure,
-            MissionSyncApply
+            MissionSyncApply,
+            CinematicSyncStatus,
+            CinematicSyncSkip
         },
         StringComparer.Ordinal);
 }

@@ -31,6 +31,7 @@
 #include "aimp/ItemSync.h"
 #include "aimp/ThrowableSync.h"
 #include "aimp/MissionSync.h"
+#include "aimp/AlienPvPInputIsolation.h"
 #include "aimp/LevelGenerationTracker.h"
 #include "aimp/MissionLevelObservation.h"
 #include "aimp/MultiplayerPause.h"
@@ -3291,6 +3292,27 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
                 pending->request.command == "RETURN_TO_FRONTEND") {
                 result = gameCommands_->ExecuteReturnToFrontend();
             } else if (
+                pending->request.command == "CINEMATIC_SYNC_STATUS") {
+                const auto stage=alien_pvp_input::PollCinematic();
+                result.executed=stage!=alien_pvp_input::CinematicSignal::Unavailable;
+                switch (stage) {
+                case alien_pvp_input::CinematicSignal::HostSkip:
+                    result.statusCode="CINEMATIC_SYNC_HOST_SKIP";break;
+                case alien_pvp_input::CinematicSignal::ClientBlocked:
+                    result.statusCode="CINEMATIC_SYNC_CLIENT_BLOCKED";break;
+                case alien_pvp_input::CinematicSignal::Playing:
+                    result.statusCode="CINEMATIC_SYNC_PLAYING";break;
+                case alien_pvp_input::CinematicSignal::Idle:
+                    result.statusCode="CINEMATIC_SYNC_IDLE";break;
+                default:result.statusCode="CINEMATIC_SYNC_UNAVAILABLE";break;
+                }
+                result.message=result.statusCode;
+            } else if (pending->request.command=="CINEMATIC_SYNC_SKIP") {
+                result.executed=alien_pvp_input::ApplyCinematicSkip();
+                result.statusCode=result.executed
+                    ? "CINEMATIC_SYNC_SKIP_APPLIED" : "CINEMATIC_SYNC_SKIP_NOT_ACTIVE";
+                result.message=result.statusCode;
+            } else if (
                 pending->request.command == "MISSION_SYNC_CONFIG" || pending->request.command == "MISSION_SYNC_APPLY") {
                 result = gameCommands_->ExecuteMissionSync(pending->request.missionSync,
                     pending->request.command == "MISSION_SYNC_CONFIG");
@@ -3325,8 +3347,11 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
                 ((pending->request.command == "WORLD_MANIFEST_LOAD" &&
                   nativeStatusCode == "WORLD_MANIFEST_PREPARING") ||
                  nativeStatusCode.rfind("ITEM_SYNC_", 0U) == 0U ||
-                 nativeStatusCode.rfind("ALIEN_PVP_", 0U) == 0U);
-            if (remoteEquipmentRetry || remoteEquipmentTerminal || preservedStatus) {
+                 nativeStatusCode.rfind("ALIEN_PVP_", 0U) == 0U ||
+                 nativeStatusCode.rfind("CINEMATIC_SYNC_", 0U) == 0U);
+            if (remoteEquipmentRetry || remoteEquipmentTerminal || preservedStatus ||
+                pending->request.command=="CINEMATIC_SYNC_STATUS" ||
+                pending->request.command=="CINEMATIC_SYNC_SKIP") {
                 // Preserve the native equipment provisioning stage/status so
                 // the Launcher can distinguish convergence from terminal
                 // fail-closed errors without collapsing them into TASK_FAULT.
