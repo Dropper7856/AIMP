@@ -51,7 +51,11 @@ internal sealed record NativeRuntimeSnapshot(
     uint RemoteCharacterRuntimeId = 0,
     Guid RemoteCharacterConnectionIdentity = default,
     NativePlayerHidingStatePayload? LocalHiding = null,
-    DateTimeOffset? LocalHidingReceivedAt = null)
+    DateTimeOffset? LocalHidingReceivedAt = null,
+    NativePlayerAnimationStatePayload? LocalAnimation = null,
+    DateTimeOffset? LocalAnimationReceivedAt = null,
+    string CurrentLevelName = "",
+    bool LevelTransitioning = false)
 {
     internal static NativeRuntimeSnapshot Empty { get; } = new(
         false, 0, string.Empty, 0, string.Empty, false, false, string.Empty,

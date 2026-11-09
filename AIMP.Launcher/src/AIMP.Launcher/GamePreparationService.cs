@@ -15,7 +15,7 @@ internal static class GamePreparationSynchronization
 
 public sealed class GamePreparationService
 {
-    private const int RecipeVersion = 13; // Crew representations (E_RIPLEY, DALLAS, PARKER, LAMBERT, ASH) and their ANIMATION.PAK patch.
+    private const int RecipeVersion = 14; // Prepare campaign destinations for native SwitchLevel continuity.
     private readonly object _sync = new();
     private readonly LauncherSettingsStore _settings;
     private readonly LauncherDiagnostics _diagnostics;
@@ -234,7 +234,7 @@ public sealed class GamePreparationService
             {
                 token.ThrowIfCancellationRequested();
                 AssertGameStopped();
-                var levels = WorldManifestLevelDiscovery.Discover(game).Where(l => l.CanCompile).ToArray();
+                var levels = WorldManifestLevelDiscovery.Discover(game, includeCampaign: true).Where(l => l.CanCompile).ToArray();
                 if (levels.Length == 0) throw new InvalidDataException("No playable levels were found.");
                 // Global, not level-bound: verified (and re-applied after a game
                 // file repair) on every preparation, even with a valid receipt.

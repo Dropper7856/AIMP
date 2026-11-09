@@ -538,7 +538,10 @@ void CaptureLocal(const LocalInput& input) noexcept {
 }
 Frame VentAuthority() noexcept {return g.ventAuthority;}
 bool ControlActive() noexcept {
-    return g.context.owned && g.context.localOwner && g.aligned && !g.deliveryFault &&
+    // A Client pilot aligns on the Host's first Correction. A Host pilot IS
+    // the authority and never receives one, so it was never "aligned" (468:
+    // permanent "Waiting for Alien control authorization", no free camera).
+    return g.context.owned && g.context.localOwner && (g.aligned || g.context.host) && !g.deliveryFault &&
         g.window.ActiveAt(GetTickCount64());
 }
 bool VentPending() noexcept {

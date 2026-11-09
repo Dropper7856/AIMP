@@ -378,6 +378,11 @@ public sealed partial class LobbyClient : IAsyncDisposable
                 Interlocked.Exchange(ref _lastHostSeenTicks, Environment.TickCount64);
                 switch (frame.Type)
                 {
+                    case MessageType.CampaignSaveChunk:
+                        HandleCampaignSaveChunk(frame.Payload);
+                        break;
+                    case MessageType.CampaignSaveRequest:
+                        throw new ProtocolException("Only clients request campaign save downloads.");
                     case MessageType.AISyncExecutionControl:
                         await HandleAISyncExecutionControlAsync(frame.Payload).ConfigureAwait(false);
                         break;
@@ -635,6 +640,7 @@ public sealed partial class LobbyClient : IAsyncDisposable
         }
         finally
         {
+            AbortCampaignDownload();
             await StopShadowControlsAsync().ConfigureAwait(false);
             ClearAISyncShadow();
             await ClearAISyncExecutionAsync().ConfigureAwait(false);
@@ -746,6 +752,7 @@ public sealed partial class LobbyClient : IAsyncDisposable
         }
 
         _shutdown.Cancel();
+        AbortCampaignDownload();
         _connection.Client.Dispose();
         foreach (var task in new[] { _readLoop, _heartbeatLoop }.OfType<Task>())
         {

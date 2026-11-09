@@ -20,12 +20,16 @@ namespace AIMP.Launcher;
 /// Hiding entry/idle/exit aliases also use the player's FEMALEFP clips in the
 /// base table for isolated remote animation commands. Upper-body weapon layers
 /// still come from the weapon contexts.
+/// AnimationSync: every other first-person alias the representation lacks
+/// (interactions: buttons, generators, terminals, vents, levers, hacking...) is
+/// added to its base table too, so any scripted clip the owner plays can be
+/// replayed by alias on the remote body. Retail aliases are never replaced.
 /// ANIMATION.PAK is global: the retail file is backed up once and every
 /// installation rebuilds the patched file from that backup.
 /// </summary>
 internal static class RemoteCrouchAnimationInstaller
 {
-    private const int PatchVersion = 7;
+    private const int PatchVersion = 8;
     private const string PlayerClipDbEntry = @"DATA\ANIM_SYS\2554777613_ANIM_CLIP_DB.BIN"; // 1ST_PERSON_RIPLEY
     private const string GlobalClipDbEntry = @"DATA\ANIM_SYS\ANIM_CLIP_DB.BIN";
     private const string CrouchedContext = "CROUCHED";
@@ -213,6 +217,7 @@ internal static class RemoteCrouchAnimationInstaller
         var global = GlobalClipDatabase.Parse(globalEntry.Content);
         if (!global.Serialize().AsSpan().SequenceEqual(globalEntry.Content))
             throw new InvalidDataException("The global animation database is not in the supported format.");
+        AddSharedPlayerClips(pak, global, player, db, profile);
         foreach (var source in PlayerSources)
         {
             var clip = PlayerClip(player, source);
@@ -263,6 +268,48 @@ internal static class RemoteCrouchAnimationInstaller
         ("locomotion_cycle_blend", @"HUMAN\LOCOMOTIONCYCLE"),
         ("aimed_locomotion_cycle_blend", @"HUMAN\AIMED_LOCOMOTION_CYCLE_BLEND"),
     ];
+
+    // AnimationSync: player base-table aliases this representation lacks. Only
+    // clips without a per-database metadata instance, in a section layout the
+    // engine can load for another character. A resident clip group that cannot
+    // be added as a dependency (shared range) leaves that group's aliases out
+    // rather than failing the whole preparation.
+    private static void AddSharedPlayerClips(PAK2 pak, GlobalClipDatabase global, AnimClipDatabase player,
+        AnimClipDatabase db, Profile profile)
+    {
+        var entries = EntryNames(pak);
+        var candidates = new List<(uint Hash, AnimClipDatabase.Clip Clip, uint? Group)>();
+        foreach (var (hash, slot) in player.Animations.Keys)
+        {
+            if (db.Animations.Contains(hash)) continue;
+            var clip = player.Animations.Values[slot];
+            if (SharedSection(entries, global, clip, out var group)) candidates.Add((hash, clip, group));
+        }
+        var refused = new HashSet<uint>();
+        foreach (var group in candidates.Select(c => c.Group).OfType<uint>().Distinct())
+        {
+            try { global.AddDependency(profile.Hash, group); }
+            catch (InvalidDataException) { refused.Add(group); }
+        }
+        foreach (var (hash, clip, group) in candidates)
+            if (group is not uint resident || !refused.Contains(resident)) db.Animations.Set(hash, clip);
+    }
+
+    // true = shareable; group = the resident clip group to depend on (null when streamed).
+    private static HashSet<string> EntryNames(PAK2 pak) =>
+        pak.Entries.Select(e => e.Filename).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    private static bool SharedSection(HashSet<string> entries, GlobalClipDatabase global, AnimClipDatabase.Clip clip, out uint? group)
+    {
+        group = null;
+        if (clip.MetadataInstance != 0 || global.SectionGroup(clip.Path) is not uint section) return false;
+        var streamed = global.SectionClipIndex(clip.Path) == uint.MaxValue;
+        if (streamed && section != clip.Path) return false;
+        var name = $@"DATA\ANIM_SYS\{(streamed ? "STREAMED" : "RESIDENT")}\ANIM_CLIP_DB_SEC_{section}.BIN";
+        if (!entries.Contains(name)) return false;
+        group = streamed ? null : section;
+        return true;
+    }
 
     private static AnimClipDatabase.Clip CrouchAim(AnimClipDatabase db) =>
         db.Context("WEAPON_SHOTGUN")?.Animations.Get(AnimClipDatabase.HashName("cover_low_aim"))
@@ -357,6 +404,19 @@ internal static class RemoteCrouchAnimationInstaller
                 !global.Dependencies(profile.Hash).Contains(group))
                 throw new InvalidDataException($"Patched {character} does not load player clip '{source}'.");
         }
+        // AnimationSync: a shared player alias must be loadable where present.
+        var dependencies = global.Dependencies(profile.Hash);
+        var entries = EntryNames(pak);
+        var shared = 0;
+        foreach (var (hash, slot) in player.Animations.Keys)
+        {
+            var clip = player.Animations.Values[slot];
+            if (db.Animations.Get(hash) != clip || !SharedSection(entries, global, clip, out var group)) continue;
+            if (group is uint resident && !dependencies.Contains(resident))
+                throw new InvalidDataException($"Patched {character} does not load shared player clip {hash}.");
+            shared++;
+        }
+        if (shared == 0) throw new InvalidDataException($"Patched {character} lacks the shared player clips.");
         var def = Entry(pak, profile.SkeletonDefEntry).Content;
         var sources = Enumerable.Range(0, BitConverter.ToInt32(def, LowResCountOffset))
             .Select(i => BitConverter.ToUInt32(def, LowResSourcesOffset + i * 4)).ToHashSet();

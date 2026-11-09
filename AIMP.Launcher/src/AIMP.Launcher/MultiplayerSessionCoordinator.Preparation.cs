@@ -75,6 +75,7 @@ internal sealed partial class MultiplayerSessionCoordinator
     {
         PreparedWorldManifest? prepared = null;
         string error = string.Empty;
+        string campaignSha256 = string.Empty;
         try
         {
             await SendStatusAsync("Verifying level preparation...").ConfigureAwait(false);
@@ -87,10 +88,18 @@ internal sealed partial class MultiplayerSessionCoordinator
             // The normal level manifest remains read-only and does not depend on this BML.
             await _gamePreparation.PrepareAlienVsSurvivorsAsync(lobby.AlienVsSurvivors, token)
                 .ConfigureAwait(false);
+            if (lobby.Campaign is not null)
+            {
+                LobbyHost? campaignHost; LobbyClient? campaignClient;
+                lock (_stateGate) { campaignHost = _host; campaignClient = _client; }
+                campaignSha256 = await PrepareCampaignProfileAsync(lobby, campaignHost, campaignClient, token)
+                    .ConfigureAwait(false);
+            }
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { return null; }
         catch (Exception exception) when (exception is not OutOfMemoryException)
         {
+            prepared = null;
             error = exception.Message.Length <= 2048 ? exception.Message : exception.Message[..2048];
             _diagnostics.Log("Preparation", $"Level preflight failed for {lobby.Level}: {error}");
         }
@@ -107,7 +116,7 @@ internal sealed partial class MultiplayerSessionCoordinator
         if (peer == 0UL) return null;
         var report = new LobbyPreparationPayload(lobby.SessionId, peer, lobby.Level,
             lobby.PreparationToken, prepared?.Identity, prepared?.Sha256 ?? string.Empty,
-            prepared is not null, error);
+            prepared is not null, error, prepared is not null ? campaignSha256 : string.Empty);
         try
         {
             if (host is not null) await host.SetHostPreparationAsync(report, token).ConfigureAwait(false);
@@ -184,7 +193,8 @@ internal sealed partial class MultiplayerSessionCoordinator
             var result = await _controller.ExecuteCommandAsync("SESSION_ROUND_BOUNDARY",
                 new Dictionary<string, string>(StringComparer.Ordinal)
                 {
-                    ["sessionId"] = start.SessionId.ToString("D")
+                    ["sessionId"] = start.SessionId.ToString("D"),
+                    ["generation"] = start.LevelGeneration.ToString(CultureInfo.InvariantCulture)
                 }, _lifetime.Token).ConfigureAwait(false);
             if (!result.Executed || result.StatusCode != "SESSION_ROUND_BOUNDARY_APPLIED")
             {
@@ -276,6 +286,7 @@ internal sealed partial class MultiplayerSessionCoordinator
         {
             if (_loadingHoldStart is { } held && _start?.SessionId == held.SessionId
                 && _start.LevelGeneration == held.LevelGeneration
+                && LevelGameMode(held.Level) != "Campaign"
                 && !_sessionReleaseRunning
                 && DateTimeOffset.UtcNow - _loadingHoldStartedUtc >= LoadingHoldMaximumDuration)
             {

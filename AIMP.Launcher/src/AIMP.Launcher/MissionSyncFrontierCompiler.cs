@@ -10,13 +10,19 @@ namespace AIMP.Launcher;
 // Repeatable: a player-chosen nested mission start (a hub terminal) can be
 // committed again later in the same round; other frontiers commit once.
 internal readonly record struct MissionSyncFrontier(
-    WorldEntityDescriptor Source, uint Signal, bool PayloadTolerant = false, bool Repeatable = false);
+    WorldEntityDescriptor Source, uint Signal, bool PayloadTolerant = false, bool Repeatable = false,
+    bool PublicInput = false, bool OrderedOccurrences = false, bool ScheduledInput = false,
+    bool PlayerIngress = false);
 
 internal static class MissionSyncFrontierCompiler
 {
     // "AMS2": v1 entries plus a uint flags word. Must match AIMP.Native MissionSync.
     internal const uint CatalogMagic = 0x32534D41U;
     internal const uint FlagPayloadTolerant = 1U;
+    internal const uint FlagPublicInput = 2U;
+    internal const uint FlagOrderedOccurrences = 4U;
+    internal const uint FlagScheduledInput = 8U;
+    internal const uint FlagPlayerIngress = 16U;
 
     private static readonly HashSet<uint> CompletionPorts = new[]
     {
@@ -92,15 +98,74 @@ internal static class MissionSyncFrontierCompiler
         WorldManifest manifest, bool survival = false)
     {
         var entities = manifest.Entities.ToDictionary(value => value.EntityId);
-        var admitted = DirectFrontiers(manifest, entities, survival);
+        var admitted = survival ? DirectFrontiers(manifest, entities, true)
+            : CampaignFrontiers(manifest, entities);
         if (survival) admitted.AddRange(ProxiedFrontiers(manifest, entities, admitted));
         var roots = admitted
-            .GroupBy(value => (value.Source.EntityId, value.Signal)).Select(group => group.First())
+            .GroupBy(value => (value.Source.EntityId, value.Signal, value.PublicInput, value.ScheduledInput)).Select(group => group.First())
             .OrderBy(value => value.Source.EntityId.High).ThenBy(value => value.Source.EntityId.Low)
-            .ThenBy(value => value.Signal).ToArray();
-        if (roots.Length > MissionSignalValidation.MaximumSignalsPerGeneration)
+            .ThenBy(value => value.Signal).ThenBy(value => value.PublicInput).ThenBy(value => value.ScheduledInput).ToArray();
+        if (roots.Length > MissionSignalValidation.MaximumFrontiersPerGeneration)
             throw new InvalidOperationException("MissionSync has too many authored mission frontiers.");
         return roots;
+    }
+
+    // The authored graph defines the campaign boundary. Port spelling is not
+    // progression semantics: custom mission pins and nested sequences qualify
+    // through their method contracts, including UI/AI/Player consequences.
+    private static List<MissionSyncFrontier> CampaignFrontiers(WorldManifest manifest,
+        IReadOnlyDictionary<WorldEntityId, WorldEntityDescriptor> entities)
+    {
+        var missionGraphs = manifest.Composites.Where(value => !value.AimpNamespace
+            && IsMissionGraph(value.Name)).Select(value => value.CompositeShortGuid).ToHashSet();
+        var paths = manifest.InstancePaths.ToDictionary(value => value.PathId, value => value.Steps);
+        var missionPaths = manifest.Entities.Where(value => value.Kind == WorldEntityKind.CompositeInstance
+                && missionGraphs.Contains(value.PrimitiveType) && paths.ContainsKey(value.InstancePathId))
+            .Select(value => paths[value.InstancePathId].Append(value.SourceShortGuid).ToArray()).ToArray();
+        bool InMission(WorldEntityDescriptor value) => missionGraphs.Contains(value.SourceCompositeShortGuid)
+            || paths.TryGetValue(value.InstancePathId, out var path)
+                && missionPaths.Any(prefix => path.Count >= prefix.Length
+                    && path.Take(prefix.Length).SequenceEqual(prefix));
+        bool Addressable(WorldEntityDescriptor value) => value.EntityId.IsValid
+            && value.Domain != WorldDomain.AIMP
+            && (value.Flags & WorldEntityFlags.RuntimeAddressable) != 0;
+
+        var methods = manifest.CompositePublicInputs
+            .GroupBy(value => (value.OwnerCompositeInstance, value.PublicInputShortGuid))
+            .Where(group => group.All(value => value.NoTypedData))
+            .Select(group => group.Key).ToHashSet();
+        bool ControlTarget(WorldConnectionDescriptor edge) =>
+            entities.TryGetValue(edge.TargetEntity, out var target) && Addressable(target)
+            && (target.Kind == WorldEntityKind.CompositeInstance
+                ? methods.Contains((target.EntityId, edge.TargetParameter))
+                : target.Kind == WorldEntityKind.Function && ControlInputs.Contains(edge.TargetParameter));
+
+        var result = manifest.Connections.GroupBy(edge => (edge.SourceEntity, edge.SourceParameter))
+            .Where(group => group.Key.SourceParameter != 0U
+                && entities.TryGetValue(group.Key.SourceEntity, out var source)
+                && Addressable(source) && InMission(source)
+                && source.Kind is WorldEntityKind.CompositeInstance or WorldEntityKind.Function or WorldEntityKind.Proxy
+                && group.All(ControlTarget))
+            .Select(group => new MissionSyncFrontier(entities[group.Key.SourceEntity], group.Key.SourceParameter,
+                PayloadTolerant: false, Repeatable: true, OrderedOccurrences: true,
+                PlayerIngress: entities[group.Key.SourceEntity].PrimitiveName is
+                    "PlayerTriggerBox" or "PlayerTriggerSphere" or "Interaction" or "MonitorPadInput" or "ButtonMashPrompt")).ToList();
+        // Intercept a whole nested mission/sequence at its public Method, before
+        // dispatch. DataType.NONE is an authored contract, not a guessed name.
+        result.AddRange(methods.Where(method => entities.TryGetValue(method.OwnerCompositeInstance, out var owner)
+                && Addressable(owner) && (InMission(owner) || missionGraphs.Contains(owner.PrimitiveType)))
+            .Select(method => new MissionSyncFrontier(entities[method.OwnerCompositeInstance],
+                method.PublicInputShortGuid, PayloadTolerant: true, Repeatable: true,
+                PublicInput: true, OrderedOccurrences: true)));
+        // These are engine transitions, independent of mission or map names.
+        // Catch their actual scheduled trigger even if an outer mission pin
+        // cannot be represented without typed sender-local data.
+        result.AddRange(manifest.Entities.Where(value => Addressable(value)
+                && value.Kind == WorldEntityKind.Function && value.PrimitiveName is "SwitchLevel" or "GoToFrontend" or "Checkpoint")
+            .Select(value => new MissionSyncFrontier(value, ShortGuidUtils.Generate("trigger").AsUInt32,
+                Repeatable: true, OrderedOccurrences: true, ScheduledInput: true,
+                PlayerIngress: value.PrimitiveName == "Checkpoint")));
+        return result;
     }
 
     private static List<MissionSyncFrontier> DirectFrontiers(WorldManifest manifest,
@@ -286,7 +351,12 @@ internal static class MissionSyncFrontierCompiler
             writer.Write(root.Source.EntityId.Low);
             writer.Write(root.Source.CathodeEntityA);
             writer.Write(root.Source.CathodeEntityB);
-            writer.Write(root.Signal); writer.Write(root.PayloadTolerant ? FlagPayloadTolerant : 0U);
+            writer.Write(root.Signal);
+            writer.Write((root.PayloadTolerant ? FlagPayloadTolerant : 0U)
+                | (root.PublicInput ? FlagPublicInput : 0U)
+                | (root.OrderedOccurrences ? FlagOrderedOccurrences : 0U)
+                | (root.ScheduledInput ? FlagScheduledInput : 0U)
+                | (root.PlayerIngress ? FlagPlayerIngress : 0U));
         }
         return stream.ToArray();
     }

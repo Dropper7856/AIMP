@@ -1258,6 +1258,10 @@ private:
     return 0U;
 }
 
+// Process-local lineage marker; never a WorldSync wire root kind. It survives
+// delayed WorkItems through the existing retained callback/cause tables.
+constexpr std::uint8_t kMissionRootKind = 0xFEU;
+
 // Borrowed retail references only. The constructor retains the work-item in
 // +0C until 00922800 releases it; this is not the target/shared-ref at +08.
 // Keep protected native reads in POD helpers (MSVC C2712).
@@ -2169,6 +2173,32 @@ void PublicCapture(void* self, void** instance,
             CarryOriginInFrame(origin, epoch, reinterpret_cast<std::uintptr_t>(input));
         }
     }
+    const auto missionCause = scheduledShape ? TaskCause(const_cast<std::uint32_t*>(input), epoch)
+        : TaskCause(restoredParent != nullptr ? restoredParent : ReadWorkHolder(callback), epoch);
+    if (!mission_sync::ReplayActive() && CurrentRootKind() != kMissionRootKind
+        && missionCause.rootKind != kMissionRootKind) {
+        void* execution{}; void* parent{}; std::uint32_t port{};
+        bool payloadless{}, method{};
+        // The public dispatcher supplies a caller execution as well as its
+        // interface self. Derive the receiving owner from self, then verify it;
+        // caller identity is never authority to replay a different composite.
+        void* boundaryOwner{}; IdentityFailure failure{};
+        if (ReadPublicArguments(instance, input, callback, execution, port, parent, payloadless)
+            && ReadBoundaryOwner(self, boundaryOwner, failure)
+            && mission_sync::Candidate(boundaryOwner, port, method, 3U)) {
+            if ((!payloadless && !method) || delay != 0.0 || tail != 0U) {
+                mission_sync::NoteUnsafeShape(!payloadless, delay != 0.0, tail != 0U);
+            } else if (origin == Origin::RemoteRoot) {
+                return; // A WorldSync replay cannot run ahead of its mission commit.
+            } else if ((origin == Origin::None || origin == Origin::LocalRoot)
+                && !replication_core::RemoteApplyActive()
+                && mission_sync::Capture(boundaryOwner, port, 3U,
+                    CurrentCausalStamp(epoch).source == CausalSource::Player)) {
+                mission_sync::NoteCapturedShape(!payloadless, false, false);
+                return;
+            }
+        }
+    }
     if (origin != Origin::None) {
         // This invocation is covered by a concrete ROOT scope or by work
         // created inside that scope. Shared causal identity alone never grants
@@ -2779,11 +2809,13 @@ void OutputCapture(void* self, void** instance, const std::uint32_t* input,
     const bool worldRemoteMission = missionOrigin == Origin::RemoteRoot;
     const bool localMission = (missionOrigin == Origin::None ||
         missionOrigin == Origin::LocalRoot) && !replication_core::RemoteApplyActive();
-    if (!mission_sync::ReplayActive() && (localMission || worldRemoteMission)) {
+    if (!mission_sync::ReplayActive() && CurrentRootKind() != kMissionRootKind
+        && (localMission || worldRemoteMission)) {
         void* missionExecution{}; void* missionCallback{};
         std::uint32_t missionPort{}; bool payloadless{}; bool payloadTolerant{};
         if (ReadPublicArguments(instance, input, callback, missionExecution, missionPort,
                 missionCallback, payloadless) &&
+            TaskCause(missionCallback, gEpoch.load(std::memory_order_relaxed)).rootKind != kMissionRootKind &&
             mission_sync::Candidate(missionExecution, missionPort, payloadTolerant)) {
             // Previous builds captured a VariableBool output with native typed
             // data and replayed it with an EMPTY callback. Both peers returned
@@ -2802,7 +2834,8 @@ void OutputCapture(void* self, void** instance, const std::uint32_t* input,
                     void* definition{};
                     if (OutputDefinition(missionExecution, selector, definition) && definition == self) {
                         if (worldRemoteMission) return; // Mission commit owns fan-out.
-                        captured = mission_sync::Capture(missionExecution, missionPort, selector);
+                        captured = mission_sync::Capture(missionExecution, missionPort, selector,
+                            CurrentCausalStamp(gEpoch.load(std::memory_order_relaxed)).source == CausalSource::Player);
                         if (captured) mission_sync::NoteCapturedShape(!payloadless, false, false);
                         break;
                     }
@@ -3390,6 +3423,19 @@ bool LevelExitSuppressed(WorldEntityRegistry& registry, void** target, void* ite
         return false; // Keep the retail timer, score and camera consequences.
     }
     const auto primitive = registry.FindWorldEntityPrimitiveType(*id);
+    if (primitive && *primitive == player_lifecycle::kSwitchLevelPrimitive
+        && mission_sync::CampaignActive()) {
+        const auto epoch = gEpoch.load(std::memory_order_relaxed);
+        const auto cause = TaskCause(item, epoch);
+        // The same authored transition runs on every participant. Preserve the
+        // game's destination/checkpoint/spawn logic and keep the lobby alive.
+        if (mission_sync::ReplayActive() || CurrentRootKind() == kMissionRootKind
+            || cause.rootKind == kMissionRootKind) return false;
+        bool ignored{};
+        auto* execution = ExecutionFromShared(ReadWorkHolder(target));
+        if (mission_sync::Candidate(execution, input, ignored, 4U)
+            && mission_sync::Capture(execution, input, 4U)) return true;
+    }
     return primitive && player_lifecycle::LevelExitPrimitive(*primitive) &&
         player_lifecycle::DecideLevelExit(*primitive);
 }
@@ -3403,6 +3449,26 @@ std::uint8_t __fastcall WorkExecuteDetour(void* manager, void*, void** target,
         return original(manager, target, owner, itemHolder);
     // Retail dereferences this holder immediately (009266BE/00926705).
     void* item = itemHolder == nullptr ? nullptr : *itemHolder;
+    // Campaign engine actions (including save stations) are authored once in
+    // the manifest. Resolve their scheduled input in each peer's own world;
+    // never send a station pointer or invoke the UI's checkpoint update call.
+    if (mission_sync::CampaignActive() && SessionAuthorityBound()) {
+        const auto campaignEpoch = gEpoch.load(std::memory_order_relaxed);
+        auto campaignOrigin = FindOrigin(item, campaignEpoch);
+        CausalStamp campaignStamp{};
+        auto campaignCause = TaskCause(item, campaignEpoch);
+        MergeParentContext(ParentContext(ReadRetainedParent(item), campaignEpoch),
+            campaignOrigin, campaignStamp, campaignCause);
+        std::uint32_t campaignInput{};
+        if (!mission_sync::ReplayActive() && CurrentRootKind() != kMissionRootKind
+            && campaignCause.rootKind != kMissionRootKind
+            && ReadPublicInput(static_cast<const std::uint32_t*>(item), campaignInput)) {
+            auto* execution = ExecutionFromShared(ReadWorkHolder(target));
+            bool tolerant{};
+            if (mission_sync::Candidate(execution, campaignInput, tolerant, 4U)
+                && mission_sync::Capture(execution, campaignInput, 4U)) return 0U;
+        }
+    }
     if (LevelExitSuppressed(*registry, target, item)) return 0U;
     if (!runtime_features::Enabled(runtime_features::Feature::WorldSyncHooks)) {
         return original(manager, target, owner, itemHolder);
@@ -3416,8 +3482,9 @@ std::uint8_t __fastcall WorkExecuteDetour(void* manager, void*, void** target,
     MergeParentContext(parentContext, origin, causalStamp, cause);
     // Delayed remote descendants execute after the RemoteApply TLS scope has
     // returned. Use restored lineage as well as TLS to protect local controls.
-    if (origin == Origin::RemoteRoot || CurrentOrigin() == Origin::RemoteRoot ||
-        replication_core::RemoteApplyActive()) {
+    if (cause.rootKind != kMissionRootKind && CurrentRootKind() != kMissionRootKind
+        && (origin == Origin::RemoteRoot || CurrentOrigin() == Origin::RemoteRoot ||
+            replication_core::RemoteApplyActive())) {
         const auto targetId = registry->IdentifyRuntimeEntity(
             ExecutionFromShared(ReadWorkHolder(target)));
         const auto primitive = targetId
@@ -4379,8 +4446,16 @@ LocalCompositeInputInvokeStatus InvokeMissionOutputGuarded(PublicFn original, vo
 #if defined(_MSC_VER) && defined(_M_IX86)
     __try {
 #endif
-        InvokePublicScoped(original, Origin::RemoteRoot, gEpoch.load(std::memory_order_relaxed),
-            definition, &sharedRef, &port, &callback, 0.0, 0U);
+        const auto epoch = gEpoch.load(std::memory_order_relaxed);
+        ContextTrace cause{};
+        cause.rootKind = kMissionRootKind;
+        cause.epoch = epoch;
+        cause.invocation = gInvocationSerial.fetch_add(1U, std::memory_order_relaxed);
+        cause.input = port;
+        StoreTaskCause(callback, cause, epoch);
+        BindParentContext(callback, Origin::RemoteRoot, {}, cause, epoch);
+        InvokePublicScoped(original, Origin::RemoteRoot, epoch,
+            definition, &sharedRef, &port, &callback, 0.0, 0U, &cause);
         return LocalCompositeInputInvokeStatus::Invoked;
 #if defined(_MSC_VER) && defined(_M_IX86)
     } __except (EXCEPTION_EXECUTE_HANDLER) { return LocalCompositeInputInvokeStatus::NativeFault; }
@@ -4390,12 +4465,33 @@ LocalCompositeInputInvokeStatus InvokeMissionOutputGuarded(PublicFn original, vo
 
 LocalCompositeInputInvokeStatus InvokeMissionOutputNoCapture(
     const WorldEntityLease& lease, const std::uint32_t port, const std::uint8_t selector) noexcept {
+    if (selector == 4U) {
+        if (!lease || port == 0U) return LocalCompositeInputInvokeStatus::InvalidBoundary;
+        cathode_primitives::NativeCallbackLease parent, work;
+        if (cathode_primitives::CreateNativeCallback(lease, 0x10000000U, {}, parent) !=
+                cathode_primitives::ExecuteStatus::Queued
+            || cathode_primitives::CreateNativeContextFrame(lease, port, 0x10000000U, 0U,
+                {}, &parent, work) != cathode_primitives::ExecuteStatus::Queued)
+            return LocalCompositeInputInvokeStatus::RuntimeUnavailable;
+        const auto epoch = gEpoch.load(std::memory_order_relaxed);
+        ContextTrace cause{};
+        cause.rootKind = kMissionRootKind; cause.epoch = epoch; cause.input = port;
+        cause.invocation = gInvocationSerial.fetch_add(1U, std::memory_order_relaxed);
+        StoreTaskCause(parent.Get(), cause, epoch);
+        StoreTaskCause(work.Get(), cause, epoch);
+        BindParentContext(parent.Get(), Origin::RemoteRoot, {}, cause, epoch);
+        Tag(work.Get(), Origin::RemoteRoot, epoch);
+        return cathode_primitives::ExecuteRetainedInput(lease, lease, work)
+            ? LocalCompositeInputInvokeStatus::Invoked : LocalCompositeInputInvokeStatus::NativeFault;
+    }
     auto* sharedRef = WorldPublicActionLeaseAccess::SharedRef(lease);
     void* definition{};
     if (!lease || sharedRef == nullptr || port == 0U ||
-        !OutputDefinition(lease.Get(), selector, definition))
+        !(selector == 3U ? PublicDefinition(lease.Get(), definition)
+                        : OutputDefinition(lease.Get(), selector, definition)))
         return LocalCompositeInputInvokeStatus::InvalidBoundary;
-    const auto original = reinterpret_cast<PublicFn>(gOutputTrampoline.load(std::memory_order_acquire));
+    const auto original = reinterpret_cast<PublicFn>((selector == 3U ? gPublicTrampoline : gOutputTrampoline)
+        .load(std::memory_order_acquire));
     if (original == nullptr) return LocalCompositeInputInvokeStatus::RuntimeUnavailable;
     // v355 replayed with a null callback. Retail receivers dereference the
     // causal WorkItem (e.g. the activation handler FUN_00937670 -> 004DFE90

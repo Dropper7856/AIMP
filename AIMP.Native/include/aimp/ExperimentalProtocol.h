@@ -59,6 +59,8 @@ struct GameCommandRequest : RequestEnvelope {
     bool sessionLoadingActive{};
     std::string sessionLoadingSessionId;
     std::uint32_t sessionLoadingGeneration{};
+    std::string campaignProfileAction;
+    std::string campaignProfilePath;
     PopupMessageCommand popupMessage;
     SpawnCharacterCommand spawnCharacter;
     CharacterDirectMoveCommand characterDirectMove;

@@ -90,6 +90,9 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private PlayerTorchSnapshot? _lastQueuedTorch;
     private PlayerHidingSnapshot? _hiding;
     private PlayerHidingSnapshot? _lastQueuedHiding;
+    private PlayerAnimationSnapshot? _animation;
+    private PlayerAnimationSnapshot? _lastQueuedAnimation;
+    private long _lastQueuedAnimationAt;
     private bool _positionSendRunning;
     private ulong _localPositionSequence;
     private NativePlayerEquipmentStatePayload? _localEquipmentState;
@@ -629,6 +632,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         string positionError = "")
     {
         var now = DateTimeOffset.UtcNow;
+        TryScheduleCampaignContinuation(runtime);
+        TryScheduleCampaignSaveCapture(runtime, now);
         InvalidateWorldContextForRuntimeGeneration(runtime.LevelGeneration);
         UpdateObservedTransform(
             now, positionAvailable, position, yawAvailable, yaw,
@@ -659,6 +664,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             _posture = positionAvailable ? movementProfile.Posture : null;
             _torch = positionAvailable ? movementProfile.Torch : null;
             _hiding = positionAvailable ? movementProfile.Hiding : null;
+            _animation = positionAvailable ? movementProfile.Animation : null;
             if (positionAvailable)
             {
                 UpdateLocalMovementSpeed(now, position);
@@ -858,7 +864,9 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         await StopNetworkAsync("Creating a new lobby").ConfigureAwait(false);
         var settings = _settingsStore.Load();
         ValidateDeveloperLobby(settings, message);
-        var options = CreateHostOptions(settings, message);
+        var (selection, campaign, bundle) = ResolveCampaignLobby(message);
+        var options = CreateHostOptions(settings, selection) with { Campaign = campaign };
+        _hostCampaignBundle = bundle;
         var host = await StartMenuHostAsync(options).ConfigureAwait(false);
         _diagnostics.Log("Multiplayer", $"Lobby hosted on port {host.BoundPort}. Alien enabled={options.AlienEnabled}.");
         await SendMenuLobbyOpenedAsync("host").ConfigureAwait(false);
@@ -873,6 +881,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         lock (_stateGate) _host = host;
         try
         {
+            if (options.Campaign?.Action == "continue")
+                host.SetCampaignSaveBundle(_hostCampaignBundle ?? throw new InvalidOperationException("The selected checkpoint is unavailable."));
             host.Start();
             await SetNativeWorldSyncLifecycleAsync(
                 host.SessionId, host.HostPeerId, true, 0, true, false, "lobby-host-created")
@@ -987,7 +997,6 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         LobbyHost? host;
         lock (_stateGate) host = _host;
         if (host is null) throw new InvalidOperationException("Only the lobby host can start the game.");
-        host.SetLevel(ResolveLevel(message));
         host.RefreshWorldPreparation();
         await AwaitLobbyPreparationAsync(host).ConfigureAwait(false);
         if (!host.CanStart) throw new InvalidOperationException(
@@ -2723,6 +2732,11 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
 
     private async Task ApplyLobbyStartedAsync(LobbyStartPayload value)
     {
+        if (value.CampaignContinuation)
+        {
+            await ApplyCampaignContinuationAsync(value).ConfigureAwait(false);
+            return;
+        }
         var worldSyncEnabled = _performanceIsolation.IsEnabled(PerformanceIsolationModule.WorldSync) && !IsSoloSession();
         uint[] previousCharacters;
         LobbyHost? host;
@@ -2816,6 +2830,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _lastQueuedPosture = null;
         _lastQueuedTorch = null;
         _lastQueuedHiding = null;
+        _lastQueuedAnimation = null;
         _positionSendRunning = false;
         _localPositionSequence = 0;
         // Native PlayerSync state belongs to the AI.exe runtime, not to a lobby
@@ -3123,7 +3138,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             _pendingLocalPosition = new PlayerPositionSnapshotPayload(_start.SessionId, peerId,
                 _start.LevelGeneration, ++_localPositionSequence, now.ToUnixTimeMilliseconds(),
                 _position.X, _position.Y, _position.Z, _yaw, _moveType, _nativeMoveSpeed, _posture, _torch,
-                incarnation, _hiding);
+                incarnation, _hiding, _animation);
             QueueLocalPostureEdge(_pendingLocalPosition);
             if (_positionSendRunning) return false;
             _positionSendRunning = true;
@@ -3153,13 +3168,15 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             if (_pendingLocalPostureEdges.TryDequeue(out var edge))
             {
                 if (_pendingLocalPosition?.Sequence == edge.Sequence) _pendingLocalPosition = null;
-                return edge with { Hiding = PlayerPostureDispatchQueue.Advance(edge.Hiding,
-                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - edge.SentAtUnixMilliseconds) };
+                var queued = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - edge.SentAtUnixMilliseconds;
+                return edge with { Hiding = PlayerPostureDispatchQueue.Advance(edge.Hiding, queued),
+                    Animation = PlayerAnimationCodec.Advance(edge.Animation, queued) };
             }
             var value = _pendingLocalPosition;
             _pendingLocalPosition = null;
             if (value is null) _positionSendRunning = false;
-            return value;
+            return value is null ? null : value with { Animation = PlayerAnimationCodec.Advance(value.Animation,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - value.SentAtUnixMilliseconds) };
         }
     }
 
@@ -3168,15 +3185,20 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         var posture = value.Posture ?? _lastQueuedPosture;
         var torch = value.Torch ?? _lastQueuedTorch;
         var hiding = value.Hiding ?? _lastQueuedHiding;
+        var animation = value.Animation ?? PlayerAnimationCodec.Advance(_lastQueuedAnimation,
+            value.SentAtUnixMilliseconds - _lastQueuedAnimationAt);
+        _lastQueuedAnimationAt = value.SentAtUnixMilliseconds;
         var changed = posture != _lastQueuedPosture || torch?.Enabled != _lastQueuedTorch?.Enabled
-            || !PlayerHidingPresentationCodec.SameTransition(hiding, _lastQueuedHiding);
+            || !PlayerHidingPresentationCodec.SameTransition(hiding, _lastQueuedHiding)
+            || !PlayerAnimationCodec.SameTransition(animation, _lastQueuedAnimation);
         _lastQueuedPosture = posture;
         _lastQueuedTorch = torch;
         _lastQueuedHiding = hiding;
+        _lastQueuedAnimation = animation;
         if (!changed) return;
         if (_pendingLocalPostureEdges.Count == PlayerPostureDispatchQueue.Capacity)
             _pendingLocalPostureEdges.Dequeue();
-        _pendingLocalPostureEdges.Enqueue(value with { Posture = posture, Torch = torch, Hiding = hiding });
+        _pendingLocalPostureEdges.Enqueue(value with { Posture = posture, Torch = torch, Hiding = hiding, Animation = animation });
     }
 
     private void ClearPendingLocalPositions()
@@ -3186,6 +3208,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _lastQueuedPosture = null;
         _lastQueuedTorch = null;
         _lastQueuedHiding = null;
+        _lastQueuedAnimation = null;
     }
 
     private Task SendLocalPositionAsync(PlayerPositionSnapshotPayload value)
@@ -3898,6 +3921,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     private void OnNetworkError(object? sender, ErrorPayload value)
     {
         _ = SendErrorAsync($"{value.Code}: {value.Message}");
+        if (value.Code.StartsWith("MISSION_SYNC_", StringComparison.Ordinal))
+            lock (_stateGate) FailMissionSyncLocked(value.Message);
         if (value.Code == "MISSION_CATALOG_MISMATCH") _ = ShowPreparationFailureAsync(value.Message);
     }
 
@@ -4932,6 +4957,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
 
     private async Task StopNetworkAsync(string reason)
     {
+        await ReleaseCampaignProfileBestEffortAsync().ConfigureAwait(false);
         await ReleaseSessionLoadingBestEffortAsync().ConfigureAwait(false);
         var stopState = BeginNetworkStop();
         DetachNetwork(stopState.Host, stopState.Client);
@@ -5034,7 +5060,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     }
 
     private IReadOnlyDictionary<string, string> BuildConfigValues(LauncherSettings settings) =>
-        AddDeveloperLevels(settings, new Dictionary<string, string>(StringComparer.Ordinal)
+        AddCampaignSaves(AddDeveloperLevels(settings, new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["mode"] = State.IsHost ? "Host" : "Client",
             ["playerName"] = settings.PlayerName,
@@ -5047,7 +5073,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             ["visibility"] = "Private",
             ["survivorMapId"] = "ChallengeMap16",
             ["survivorMapName"] = "ChallengeMap16"
-        });
+        }));
 
     private async Task SendCurrentLobbyAsync()
     {
@@ -5113,6 +5139,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             ["mapId"] = start.Level,
             ["mapName"] = start.Level,
             ["engineLevelPath"] = @"Production\" + start.Level,
+            ["campaignAction"] = start.Campaign?.Action ?? "level",
+            ["campaignDifficulty"] = start.Campaign?.Difficulty ?? "medium",
             ["hostId"] = ResolveHostId(),
             ["status"] = "starting"
         };

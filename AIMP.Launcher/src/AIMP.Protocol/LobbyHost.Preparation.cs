@@ -78,6 +78,12 @@ public sealed partial class LobbyHost
         if (!string.Equals(_state, "Lobby", StringComparison.Ordinal)
             || preparation.PreparationToken != _preparationToken
             || !string.Equals(preparation.Level, _level, StringComparison.OrdinalIgnoreCase)) return false;
+        if (preparation.Ready && !string.Equals(preparation.CampaignSaveSha256,
+            _campaignLaunch?.Sha256 ?? "", StringComparison.OrdinalIgnoreCase))
+        {
+            _lobbyPreparations.Remove(preparation.PeerId);
+            return false;
+        }
         _lobbyPreparations[preparation.PeerId] = preparation;
         return true;
     }
@@ -179,13 +185,12 @@ public sealed partial class LobbyHost
 
     private bool MissionPreparationsMatchLocked()
     {
-        // Mission catalog hash equality check DISABLED: identical, unmodified levels can still
-        // produce slightly different mission catalog hashes, which blocked sessions needlessly.
-        // The original check is kept below for reference.
-        return true;
-        // if (!_missionPreparationHashes.TryGetValue(HostPeerId, out var hostHash)) return true;
-        // return _clients.Keys.All(peer => !_missionPreparationHashes.TryGetValue(peer, out var hash)
-        //     || string.Equals(hash, hostHash, StringComparison.OrdinalIgnoreCase));
+        // Campaign replay now grants authority to these exact identities and
+        // input contracts. Preserve the existing Survival preparation policy.
+        if (!_missionCatalog.Values.Any(ordered => ordered)) return true;
+        if (!_missionPreparationHashes.TryGetValue(HostPeerId, out var hostHash)) return true;
+        return _clients.Keys.All(peer => !_missionPreparationHashes.TryGetValue(peer, out var hash)
+            || string.Equals(hash, hostHash, StringComparison.OrdinalIgnoreCase));
     }
 
     private async Task PublishSessionReleaseAsync(

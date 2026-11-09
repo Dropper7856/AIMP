@@ -1,5 +1,6 @@
 #include "aimp/PlayerPostureRuntime.h"
 #include "aimp/PlayerHidingPresentationRuntime.h"
+#include "aimp/AnimationSyncRuntime.h"
 #include "aimp/PlayerCharacters.h"
 #include "aimp/CrashGuard.h"
 #include "aimp/PlayerAnimationClipCapture.h"
@@ -597,6 +598,8 @@ void ReconcileAllOnEngineThread() noexcept {
     for (const auto& item : work) {
         if (item.character == 0U) continue;
         if (player_hiding_presentation::Active(item.character)) continue;
+        // A replicated interaction clip owns the cycle; stance refreshes wait.
+        if (animation_sync::ClipPlaying(item.character)) continue;
         auto result = item.diagnostics;
         result.desiredCrouched = (item.desired.flags & 7U) != 0U;
         result.desiredDeepCrouched = (item.desired.flags & 2U) != 0U;

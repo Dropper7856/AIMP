@@ -10,6 +10,7 @@
 #include <fstream>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace aimp::mission_sync {
@@ -17,15 +18,34 @@ namespace {
 // flags bit0: compiler-proven interface pin with control-only targets, so a
 // runtime data reference attached to the emission is not mission data.
 constexpr std::uint32_t kFlagPayloadTolerant = 1U;
-struct Frontier final { WorldEntityId entity{}; std::uint32_t port{}; std::uint32_t flags{}; };
+constexpr std::uint32_t kFlagPublicInput = 2U;
+constexpr std::uint32_t kFlagOrderedOccurrences = 4U;
+constexpr std::uint32_t kFlagScheduledInput = 8U;
+constexpr std::uint32_t kFlagPlayerIngress = 16U;
+constexpr std::uint32_t kInputKindMask = kFlagPublicInput | kFlagScheduledInput;
+std::uint32_t InputFlags(const std::uint8_t selector) noexcept {
+    return selector == 3U ? kFlagPublicInput : selector == 4U ? kFlagScheduledInput : 0U;
+}
+struct Frontier final {
+    WorldEntityId entity{}; std::uint32_t port{}; std::uint32_t flags{};
+    std::array<std::uint64_t, 4U> observedOccurrence{}, committedOccurrence{};
+};
+struct EntityHash final {
+    std::size_t operator()(const WorldEntityId& value) const noexcept {
+        return std::hash<std::uint64_t>{}(value.high) ^ (std::hash<std::uint64_t>{}(value.low) << 1U);
+    }
+};
 std::mutex gMutex;
 std::unordered_map<std::uint64_t, std::vector<Frontier>> gFrontiers;
+std::unordered_map<WorldEntityId, std::uint64_t, EntityHash> gEntitySources;
+std::unordered_map<std::uint32_t, std::unordered_set<std::uint64_t>> gOutputPortSources;
 std::deque<Signal> gObserved;
 std::atomic<WorldEntityRegistry*> gRegistry{};
 WorldEntityId gMap{};
 std::uint32_t gGeneration{};
 std::uint64_t gSequence{}, gCommitted{}, gCaptured{}, gApplied{}, gUnsupported{}, gFailures{};
 std::uint64_t gWithPayload{}, gWithDelay{}, gWithTail{};
+std::uint64_t gAutonomousSuppressed{};
 std::uint64_t gUnsafePayload{}, gUnsafeDelay{}, gUnsafeTail{};
 // Engine-side observation coverage: distinguish authored-port mismatch from
 // runtime identity mismatch and a rejected local OutputDefinition selector.
@@ -46,7 +66,7 @@ std::array<ForeignPortEvidence, 16U> gForeignPorts{};
 // Engine-thread-only scope: distinguishes an authoritative MissionSync APPLY
 // from a WorldSync RemoteRoot replay of a potentially overlapping frontier.
 thread_local bool gMissionReplayActive{};
-bool gEnabled{}, gFault{};
+bool gEnabled{}, gFault{}, gCampaign{}, gHost{};
 
 template<typename T> bool Read(std::ifstream& stream, T& value) {
     return static_cast<bool>(stream.read(reinterpret_cast<char*>(&value), sizeof(value)));
@@ -56,14 +76,26 @@ std::uint64_t Key(const CathodeRuntimeKey& key) noexcept {
 }
 bool Current(WorldEntityRegistry& registry) noexcept {
     const auto context = registry.ReplicationContext();
-    return context.manifestLoaded && context.levelGeneration == gGeneration && context.mapContentId == gMap;
+    return world_actions::SessionAuthorityBound() && context.manifestLoaded
+        && context.levelGeneration == gGeneration && context.mapContentId == gMap;
 }
-const Frontier* Find(void* execution, const std::uint32_t port, WorldEntityRegistry& registry) noexcept {
+Frontier* Find(void* execution, const std::uint32_t port, WorldEntityRegistry& registry,
+    const std::uint8_t inputKind = 0U) noexcept {
     CathodeRuntimeKey key{};
     if (!registry.TryExtractRuntimeKey(execution, key)) return nullptr;
     const auto found = gFrontiers.find(Key(key));
     if (found == gFrontiers.end()) return nullptr;
-    for (const auto& entry : found->second) if (entry.port == port) return &entry;
+    for (auto& entry : found->second)
+        if (entry.port == port && (entry.flags & kInputKindMask) == InputFlags(inputKind)) return &entry;
+    return nullptr;
+}
+Frontier* Find(const Signal& signal) noexcept {
+    const auto source = gEntitySources.find(signal.entity);
+    if (source == gEntitySources.end()) return nullptr;
+    const auto entries = gFrontiers.find(source->second);
+    if (entries == gFrontiers.end()) return nullptr;
+    for (auto& entry : entries->second)
+        if (entry.port == signal.port && (entry.flags & kInputKindMask) == InputFlags(signal.selector)) return &entry;
     return nullptr;
 }
 }
@@ -72,8 +104,8 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
     const std::string& role, std::string& error) {
     if (role == "off") {
         std::scoped_lock lock(gMutex);
-        gEnabled = false;
-        gFrontiers.clear(); gObserved.clear();
+        gEnabled = false; gCampaign = false;
+        gFrontiers.clear(); gEntitySources.clear(); gOutputPortSources.clear(); gObserved.clear();
         gRegistry.store(nullptr, std::memory_order_release);
         return true;
     }
@@ -83,7 +115,7 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
     std::uint32_t magic{}, count{};
     WorldEntityId map{};
     if (!Read(file, magic) || magic != 0x32534D41U || !Read(file, map.high) ||
-        !Read(file, map.low) || !Read(file, count) || count > 4096U) {
+        !Read(file, map.low) || !Read(file, count) || count > 65536U) {
         error = "Invalid MissionSync frontier catalogue."; return false;
     }
     const auto context = registry.ReplicationContext();
@@ -96,14 +128,17 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
         CathodeRuntimeKey key{};
         if (!Read(file, entry.entity.high) || !Read(file, entry.entity.low) ||
             !Read(file, key.entityA) || !Read(file, key.entityB) || !Read(file, entry.port) ||
-            !Read(file, entry.flags) || (entry.flags & ~kFlagPayloadTolerant) != 0U ||
+            !Read(file, entry.flags) || (entry.flags & ~(kFlagPayloadTolerant | kInputKindMask | kFlagOrderedOccurrences | kFlagPlayerIngress)) != 0U ||
+            (entry.flags & kInputKindMask) == kInputKindMask ||
             !entry.entity.Valid() || key.entityA == 0U || entry.port == 0U) {
             error = "Truncated or invalid mission frontier."; return false;
         }
         const auto known = registry.FindWorldEntityId(key);
         if (!known || !(*known == entry.entity)) { error = "Mission frontier identity is absent from the manifest."; return false; }
         auto& ports = entries[Key(key)];
-        if (std::any_of(ports.begin(), ports.end(), [&](const Frontier& other) { return other.port == entry.port; })) {
+        if (std::any_of(ports.begin(), ports.end(), [&](const Frontier& other) {
+                return other.port == entry.port && ((other.flags ^ entry.flags) & kInputKindMask) == 0U;
+            })) {
             error = "Duplicate mission frontier."; return false;
         }
         ports.push_back(entry);
@@ -114,9 +149,24 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
     // journal or discard a captured event while peers are still loading.
     if (gEnabled && gGeneration == context.levelGeneration && gMap == map) return true;
     gFrontiers = std::move(entries); gObserved.clear();
+    gEntitySources.clear();
+    gHost = role == "host";
+    gOutputPortSources.clear();
+    for (const auto& [key, ports] : gFrontiers)
+        for (const auto& entry : ports) {
+            gEntitySources.emplace(entry.entity, key);
+            if ((entry.flags & kInputKindMask) == 0U) gOutputPortSources[entry.port].insert(key);
+        }
+    gCampaign = std::any_of(gFrontiers.begin(), gFrontiers.end(), [](const auto& pair) {
+        return std::any_of(pair.second.begin(), pair.second.end(), [](const Frontier& entry) {
+            return (entry.flags & kFlagOrderedOccurrences) != 0U;
+        });
+    });
     gMap = map; gGeneration = context.levelGeneration;
     gSequence = 0U; gCommitted = 0U;
     gCaptured = 0U; gApplied = 0U; gUnsupported = 0U; gFailures = 0U;
+    gAutonomousSuppressed = 0U;
+    gWithPayload = gWithDelay = gWithTail = 0U;
     gUnsafePayload = gUnsafeDelay = gUnsafeTail = 0U;
     gRawOutputAttempts.store(0U, std::memory_order_relaxed);
     gRawOutputLocalRoot.store(0U, std::memory_order_relaxed);
@@ -133,6 +183,12 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
 }
 
 bool ReplayActive() noexcept { return gMissionReplayActive; }
+bool CampaignActive() noexcept {
+    auto* registry = gRegistry.load(std::memory_order_acquire);
+    if (registry == nullptr) return false;
+    std::scoped_lock lock(gMutex);
+    return gEnabled && gCampaign && Current(*registry);
+}
 void ObserveOutputAttempt(bool localRoot, bool remoteRoot) noexcept {
     if (gRegistry.load(std::memory_order_relaxed) == nullptr) return;
     gRawOutputAttempts.fetch_add(1U, std::memory_order_relaxed);
@@ -146,14 +202,9 @@ void ProbeScopedOutput(void* execution, std::uint32_t port, bool localRoot) noex
     if (!gEnabled || !Current(*registry)) return;
     CathodeRuntimeKey key{};
     if (!registry->TryExtractRuntimeKey(execution, key)) return;
-    bool exact = false, foreign = false;
-    for (const auto& [source, entries] : gFrontiers) {
-        for (const auto& entry : entries) {
-            if (entry.port != port) continue;
-            if (source == Key(key)) exact = true;
-            else foreign = true;
-        }
-    }
+    const auto found = gOutputPortSources.find(port);
+    const bool exact = found != gOutputPortSources.end() && found->second.contains(Key(key));
+    const bool foreign = found != gOutputPortSources.end() && !found->second.empty() && !exact;
     if (localRoot) {
         if (exact) ++gScopedLocalExact;
         else if (foreign) ++gScopedLocalForeign;
@@ -162,7 +213,7 @@ void ProbeScopedOutput(void* execution, std::uint32_t port, bool localRoot) noex
         else if (foreign) ++gScopedRemoteForeign;
     }
 }
-bool Candidate(void* execution, const std::uint32_t port, bool& payloadTolerant) noexcept {
+bool Candidate(void* execution, const std::uint32_t port, bool& payloadTolerant, const std::uint8_t inputKind) noexcept {
     payloadTolerant = false;
     auto* registry = gRegistry.load(std::memory_order_acquire);
     if (registry == nullptr) return false;
@@ -180,20 +231,14 @@ bool Candidate(void* execution, const std::uint32_t port, bool& payloadTolerant)
         ++gOutputKnownSource;
         gLastKnownSourcePort = port;
         for (const auto& entry : found->second) {
-            if (entry.port == port) {
+            if (entry.port == port && (entry.flags & kInputKindMask) == InputFlags(inputKind)) {
                 ++gOutputMatched;
                 payloadTolerant = (entry.flags & kFlagPayloadTolerant) != 0U;
                 return true;
             }
         }
     }
-    bool portInCatalog = false;
-    for (const auto& [source, entries] : gFrontiers) {
-        static_cast<void>(source);
-        for (const auto& entry : entries)
-            if (entry.port == port) { portInCatalog = true; break; }
-        if (portInCatalog) break;
-    }
+    const bool portInCatalog = gOutputPortSources.contains(port);
     if (portInCatalog) {
         ++gOutputPortOnOtherSource;
         // Store bounded *observed* source identities for each compiled port.
@@ -224,17 +269,25 @@ bool Candidate(void* execution, const std::uint32_t port, bool& payloadTolerant)
     }
     return false;
 }
-bool Capture(void* execution, const std::uint32_t port, const std::uint8_t selector) noexcept {
+bool Capture(void* execution, const std::uint32_t port, const std::uint8_t selector,
+    const bool playerInitiated) noexcept {
     auto* registry = gRegistry.load(std::memory_order_acquire);
     if (registry == nullptr) return false;
     std::scoped_lock lock(gMutex);
-    if (!gEnabled || !Current(*registry) || (selector != 1U && selector != 2U)) return false;
-    const auto* entry = Find(execution, port, *registry);
+    if (!gEnabled || !Current(*registry) || selector < 1U || selector > 4U) return false;
+    auto* entry = Find(execution, port, *registry, selector);
     if (entry == nullptr) return false;
+    // Only the Host originates autonomous campaign decisions. A Client's
+    // delayed equivalent timer/animation completion must not become occurrence
+    // N+1 just because commit N arrived first. Clients still propose actual
+    // player ingresses; the native graph executes on every participant.
+    if ((entry->flags & kFlagOrderedOccurrences) != 0U && !gHost && !playerInitiated
+        && (entry->flags & kFlagPlayerIngress) == 0U) { ++gAutonomousSuppressed; return true; }
     // Host and Client both wait for the same commit stream. Never let a full
     // observation queue silently advance only one participant's mission.
     if (gObserved.size() >= 256U) { gFault = true; ++gFailures; return true; }
-    gObserved.push_back(Signal{gGeneration, ++gSequence, entry->entity, port, selector});
+    gObserved.push_back(Signal{gGeneration, ++gSequence, entry->entity, port, selector,
+        (entry->flags & kFlagOrderedOccurrences) != 0U ? ++entry->observedOccurrence[selector - 1U] : 0U});
     ++gCaptured;
     return true;
 }
@@ -261,13 +314,14 @@ bool Apply(const Signal& signal, std::string& status, std::string& error) noexce
         }
         if (gFault) { status = "MISSION_SYNC_FAULT"; error = "Mission signal queue overflowed."; return false; }
         if (signal.sequence <= gCommitted) { status = "MISSION_SYNC_ALREADY_APPLIED"; return true; }
-        bool allowed = false;
-        for (const auto& [key, ports] : gFrontiers) {
-            static_cast<void>(key);
-            for (const auto& entry : ports) if (entry.entity == signal.entity && entry.port == signal.port) allowed = true;
-        }
+        if (signal.selector < 1U || signal.selector > 4U) { status = "MISSION_SYNC_REJECTED"; return false; }
+        const auto* entry = Find(signal);
+        const bool allowed = entry != nullptr &&
+            (((entry->flags & kFlagOrderedOccurrences) == 0U && signal.occurrence == 0U)
+                || ((entry->flags & kFlagOrderedOccurrences) != 0U
+                    && signal.occurrence == entry->committedOccurrence[signal.selector - 1U] + 1U));
         if (!allowed || signal.sequence != gCommitted + 1U ||
-            (signal.selector != 1U && signal.selector != 2U)) {
+            signal.selector < 1U || signal.selector > 4U) {
             status = "MISSION_SYNC_REJECTED"; error = "Unknown mission frontier or out-of-order commit."; return false;
         }
     }
@@ -294,6 +348,13 @@ bool Apply(const Signal& signal, std::string& status, std::string& error) noexce
         return false;
     }
     gCommitted = signal.sequence; ++gApplied;
+    if (signal.occurrence != 0U) {
+        if (auto* entry = Find(signal)) {
+            entry->committedOccurrence[signal.selector - 1U] = signal.occurrence;
+            entry->observedOccurrence[signal.selector - 1U] =
+                (std::max)(entry->observedOccurrence[signal.selector - 1U], signal.occurrence);
+        }
+    }
     status = "MISSION_SYNC_APPLIED";
     return true;
 }
@@ -312,6 +373,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
         {{"generation", Diagnostics::Unsigned(gGeneration), true},
          {"sources", Diagnostics::Unsigned(gFrontiers.size()), true},
          {"captured", Diagnostics::Unsigned(gCaptured), true},
+         {"autonomousClientSuppressed", Diagnostics::Unsigned(gAutonomousSuppressed), true},
          {"rawOutputHookCalls", Diagnostics::Unsigned(gRawOutputAttempts.load(std::memory_order_relaxed)), true},
          {"rawOutputLocalRoot", Diagnostics::Unsigned(gRawOutputLocalRoot.load(std::memory_order_relaxed)), true},
          {"rawOutputRemoteRoot", Diagnostics::Unsigned(gRawOutputRemoteRoot.load(std::memory_order_relaxed)), true},

@@ -572,6 +572,39 @@ bool AttackQuery(const ap::attack::Memory& memory,const ap::attack::Manager& man
 // this engine-thread call. 453 kept it held for the whole action: the leased
 // Alien's retail brain (worker thread, not lease-fenced) then started its own
 // kill, which AISync never captures, so the pilot's PC saw no animation.
+// When the Host itself pilots the Alien, the only human the Alien could have
+// selected is the hidden technical player, so the selector often has NO
+// current record (+10) and Hold reports noRecord (468 test). Retail 0072AFB0
+// (first half of the CATHODE set-target 005FBB40) makes the victim's record
+// the selector's forced target (+C). Its 0072B880 refresh is the fenced
+// coordinator, so instead install that record as current the donor's way
+// (hugger.cpp EnsureTargetEntry): slots are smart pointers with the refcount
+// at record+14, so take our own reference before storing it. Engine thread.
+constexpr std::uintptr_t kTargetEntryTableRva=0x00EEE8B8U;
+bool CallSetForcedTarget(std::uintptr_t selector,std::uintptr_t victim) noexcept {
+    __try {
+        reinterpret_cast<void(__thiscall*)(void*,std::uintptr_t)>(gBase+0x0032AFB0U)(reinterpret_cast<void*>(selector),victim);
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+}
+bool EnsureCurrentTargetRecord(const std::uintptr_t selector,const std::uintptr_t victim) noexcept {
+    std::uintptr_t current{},forced{},forcedTarget{};
+    if(!selector || !Read(selector+0x10U,current))return false;
+    if(current)return true;
+    if(!Read(selector+0xCU,forced) || !forced || !Read(forced+0x42CU,forcedTarget) || forcedTarget!=victim) {
+        if(!CallSetForcedTarget(selector,victim))return false;
+    }
+    for(const auto offset:{0x0CU,0x14U,0x18U}) {
+        std::uintptr_t entry{},table{};std::int32_t references{};
+        if(!Read(selector+offset,entry) || !entry || !Read(entry,table) || table!=gBase+kTargetEntryTableRva ||
+            !Read(entry+0x14U,references) || references<=0)continue;
+        ++references;
+        if(!crash_guard::TryWrite(reinterpret_cast<void*>(entry+0x14U),&references,sizeof(references)))return false;
+        if(!crash_guard::TryWrite(reinterpret_cast<void*>(selector+0x10U),&entry,sizeof(entry)))return false;
+        return true;
+    }
+    return false;
+}
 bool AttackAvailability(const ap::Context& c,const PairIdentity& victim,std::uintptr_t& chooser,
     bool& ready,std::uint32_t& selector) noexcept {
     ready=false;selector=0U;PairIdentity source{};
@@ -581,6 +614,13 @@ bool AttackAvailability(const ap::Context& c,const PairIdentity& victim,std::uin
         !PairIdentityLive(source) || !ap::attack::Resolve(memory,c.character,source.animated,manager) ||
         (chooser && chooser!=manager.address))return false;
     chooser=manager.address;active.attackAnimated=source.animated;
+    {
+        std::uintptr_t context{},querySelector{},brainSelector{};
+        if(Read(manager.address+4U,context) && context && Read(context+0xC8U,querySelector) && querySelector)
+            static_cast<void>(EnsureCurrentTargetRecord(querySelector,victim.character));
+        if(Read(source.animated+0x34A8U,brainSelector) && brainSelector && brainSelector!=querySelector)
+            static_cast<void>(EnsureCurrentTargetRecord(brainSelector,victim.character));
+    }
     switch(ap::attack::Hold(memory,manager,victim.character,active.heldTarget)) {
     case ap::attack::HoldResult::Held:break;
     case ap::attack::HoldResult::NoSelection:TraceAttack(1U);return true;

@@ -268,7 +268,34 @@ public sealed record PlayerPositionSnapshotPayload(
     // Source-owner allocated, monotone within this session/peer. Zero means
     // unavailable. Never a runtime ID or permission to enter a native pair.
     uint CharacterIncarnation = 0,
-    PlayerHidingSnapshot? Hiding = null);
+    PlayerHidingSnapshot? Hiding = null,
+    PlayerAnimationSnapshot? Animation = null);
+
+// AnimationSync: the owner's current CATHODE scripted clip (CMD_PlayAnimation
+// on THE_PLAYER: buttons, generators, terminals, vents...). Animation is the
+// engine's FNV-1a alias; each receiver resolves it in its own representation's
+// clip database, so no animation is special-cased. Transition 0 means no clip
+// (PlayerAnimationCodec.None); null is an unavailable sample. Elapsed time lets
+// a late snapshot be skipped instead of replaying a finished action.
+public sealed record PlayerAnimationSnapshot(
+    [property: JsonRequired] ulong Transition,
+    [property: JsonRequired] uint Animation,
+    [property: JsonRequired] uint ElapsedMilliseconds,
+    [property: JsonRequired] int StartFrame,
+    [property: JsonRequired] int EndFrame,
+    [property: JsonRequired] int Loops,
+    [property: JsonRequired] float Speed,
+    [property: JsonRequired] float BlendIn,
+    [property: JsonRequired] float X,
+    [property: JsonRequired] float Y,
+    [property: JsonRequired] float Z,
+    [property: JsonRequired] float Yaw,
+    [property: JsonRequired] float PhaseSeconds,
+    [property: JsonRequired] float DurationSeconds,
+    [property: JsonRequired] uint Attachment0 = 0,
+    [property: JsonRequired] uint Attachment1 = 0,
+    [property: JsonRequired] uint Attachment2 = 0,
+    [property: JsonRequired] uint Attachment3 = 0);
 
 public enum PlayerActionKind
 {
@@ -280,6 +307,10 @@ public enum PlayerActionKind
 // Local IPC observation. Addresses and construction serials never leave the PC.
 public sealed record NativePlayerHidingStatePayload(
     int SchemaVersion, ulong NativeGeneration, uint Character, ulong Serial, string Presentation);
+
+public sealed record NativePlayerAnimationStatePayload(
+    int SchemaVersion, ulong NativeGeneration, uint Character, ulong Serial, string Animation,
+    [property: JsonRequired] ulong SampledAtTickMilliseconds);
 
 public sealed record NativePlayerEquipmentStatePayload(
     int SchemaVersion,
@@ -352,7 +383,10 @@ public sealed record LobbyStartPayload(
     int LevelGeneration,
     bool AlienEnabled = true,
     bool AlienVsSurvivors = false,
-    ulong AlienPeerId = 0);
+    ulong AlienPeerId = 0,
+    bool CampaignContinuation = false,
+    ulong PreviousMissionSequence = 0,
+    CampaignLaunchDescriptor? Campaign = null);
 
 public sealed record LobbyPlayer(
     ulong PeerId,
@@ -375,7 +409,8 @@ public sealed record LobbySnapshotPayload(
     bool WorldPreparationRequired = false,
     bool AlienEnabled = true,
     bool AlienVsSurvivors = false,
-    ulong AlienPeerId = 0);
+    ulong AlienPeerId = 0,
+    CampaignLaunchDescriptor? Campaign = null);
 
 public sealed record DiscoveryAnnouncement(
     ushort ProtocolVersion,
@@ -404,7 +439,8 @@ public sealed record LobbyPreparationPayload(
     WorldManifestIdentity? Manifest,
     string ManifestSha256,
     bool Ready,
-    string Error);
+    string Error,
+    string CampaignSaveSha256 = "");
 
 // Sent only after world recovery, native binding and remote players are ready.
 public sealed record SessionPreparedPayload(Guid SessionId, ulong PeerId, int LevelGeneration, string MissionSha256 = "");

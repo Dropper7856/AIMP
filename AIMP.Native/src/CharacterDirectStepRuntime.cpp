@@ -7,6 +7,8 @@
 #include "aimp/PlayerHidingRuntime.h"
 #include "aimp/PlayerHidingPresentationRuntime.h"
 #include "aimp/PlayerHidingLocalCapture.h"
+#include "aimp/AnimationSyncRuntime.h"
+#include "aimp/AnimationSyncPropsRuntime.h"
 #include "aimp/HidingDoorPresentation.h"
 #include "aimp/HidingPresentationAudio.h"
 
@@ -2655,6 +2657,50 @@ void FollowHidingClipPath(MovementSlot& slot, const std::uintptr_t characterAddr
     gHidingFollowFrames.fetch_add(1U, std::memory_order_relaxed);
 }
 
+std::atomic<std::uint64_t> gAnimationFollowFrames{0U};
+std::atomic<std::uint64_t> gAnimationFollowRejected{0U};
+
+// AnimationSync: the owner's Character really converges onto the interaction
+// (button panel, generator, vent...) while its clip plays. The representation
+// plays the same clip in place, so carry it along the owner's network path and
+// heading, smoothed and capped per frame like the locker clips.
+void FollowAnimationClipPath(MovementSlot& slot, const std::uintptr_t characterAddress) noexcept {
+    float targetX{}, targetY{}, targetZ{}, currentX{}, currentY{}, currentZ{};
+    if (!LoadNetworkTarget(slot, targetX, targetY, targetZ) ||
+        !ReadTransform(characterAddress, currentX, currentY, currentZ)) return;
+    const auto dx = targetX - currentX, dy = targetY - currentY, dz = targetZ - currentZ;
+    const auto distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (!std::isfinite(distance) || distance > kHidingFollowMaximumGap) {
+        gAnimationFollowRejected.fetch_add(1U, std::memory_order_relaxed);
+        return;
+    }
+    if (distance > kHidingFollowDeadZone) {
+        const auto scale = distance > kHidingFollowMaximumStep ? kHidingFollowMaximumStep / distance : 1.0F;
+        const float position[3]{currentX + dx * scale, currentY + dy * scale, currentZ + dz * scale};
+        if (!TeleportCharacter(characterAddress, position[0], position[1], position[2]) ||
+            !GuardedWriteValue(characterAddress + kCharacterPositionOffset, position[0]) ||
+            !GuardedWriteValue(characterAddress + kCharacterPositionOffset + 4, position[1]) ||
+            !GuardedWriteValue(characterAddress + kCharacterPositionOffset + 8, position[2])) {
+            gAnimationFollowRejected.fetch_add(1U, std::memory_order_relaxed);
+            return;
+        }
+    }
+    // Unlike a locker, the owner's heading is meaningful here: it turns to
+    // face the panel during convergence. Bounded turn per frame.
+    if (slot.hasReplicatedYaw.load(std::memory_order_acquire)) {
+        float yaw{};
+        const auto target = LoadFloat(slot.replicatedYawBits);
+        if (ReadReplicatedYaw(characterAddress, yaw)) {
+            constexpr float kMaximumTurn = 0.12F;
+            const auto error = std::remainder(target - yaw, 6.28318530717958647692F);
+            if (std::isfinite(error) && std::abs(error) > 0.005F)
+                static_cast<void>(WriteReplicatedYaw(characterAddress,
+                    yaw + (std::max)(-kMaximumTurn, (std::min)(kMaximumTurn, error))));
+        }
+    }
+    gAnimationFollowFrames.fetch_add(1U, std::memory_order_relaxed);
+}
+
 void PumpSlotOnEngineThread(
     MovementSlot& slot,
     const EnginePumpPhase phase) noexcept {
@@ -2688,6 +2734,20 @@ void PumpSlotOnEngineThread(
             player_hiding_presentation::HiddenExitHeading(characterAddress, exitYaw) &&
             WriteReplicatedYaw(characterAddress, exitYaw))
             gHidingExitHeadingFrames.fetch_add(1U, std::memory_order_relaxed);
+        return;
+    }
+
+    // A replicated interaction clip owns the representation: no Move/Idle;
+    // the follower re-places it once the clip ends.
+    if (animation_sync::OwnsMovement(characterAddress)) {
+        slot.initialPlacementPending.store(true, std::memory_order_release);
+        slot.nativeStateActive.store(false, std::memory_order_release);
+        slot.moveActive.store(false, std::memory_order_release);
+        slot.driveRequested.store(false, std::memory_order_release);
+        slot.certifiedCycleAddress.store(0U, std::memory_order_release);
+        slot.preparedTargetRevision.store(0U, std::memory_order_release);
+        if (phase == EnginePumpPhase::PostCharacterManager && animation_sync::ClipPlaying(characterAddress))
+            FollowAnimationClipPath(slot, characterAddress);
         return;
     }
 
@@ -3392,6 +3452,13 @@ bool Install(
     player_torch::Initialize(moduleBase);
     player_hiding::Initialize(moduleBase);
     player_hiding_presentation::Initialize(moduleBase, reinterpret_cast<std::uintptr_t>(gEnterIdleCycle));
+    if (!animation_sync::props::Install(hooks, moduleBase, error)) {
+        std::string rollbackError;
+        static_cast<void>(hooks.UninstallFrom(hookCheckpoint, rollbackError));
+        error = "AnimationSync attachment observation: " + error;
+        return false;
+    }
+    animation_sync::Initialize(moduleBase, reinterpret_cast<std::uintptr_t>(gEnterIdleCycle));
     std::string hidingAudioError;
     if (hiding_presentation_audio::Initialize(moduleBase, hidingAudioError))
         static_cast<void>(hiding_presentation_audio::InstallMetadataFilter(hooks, hidingAudioError));
@@ -3425,12 +3492,15 @@ void PumpOnEngineThread(const EnginePumpPhase phase) noexcept {
         // Empty value slots cannot access actors; release any pinned streamed
         // clip requests on this engine thread while their DB is still owned.
         player_hiding_presentation::PumpAllOnEngineThread();
+        animation_sync::PumpAllOnEngineThread();
         return;
     }
     if (phase == EnginePumpPhase::PreCharacterManager) {
         player_hiding_local::PumpOnEngineThread();
         hiding_door_presentation::PumpAllOnEngineThread();
         player_hiding_presentation::PumpAllOnEngineThread();
+        animation_sync::PumpLocalOnEngineThread();
+        animation_sync::PumpAllOnEngineThread();
     }
     for (auto& slot : gSlots) {
         PumpSlotOnEngineThread(slot, phase);
@@ -3818,6 +3888,7 @@ void Stop() noexcept {
         std::string ignored;
         static_cast<void>(player_hiding::Publish(character, false, {}, ignored));
         static_cast<void>(player_hiding_presentation::Publish(character, {}, ignored));
+        static_cast<void>(animation_sync::Publish(character, {}, ignored));
         hiding_door_presentation::Forget(character);
         slot.remainingFrames.store(0U, std::memory_order_release);
         slot.stopPending.store(true, std::memory_order_release);
@@ -3829,6 +3900,7 @@ void ForgetCharacter(const std::uintptr_t characterAddress) noexcept {
     player_torch::Forget(characterAddress);
     player_hiding::Forget(characterAddress);
     player_hiding_presentation::Forget(characterAddress);
+    animation_sync::Forget(characterAddress);
     hiding_door_presentation::Forget(characterAddress);
     if (auto* slot = FindSlot(characterAddress); slot != nullptr) ReleaseSlot(*slot);
 }
@@ -3839,6 +3911,7 @@ void ForgetAll() noexcept {
     player_hiding::ForgetAll();
     player_hiding_presentation::ForgetAll();
     player_hiding_local::ForgetAll();
+    animation_sync::ForgetAll();
     hiding_door_presentation::ForgetAll();
     for (auto& slot : gSlots) {
         const auto character =
@@ -3857,6 +3930,7 @@ bool Stop(const std::uintptr_t characterAddress) noexcept {
     std::string ignored;
     static_cast<void>(player_hiding::Publish(characterAddress, false, {}, ignored));
     static_cast<void>(player_hiding_presentation::Publish(characterAddress, {}, ignored));
+    static_cast<void>(animation_sync::Publish(characterAddress, {}, ignored));
     hiding_door_presentation::Forget(characterAddress);
     auto* slot = FindSlot(characterAddress);
     if (slot == nullptr) return true;

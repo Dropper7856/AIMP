@@ -91,7 +91,8 @@ internal readonly record struct LocalPlayerMovementProfile(
     float RunSpeed,
     PlayerPostureSnapshot? Posture = null,
     PlayerTorchSnapshot? Torch = null,
-    PlayerHidingSnapshot? Hiding = null)
+    PlayerHidingSnapshot? Hiding = null,
+    PlayerAnimationSnapshot? Animation = null)
 {
     internal float SpeedFor(PlayerMoveType moveType) => moveType switch
     {
@@ -259,8 +260,9 @@ internal sealed class LocalPlayerPositionReader : IDisposable
         _hidingReader.TryCapture(runtime.ModuleBase, characterBase, runtime.LevelGeneration, out var hiding,
             () => TryReadCharacterBase(runtime.ModuleBase, out var after) && after == characterBase);
         hiding = LocalPlayerHidingReader.WithPresentation(hiding, runtime, characterBase, DateTimeOffset.UtcNow);
+        var animation = LocalPlayerAnimationReader.Read(runtime, characterBase, DateTimeOffset.UtcNow);
         if (!TryReadCharacterBase(runtime.ModuleBase, out var current) || current != characterBase) return false;
-        movementProfile = movementProfile with { Posture = posture, Torch = torch, Hiding = hiding };
+        movementProfile = movementProfile with { Posture = posture, Torch = torch, Hiding = hiding, Animation = animation };
         return true;
     }
 

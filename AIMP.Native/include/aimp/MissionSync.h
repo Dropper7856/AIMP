@@ -15,6 +15,7 @@ struct Signal final {
     WorldEntityId entity{};
     std::uint32_t port{};
     std::uint8_t selector{};
+    std::uint64_t occurrence{};
 };
 // Configuration and replay execute on the engine thread. The catalogue is
 // derived from this map's authored mission graph, never from remote pointers.
@@ -29,8 +30,9 @@ void ProbeScopedOutput(void* execution, std::uint32_t port, bool localRoot) noex
 bool ReplayActive() noexcept;
 // payloadTolerant: the matched frontier is a Composite/Proxy interface pin whose
 // targets are control inputs only; its runtime data reference is not replayed.
-bool Candidate(void* execution, std::uint32_t port, bool& payloadTolerant) noexcept;
-bool Capture(void* execution, std::uint32_t port, std::uint8_t selector) noexcept;
+bool Candidate(void* execution, std::uint32_t port, bool& payloadTolerant, std::uint8_t inputKind = 0U) noexcept;
+bool CampaignActive() noexcept;
+bool Capture(void* execution, std::uint32_t port, std::uint8_t selector, bool playerInitiated = false) noexcept;
 void Unsupported() noexcept;
 // Shape of a captured frontier call that the commit replay normalizes away:
 // the frontier's targets are control inputs only (compiler-proven), so its data

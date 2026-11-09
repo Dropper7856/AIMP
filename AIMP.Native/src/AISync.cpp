@@ -635,7 +635,8 @@ struct AlienPvPNativeLease final {
     std::uint32_t boundaryOffset{}, boundaryValue{};
     std::uint32_t retainedKind{},retainedStatus{},retainedRetired{};
     bool fenced{}, drained{}, owned{}, navigationDrainEntered{}, releasing{};
-    bool retainedDrainFault{};
+    bool retainedDrainFault{}, backstageCancelEntered{};
+    std::uintptr_t cancelledRequest{};
 };
 AlienPvPNativeLease gPvPLease{};
 bool PvPCharacterFenced(std::uintptr_t character) noexcept;
@@ -10733,6 +10734,8 @@ bool PvPTryRetireRetainedMovement(Actor& actor) noexcept {
         case 1U:expected=0xEB1A70U;break;case 2U:expected=0xEB1A60U;break;
         case 3U:expected=0xEB1A50U;break;case 4U:expected=0xEB19CCU;break;
         case 7U:expected=0xEB19BCU;break;case 9U:expected=0xEB19ACU;break;
+        // Only the backstage reservation this lease itself cancelled.
+        case 5U:if(!gPvPLease.backstageCancelEntered)return false;expected=0xEB198CU;break;
         default:return false; // No action, placement, pair or scheduler-mode request.
         }
         if(type!=gBase+expected || state<3U || state>5U)return false;
@@ -10742,6 +10745,50 @@ bool PvPTryRetireRetainedMovement(Actor& actor) noexcept {
         ++gPvPLease.retainedRetired;
     }
     return false;
+}
+// The fence stops new BT decisions, not a request already running. Two seen
+// on the Host at spawn (465/466), both leaving possession Draining:
+// - the spawn Move (kind1, issued on the Alien's first frame) whose route
+//   enters a vent: about 45s of cycle75 traversal before it ends;
+// - then the Alien parked backstage: cycle77 timed hold (00401520, no
+//   traversal path/listener) under a running kind5 reservation that only the
+//   fenced BT would ever clear.
+// Cancel exactly that single active request through the retail request
+// cancel, once per request; the retained-list collector then retires it like
+// any other terminal request. Cycle75/76 traversal is never cancelled.
+bool PvPTryCancelActiveRequest(Actor& actor) noexcept {
+    if(!gPvPLease.drained || gPvPLease.owned || gPvPLease.retainedDrainFault ||
+        !PvPLeaseScopeCurrent() || !PvPLeaseLiveIdentity() ||
+        PairSourceBusy(actor.character) || !UnownedCleanupAllowed(actor)){gPvPLease.retainedKind=0x101U;return false;}
+    const auto scheduler=actor.character+0x2CD0U;
+    std::uintptr_t owner{},cycle{},cycleType{},sentinel{},node{},request{},type{},requestOwner{};
+    std::uint32_t count{},kind{},state{};std::uint8_t cycleState{},a{},b{};
+    // Active list (+2CD4 sentinel, +2CD8 count) is an MSVC std::list of raw
+    // requests: node +0 next, +8 request (same walk as BootstrapNativeActor).
+    // Diagnostic: a refusal leaves 0x100+step in retainedKind.
+    if(!Read(scheduler,owner)||owner!=actor.character||
+        !Read(actor.character+0x36CU,cycle)||!cycle||!Read(cycle,cycleType)||!Read(cycle+0x1AU,cycleState)||
+        !Read(actor.character+0x2DAU,a)||!Read(actor.character+0x2DBU,b)){gPvPLease.retainedKind=0x102U;return false;}
+    if(!Read(scheduler+4U,sentinel)||!sentinel||!Read(scheduler+8U,count)||count!=1U||
+        !Read(sentinel,node)||!node||node==sentinel||!Read(node+8U,request)||!request){gPvPLease.retainedKind=0x103U;return false;}
+    if(!Read(request,type)||!Read(request+0x10U,kind)||
+        !Read(request+0x14U,requestOwner)||requestOwner!=scheduler||
+        !Read(request+0xCU,state)||state<1U||state>2U){gPvPLease.retainedKind=0x104U;return false;}
+    if(request==gPvPLease.cancelledRequest)return false;
+    const bool frontstageMove=!a&&!b&&(cycleState==55U||cycleState==56U||cycleState==59U)&&
+        ((kind==1U&&type==gBase+0xEB1A70U)||(kind==2U&&type==gBase+0xEB1A60U)||(kind==3U&&type==gBase+0xEB1A50U));
+    const bool backstageHold=(a||b)&&cycleType==gBase+0xDBB1B8U&&cycleState==0x4DU&&
+        kind==5U&&type==gBase+0xEB198CU&&!gPvPLease.backstageCancelEntered;
+    if(!frontstageMove&&!backstageHold){gPvPLease.retainedKind=0x110U+kind;gPvPLease.retainedStatus=cycleState;return false;}
+    gPvPLease.retainedKind=kind;gPvPLease.retainedStatus=state;
+    // One attempt per request: a fault or a request that survives its own
+    // cancel stays visible as Draining instead of being cancelled in a loop.
+    gPvPLease.cancelledRequest=request;
+    if(kind==5U)gPvPLease.backstageCancelEntered=true;
+    __try {
+        reinterpret_cast<void(__thiscall*)(void*)>(gBase+0x00283DB0U)(reinterpret_cast<void*>(request));
+    } __except(EXCEPTION_EXECUTE_HANDLER) {gPvPLease.retainedDrainFault=true;return false;}
+    return true;
 }
 
 // Host-validated owner observations update only the exact possessed replica.
@@ -10848,6 +10895,13 @@ bool PvPTryDrain(AlienPvPLeaseStatus& status) noexcept {
     if(check==Check::Waiting && (failure.offset==0x2CE4U ||
         (failure.offset==0x36CU && failure.value==56U)) && PvPTryRetireRetainedMovement(*actor)) {
         failure={};check=execution::InspectAlienPossessionBoundary(memory,lifetime,true,&failure);
+    }
+    if(check==Check::Waiting && (failure.offset==0x2CD8U || (failure.offset==0x36CU && failure.value==56U)) &&
+        PvPTryCancelActiveRequest(*actor)) {
+        failure={};check=execution::InspectAlienPossessionBoundary(memory,lifetime,true,&failure);
+        if(check==Check::Waiting && failure.offset==0x2CE4U && PvPTryRetireRetainedMovement(*actor)) {
+            failure={};check=execution::InspectAlienPossessionBoundary(memory,lifetime,true,&failure);
+        }
     }
     if (check == Check::Waiting && PvPTryClearDrainedNavigation(*actor,failure)) {
         failure={};

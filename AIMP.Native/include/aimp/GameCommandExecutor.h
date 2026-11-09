@@ -9,6 +9,7 @@
 #include "aimp/PlayerCharacters.h"
 #include "aimp/PlayerPostureRuntime.h"
 #include "aimp/PlayerHidingPresentation.h"
+#include "aimp/AnimationSync.h"
 
 namespace aimp {
 
@@ -64,6 +65,8 @@ struct CharacterDirectMoveCommand {
     std::array<float, 3> playerHidingAnchor{};
     bool hasPlayerHidingPresentation{};
     player_hiding_presentation::State playerHidingPresentation{};
+    bool hasPlayerAnimation{};
+    animation_sync::State playerAnimation{};
 };
 
 struct CharacterDirectStepCommand {
@@ -127,7 +130,7 @@ struct ItemSyncApplyCommand {
 };
 struct MissionSyncCommand {
     std::string path, role;
-    std::uint64_t sequence{}, entityHigh{}, entityLow{};
+    std::uint64_t sequence{}, entityHigh{}, entityLow{}, occurrence{};
     std::uint32_t signal{};
     std::uint8_t selector{};
 };

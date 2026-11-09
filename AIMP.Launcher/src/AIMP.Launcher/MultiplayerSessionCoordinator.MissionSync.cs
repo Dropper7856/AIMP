@@ -59,7 +59,10 @@ internal sealed partial class MultiplayerSessionCoordinator
         LobbyHost? missionHost;
         lock (_stateGate) missionHost = _host;
         missionHost?.SetMissionRepeatableFrontiers(roots.Where(root => root.Repeatable)
-            .Select(root => (root.Source.EntityId.ToString(), root.Signal)));
+            .Select(root => (root.Source.EntityId.ToString(), root.Signal)), expectedGeneration: start.LevelGeneration);
+        missionHost?.SetMissionFrontierCatalog(start.LevelGeneration, roots.SelectMany(root =>
+            (root.ScheduledInput ? new byte[] { 4 } : root.PublicInput ? new byte[] { 3 } : new byte[] { 1, 2 })
+                .Select(selector => (root.Source.EntityId.ToString(), root.Signal, selector, root.OrderedOccurrences))));
         var path = enabled ? Path.Combine(Path.GetTempPath(), $"aimp-mission-{Guid.NewGuid():N}.bin") : "";
         try
         {
@@ -118,7 +121,7 @@ internal sealed partial class MultiplayerSessionCoordinator
                 $"runtimeKey={root.Source.CathodeEntityA:X8}:{root.Source.CathodeEntityB:X8} " +
                 $"sourceComposite=0x{root.Source.SourceCompositeShortGuid:X8} " +
                 $"primitive={root.Source.PrimitiveName} kind={root.Source.Kind} domain={root.Source.Domain} " +
-                $"payloadTolerant={root.PayloadTolerant}.");
+                $"payloadTolerant={root.PayloadTolerant} publicInput={root.PublicInput} orderedOccurrences={root.OrderedOccurrences}.");
         if (enabled && roots.Count == 0)
             _diagnostics.Log("MissionSync", $"No safe {mode} objective frontier was proven by the " +
                 "manifest. Raw player interactions are NOT replayed as mission commits.");
@@ -132,7 +135,7 @@ internal sealed partial class MultiplayerSessionCoordinator
                 || LevelGameMode(_start.Level) is not ("Campaign" or "Survival")
                 || (_host is null && _client is null)) return;
             var signal = new MissionSignalPayload(_start.SessionId, _host?.HostPeerId ?? _client!.PeerId,
-                _start.LevelGeneration, value.Sequence, value.EntityId, value.Signal, value.InterfaceSelector);
+                _start.LevelGeneration, value.Sequence, value.EntityId, value.Signal, value.InterfaceSelector, value.Occurrence);
             if (!_missionReports.Writer.TryWrite((_missionEpoch, _host, _client, signal)))
                 FailMissionSyncLocked("MissionSync local report queue is full; progression stopped.");
         }
@@ -230,7 +233,8 @@ internal sealed partial class MultiplayerSessionCoordinator
             ["entityId"] = signal.EntityId,
             ["signal"] = signal.Signal.ToString(CultureInfo.InvariantCulture),
             ["selector"] = signal.InterfaceSelector.ToString(CultureInfo.InvariantCulture),
-            ["sequence"] = signal.Sequence.ToString(CultureInfo.InvariantCulture)
+            ["sequence"] = signal.Sequence.ToString(CultureInfo.InvariantCulture),
+            ["occurrence"] = signal.Occurrence.ToString(CultureInfo.InvariantCulture)
         }, _lifetime.Token, waitForExecution: true, expectedLevelGeneration: nativeGeneration)
             .WaitAsync(TimeSpan.FromSeconds(20), _lifetime.Token).ConfigureAwait(false);
         if (!result.Executed) throw new InvalidOperationException($"{result.StatusCode}: {result.Message}");

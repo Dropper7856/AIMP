@@ -56,7 +56,9 @@ internal sealed partial class MultiplayerSessionCoordinator
             }
             scope = (start.SessionId, start.LevelGeneration, runtime.LevelGeneration, runtime.ProcessId, start.AlienPeerId);
             // Keep checking after success. A retail Alien can be replaced at a vent.
-            _nextAlienPvPBindUtc = now.AddSeconds(_alienPvPBoundScope == scope ? 5 : 2);
+            // Until owned, poll fast: the spawn Move must be cancelled while the
+            // Alien still runs (cycle56), before its route enters a vent.
+            _nextAlienPvPBindUtc = _alienPvPBoundScope == scope ? now.AddSeconds(5) : now.AddMilliseconds(500);
         }
         _ = BindNativeAlienAsync(scope);
     }

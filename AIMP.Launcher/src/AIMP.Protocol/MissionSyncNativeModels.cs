@@ -7,4 +7,5 @@ public sealed record NativeMissionSignalPayload(
     [property: JsonRequired] ulong Sequence,
     [property: JsonRequired] string EntityId,
     [property: JsonRequired] uint Signal,
-    [property: JsonRequired] byte InterfaceSelector);
+    [property: JsonRequired] byte InterfaceSelector,
+    ulong Occurrence = 0);
