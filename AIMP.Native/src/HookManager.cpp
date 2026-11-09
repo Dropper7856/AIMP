@@ -394,7 +394,21 @@ bool HookManager::Install(const HookRequest& request, std::string& error) {
         !request.relocationSafePrefix ||
         !request.expected.IsValid() ||
         request.expected.bytes.size() < request.patchLength) {
-        error = "invalid or non-certified hook request";
+        // Report the actual rejected field instead of hiding deployment or
+        // construction mistakes behind the same generic error. Keep every
+        // original validation requirement; no hook is allowed to fail open.
+        std::ostringstream detail;
+        detail << "invalid or non-certified hook request [" << request.name << "]:";
+        if (request.target == nullptr) detail << " target=null;";
+        if (request.detour == nullptr) detail << " detour=null;";
+        if (request.trampolineOut == nullptr) detail << " trampolineOut=null;";
+        if (request.patchLength < 5 || request.patchLength > 32)
+            detail << " patchLength=" << request.patchLength << " (expected 5..32);";
+        if (!request.relocationSafePrefix) detail << " relocationSafePrefix=false;";
+        if (!request.expected.IsValid()) detail << " invalid expected bytes/mask;";
+        if (request.expected.bytes.size() < request.patchLength)
+            detail << " expected signature shorter than patchLength;";
+        error = detail.str();
         return false;
     }
     if (std::any_of(hooks_.begin(), hooks_.end(), [&](const auto& hook) {

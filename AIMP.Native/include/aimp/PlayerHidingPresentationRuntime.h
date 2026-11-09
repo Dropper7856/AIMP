@@ -1,7 +1,6 @@
 #pragma once
 
 #include "aimp/PlayerHidingPresentation.h"
-#include "aimp/AISyncNativeIntent.h"
 #include <cstdint>
 #include <string>
 
@@ -26,12 +25,6 @@ struct ClipSelection final { std::uint32_t phase{}, kind{}; };
         (door.elapsedMilliseconds <= 500U || interactionActive || nativePhase == 1U)) return 1U;
     return 0U;
 }
-// Exit heading: the entry heading turned half a revolution, wrapped to
-// [-pi, pi] (the replicated yaw contract is |yaw| <= 3.3).
-[[nodiscard]] constexpr float ExitYaw(float entryYaw) noexcept {
-    constexpr float pi = 3.14159265358979F;
-    return entryYaw > 0.0F ? entryYaw - pi : entryYaw + pi;
-}
 [[nodiscard]] constexpr ClipSelection ClassifyClip(std::uint32_t token) noexcept {
     switch (token) {
     case 0xCF2A9F36U: return {1U, 1U};
@@ -43,35 +36,19 @@ struct ClipSelection final { std::uint32_t phase{}, kind{}; };
     default: return {};
     }
 }
-[[nodiscard]] constexpr std::uint32_t ClipToken(std::uint32_t kind, std::uint32_t phase) noexcept {
-    if (kind == 1U) return phase == 1U ? 0xCF2A9F36U : phase == 2U ? 0x1C440762U : phase == 3U ? 0x5E642560U : 0U;
-    if (kind == 2U) return phase == 1U ? 0x80645982U : phase == 2U ? 0x15691ACEU : phase == 3U ? 0x3FDD3AF4U : 0U;
-    return 0U;
-}
-// Resource identity must come from this receiver's actual Character animation
-// database. References, external clocks, signal and all camera flags stay zero.
-bool BuildPlaybackIntent(const State&, std::uint32_t localResourceToken,
-    ai_sync::native_intent::Payload&) noexcept;
-
-// Pass CharacterDirectStepRuntime's already-certified original Idle trampoline
-// (gEnterIdleCycle), not its hooked retail entry. It receives ECX=cycle, RET0.
-// Zero disables playback admission; capture/value mailboxes remain available.
+// Capture and occupancy only. AnimationSync owns playback and authored turns.
 void Initialize(std::uintptr_t moduleBase, std::uintptr_t nativeIdleTransition = 0U) noexcept;
-// Value-only IPC mailbox. Phase zero requests cancellation on the engine thread.
+// Value-only occupancy mailbox. Phase zero releases the hidden movement lock.
 bool Publish(std::uintptr_t character, const State&, std::string& error) noexcept;
 // Call before movement/turn/pose correction, even without a movement mailbox.
-// True means that presentation owns movement (also true for a settled Hidden).
+// True only for settled Hidden; entry and exit belong to AnimationSync.
 bool PumpOnEngineThread(std::uintptr_t character) noexcept;
 void PumpAllOnEngineThread() noexcept;
-// After ForgetAll, release pinned clip requests without inspecting Characters.
-// If the engine cannot run again, the bounded pool remains inert until exit.
+// Compatibility no-op: this module no longer requests animation streams.
 void DrainStreamsOnEngineThread() noexcept;
 [[nodiscard]] bool Active(std::uintptr_t character) noexcept;
-// Our entry/exit clip currently owns the actor (not a settled Hidden phase).
+// Compatibility queries return false: no legacy clip or forced exit heading.
 [[nodiscard]] bool ClipPlaying(std::uintptr_t character) noexcept;
-// Settled Hidden (no clip): the heading the exit clip will use. A clip takes
-// the body's current orientation, and a yaw write only turns the body on the
-// next ticks, so the invisible body must already face out when exit starts.
 [[nodiscard]] bool HiddenExitHeading(std::uintptr_t character, float& yaw) noexcept;
 // Actual local player, engine thread only. true + State{} means visible;
 // false means a torn/unavailable sample or hiding without an exact door latch.

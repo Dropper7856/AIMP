@@ -17,6 +17,9 @@ constexpr std::uintptr_t kAttachmentType = 0xDF0778U;
 constexpr std::uintptr_t kCharacterType = 0xDD08D8U;
 std::atomic<std::uintptr_t> gBase{}, gLocal{};
 std::atomic<std::uint32_t> gLocalRuntime{}, gDetours{};
+// HookManager retains this output until retired trampolines are released.
+// Keep it separate from the atomic publication consumed by the detour.
+void* gOriginalStorage{};
 std::atomic<void*> gOriginal{};
 std::atomic<bool> gEnabled{};
 struct Sighting { std::uintptr_t node{}; std::uint32_t token{}; std::uint64_t at{}; };
@@ -205,6 +208,8 @@ void Release(Prop& prop) noexcept {
 }
 }
 
+const char* BuildTag() noexcept { return "AIMP-ANIMATIONSYNC-LOCAL-POSE-472-20261109"; }
+
 bool Install(HookManager& hooks, std::uintptr_t moduleBase, std::string& error) {
     if (!hooks.ExactBuildValidated() || moduleBase == 0U) { error = "AnimationSync props require the exact retail build."; return false; }
     gBase.store(moduleBase);
@@ -227,6 +232,7 @@ bool Install(HookManager& hooks, std::uintptr_t moduleBase, std::string& error) 
     request.patchLength = 6U; request.relocationSafePrefix = true;
     for (const auto byte : {0x55,0x8B,0xEC,0x83,0xE4,0xF0}) request.expected.bytes.push_back(static_cast<std::uint8_t>(byte));
     request.expected.mask = "xxxxxx";
+    request.trampolineOut = &gOriginalStorage;
     request.publishedTrampolineOut = &gOriginal;
     if (!hooks.Install(request, error)) return false;
     gEnabled.store(true);

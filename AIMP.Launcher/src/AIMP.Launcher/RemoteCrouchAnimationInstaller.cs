@@ -142,7 +142,11 @@ internal static class RemoteCrouchAnimationInstaller
 
         var current = Hash(target);
         if (state != null && state.PatchVersion == PatchVersion && current == state.PatchedSha256 &&
-            File.Exists(backup) && Hash(backup) == state.OriginalSha256) return;
+            File.Exists(backup) && Hash(backup) == state.OriginalSha256)
+        {
+            AnimationSyncBoneMasks.Ensure(game, backup, state.OriginalSha256, token);
+            return;
+        }
 
         // The current file is retail unless it is our own earlier output. A
         // repaired or updated game replaces the retained original.
@@ -174,6 +178,7 @@ internal static class RemoteCrouchAnimationInstaller
             File.Move(statePath + ".tmp", statePath, true);
         }
         finally { if (File.Exists(staged)) File.Delete(staged); }
+        AnimationSyncBoneMasks.Ensure(game, backup, original, token);
     }
 
     private static PAK2.File Entry(PAK2 pak, string name) =>

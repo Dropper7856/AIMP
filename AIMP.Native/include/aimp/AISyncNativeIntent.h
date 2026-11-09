@@ -122,6 +122,23 @@ using CanonicalPayload = std::array<std::uint8_t, kBytes>;
     output=p;
     return Validate(output);
 }
+// A Host script's RuntimeKeys name world-global CATHODE objects, including
+// THE_PLAYER placement, external clocks and scene callbacks. Re-resolving them
+// on an observer can move its local player during an Alien vent kill. Replay
+// only the actor clip; leave the original wire payload intact for receipts.
+// Scripted update RVA256BE0 consumes placement refs at cycle+44/+4C and flags
+// +98..9B. Initializer RVA26C4C0 also uses these flags for scene side effects.
+[[nodiscard]] inline bool IsolateObserverScripted(const Payload& input, Payload& output) noexcept {
+    if (input.words[0] != 20U || !Validate(input)) return false;
+    Payload isolated{};
+    isolated.words[0] = 20U;
+    // Resource, alias, start/end frames, count, speed, blend and timing scalar.
+    for (std::size_t i = 21U; i <= 28U; ++i) isolated.words[i] = input.words[i];
+    isolated.words[30] = std::bit_cast<std::uint32_t>(-1.F);
+    if (!Validate(isolated)) return false;
+    output = isolated;
+    return true;
+}
 [[nodiscard]] inline bool Encode(const Payload& value, CanonicalPayload& output) noexcept {
     if (!Validate(value)) return false;
     for (std::size_t i = 0; i < value.words.size(); ++i)

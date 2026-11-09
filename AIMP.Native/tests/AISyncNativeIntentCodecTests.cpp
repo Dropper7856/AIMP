@@ -152,6 +152,33 @@ void NewContracts() {
     }
     for(auto id : {24U,26U,0xFFFFFFFFU}) Check(!native_intent::Validate(Intent(id)),"future contract admitted");
 }
+void ObserverScriptIsolation() {
+    // Observed vent-kill constructors used resolved refs0/1 and flagsD2B80
+    // (then D2D80). Their local aliases/resources remain valid actor inputs,
+    // but their scene context must never bind to the observer's THE_PLAYER.
+    for (const auto flags : {0x000D2B80U, 0x000D2D80U, native_intent::kScriptedFlags}) {
+        auto source = Intent(20);
+        source.words[1] = 15U;
+        for (std::size_t i=12U;i<20U;++i) source.words[i]=0x10203040U+static_cast<std::uint32_t>(i);
+        source.words[28] = std::bit_cast<std::uint32_t>(0.5F);
+        source.words[33] = flags;
+        const auto original = source;
+        native_intent::Payload isolated{};
+        Check(native_intent::IsolateObserverScripted(source,isolated),"observer scripted isolation refused valid input");
+        Check(source==original,"observer isolation changed receipt/wire identity");
+        Check(isolated.words[1]==0U&&isolated.words[33]==0U,"observer retained scene flags or resolved reference evidence");
+        for (std::size_t i=12U;i<=20U;++i) Check(isolated.words[i]==0U,"observer retained foreign scene reference");
+        for (std::size_t i=21U;i<=28U;++i) Check(isolated.words[i]==source.words[i],"observer lost actor clip/timeline parameters");
+        Check(isolated.words[29]==0U&&isolated.words[30]==std::bit_cast<std::uint32_t>(-1.F)&&
+            isolated.words[31]==0U&&isolated.words[32]==0U,"observer retained external timeline/placement controls");
+        native_intent::Payload twice{};
+        Check(native_intent::IsolateObserverScripted(isolated,twice)&&twice==isolated,"observer isolation is not idempotent");
+    }
+    native_intent::Payload output=Intent(9);const auto before=output;
+    Check(!native_intent::IsolateObserverScripted(Intent(9),output)&&output==before,"observer isolation accepted other constructor");
+    auto invalid=Intent(20);invalid.words[21]=0U;
+    Check(!native_intent::IsolateObserverScripted(invalid,output)&&output==before,"observer isolation repaired invalid wire input");
+}
 void WireAndReceipts() {
     auto r=Record();execution::Batch batch{};batch.scope=r.scope;batch.batchId=5;batch.count=2;batch.records[0]=r;
     auto scalar=r;scalar.nativeKind=7;scalar.admission=0;scalar.intent={};batch.records[1]=scalar;
@@ -205,4 +232,4 @@ void WireAndReceipts() {
     }
 }
 }
-int main() { PayloadDomain();NewContracts();WireAndReceipts();std::cout<<"AISync native intent codec PASS (offline)\n"; }
+int main() { PayloadDomain();NewContracts();ObserverScriptIsolation();WireAndReceipts();std::cout<<"AISync native intent codec PASS (offline)\n"; }

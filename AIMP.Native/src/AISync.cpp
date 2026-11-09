@@ -2363,8 +2363,13 @@ std::uint32_t __fastcall RecordEligibilityDetour(void* logical, void*) noexcept 
     return AdaptParticipantEligibility(logical, gRecordEligibilityOwner, gRecordEligibilityTarget,
         gRecordEligibilityChecks, gRecordEligibilityOverrides);
 }
-// PvP left-click probe on retail ActionMeleeAttack start 00717D90
-// (thiscall(node, character, state), RET 8; refusal writes state+4 = 8).
+// PvP left-click probe on retail ActionMeleeAttack start 00717D90.
+// It is the node vtable +34 Start slot that 006D0260 calls with ECX=node and
+// FIVE stack words (owner, execution, tree, previousFailure, previousSuccess);
+// every exit is RET 14h and the body reads the tree argument. A two-argument
+// RET 8 detour left 12 bytes on 006D0260's stack, so it popped EDI=tree,
+// ESI=0 and returned to EIP=0 the first time any Host Alien started a melee
+// attack. Refusal writes execution+4 = 8.
 // Observation only, for the Alien whose melee is armed; may run on workers.
 std::atomic<std::uintptr_t> gPvPMeleeWatch{};
 // The leased Alien whose left-click melee is armed. Only its retail decision
@@ -2396,11 +2401,13 @@ std::atomic<std::uint32_t> gPvPArmedBrainFaults{};
 std::atomic<std::uint32_t> gPvPMeleeStarts{},gPvPMeleeRefused{},gPvPMeleeLastType{};
 void* gPvPMeleeStartTrampoline{};
 std::atomic<void*> gPvPMeleeStartOriginal{};
-void __fastcall PvPMeleeStartDetour(void* node, void*, std::uintptr_t character, std::uintptr_t state) noexcept {
-    using MeleeStart = void(__thiscall*)(void*, std::uintptr_t, std::uintptr_t);
+void __fastcall PvPMeleeStartDetour(void* node, void*, std::uintptr_t character, std::uintptr_t state,
+    std::uintptr_t tree, std::uint32_t previousFailure, std::uint32_t previousSuccess) noexcept {
+    using MeleeStart = void(__thiscall*)(void*, std::uintptr_t, std::uintptr_t, std::uintptr_t,
+        std::uint32_t, std::uint32_t);
     const auto original = reinterpret_cast<MeleeStart>(gPvPMeleeStartOriginal.load(std::memory_order_acquire));
     if (original == nullptr) return;
-    original(node, character, state);
+    original(node, character, state, tree, previousFailure, previousSuccess);
     if (character == 0U || character != gPvPMeleeWatch.load(std::memory_order_relaxed)) return;
     gPvPMeleeStarts.fetch_add(1U, std::memory_order_relaxed);
     std::uint32_t result{}, type{};
@@ -6395,16 +6402,10 @@ execution::Readiness CheckNativeIntent(const transactions::Record& record,const 
         !Read(binding.character+0x36CU,cycle)||!cycle||!Read(cycle+4U,owner)||owner!=binding.character)
         return execution::Readiness::Waiting;
     if(record.intent.words[0]==20U) {
-        for(std::size_t i=12U;i<20U;i+=2U) {
-            const auto& w=record.intent.words;
-            if(!w[i]&&!w[i+1])continue;
-            if((w[1]&(1U<<((i-12U)/2U)))==0U)continue;
-            if(!gScriptReferences)return execution::Readiness::Waiting;
-            bool fault{};
-            auto reference=gScriptReferences->ResolveRuntimeReference({w[i],w[i+1]},fault);
-            if(fault)return execution::Readiness::Rejected;
-            if(!reference)return execution::Readiness::Waiting;
-        }
+        native_intent::Payload isolated{};
+        if(!native_intent::IsolateObserverScripted(record.intent,isolated))return execution::Readiness::Rejected;
+        // Foreign scene refs are intentionally not resolved on an observer.
+        // In particular, THE_PLAYER must remain this PC's own camera/player.
     }
     return execution::Readiness::Ready;
 }
@@ -6472,22 +6473,15 @@ transactions::NativeOutcome InvokeNativeIntent(const transactions::Record& recor
     // keep the retail movement resource alive across callbacks and readback.
     const character_direct_step_runtime::MovementResourceLease resources(binding.character);
     if(!resources||!NativeIntentActorCurrent(record,binding))return NativeOutcome::Unknown;
-    // Retain resolved CATHODE objects across destruction of the old cycle and
-    // initialization of the new graph. A readiness probe alone does not pin.
-    std::array<WorldEntityLease,4> scriptReferences{};
+    // Receipts keep the exact Host instruction. Only the local native call is
+    // isolated from global CATHODE placement/camera/clock references.
+    native_intent::Payload isolated{};
+    const native_intent::Payload* replay=&record.intent;
     if(record.intent.words[0]==20U) {
-        const auto& p=record.intent.words;
-        for(std::size_t i=0;i<scriptReferences.size();++i) {
-            const auto at=12U+2U*i;
-            if(!p[at]&&!p[at+1U])continue;
-            if(!gScriptReferences)return NativeOutcome::Unknown;
-            bool fault{};
-            scriptReferences[i]=gScriptReferences->ResolveRuntimeReference({p[at],p[at+1U]},fault);
-            if(fault||((p[1]&(1U<<i))!=0U&&!scriptReferences[i])||
-                !NativeIntentActorCurrent(record,binding))return NativeOutcome::Unknown;
-        }
+        if(!native_intent::IsolateObserverScripted(record.intent,isolated))return NativeOutcome::Rejected;
+        replay=&isolated;
     }
-    const auto& w=record.intent.words;const auto entry=NativeIntentContract(w[0]);
+    const auto& w=replay->words;const auto entry=NativeIntentContract(w[0]);
     std::uint32_t args[2]{w[2],w[3]};alignas(16) std::uint8_t identities[2][0x60]{};
     // 006586A0 -> 00401410 copies with MOVAPS: the pointed-to vector,
     // not just the enclosing stack frame, must be aligned to sixteen bytes.

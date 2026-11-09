@@ -10,7 +10,6 @@
 #include "aimp/AnimationSyncRuntime.h"
 #include "aimp/AnimationSyncPropsRuntime.h"
 #include "aimp/HidingDoorPresentation.h"
-#include "aimp/HidingPresentationAudio.h"
 
 #include "aimp/CrashGuard.h"
 #include "aimp/HookManager.h"
@@ -2622,41 +2621,6 @@ __declspec(naked) void NpcLocomotionPreTransformDetour() {
 
 #endif
 
-std::atomic<std::uint64_t> gHidingFollowFrames{0U};
-std::atomic<std::uint64_t> gHidingFollowRejected{0U};
-std::atomic<std::uint64_t> gHidingExitHeadingFrames{0U};
-
-// The remote actor plays the first-person locker clip without its root motion,
-// so it never leaves the prop. During the entry and exit clips, carry it along
-// the owner's own network path (the owner's Character really walks in/out),
-// smoothed per frame, while the clip keeps animating the body.
-void FollowHidingClipPath(MovementSlot& slot, const std::uintptr_t characterAddress) noexcept {
-    float targetX{}, targetY{}, targetZ{}, currentX{}, currentY{}, currentZ{};
-    if (!LoadNetworkTarget(slot, targetX, targetY, targetZ) ||
-        !ReadTransform(characterAddress, currentX, currentY, currentZ)) return;
-    const auto dx = targetX - currentX, dy = targetY - currentY, dz = targetZ - currentZ;
-    const auto distance = std::sqrt(dx * dx + dy * dy + dz * dz);
-    if (!std::isfinite(distance) || distance > kHidingFollowMaximumGap) {
-        gHidingFollowRejected.fetch_add(1U, std::memory_order_relaxed);
-        return;
-    }
-    if (distance > kHidingFollowDeadZone) {
-        const auto scale = distance > kHidingFollowMaximumStep ? kHidingFollowMaximumStep / distance : 1.0F;
-        const float position[3]{currentX + dx * scale, currentY + dy * scale, currentZ + dz * scale};
-        if (!TeleportCharacter(characterAddress, position[0], position[1], position[2]) ||
-            !GuardedWriteValue(characterAddress + kCharacterPositionOffset, position[0]) ||
-            !GuardedWriteValue(characterAddress + kCharacterPositionOffset + 4, position[1]) ||
-            !GuardedWriteValue(characterAddress + kCharacterPositionOffset + 8, position[2])) {
-            gHidingFollowRejected.fetch_add(1U, std::memory_order_relaxed);
-            return;
-        }
-    }
-    // Orientation stays the clip's own alignment: the owner's Character yaw
-    // keeps the entry heading while hidden, so following it would turn the
-    // actor back into the locker.
-    gHidingFollowFrames.fetch_add(1U, std::memory_order_relaxed);
-}
-
 std::atomic<std::uint64_t> gAnimationFollowFrames{0U};
 std::atomic<std::uint64_t> gAnimationFollowRejected{0U};
 
@@ -2668,6 +2632,7 @@ void FollowAnimationClipPath(MovementSlot& slot, const std::uintptr_t characterA
     float targetX{}, targetY{}, targetZ{}, currentX{}, currentY{}, currentZ{};
     if (!LoadNetworkTarget(slot, targetX, targetY, targetZ) ||
         !ReadTransform(characterAddress, currentX, currentY, currentZ)) return;
+    targetY += animation_sync::HeightOffset(characterAddress);
     const auto dx = targetX - currentX, dy = targetY - currentY, dz = targetZ - currentZ;
     const auto distance = std::sqrt(dx * dx + dy * dy + dz * dz);
     if (!std::isfinite(distance) || distance > kHidingFollowMaximumGap) {
@@ -2715,28 +2680,6 @@ void PumpSlotOnEngineThread(
         return;
     }
 
-    if (player_hiding_presentation::Active(characterAddress)) {
-        slot.hidingOwned.store(true, std::memory_order_release);
-        slot.initialPlacementPending.store(true, std::memory_order_release);
-        slot.nativeStateActive.store(false, std::memory_order_release);
-        slot.moveActive.store(false, std::memory_order_release);
-        slot.driveRequested.store(false, std::memory_order_release);
-        slot.certifiedCycleAddress.store(0U, std::memory_order_release);
-        slot.preparedTargetRevision.store(0U, std::memory_order_release);
-        // After the retail tick, so the clip cannot pull the actor back.
-        if (phase == EnginePumpPhase::PostCharacterManager &&
-            player_hiding_presentation::ClipPlaying(characterAddress))
-            FollowHidingClipPath(slot, characterAddress);
-        // While invisible inside the prop, turn the body to face out so the
-        // exit clip starts facing the right way instead of turning afterwards.
-        float exitYaw{};
-        if (phase == EnginePumpPhase::PostCharacterManager &&
-            player_hiding_presentation::HiddenExitHeading(characterAddress, exitYaw) &&
-            WriteReplicatedYaw(characterAddress, exitYaw))
-            gHidingExitHeadingFrames.fetch_add(1U, std::memory_order_relaxed);
-        return;
-    }
-
     // A replicated interaction clip owns the representation: no Move/Idle;
     // the follower re-places it once the clip ends.
     if (animation_sync::OwnsMovement(characterAddress)) {
@@ -2748,6 +2691,17 @@ void PumpSlotOnEngineThread(
         slot.preparedTargetRevision.store(0U, std::memory_order_release);
         if (phase == EnginePumpPhase::PostCharacterManager && animation_sync::ClipPlaying(characterAddress))
             FollowAnimationClipPath(slot, characterAddress);
+        return;
+    }
+
+    if (player_hiding_presentation::Active(characterAddress)) {
+        slot.hidingOwned.store(true, std::memory_order_release);
+        slot.initialPlacementPending.store(true, std::memory_order_release);
+        slot.nativeStateActive.store(false, std::memory_order_release);
+        slot.moveActive.store(false, std::memory_order_release);
+        slot.driveRequested.store(false, std::memory_order_release);
+        slot.certifiedCycleAddress.store(0U, std::memory_order_release);
+        slot.preparedTargetRevision.store(0U, std::memory_order_release);
         return;
     }
 
@@ -3452,16 +3406,14 @@ bool Install(
     player_torch::Initialize(moduleBase);
     player_hiding::Initialize(moduleBase);
     player_hiding_presentation::Initialize(moduleBase, reinterpret_cast<std::uintptr_t>(gEnterIdleCycle));
-    if (!animation_sync::props::Install(hooks, moduleBase, error)) {
-        std::string rollbackError;
-        static_cast<void>(hooks.UninstallFrom(hookCheckpoint, rollbackError));
-        error = "AnimationSync attachment observation: " + error;
-        return false;
-    }
+    // Optional: prop attachments only decorate a replayed clip. A failed
+    // observation hook must never take remote movement down with it.
+    std::string propsError;
+    static_cast<void>(animation_sync::props::Install(hooks, moduleBase, propsError));
     animation_sync::Initialize(moduleBase, reinterpret_cast<std::uintptr_t>(gEnterIdleCycle));
-    std::string hidingAudioError;
-    if (hiding_presentation_audio::Initialize(moduleBase, hidingAudioError))
-        static_cast<void>(hiding_presentation_audio::InstallMetadataFilter(hooks, hidingAudioError));
+    // Optional as well: without the layer-blend redirect clips play unmasked.
+    std::string maskError;
+    static_cast<void>(animation_sync::InstallMaskHook(hooks, moduleBase, maskError));
     gInstalled.store(true, std::memory_order_release);
     return true;
 #endif
@@ -3513,6 +3465,7 @@ void PumpOnEngineThread(const EnginePumpPhase phase) noexcept {
     if (phase == EnginePumpPhase::PostCharacterManager) {
         player_torch::PumpAllOnEngineThread();
         player_hiding::PumpAllOnEngineThread();
+        animation_sync::ApplyMasksOnEngineThread();
     }
 }
 
@@ -3751,9 +3704,7 @@ bool ApplyReplicatedYaw(
     return false;
 }
 HidingFollowStats HidingFollowSnapshot() noexcept {
-    return {gHidingFollowFrames.load(std::memory_order_relaxed),
-        gHidingFollowRejected.load(std::memory_order_relaxed),
-        gHidingExitHeadingFrames.load(std::memory_order_relaxed)};
+    return {}; // legacy manual locker follower retired; AnimationSync owns it
 }
 
 bool ApplyAIRecoveryTransform(std::uintptr_t character,const float* position,float yaw) noexcept {

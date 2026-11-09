@@ -1,5 +1,6 @@
 #include "aimp/PlayerHidingRuntime.h"
 #include "aimp/AISync.h"
+#include "aimp/AnimationSyncRuntime.h"
 #include "aimp/CharacterIncarnation.h"
 #include "aimp/AlienPvPHidingSearchPolicy.h"
 
@@ -434,7 +435,10 @@ void PumpOnEngineThread(const std::uintptr_t character, const std::uintptr_t man
         state = *slot;
     }
 
-    const auto desired = state.diagnostics.desired && !state.pvpCaptureRevealed && !SearchVisible(character);
+    // PLAYER_HIDING can be set before the native entrance has finished. Let
+    // observers see its authored turn and settle before concealing the body.
+    const auto desired = state.diagnostics.desired && !state.pvpCaptureRevealed &&
+        !SearchVisible(character) && !animation_sync::HidingTransitionPlaying(character);
     bool concealed{}, applied{}, success{true};
     const auto readable = ReadConcealed(character, concealed);
     // Hide whenever the owner is hidden and the body is visible (retail may

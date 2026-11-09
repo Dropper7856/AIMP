@@ -456,6 +456,12 @@ if(BUILD_TESTING)
     target_compile_options(AIMP.AISyncTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
     add_test(NAME AISyncOwnershipAndNavigation COMMAND AIMP.AISyncTests
         "${CMAKE_CURRENT_SOURCE_DIR}/../tests/fixtures/aisync-participant-config-v3.hex")
+    add_executable(AIMP.AnimationSyncPropsHookTests tests/AnimationSyncPropsHookTests.cpp)
+    target_link_libraries(AIMP.AnimationSyncPropsHookTests PRIVATE AIMP.Core)
+    target_compile_options(AIMP.AnimationSyncPropsHookTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.AnimationSyncPropsHookTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME AnimationSyncPropsHookInstallation COMMAND AIMP.AnimationSyncPropsHookTests)
     add_executable(AIMP.AISyncHookTests tests/AISyncHookInstallationTests.cpp)
     target_link_libraries(AIMP.AISyncHookTests PRIVATE AIMP.Core)
     target_compile_definitions(AIMP.AISyncHookTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

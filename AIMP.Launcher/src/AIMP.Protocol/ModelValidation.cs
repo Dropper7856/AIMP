@@ -882,7 +882,7 @@ public static class ModelValidation
         if (value is null
             || !GameCommandNames.All.Contains(value.Command)
             || value.Arguments is null
-            || value.Arguments.Count > 16)
+            || value.Arguments.Count > 17)
         {
             throw new ProtocolException("The game command is invalid.");
         }

@@ -276,6 +276,12 @@ DWORD Bootstrap::RunImpl() {
         {{"architecture", "x86"},
          {"runtime", "static_msvc"},
          {"module", Diagnostics::Pointer(module_)}});
+    // This tag comes from the same object file as the attachment hook fix.
+    // Launcher and DLL revisions are delivered together and must match exactly.
+    diagnostics.Log(
+        "info",
+        "animationsync_patch_build",
+        animation_sync::props::BuildTag());
     LogResearchGates(diagnostics);
 
     const auto executablePath = CurrentExecutablePath();
@@ -759,6 +765,11 @@ DWORD Bootstrap::RunImpl() {
                 resolver->Resolve(SymbolId::GlobalStateRoot),
                 *hooks,
                 characterMovementHookError)) {
+            diagnostics.Log(
+                "info",
+                "animationsync_props_hook_installed",
+                "AnimationSync attachment observation is installed with persistent and atomic trampoline outputs; it was not skipped.",
+                {{"buildId", animation_sync::props::BuildTag()}});
             diagnostics.Log(
                 "info",
                 "character_movement_realtime_hook",
