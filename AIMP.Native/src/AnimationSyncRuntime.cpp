@@ -1070,6 +1070,7 @@ bool HidingClipPlaying(const std::uintptr_t character, const std::uint32_t phase
     Cycle current{};
     return slot != nullptr && slot->owned.address != 0U && RemoteReady(character) &&
         ReadCycle(character, current) && Owned(current, slot->owned) &&
+        current.graph != 0U && (current.flags & 6U) == 0U &&
         player_hiding_presentation::ClassifyClip(slot->owned.animation).phase == phase;
 }
 bool HidingEntryPlaying(const std::uintptr_t character) noexcept {
