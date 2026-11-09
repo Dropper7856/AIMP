@@ -51,8 +51,20 @@ int main() {
     Check(std::abs(aimp::animation_sync::PosturalHeightOffset(0.03F, 2.0F, 1.85F) - 0.18F) < 0.0001F &&
         std::abs(aimp::animation_sync::PosturalHeightOffset(0.03F, 2.0F, 2.0F) - 0.03F) < 0.0001F,
         "A small first-person crouch does not lower the remote actor");
-    Check(std::abs(aimp::animation_sync::PosturalHeightOffset(0.03F, 2.0F, 1.5F) - 0.03F) < 0.0001F,
+    Check(std::abs(aimp::animation_sync::PosturalHeightOffset(0.03F, 2.0F, 1.5F) - 0.3425F) < 0.0001F,
+        "Intermediate first-person lean fades height correction without popping");
+    Check(std::abs(aimp::animation_sync::PosturalHeightOffset(0.03F, 2.0F, 1.25F) - 0.03F) < 0.0001F,
         "Real traversal over a larger vertical gap remains synchronized");
+    Check(std::abs(aimp::animation_sync::PosturalHeightOffset(0.03F, 2.0F, 1.65F) -
+        aimp::animation_sync::PosturalHeightOffset(0.03F, 2.0F, 1.6499F)) < 0.001F,
+        "Height correction is continuous at the old snapping transition");
+    Check(DeferExitReveal(3U, true, false, 300U) &&
+        !DeferExitReveal(3U, true, true, 300U) &&
+        !DeferExitReveal(3U, true, false, 1500U),
+        "Native exit admission or bounded timeout controls actor reveal");
+    Check(!DeferExitReveal(2U, true, false, 100U) &&
+        !DeferExitReveal(3U, false, false, 100U),
+        "Entry, hidden idle and already-visible characters do not delay reveal");
     state.hierarchyHash = 123U; state.animate = false;
     Initialize(0U);
     std::string error;

@@ -36,7 +36,12 @@ struct State final {
 [[nodiscard]] inline float PosturalHeightOffset(float baseline, float ownerStartY, float ownerY) noexcept {
     if (!std::isfinite(baseline) || !std::isfinite(ownerStartY) || !std::isfinite(ownerY)) return baseline;
     const auto delta = ownerStartY - ownerY;
-    return std::abs(delta) <= 0.25F ? baseline + delta : baseline;
+    const auto distance = std::abs(delta);
+    // Smoothly fade compensation; the old 25-cm switch jerked the visible
+    // character during first-person locker leaning.
+    if (distance <= 0.35F) return baseline + delta;
+    if (distance >= 0.75F) return baseline;
+    return baseline + delta * ((0.75F - distance) / 0.40F);
 }
 inline constexpr std::uint32_t kMaximumElapsedMilliseconds = 60000U;
 inline bool Active(const State& value) noexcept { return value.transition != 0U; }

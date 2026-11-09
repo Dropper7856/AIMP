@@ -86,7 +86,7 @@ struct Slot final {
     std::uint64_t holsterStarted{}, unarmedAt{}, holsterWait{};
     // The owner's player position sits a few cm below where a crew
     // representation stands; the clip keeps the representation's grounding.
-    float heightOffset{}, ownerStartY{};
+    float heightOffset{}, ownerStartY{}, ownedYaw{};
     Cycle owned{};
     RemoteDiagnostics diagnostics{};
 };
@@ -769,6 +769,7 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
     if (constructed) {
         slot.owned = current; slot.startedAt = now; slot.ownedLoops = playback.loops;
         slot.ownerStartY = slot.desired.position[1];
+        slot.ownedYaw = heading;
     }
     if (!invoked || !constructed || (current.flags & 4U) != 0U || current.graph == 0U) {
         ++d.failed; d.stage = "native-admission"; return;
@@ -807,6 +808,7 @@ bool PumpOne(const std::uintptr_t character) noexcept {
     slot->maskActive = copy.maskActive; slot->crewDriven = copy.crewDriven; slot->crewDisplaced = copy.crewDisplaced;
     slot->holsterStarted = copy.holsterStarted; slot->unarmedAt = copy.unarmedAt; slot->holsterWait = copy.holsterWait;
     slot->heightOffset = copy.heightOffset; slot->ownerStartY = copy.ownerStartY;
+    slot->ownedYaw = copy.ownedYaw;
     slot->diagnostics = copy.diagnostics;
     if (slot->desired.transition == copy.desired.transition) slot->handled = copy.handled;
     return true;
@@ -1053,19 +1055,31 @@ float HeightOffset(const std::uintptr_t character, const float ownerY) noexcept 
 float PlaybackYaw(const std::uintptr_t character, const float ownerYaw) noexcept {
     const std::lock_guard lock(gMutex);
     const auto* slot = Find(character);
-    return slot != nullptr && slot->owned.address != 0U &&
-        player_hiding_presentation::ClassifyClip(slot->owned.animation).phase == 3U
-        ? player_hiding_presentation::ExitYaw(ownerYaw) : ownerYaw;
+    if (slot == nullptr || slot->owned.address == 0U) return ownerYaw;
+    const auto phase = player_hiding_presentation::ClassifyClip(slot->owned.animation).phase;
+    // An interaction bound to a locker handle needs the heading captured at
+    // admission, not the moving first-person camera while inside the locker.
+    return phase == 1U || phase == 3U ? slot->ownedYaw : ownerYaw;
 }
 bool ClipPlaying(const std::uintptr_t character) noexcept {
     return OwnsMovement(character);
 }
-bool HidingTransitionPlaying(const std::uintptr_t character) noexcept {
+bool HidingClipPlaying(const std::uintptr_t character, const std::uint32_t phase) noexcept {
     const std::lock_guard lock(gMutex);
     const auto* slot = Find(character);
-    if (slot == nullptr || slot->owned.address == 0U) return false;
-    const auto phase = player_hiding_presentation::ClassifyClip(slot->owned.animation).phase;
-    return phase == 1U || phase == 3U;
+    Cycle current{};
+    return slot != nullptr && slot->owned.address != 0U && RemoteReady(character) &&
+        ReadCycle(character, current) && Owned(current, slot->owned) &&
+        player_hiding_presentation::ClassifyClip(slot->owned.animation).phase == phase;
+}
+bool HidingEntryPlaying(const std::uintptr_t character) noexcept {
+    return HidingClipPlaying(character, 1U);
+}
+bool HidingExitPlaying(const std::uintptr_t character) noexcept {
+    return HidingClipPlaying(character, 3U);
+}
+bool HidingTransitionPlaying(const std::uintptr_t character) noexcept {
+    return HidingEntryPlaying(character) || HidingExitPlaying(character);
 }
 void Forget(const std::uintptr_t character) noexcept {
     const std::lock_guard lock(gMutex);

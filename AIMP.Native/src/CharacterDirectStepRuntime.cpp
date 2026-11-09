@@ -2689,7 +2689,11 @@ void PumpSlotOnEngineThread(
         slot.driveRequested.store(false, std::memory_order_release);
         slot.certifiedCycleAddress.store(0U, std::memory_order_release);
         slot.preparedTargetRevision.store(0U, std::memory_order_release);
-        if (phase == EnginePumpPhase::PostCharacterManager && animation_sync::ClipPlaying(characterAddress))
+        // The entry animation is anchored at the locker handle. Following
+        // the owner's movement inside the prop pulls the hands out of place.
+        if (phase == EnginePumpPhase::PostCharacterManager &&
+            animation_sync::ClipPlaying(characterAddress) &&
+            !animation_sync::HidingEntryPlaying(characterAddress))
             FollowAnimationClipPath(slot, characterAddress);
         return;
     }

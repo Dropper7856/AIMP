@@ -45,6 +45,9 @@ bool InstallMaskHook(HookManager& hooks, std::uintptr_t moduleBase, std::string&
 // Keep the actor visible through native locker entry/exit, but allow the
 // occupancy runtime to conceal a settled hidden idle (which may loop).
 [[nodiscard]] bool HidingTransitionPlaying(std::uintptr_t character) noexcept;
+// Only true for an already constructed and owned native animation cycle.
+[[nodiscard]] bool HidingEntryPlaying(std::uintptr_t character) noexcept;
+[[nodiscard]] bool HidingExitPlaying(std::uintptr_t character) noexcept;
 // Height kept while the clip plays: representation ground minus owner position.
 [[nodiscard]] float HeightOffset(std::uintptr_t character, float ownerY) noexcept;
 // A hiding exit uses its authored outward heading, not the owner network yaw.

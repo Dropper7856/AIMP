@@ -33,6 +33,12 @@ struct ClipSelection final { std::uint32_t phase{}, kind{}; };
     if (kind == 2U) return phase == 1U ? 0x80645982U : phase == 2U ? 0x15691ACEU : phase == 3U ? 0x3FDD3AF4U : 0U;
     return 0U;
 }
+// Stay concealed until the exit clip is admitted, but do not wait forever if
+// streaming or native execution fails.
+[[nodiscard]] constexpr bool DeferExitReveal(std::uint32_t phase, bool concealedByUs,
+    bool exitPlaying, std::uint64_t elapsedMs) noexcept {
+    return phase == 3U && concealedByUs && !exitPlaying && elapsedMs < 1500U;
+}
 // Hiding keeps the owner's entry heading. The outgoing clip is authored
 // facing out of the prop, half a turn away from that stored heading.
 [[nodiscard]] constexpr float ExitYaw(float entryYaw) noexcept {

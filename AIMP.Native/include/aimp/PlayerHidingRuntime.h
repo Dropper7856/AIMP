@@ -43,7 +43,7 @@ DiagnosticsSnapshot Snapshot(std::uintptr_t character) noexcept;
 // Cumulative since Initialize, including actors whose per-stay mailbox has
 // already been released. Zero counters in Snapshot alone are not history.
 struct HistorySnapshot final {
-    std::uint64_t hiddenEdges{}, visibleEdges{}, hides{}, shows{}, failures{};
+    std::uint64_t hiddenEdges{}, visibleEdges{}, hides{}, shows{}, failures{}, exitRevealDeferredFrames{};
     std::uintptr_t lastHiddenRequestedCharacter{}, lastHiddenCharacter{}, lastShownCharacter{};
 };
 HistorySnapshot History() noexcept;

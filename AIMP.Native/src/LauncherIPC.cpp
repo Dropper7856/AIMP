@@ -3508,6 +3508,7 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
              {"localHidden", Diagnostics::Unsigned(hidingLocal.hidden), true},
              {"localExiting", Diagnostics::Unsigned(hidingLocal.exiting), true},
              {"localUnavailable", Diagnostics::Unsigned(hidingLocal.unavailable), true},
+             {"exitRevealDeferredFrames", Diagnostics::Unsigned(hidingHistory.exitRevealDeferredFrames), true},
              {"clipFollowFrames", Diagnostics::Unsigned(hidingFollow.frames), true},
              {"clipFollowRejected", Diagnostics::Unsigned(hidingFollow.rejected), true},
              {"hiddenExitHeadingFrames", Diagnostics::Unsigned(hidingFollow.exitHeadingFrames), true},

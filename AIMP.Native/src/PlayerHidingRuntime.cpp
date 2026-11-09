@@ -69,7 +69,7 @@ struct Spot final {
 
 struct Slot final {
     std::uintptr_t character{};
-    std::uint64_t epoch{}, retryAt{}, spotRetryAt{};
+    std::uint64_t epoch{}, retryAt{}, spotRetryAt{}, exitRevealAt{};
     // This runtime hid the body. Never reveal a body hidden by retail itself
     // (death, despawn, cinematic): only undo our own concealment.
     bool concealedByUs{};
@@ -435,10 +435,17 @@ void PumpOnEngineThread(const std::uintptr_t character, const std::uintptr_t man
         state = *slot;
     }
 
-    // PLAYER_HIDING can be set before the native entrance has finished. Let
-    // observers see its authored turn and settle before concealing the body.
-    const auto desired = state.diagnostics.desired && !state.pvpCaptureRevealed &&
-        !SearchVisible(character) && !animation_sync::HidingTransitionPlaying(character);
+    // A settled hidden player must disappear even if the entry clip is still
+    // finishing. Conversely, wait until the actual exit clip has started
+    // before showing the body again, with bounded failure recovery.
+    const auto now = GetTickCount64();
+    const auto exitAge = state.exitRevealAt != 0U && now >= state.exitRevealAt
+        ? now - state.exitRevealAt : 1500U;
+    const auto deferExit = player_hiding_presentation::DeferExitReveal(
+        state.presentation.phase, state.concealedByUs,
+        animation_sync::HidingExitPlaying(character), exitAge);
+    const auto desired = (state.diagnostics.desired || deferExit) &&
+        !state.pvpCaptureRevealed && !SearchVisible(character);
     bool concealed{}, applied{}, success{true};
     const auto readable = ReadConcealed(character, concealed);
     // Hide whenever the owner is hidden and the body is visible (retail may
@@ -449,7 +456,7 @@ void PumpOnEngineThread(const std::uintptr_t character, const std::uintptr_t man
         applied = true;
         success = ApplyVisibility(character, needHide, concealed, state.diagnostics.stage);
     } else if (readable && !needHide && !needShow) {
-        state.diagnostics.stage = desired ? "hidden" : "visible";
+        state.diagnostics.stage = deferExit ? "exit-await-animation" : desired ? "hidden" : "visible";
     }
 
     std::scoped_lock lock(gMutex);
@@ -460,6 +467,7 @@ void PumpOnEngineThread(const std::uintptr_t character, const std::uintptr_t man
     }
     slot->diagnostics.concealed = concealed;
     slot->diagnostics.stage = state.diagnostics.stage;
+    if (deferExit) ++gHistory.exitRevealDeferredFrames;
     if (applied) {
         if (success) {
             slot->concealedByUs = needHide;
@@ -562,6 +570,13 @@ bool Publish(const std::uintptr_t character, const bool hidden, const std::array
         Orphan(slot->spot);
         slot->spot = {};
         slot->spotRetryAt = 0U;
+    }
+    if (phase == 3U) {
+        if (slot->presentation.phase != 3U ||
+            slot->presentation.transition != presentation->transition)
+            slot->exitRevealAt = GetTickCount64();
+    } else {
+        slot->exitRevealAt = 0U;
     }
     slot->diagnostics.desired = concealed;
     slot->occupied = occupied;
