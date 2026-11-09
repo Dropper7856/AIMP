@@ -15,7 +15,7 @@ internal static class GamePreparationSynchronization
 
 public sealed class GamePreparationService
 {
-    private const int RecipeVersion = 14; // Prepare campaign destinations for native SwitchLevel continuity.
+    private const int RecipeVersion = 15; // Import multiplayer E_RIPLEY into campaign levels as well as compiling their manifests.
     private readonly object _sync = new();
     private readonly LauncherSettingsStore _settings;
     private readonly LauncherDiagnostics _diagnostics;
@@ -258,9 +258,14 @@ public sealed class GamePreparationService
                 }
                 Update("Character", 2, 0, levels.Length, string.Empty, "Preparing multiplayer characters");
                 var timer = Stopwatch.StartNew();
+                // Every discovered campaign level receives a manifest below.
+                // The previous default includeCampaign=false omitted E_RIPLEY
+                // and its DisplayModel dependencies from those same levels.
+                // The native Spawn130 receiver still acknowledged the request,
+                // but no remote Character was ever materialized.
                 RipleyCharacterInstaller.Install(game, new InlineProgress<RipleyInstallProgress>(p =>
                     Update("Character", 2 + (int)(38L * p.CompletedLevels / Math.Max(1, p.TotalLevels)),
-                        p.CompletedLevels, p.TotalLevels, p.Level, p.Message)), token);
+                        p.CompletedLevels, p.TotalLevels, p.Level, p.Message)), token, includeCampaign: true);
                 // The character step held every level's assets; return that memory
                 // before sizing the manifest workers on the free physical memory.
                 GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
