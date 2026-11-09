@@ -146,8 +146,16 @@ internal static class MissionSyncFrontierCompiler
                 && Addressable(source) && InMission(source)
                 && source.Kind is WorldEntityKind.CompositeInstance or WorldEntityKind.Function or WorldEntityKind.Proxy
                 && group.All(ControlTarget))
+            // All authored destinations have been certified as data-free
+            // control inputs above: CompositeInstance methods are explicitly
+            // NoTypedData, while Function destinations use the small stateless
+            // ControlInputs allowlist. The outgoing native callback can carry
+            // a sender-local CATHODE reference even though no receiver reads
+            // it. Never serialize that pointer; only replay the control edge.
+            // Previously PayloadTolerant=false left every such campaign output
+            // local (657/748 rejected in the BSP_TORRENS diagnostics).
             .Select(group => new MissionSyncFrontier(entities[group.Key.SourceEntity], group.Key.SourceParameter,
-                PayloadTolerant: false, Repeatable: true, OrderedOccurrences: true,
+                PayloadTolerant: true, Repeatable: true, OrderedOccurrences: true,
                 PlayerIngress: entities[group.Key.SourceEntity].PrimitiveName is
                     "PlayerTriggerBox" or "PlayerTriggerSphere" or "Interaction" or "MonitorPadInput" or "ButtonMashPrompt")).ToList();
         // Intercept a whole nested mission/sequence at its public Method, before

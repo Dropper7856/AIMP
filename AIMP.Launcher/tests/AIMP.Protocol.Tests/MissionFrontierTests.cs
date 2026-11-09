@@ -29,6 +29,14 @@ internal static class MissionFrontierTests
         var roots = MissionSyncFrontierCompiler.Compile(manifest);
         AssertEx.Equal(1, roots.Count); // UI objective is part of the same authored fan-out.
         AssertEx.Equal(Source, roots[0].Source.EntityId);
+        // A campaign mission output feeding exclusively a stateless control
+        // input is safe to replay without its sender-local callback reference.
+        var controlOnly = manifest with { Connections = manifest.Connections
+            .Where(value => value.TargetEntity == Objective).ToArray() };
+        var campaign = MissionSyncFrontierCompiler.Compile(controlOnly);
+        AssertEx.Equal(1, campaign.Count);
+        AssertEx.True(campaign[0].PayloadTolerant);
+        AssertEx.True(campaign[0].OrderedOccurrences);
         var typedBranch = manifest with { Connections = manifest.Connections.Append(
             new WorldConnectionDescriptor(Source, Port("key_accepted"), Door, Port("position"), true)).ToArray() };
         AssertEx.Equal(0, MissionSyncFrontierCompiler.Compile(typedBranch).Count);
