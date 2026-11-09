@@ -194,6 +194,17 @@ public sealed partial class LobbyHost : IAsyncDisposable
     public event EventHandler<PlayerEquipmentSnapshotPayload>? PlayerEquipmentReceived;
 
     public event EventHandler<PlayerActionEventPayload>? PlayerActionReceived;
+    // Host emits a single authoritative skip edge per held-Enter press.
+    public Task PublishHostCinematicSkipAsync(CinematicSkipPayload payload,
+        CancellationToken cancellationToken = default)
+    {
+        ModelValidation.Validate(payload);
+        lock (_stateLock)
+            if (payload.SessionId != SessionId || payload.LevelGeneration != _levelGeneration)
+                throw new InvalidOperationException("Cinematic skip belongs to another lobby generation.");
+        return BroadcastAsync(MessageType.CinematicSkipCommitted,
+            JsonPayload.Serialize(payload),cancellationToken);
+    }
     public event EventHandler<ReadOnlyMemory<byte>>? AISyncImpactReceived;
 
     public event EventHandler<WorldNetworkContext>? WorldContextReceived;
@@ -1283,6 +1294,8 @@ public sealed partial class LobbyHost : IAsyncDisposable
                     break;
                 case MessageType.CampaignSaveChunk:
                     throw new ProtocolException("Clients may not upload campaign saves.");
+                case MessageType.CinematicSkipCommitted:
+                    throw new ProtocolException("Only the Host can skip a campaign cinematic.");
                 case MessageType.AISyncExecutionControl:
                     HandleAISyncExecutionControl(state, frame.Payload);
                     break;

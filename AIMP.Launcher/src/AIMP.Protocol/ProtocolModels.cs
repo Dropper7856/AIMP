@@ -376,6 +376,10 @@ public sealed record PlayerActionEventPayload(
     int CurrentEquipmentIndex,
     int PresentationState);
 
+// Cutscene skip never carries a native pointer, input event, or client proposal.
+// Only the Host can decide this one-shot gameplay transition.
+public sealed record CinematicSkipPayload(Guid SessionId,int LevelGeneration,ulong Sequence);
+
 public sealed record LobbyStartPayload(
     Guid SessionId,
     long StartAtUnixMilliseconds,

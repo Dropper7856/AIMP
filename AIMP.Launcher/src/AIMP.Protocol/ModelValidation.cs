@@ -368,6 +368,13 @@ public static class ModelValidation
             throw new ProtocolException("The player-action event is invalid.");
     }
 
+    public static void Validate(CinematicSkipPayload? value)
+    {
+        if (value is null || value.SessionId==Guid.Empty
+            || value.LevelGeneration<1 || value.Sequence==0UL)
+            throw new ProtocolException("The Host cinematic-skip decision is invalid.");
+    }
+
     public static void Validate(LobbyPreparationPayload? value)
     {
         if (value is null || value.SessionId == Guid.Empty || value.PeerId == 0

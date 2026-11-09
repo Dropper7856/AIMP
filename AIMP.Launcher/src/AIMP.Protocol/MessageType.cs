@@ -115,6 +115,7 @@ public enum MessageType : ushort
 
     CampaignSaveRequest = 156, // Authenticated client -> host; selected immutable save only.
     CampaignSaveChunk = 157, // Host -> requesting client; ordered bounded download.
+    CinematicSkipCommitted = 158, // Authenticated Host -> Clients only; current campaign generation.
 
     TestModeConfigure = 200,
     CapabilityQuery = 201,

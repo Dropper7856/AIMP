@@ -69,6 +69,7 @@ public sealed partial class LobbyClient : IAsyncDisposable
     public event EventHandler<PlayerEquipmentSnapshotPayload>? PlayerEquipmentReceived;
 
     public event EventHandler<PlayerActionEventPayload>? PlayerActionReceived;
+    public event EventHandler<CinematicSkipPayload>? CinematicSkipCommitted;
 
 
     public event EventHandler<WorldNetworkContext>? WorldContextReceived;
@@ -416,6 +417,14 @@ public sealed partial class LobbyClient : IAsyncDisposable
                         break;
                     case MessageType.MissionSignalCommitted:
                         HandleMissionSignalCommitted(frame.Payload);
+                        break;
+                    case MessageType.CinematicSkipCommitted:
+                        var cinematic = JsonPayload.Deserialize<CinematicSkipPayload>(frame.Payload.Span);
+                        ModelValidation.Validate(cinematic);
+                        if (cinematic.SessionId!=SessionId)
+                            throw new ProtocolException("Host cinematic skip session mismatch.");
+                        if (cinematic.LevelGeneration==Snapshot?.LevelGeneration)
+                            CinematicSkipCommitted?.Invoke(this,cinematic);
                         break;
                     case MessageType.Heartbeat:
                         break;

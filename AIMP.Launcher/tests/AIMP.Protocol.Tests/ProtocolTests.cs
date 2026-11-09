@@ -38,6 +38,11 @@ internal static class ProtocolTests
         var identity = Guid.NewGuid();
         var capture = CreateCapture(identity);
         ModelValidation.Validate(capture);
+        var skip = new CinematicSkipPayload(identity,1,1);
+        ModelValidation.Validate(skip);
+        AssertEx.Equal(skip,JsonPayload.Deserialize<CinematicSkipPayload>(JsonPayload.Serialize(skip)));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(skip with { Sequence=0 }));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(skip with { SessionId=Guid.Empty }));
         var decoded = JsonPayload.Deserialize<CaptureStatePayload>(
             JsonPayload.Serialize(capture));
 
