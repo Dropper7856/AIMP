@@ -28,6 +28,11 @@ internal sealed partial class MultiplayerSessionCoordinator
     private DateTimeOffset _loadingHoldStartedUtc;
     // Failsafe: the loading screen is removed automatically after this delay, whatever the barrier state.
     private static readonly TimeSpan LoadingHoldMaximumDuration = TimeSpan.FromSeconds(30);
+    // Campaign levels can open on a retail cinematic during which the held
+    // world never materializes remote Characters; they finish after release.
+    private static readonly TimeSpan CampaignLoadingHoldMaximumDuration = TimeSpan.FromSeconds(90);
+    private static readonly TimeSpan CampaignCharacterWait = TimeSpan.FromSeconds(20);
+    private bool _campaignCharacterWaitLogged;
     private static readonly TimeSpan WorldQuiescenceTimeout = TimeSpan.FromSeconds(8);
 
     private void ReportSessionPreparationProgress(NativeRuntimeSnapshot runtime, DateTimeOffset now, string positionError)
@@ -286,9 +291,9 @@ internal sealed partial class MultiplayerSessionCoordinator
         {
             if (_loadingHoldStart is { } held && _start?.SessionId == held.SessionId
                 && _start.LevelGeneration == held.LevelGeneration
-                && LevelGameMode(held.Level) != "Campaign"
                 && !_sessionReleaseRunning
-                && DateTimeOffset.UtcNow - _loadingHoldStartedUtc >= LoadingHoldMaximumDuration)
+                && DateTimeOffset.UtcNow - _loadingHoldStartedUtc >= (LevelGameMode(held.Level) == "Campaign"
+                    ? CampaignLoadingHoldMaximumDuration : LoadingHoldMaximumDuration))
             {
                 _sessionReleaseRunning = true;
                 expired = held;
@@ -320,7 +325,17 @@ internal sealed partial class MultiplayerSessionCoordinator
             var localPeer = _host?.HostPeerId ?? _client?.PeerId ?? 0UL;
             if (_lobby.Players.Any(player => player.PeerId != localPeer &&
                 (!current.AlienVsSurvivors || player.PeerId != current.AlienPeerId) &&
-                (!_remoteCharacters.TryGetValue(player.PeerId, out var character) || character == 0U))) return;
+                (!_remoteCharacters.TryGetValue(player.PeerId, out var character) || character == 0U)))
+            {
+                if (LevelGameMode(current.Level) != "Campaign"
+                    || DateTimeOffset.UtcNow - _loadingHoldStartedUtc < CampaignCharacterWait) return;
+                if (!_campaignCharacterWaitLogged)
+                {
+                    _campaignCharacterWaitLogged = true;
+                    _diagnostics.Log("Preparation", "Campaign: remote Characters are still loading; " +
+                        "releasing without them, their accepted spawns complete in gameplay.");
+                }
+            }
             var runtime = _controller.Snapshot;
             if (!runtime.IpcConnected || !runtime.EngineThreadReady) return;
             if (_worldSyncEnabledForSession && (_loadedManifest is not { } loaded

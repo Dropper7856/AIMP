@@ -45,9 +45,6 @@ int main() {
         "Exact native locker aliases bridge scriptless first-person edges");
     Check(ClipToken(0U, 1U) == 0U && ClipToken(1U, 0U) == 0U,
         "Unrelated interactions never synthesize a locker animation");
-    Check(std::abs(ExitYaw(1.0F) - (1.0F - 3.14159265358979F)) < 0.0001F &&
-        std::abs(ExitYaw(-1.0F) - (-1.0F + 3.14159265358979F)) < 0.0001F,
-        "Exit faces out of the locker on either side of the yaw wrap");
     Check(std::abs(aimp::animation_sync::PosturalHeightOffset(0.03F, 2.0F, 1.85F) - 0.18F) < 0.0001F &&
         std::abs(aimp::animation_sync::PosturalHeightOffset(0.03F, 2.0F, 2.0F) - 0.03F) < 0.0001F,
         "A small first-person crouch does not lower the remote actor");

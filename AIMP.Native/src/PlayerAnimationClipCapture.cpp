@@ -2,6 +2,7 @@
 #include "aimp/HookManager.h"
 #include "aimp/Diagnostics.h"
 #include "aimp/PlayerCharacters.h"
+#include "aimp/AnimationSyncRuntime.h"
 #include <Windows.h>
 #include <array>
 #include <atomic>
@@ -34,7 +35,15 @@ template<class T> bool Read(std::uintptr_t address, T& value) noexcept {
 void Record(void* database, const void* name, const void* contexts,
     const ClipResult* output, bool multiple) noexcept {
     std::uint32_t identity{};
-    if (!Read(reinterpret_cast<std::uintptr_t>(database) + 0x10U, identity) || !player_characters::IsRepresentation(identity)) return;
+    if (!Read(reinterpret_cast<std::uintptr_t>(database) + 0x10U, identity)) return;
+    if (!player_characters::IsRepresentation(identity)) {
+        std::uint32_t alias{}, path{};
+        ClipResult resolved{};
+        if (Read(reinterpret_cast<std::uintptr_t>(name) + 8U, alias) &&
+            Read(reinterpret_cast<std::uintptr_t>(output), resolved) && Read(resolved.resource + 0x10U, path))
+            animation_sync::ObserveResolvedAlias(identity, alias, path);
+        return;
+    }
     Row entry{}; entry.multiple = multiple;
     if (!Read(reinterpret_cast<std::uintptr_t>(name) + 8U, entry.name)) return;
     const auto contextAddress = reinterpret_cast<std::uintptr_t>(contexts);

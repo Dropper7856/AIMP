@@ -39,12 +39,6 @@ struct ClipSelection final { std::uint32_t phase{}, kind{}; };
     bool exitPlaying, std::uint64_t elapsedMs) noexcept {
     return phase == 3U && concealedByUs && !exitPlaying && elapsedMs < 1500U;
 }
-// Hiding keeps the owner's entry heading. The outgoing clip is authored
-// facing out of the prop, half a turn away from that stored heading.
-[[nodiscard]] constexpr float ExitYaw(float entryYaw) noexcept {
-    constexpr float pi = 3.14159265358979F;
-    return entryYaw > 0.0F ? entryYaw - pi : entryYaw + pi;
-}
 [[nodiscard]] constexpr ClipSelection ClassifyClip(std::uint32_t token) noexcept {
     switch (token) {
     case 0xCF2A9F36U: return {1U, 1U};
@@ -67,6 +61,9 @@ void PumpAllOnEngineThread() noexcept;
 // Compatibility no-op: this module no longer requests animation streams.
 void DrainStreamsOnEngineThread() noexcept;
 [[nodiscard]] bool Active(std::uintptr_t character) noexcept;
+// Owner's transform captured when it became hidden or started to leave:
+// inside the prop, facing out.
+[[nodiscard]] bool HiddenPlacement(std::uintptr_t character, std::array<float, 3>& position, float& yaw) noexcept;
 // Compatibility queries return false: no legacy clip or forced exit heading.
 [[nodiscard]] bool ClipPlaying(std::uintptr_t character) noexcept;
 [[nodiscard]] bool HiddenExitHeading(std::uintptr_t character, float& yaw) noexcept;

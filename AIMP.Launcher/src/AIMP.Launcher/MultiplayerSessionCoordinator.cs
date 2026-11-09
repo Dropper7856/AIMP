@@ -2769,7 +2769,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 throw new OperationCanceledException("Lobby changed while arming preparation hold.");
             _loadingHoldStart = value;
             _worldQuiescenceWaitSinceUtc = null;
-            _loadingHoldStartedUtc = DateTimeOffset.UtcNow;
+            _loadingHoldStartedUtc = DateTimeOffset.UtcNow; _campaignCharacterWaitLogged = false;
             _nextPreparationProgressUtc = DateTimeOffset.MinValue;
             _loadingOverlayAcknowledged = false;
             _loadingOverlayConnection = Guid.Empty;

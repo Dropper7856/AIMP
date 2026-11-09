@@ -30,6 +30,7 @@ constexpr float kMaximumCoordinate = 1000000.0F;
 // FUN_0078B100, the NPC_SetInvisible apply_hide/apply_show target: thiscall
 // (Character, u8) RET 4. Writes +2D9 and hides the render instances (+3F0) and
 // the equipment/torch (+1100). Retail AI ignores a target whose +2D9 is set.
+// Its prologue certifies the +2D9 offset; only that flag is written.
 constexpr std::uintptr_t kSetInvisibleRva = 0x0038B100U;
 constexpr std::array<std::uint8_t, 20> kSetInvisiblePrologue{
     0x53, 0x8B, 0x5C, 0x24, 0x08, 0x56, 0x8B, 0xF1, 0x8D, 0x8E,
@@ -179,13 +180,14 @@ bool ApplyVisibility(const std::uintptr_t character, const bool hide, bool& conc
         stage = "local-player-guard";
         if (!IsRemoteCharacter(character)) return false;
         stage = hide ? "hide" : "show";
-        using SetInvisible = void(__thiscall*)(void*, std::uint8_t);
 #ifdef AIMP_HIDING_SEARCH_TEST
-        const SetInvisible setter=&hiding_test::SetInvisible;
+        hiding_test::SetInvisible(reinterpret_cast<void*>(character),static_cast<std::uint8_t>(hide?1U:0U));
 #else
-        const auto setter=reinterpret_cast<SetInvisible>(gModuleBase+kSetInvisibleRva);
+        // Only the first statement of FUN_0078B100: the logic flag retail AI
+        // checks. A first-person player really stands inside the locker, so the
+        // render instances (+3F0) and equipment (+1100) stay visible.
+        *reinterpret_cast<std::uint8_t*>(character + kInvisibleOffset) = static_cast<std::uint8_t>(hide ? 1U : 0U);
 #endif
-        setter(reinterpret_cast<void*>(character),hide?1U:0U);
         concealed = *reinterpret_cast<const std::uint8_t*>(character + kInvisibleOffset) != 0U;
         return concealed == hide;
     } AIMP_HIDING_CATCH {

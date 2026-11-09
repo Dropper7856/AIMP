@@ -147,7 +147,13 @@ bool ReleaseAIIntentOwnership(std::uintptr_t characterAddress) noexcept;
 // never selects/reinitializes a locomotion or paired animation cycle.
 bool ApplyAIRecoveryTransform(std::uintptr_t characterAddress,const float* position,float yaw) noexcept;
 // Hiding entry/exit clip path following (frames applied, network gaps rejected).
-struct HidingFollowStats final { std::uint64_t frames{}, rejected{}, exitHeadingFrames{}; };
+// Locker entry: frames a render-only body offset was published, frames the
+// final-pose hook applied it, and the largest frame-to-frame movement (mm) of
+// the Character entity itself meanwhile.
+struct HidingFollowStats final {
+    std::uint64_t frames{}, rejected{}, exitHeadingFrames{}, refAlignFrames{};
+    std::uint32_t maxPullMm{};
+};
 HidingFollowStats HidingFollowSnapshot() noexcept;
 
 // Called from CharacterManagerUpdate on the engine thread. PRE owns normal

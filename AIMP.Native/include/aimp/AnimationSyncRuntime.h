@@ -26,6 +26,9 @@ struct LocalSnapshot final {
     bool valid{};
 };
 [[nodiscard]] LocalSnapshot ReadLocal() noexcept;
+// Clip-resolver hook feed (any thread): aliases the local player's own clip
+// database resolves, kept for the owner observation diagnostic.
+void ObserveResolvedAlias(std::uint32_t database, std::uint32_t name, std::uint32_t path) noexcept;
 
 // --- Observer side ----------------------------------------------------------
 // Value-only mailbox (IPC thread). An inactive State clears the stay.
@@ -41,13 +44,30 @@ bool InstallMaskHook(HookManager& hooks, std::uintptr_t moduleBase, std::string&
 // True while a replicated clip owns the representation (movement must hold).
 [[nodiscard]] bool OwnsMovement(std::uintptr_t character) noexcept;
 // Our clip is the current cycle: carry the actor along the owner's path.
-[[nodiscard]] bool ClipPlaying(std::uintptr_t character) noexcept;
-// Keep the actor visible through native locker entry/exit, but allow the
+[[nodiscard]] bool ClipPlaying(std::uintptr_t character) noexcept;// Keep the actor visible through native locker entry/exit, but allow the
 // occupancy runtime to conceal a settled hidden idle (which may loop).
 [[nodiscard]] bool HidingTransitionPlaying(std::uintptr_t character) noexcept;
 // Only true for an already constructed and owned native animation cycle.
 [[nodiscard]] bool HidingEntryPlaying(std::uintptr_t character) noexcept;
 [[nodiscard]] bool HidingExitPlaying(std::uintptr_t character) noexcept;
+// Engine thread. Render-only displacement of the representation's body in its
+// own model space (Y up, heading 0 = +Z): the final pose's skeleton roots are
+// turned by `yaw` about the Character origin, then moved by `offset`. The
+// Character entity, its physics and AI position stay where retail keeps them.
+bool SetVisualOffset(std::uintptr_t character, bool active, const std::array<float, 3>& offset, float yaw) noexcept;
+[[nodiscard]] std::uint64_t VisualOffsetFrames(std::uintptr_t character) noexcept;
+// Native clock of an owned locker entry clip, 0..1. Engine thread only.
+[[nodiscard]] bool HidingEntryProgress(std::uintptr_t character, float& progress) noexcept;
+// One of our locker entry/idle/exit clips is the current cycle.
+[[nodiscard]] bool HidingClipOwned(std::uintptr_t character) noexcept;
+// Engine thread. Where the owner's first-person Character stood at the time
+// our locker clip has reached (its real entry/exit path), or its latest
+// transform while hidden. False when there is nothing to show yet.
+[[nodiscard]] bool HidingTarget(std::uintptr_t character, std::array<float, 3>& position, float& yaw) noexcept;
+void ClearHidingTrack(std::uintptr_t character) noexcept;
+[[nodiscard]] bool HidingExitProgress(std::uintptr_t character, float& progress) noexcept;
+// The looped hidden idle (crouched in a small locker) is our current cycle.
+[[nodiscard]] bool HidingIdlePlaying(std::uintptr_t character) noexcept;
 // Height kept while the clip plays: representation ground minus owner position.
 [[nodiscard]] float HeightOffset(std::uintptr_t character, float ownerY) noexcept;
 // A hiding exit uses its authored outward heading, not the owner network yaw.

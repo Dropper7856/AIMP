@@ -130,6 +130,12 @@ bool Active(const std::uintptr_t character) noexcept {
     const std::lock_guard lock(gMutex); const auto* slot = Find(character);
     return slot != nullptr && slot->desired.phase == 2U;
 }
+bool HiddenPlacement(const std::uintptr_t character, std::array<float, 3>& position, float& yaw) noexcept {
+    const std::lock_guard lock(gMutex); const auto* slot = Find(character);
+    if (slot == nullptr || (slot->desired.phase != 2U && slot->desired.phase != 3U)) return false;
+    position = slot->desired.position; yaw = slot->desired.yaw;
+    return true;
+}
 bool HiddenExitHeading(const std::uintptr_t character, float& yaw) noexcept {
     static_cast<void>(character); static_cast<void>(yaw);
     return false; // the captured native clip owns its authored turn

@@ -2666,12 +2666,72 @@ void FollowAnimationClipPath(MovementSlot& slot, const std::uintptr_t characterA
     gAnimationFollowFrames.fetch_add(1U, std::memory_order_relaxed);
 }
 
+// Locker entry/hidden/exit. The first-person clip's movement (walking in,
+// half-turn, crouching place) is the owner's Character transform itself, not
+// its pose, and retail snaps a representation moved into a prop back in front
+// of it. So the Character entity stays where retail keeps it; only the
+// rendered body follows the owner's real path, sampled at the time our own
+// clip has reached (AnimationSync records it). Engine thread only.
+std::atomic<std::uint64_t> gHidingEntryApproachFrames{0U};
+std::atomic<std::uint32_t> gHidingEntryMaxPullMm{0U};
+struct HidingVisual final {
+    std::uintptr_t character{};
+    std::array<float, 3> last{};
+    float lastYaw{};
+};
+std::array<HidingVisual, 40> gHidingVisuals{};
+std::atomic<std::uintptr_t> gHidingVisualLast{};
+HidingVisual* FindHidingVisual(const std::uintptr_t characterAddress, const bool create) noexcept {
+    for (auto& visual : gHidingVisuals) if (visual.character == characterAddress) return &visual;
+    if (!create) return nullptr;
+    for (auto& visual : gHidingVisuals) if (visual.character == 0U) { visual = {}; visual.character = characterAddress; return &visual; }
+    return nullptr;
+}
+void ShowHidingPath(const std::uintptr_t characterAddress) noexcept {
+    std::array<float, 3> target{};
+    float targetYaw{}, x{}, y{}, z{}, yaw{};
+    if (!animation_sync::HidingTarget(characterAddress, target, targetYaw) ||
+        !ReadTransform(characterAddress, x, y, z) || !ReadReplicatedYaw(characterAddress, yaw)) return;
+    const auto wx = target[0] - x, wy = target[1] - y, wz = target[2] - z;
+    const auto gap = std::sqrt(wx * wx + wy * wy + wz * wz);
+    if (!std::isfinite(gap) || gap > kHidingFollowMaximumGap) return;
+    auto* visual = FindHidingVisual(characterAddress, true);
+    if (visual == nullptr) return;
+    visual->last = target; visual->lastYaw = targetYaw;
+    const auto mm = static_cast<std::uint32_t>(gap * 1000.0F);
+    if (mm > gHidingEntryMaxPullMm.load()) gHidingEntryMaxPullMm.store(mm);
+    // World offset into the Character's model space: undo its heading.
+    const auto c = std::cos(yaw), s = std::sin(yaw);
+    const std::array<float, 3> offset{wx * c - wz * s, wy, wz * c + wx * s};
+    const auto turn = static_cast<float>(std::remainder(targetYaw - yaw, 6.28318530717958647692F));
+    gHidingVisualLast.store(characterAddress);
+    if (animation_sync::SetVisualOffset(characterAddress, true, offset, turn))
+        gHidingEntryApproachFrames.fetch_add(1U, std::memory_order_relaxed);
+}
+// The locker sequence is over: put the entity where the body is shown (the
+// owner's real position once out of the prop), then drop the offset.
+void FinishHidingPath(const std::uintptr_t characterAddress) noexcept {
+    auto* visual = FindHidingVisual(characterAddress, false);
+    if (visual == nullptr) return;
+    static_cast<void>(ApplyAIRecoveryTransform(characterAddress, visual->last.data(), visual->lastYaw));
+    static_cast<void>(animation_sync::SetVisualOffset(characterAddress, false, {}, 0.0F));
+    animation_sync::ClearHidingTrack(characterAddress);
+    *visual = {};
+}
+
 void PumpSlotOnEngineThread(
     MovementSlot& slot,
     const EnginePumpPhase phase) noexcept {
     const auto characterAddress =
         slot.characterAddress.load(std::memory_order_acquire);
     if (characterAddress == 0U || characterAddress == kReservedSlot) return;
+    // The rendered body follows the owner's real locker path for the whole
+    // sequence (entry clip, hidden, exit clip), after the retail tick.
+    if (phase == EnginePumpPhase::PostCharacterManager) {
+        if (animation_sync::HidingClipOwned(characterAddress) || player_hiding::Hidden(characterAddress))
+            ShowHidingPath(characterAddress);
+        else FinishHidingPath(characterAddress);
+    }
 
     if (UsesAIHybridReplication(slot) && !AIHybridCanOwnCurrentCycle(characterAddress)) {
         // Never replace a scripted/reaction/traversal cycle with Move or Idle.
@@ -2689,12 +2749,11 @@ void PumpSlotOnEngineThread(
         slot.driveRequested.store(false, std::memory_order_release);
         slot.certifiedCycleAddress.store(0U, std::memory_order_release);
         slot.preparedTargetRevision.store(0U, std::memory_order_release);
-        // The entry animation is anchored at the locker handle. Following
-        // the owner's movement inside the prop pulls the hands out of place.
-        if (phase == EnginePumpPhase::PostCharacterManager &&
-            animation_sync::ClipPlaying(characterAddress) &&
-            !animation_sync::HidingEntryPlaying(characterAddress))
-            FollowAnimationClipPath(slot, characterAddress);
+        // A locker clip shows the owner's recorded path on the body instead.
+        if (phase == EnginePumpPhase::PostCharacterManager) {
+            if (!animation_sync::HidingClipOwned(characterAddress) && animation_sync::ClipPlaying(characterAddress))
+                FollowAnimationClipPath(slot, characterAddress);
+        }
         return;
     }
 
@@ -2706,6 +2765,8 @@ void PumpSlotOnEngineThread(
         slot.driveRequested.store(false, std::memory_order_release);
         slot.certifiedCycleAddress.store(0U, std::memory_order_release);
         slot.preparedTargetRevision.store(0U, std::memory_order_release);
+        // The entity stays in front of the prop; the body shows the owner's
+        // hidden transform (ShowHidingPath).
         return;
     }
 
@@ -3708,7 +3769,12 @@ bool ApplyReplicatedYaw(
     return false;
 }
 HidingFollowStats HidingFollowSnapshot() noexcept {
-    return {}; // legacy manual locker follower retired; AnimationSync owns it
+    HidingFollowStats stats{};
+    stats.frames = gHidingEntryApproachFrames.load(std::memory_order_relaxed);
+    const auto visual = gHidingVisualLast.load();
+    stats.refAlignFrames = visual != 0U ? animation_sync::VisualOffsetFrames(visual) : 0U;
+    stats.maxPullMm = gHidingEntryMaxPullMm.load(std::memory_order_relaxed);
+    return stats;
 }
 
 bool ApplyAIRecoveryTransform(std::uintptr_t character,const float* position,float yaw) noexcept {

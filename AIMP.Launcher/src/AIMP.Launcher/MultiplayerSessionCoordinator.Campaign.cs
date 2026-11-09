@@ -118,7 +118,7 @@ internal sealed partial class MultiplayerSessionCoordinator
         {
             _loadingHoldStart = next;
             _worldQuiescenceWaitSinceUtc = null;
-            _loadingHoldStartedUtc = DateTimeOffset.UtcNow;
+            _loadingHoldStartedUtc = DateTimeOffset.UtcNow; _campaignCharacterWaitLogged = false;
             _nextPreparationProgressUtc = DateTimeOffset.MinValue;
             _loadingOverlayAcknowledged = false; _loadingOverlayConnection = Guid.Empty;
             _sessionPreparedSending = _sessionPreparedSent = _sessionReleaseAuthorized = _sessionReleaseRunning = false;
