@@ -2823,6 +2823,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _remoteSpawnRetryAttempts.Clear();
         _remoteSpawnRetryNotBeforeUtc.Clear();
         _inFlightRemoteSpawns.Clear();
+        _campaignLoadingReleasedUtc = null;
         _remoteGameplayReadyPeers.Clear();
         _remoteCharacters.Clear();
         _aiSync.ClearParticipants();
@@ -4317,6 +4318,10 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         if (!runtime.IpcConnected || !runtime.EngineThreadReady
             || !runtime.CharacterCreateHookInstalled)
             return false;
+        // The campaign's cinematic/loading hold may acknowledge Spawn130 while
+        // leaving its Character tracker Pending forever. Submit only after a
+        // confirmed release and a short period of resumed actor simulation.
+        if (!CanSubmitCampaignCharacterSpawnLocked(runtime, now)) return false;
         // Manifest registration can occupy the engine thread for seconds.
         // Do not queue short-lived spawn commands behind it during preparation.
         if (_loadingHoldStart is not null && _worldSyncEnabledForSession
@@ -4354,6 +4359,10 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
                 || _remoteCharacters.ContainsKey(peerId)
                 || !_remoteGameplayReadyPeers.Contains(peerId))
                 return false;
+            // Revalidate after waiting for _spawnGate: the level may have
+            // transitioned while this async convergence was queued.
+            if (!CanSubmitCampaignCharacterSpawnLocked(
+                _controller.Snapshot, DateTimeOffset.UtcNow)) return false;
             if (_start.AlienVsSurvivors && _start.AlienPeerId == peerId) return false;
             var player = _lobby.Players.SingleOrDefault(value => value.PeerId == peerId);
             return player is not null && TryCreateSpawnTarget(player, out target);
@@ -4442,6 +4451,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             if (!_gameplayReadiness.IsReady(DateTimeOffset.UtcNow)) return false;
             if (!runtime.IpcConnected || !runtime.EngineThreadReady) return false;
             if (!runtime.CharacterCreateHookInstalled) return false;
+            // The legacy spawn-request path must obey the same campaign gate.
+            if (!CanSubmitCampaignCharacterSpawnLocked(runtime, DateTimeOffset.UtcNow)) return false;
             _spawnRequestRunning = true;
             return true;
         }
@@ -4514,6 +4525,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         var previousKey = initialRuntime.RemoteCharacterSpawnKey;
         var arguments = RemoteSpawnPlanner.Create(target.Position);
         LogSpawnPosition(target.Player, target.Position);
+        if (LevelGameMode(_start?.Level ?? string.Empty) == "Campaign")
+            _diagnostics.Log("Multiplayer", "Campaign Character spawn submitted after native loading release.");
         using var commandLifetime = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         var submission = _controller.ExecuteCommandAsync(GameCommandNames.SpawnCharacter,
             arguments, commandLifetime.Token, waitForExecution: true);

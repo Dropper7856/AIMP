@@ -33,7 +33,37 @@ internal sealed partial class MultiplayerSessionCoordinator
     private static readonly TimeSpan CampaignLoadingHoldMaximumDuration = TimeSpan.FromSeconds(90);
     private static readonly TimeSpan CampaignCharacterWait = TimeSpan.FromSeconds(20);
     private bool _campaignCharacterWaitLogged;
+    // A bootstrap Spawn130 submitted while the native loading hold suspends
+    // actor simulation can be acknowledged without ever reaching CharacterCreate.
+    // The observed BSP_TORRENS session left spawnKey=2 Pending on both peers.
+    // Campaign spawns must start only after the hold is released and retail has
+    // had a short window to resume its Character processing pipeline.
+    private static readonly TimeSpan CampaignSpawnAfterReleaseGrace = TimeSpan.FromSeconds(3);
+    private DateTimeOffset? _campaignLoadingReleasedUtc;
     private static readonly TimeSpan WorldQuiescenceTimeout = TimeSpan.FromSeconds(8);
+
+    // Caller holds _stateGate. Survival and Alien-vs-Survivors keep their
+    // existing pre-release Character convergence semantics.
+    private bool CanSubmitCampaignCharacterSpawnLocked(NativeRuntimeSnapshot runtime, DateTimeOffset now)
+    {
+        if (_start is null || LevelGameMode(_start.Level) != "Campaign") return true;
+        return _loadingHoldStart is null
+            && _campaignLoadingReleasedUtc is { } released
+            && now - released >= CampaignSpawnAfterReleaseGrace
+            && !runtime.LevelTransitioning;
+    }
+
+    private void MarkSessionLoadingReleased(LobbyStartPayload released)
+    {
+        lock (_stateGate)
+        {
+            if (_loadingHoldStart?.SessionId != released.SessionId
+                || _loadingHoldStart.LevelGeneration != released.LevelGeneration) return;
+            _loadingHoldStart = null;
+            if (LevelGameMode(released.Level) == "Campaign")
+                _campaignLoadingReleasedUtc = DateTimeOffset.UtcNow;
+        }
+    }
 
     private void ReportSessionPreparationProgress(NativeRuntimeSnapshot runtime, DateTimeOffset now, string positionError)
     {
@@ -306,8 +336,10 @@ internal sealed partial class MultiplayerSessionCoordinator
                 _diagnostics.Log("Preparation", "Loading screen timeout reached; releasing it automatically.");
                 await SetSessionLoadingHoldAsync(expired, false, _lifetime.Token).ConfigureAwait(false);
                 await SendAlienAwareLoadingReleaseAsync(expired).ConfigureAwait(false);
-                lock (_stateGate)
-                    if (ReferenceEquals(_loadingHoldStart, expired)) _loadingHoldStart = null;
+                MarkSessionLoadingReleased(expired);
+                if (LevelGameMode(expired.Level) == "Campaign")
+                    _diagnostics.Log("Preparation",
+                        "Campaign timeout release completed; remote Character spawn will be submitted after native actor simulation resumes.");
             }
             catch (Exception exception) when (exception is not OutOfMemoryException)
             { if (!_lifetime.IsCancellationRequested) _diagnostics.Log("Preparation", "Loading screen timeout release failed: " + exception.Message); }
@@ -319,9 +351,10 @@ internal sealed partial class MultiplayerSessionCoordinator
             if (_loadingHoldStart is not { } current || _start?.SessionId != current.SessionId
                 || _start.LevelGeneration != current.LevelGeneration || !_loadingOverlayAcknowledged
                 || !_localGameplayReady || !_remoteGameplayReady || _lobby is null) return;
-            // The native preparation pump advances only the Character creation
-            // queue while actor simulation stays held. A submitted spawn is not
-            // sufficient: keep the opaque screen until every mapping is Ready.
+            // Survival spawns converge during the held preparation phase.
+            // Campaign has native cinematic/actor initialization which does not
+            // reliably complete a bootstrap Spawn130 under the loading hold:
+            // release the world first, then submit fresh spawns in gameplay.
             var localPeer = _host?.HostPeerId ?? _client?.PeerId ?? 0UL;
             if (_lobby.Players.Any(player => player.PeerId != localPeer &&
                 (!current.AlienVsSurvivors || player.PeerId != current.AlienPeerId) &&
@@ -332,8 +365,8 @@ internal sealed partial class MultiplayerSessionCoordinator
                 if (!_campaignCharacterWaitLogged)
                 {
                     _campaignCharacterWaitLogged = true;
-                    _diagnostics.Log("Preparation", "Campaign: remote Characters are still loading; " +
-                        "releasing without them, their accepted spawns complete in gameplay.");
+                    _diagnostics.Log("Preparation", "Campaign: releasing before remote Character spawn; " +
+                        "native Spawn130 will be submitted after simulation resumes.");
                 }
             }
             var runtime = _controller.Snapshot;
@@ -372,10 +405,10 @@ internal sealed partial class MultiplayerSessionCoordinator
             {
                 await SetSessionLoadingHoldAsync(start, false, _lifetime.Token).ConfigureAwait(false);
                 await SendAlienAwareLoadingReleaseAsync(start).ConfigureAwait(false);
-                lock (_stateGate)
-                    if (_loadingHoldStart?.SessionId == start.SessionId && _loadingHoldStart.LevelGeneration == start.LevelGeneration)
-                        _loadingHoldStart = null;
-                _diagnostics.Log("Preparation", "All players and world systems are ready. Multiplayer released.");
+                MarkSessionLoadingReleased(start);
+                _diagnostics.Log("Preparation", LevelGameMode(start.Level) == "Campaign"
+                    ? "Campaign world released; remote Character spawns will begin after native simulation resumes."
+                    : "All players and world systems are ready. Multiplayer released.");
             }
             else
             {
