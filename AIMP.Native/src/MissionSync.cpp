@@ -1,4 +1,5 @@
 #include "aimp/MissionSync.h"
+#include "aimp/AlienPvPInputIsolation.h"
 #include "aimp/Diagnostics.h"
 #include "aimp/WorldEntityRegistry.h"
 #include "aimp/WorldPublicActions.h"
@@ -103,6 +104,7 @@ Frontier* Find(const Signal& signal) noexcept {
 bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
     const std::string& role, std::string& error) {
     if (role == "off") {
+        static_cast<void>(alien_pvp_input::ConfigureCinematic(false,false));
         std::scoped_lock lock(gMutex);
         gEnabled = false; gCampaign = false;
         gFrontiers.clear(); gEntitySources.clear(); gOutputPortSources.clear(); gObserved.clear();
@@ -179,6 +181,9 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
     gScopedLocalExact = gScopedRemoteExact = gScopedLocalForeign = gScopedRemoteForeign = 0U;
     gFault = false; gEnabled = true;
     gRegistry.store(&registry, std::memory_order_release);
+    // MissionSync supplies the validated campaign Host/Client role; cinema
+    // input authority itself travels on an independent Host-only message.
+    static_cast<void>(alien_pvp_input::ConfigureCinematic(gCampaign,gHost));
     return true;
 }
 

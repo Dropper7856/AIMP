@@ -9,6 +9,11 @@ namespace aimp::alien_pvp_input {
 bool EnsureInstalled(std::uintptr_t gameModule) noexcept;
 bool Installed() noexcept;
 void SetActive(bool enabled) noexcept;
+// Campaign-only host authority; independent of the Alien PvP input firewall.
+bool ConfigureCinematic(bool enabled,bool host) noexcept;
+enum class CinematicSignal : std::uint8_t { Unavailable, Idle, Playing, HostSkip, ClientBlocked };
+CinematicSignal PollCinematic() noexcept;
+bool ApplyCinematicSkip() noexcept;
 void Uninstall() noexcept;
 int TakeCameraWheel() noexcept;
 void SetMapMode(bool enabled) noexcept;

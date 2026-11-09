@@ -27,6 +27,11 @@ struct ImportSlot final {
 constexpr std::size_t kSlotCount=6U;
 std::array<ImportSlot,kSlotCount> gSlots{};
 std::atomic<bool> gActive{},gInstalled{};
+std::atomic<int> gCinematicRole{0}; // 0 off, 1 Host, 2 Client
+std::atomic<std::uint64_t> gCinematicHeartbeatUntil{0U},gCinematicLeaseUntil{0U};
+std::uint64_t gCinematicEnterSince{},gCinematicLastHostEdge{};
+bool gCinematicPrompted{};
+HWND gCinematicInjectedWindow{};
 std::atomic<int> gCameraWheel{};
 std::atomic<bool> gMapMode{};
 std::atomic<bool> gMapClicked{};
@@ -48,8 +53,46 @@ bool PassKey(const std::uint32_t key) noexcept {
         key==VK_SNAPSHOT || key==VK_LWIN || key==VK_RWIN;
 }
 bool Active() noexcept { return gActive.load(std::memory_order_acquire); }
+// The playable-Alien camera resolver already certifies these exact retail
+// camera manager fields. Unknown cameras are a candidate for a cutscene,
+// never authority to mutate game state.
+bool CinematicCamera() noexcept {
+    std::uintptr_t root{},manager{},follow{},head{},current{};
+    return gExecutableBase!=0U &&
+        Read(gExecutableBase+0x012F0C88U,root) && root!=0U &&
+        Read(root+0x58U,manager) && manager!=0U &&
+        Read(manager+0x1DCU,follow) && follow!=0U &&
+        Read(manager+0x1E0U,head) && head!=0U &&
+        Read(manager+0x1D8U,current) && current!=0U &&
+        current!=follow && current!=head;
+}
+bool GameFocused() noexcept {
+    const auto window=GetForegroundWindow();DWORD process{};
+    return window && GetWindowThreadProcessId(window,&process)!=0U &&
+        process==GetCurrentProcessId();
+}
+bool CinematicClient() noexcept {
+    return gCinematicRole.load(std::memory_order_acquire)==2 &&
+        gCinematicHeartbeatUntil.load(std::memory_order_acquire)>GetTickCount64() &&
+        CinematicCamera();
+}
+bool CinematicBlocked() noexcept {
+    return CinematicClient() &&
+        gCinematicLeaseUntil.load(std::memory_order_acquire)<=GetTickCount64();
+}
+void ReleaseInjectedEnter() noexcept {
+    if (!gCinematicInjectedWindow) return;
+    static_cast<void>(PostMessageW(gCinematicInjectedWindow,WM_KEYUP,VK_RETURN,0xC0000001L));
+    gCinematicInjectedWindow=nullptr;
+}
 void FilterMessage(LPMSG message) noexcept {
-    if (!Active() || !message) return;
+    if (!message) return;
+    if (CinematicBlocked() && message->wParam==VK_RETURN &&
+        (message->message==WM_KEYDOWN || message->message==WM_KEYUP ||
+         message->message==WM_SYSKEYDOWN || message->message==WM_SYSKEYUP)) {
+        message->message=WM_NULL;return;
+    }
+    if (!Active()) return;
     if(message->message==WM_MOUSEWHEEL) {
         // Raw input is the donor's primary wheel source; WM_MOUSEWHEEL is
         // suppressed so it cannot also select Amanda's equipment.
@@ -68,6 +111,8 @@ void FilterMessage(LPMSG message) noexcept {
 SHORT WINAPI HookAsync(const int key) noexcept {
     const auto original=gOriginalAsync;
     if (!original) return 0;
+    if (key==VK_RETURN && CinematicClient())
+        return CinematicBlocked()?0:static_cast<SHORT>(0x8000);
     return Active() && !PassKey(static_cast<std::uint32_t>(key)) ? 0 : original(key);
 }
 UINT WINAPI HookRaw(const HRAWINPUT input,const UINT command,
@@ -75,9 +120,19 @@ UINT WINAPI HookRaw(const HRAWINPUT input,const UINT command,
     const auto original=gOriginalRaw;
     if (!original) return static_cast<UINT>(-1);
     const auto result=original(input,command,data,size,headerSize);
-    if (!Active() || command!=RID_INPUT || !data ||
+    if (command!=RID_INPUT || !data ||
         result==static_cast<UINT>(-1) || result<sizeof(RAWINPUTHEADER)) return result;
+    if (!Active() && !CinematicBlocked()) return result;
     auto* raw=static_cast<RAWINPUT*>(data);
+    if (CinematicBlocked() && raw->header.dwType==RIM_TYPEKEYBOARD &&
+        result>=sizeof(RAWINPUTHEADER)+sizeof(RAWKEYBOARD) &&
+        raw->data.keyboard.VKey==VK_RETURN) {
+        raw->data.keyboard.Flags=RI_KEY_BREAK;
+        raw->data.keyboard.VKey=0U;
+        raw->data.keyboard.Message=WM_KEYUP;
+        return result;
+    }
+    if (!Active()) return result;
     if (raw->header.dwType==RIM_TYPEKEYBOARD && result>=sizeof(RAWINPUTHEADER)+sizeof(RAWKEYBOARD)) {
         if (!PassKey(raw->data.keyboard.VKey)) {
             raw->data.keyboard.Flags=RI_KEY_BREAK;
@@ -237,6 +292,63 @@ MapPointer TakeMapPointer() noexcept {
 }
 
 bool Installed() noexcept { return gInstalled.load(std::memory_order_acquire); }
+bool ConfigureCinematic(bool enabled,bool host) noexcept {
+    if (!enabled) {
+        gCinematicRole.store(0,std::memory_order_release);
+        gCinematicHeartbeatUntil.store(0U,std::memory_order_release);
+        gCinematicLeaseUntil.store(0U,std::memory_order_release);
+        gCinematicEnterSince=gCinematicLastHostEdge=0U;gCinematicPrompted=false;
+        ReleaseInjectedEnter();return true;
+    }
+    const auto module=reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    if (!EnsureInstalled(module)) return false;
+    gCinematicRole.store(host?1:2,std::memory_order_release);
+    gCinematicHeartbeatUntil.store(0U,std::memory_order_release);
+    gCinematicLeaseUntil.store(0U,std::memory_order_release);
+    gCinematicEnterSince=gCinematicLastHostEdge=0U;gCinematicPrompted=false;
+    return true;
+}
+CinematicSignal PollCinematic() noexcept {
+    const auto role=gCinematicRole.load(std::memory_order_acquire);
+    if (!Installed() || role==0) return CinematicSignal::Unavailable;
+    const auto now=GetTickCount64();
+    gCinematicHeartbeatUntil.store(now+1200U,std::memory_order_release);
+    const bool cinematic=CinematicCamera() && GameFocused();
+    if (gCinematicInjectedWindow &&
+        (now>=gCinematicLeaseUntil.load(std::memory_order_acquire) || !cinematic))
+        ReleaseInjectedEnter();
+    if (!cinematic) {
+        gCinematicEnterSince=0U;gCinematicPrompted=false;
+        return CinematicSignal::Idle;
+    }
+    const bool down=(GetAsyncKeyState(VK_RETURN)&0x8000)!=0;
+    if (!down) {gCinematicEnterSince=0U;gCinematicPrompted=false;}
+    else if (!gCinematicEnterSince) gCinematicEnterSince=now;
+    if (role==1 && down && now-gCinematicEnterSince>=550U &&
+        gCinematicLastHostEdge!=gCinematicEnterSince) {
+        gCinematicLastHostEdge=gCinematicEnterSince;
+        return CinematicSignal::HostSkip;
+    }
+    if (role==2 && down && !gCinematicPrompted && CinematicBlocked()) {
+        gCinematicPrompted=true;
+        return CinematicSignal::ClientBlocked;
+    }
+    return CinematicSignal::Playing;
+}
+bool ApplyCinematicSkip() noexcept {
+    if (!CinematicClient() || !GameFocused()) return false;
+    const auto window=GetForegroundWindow();
+    if (!window) return false;
+    gCinematicLeaseUntil.store(GetTickCount64()+1650U,std::memory_order_release);
+    gCinematicInjectedWindow=window;
+    // Never call an unverified retail skip function: wake the input queue
+    // and temporarily expose a Host-authorized Enter hold to game polling.
+    if (!PostMessageW(window,WM_KEYDOWN,VK_RETURN,1U)) {
+        gCinematicLeaseUntil.store(0U,std::memory_order_release);
+        gCinematicInjectedWindow=nullptr;return false;
+    }
+    return true;
+}
 void SetActive(bool enabled) noexcept {
     if(!enabled)SetMapMode(false);
     gActive.store(enabled && Installed(),std::memory_order_release);
@@ -268,6 +380,7 @@ bool EnsureInstalled(const std::uintptr_t gameModule) noexcept {
     return true;
 }
 void Uninstall() noexcept {
+    static_cast<void>(ConfigureCinematic(false,false));
     SetActive(false);
     if (!Installed()) return;
     for (const auto& slot:gSlots)
