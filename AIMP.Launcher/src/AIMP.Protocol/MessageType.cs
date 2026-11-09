@@ -52,6 +52,7 @@ public enum MessageType : ushort
     AISyncHostState = 45,
     AlienPvPNative = 48, // Native -> launcher: copied possession/input/pose observations.
     AlienPvPCommand = 49, // Launcher -> native: scoped Host-admitted PvP stream.
+    PlayerAnimationState = 50, // DLL -> Launcher local scripted-animation observation (AnimationSync).
     AISyncClientState = 46,
 
     LobbyJoin = 100,
@@ -111,6 +112,9 @@ public enum MessageType : ushort
     AlienControlPose = 153, // Host-validated physical outcome.
     AlienPoseObservation = 155, // Selected owner -> Host, validated before replication.
     AlienControlCommitted = 150, // Host -> Clients: validated player's intent, not Host-generated AI.
+
+    CampaignSaveRequest = 156, // Authenticated client -> host; selected immutable save only.
+    CampaignSaveChunk = 157, // Host -> requesting client; ordered bounded download.
 
     TestModeConfigure = 200,
     CapabilityQuery = 201,

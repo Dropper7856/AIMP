@@ -1,6 +1,7 @@
 #include "aimp/AISync.h"
 #include "aimp/VoiceSync.h"
 #include "aimp/Bootstrap.h"
+#include "aimp/AnimationSyncPropsRuntime.h"
 
 #include "aimp/AuthorityController.h"
 #include "aimp/BuildProfile.h"
@@ -38,6 +39,7 @@
 #include "aimp/ProductVersion.h"
 #include "aimp/PlayerSyncObserver.h"
 #include "aimp/PlayerLifecycle.h"
+#include "aimp/CampaignSaveRuntime.h"
 #include "aimp/UIHeapGuard.h"
 #include "aimp/LevelIntegrityGuard.h"
 #include "aimp/LoadingContextGuard.h"
@@ -693,6 +695,15 @@ DWORD Bootstrap::RunImpl() {
                 : (lifecycleError.empty()
                     ? "[PlayerLifecycle] unavailable: exact executable/profile signatures required."
                     : lifecycleError));
+    }
+
+    {
+        std::string campaignError;
+        const bool installed = validation.hashMatch &&
+            campaign_save::Install(moduleBase, campaignError);
+        diagnostics.Log(installed ? "info" : "error", "campaign_save_initialized",
+            installed ? "Multiplayer campaign saves can be isolated from personal Steam saves."
+                : (campaignError.empty() ? "Campaign save isolation requires the exact executable hash." : campaignError));
     }
 
     {
@@ -1633,6 +1644,7 @@ DWORD Bootstrap::RunImpl() {
     const bool retainUiRuntime = ui_heap_guard::Installed() || multiplayer_pause::Installed() ||
         item_sync::Installed() || throwable_sync::Installed() || voice_sync::Installed() || loading_context_guard::Installed();
     ai_sync::BeginLogicalShutdown();
+    animation_sync::props::BeginLogicalShutdown();
     const bool retainActionReleaseHook = character_action_runtime::BeginLogicalShutdown();
     character_action_probe::BeginLogicalShutdown();
     world_interactions::BeginLogicalShutdown();

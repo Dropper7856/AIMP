@@ -276,6 +276,8 @@ package frontend
       private var _leaderboard_spinner_visible:Boolean;
       
       private var _campaignLevelIds:Array = [];
+      private var _campaignSaveItem:MenuItemOptionOptionStepper;
+      private var _campaignChoices:Array = [{action:"new",id:"",label:"New campaign"}];
       private var _developerModeAvailable:Boolean = false;
       private var _developerMode:Boolean = false;
       private var _developerItem:MenuItem;
@@ -517,7 +519,8 @@ package frontend
          this._survivorMapIds = ["survival_auto"];
          this._survivorMapLabels = ["Auto Survivor Map"];
          this._survivorMapDescriptions = ["Uses the first available survivor map until the game playlist data is loaded"];
-         this._serverModeItem = new MenuItemOptionOptionStepper("Game Mode",["survival"],["Survival"],this.serverModeChangedHandler);
+         this._serverModeItem = new MenuItemOptionOptionStepper("Game Mode",["survival","campaign"],["Survival","Campaign"],this.serverModeChangedHandler);
+         this._campaignSaveItem = new MenuItemOptionOptionStepper("Campaign save",[0],["New campaign"],this.campaignSaveChangedHandler);
          this._serverMapItem = new MenuItemOptionOptionStepper("Survivor Map",this._survivorMapIds,this._survivorMapLabels,this.serverMapChangedHandler);
          this._serverPvPItem = new MenuItemOptionOptionStepper("Match Type",["coop","pvp"],["Co-op","Alien vs Survivors"],this.serverPvPChangedHandler);
          this._serverAlienItem = new MenuItemOptionOptionStepper("Alien",["1","0"],["Enabled","Disabled"]);
@@ -629,6 +632,7 @@ package frontend
          this._createServerItem.page.addItem(this._serverNameItem);
          this._createServerItem.page.addItem(this._serverPasswordItem);
          this._createServerItem.page.addItem(this._serverModeItem);
+         this._createServerItem.page.addItem(this._campaignSaveItem);
          this._createServerItem.page.addItem(this._serverMapItem);
          this._createServerItem.page.addItem(this._serverPvPItem);
          this._createServerItem.page.addItem(this._serverAlienItem);
@@ -990,6 +994,47 @@ package frontend
          this.refreshSurvivorMapOptions();
       }
       
+      private function campaignSaveChangedHandler(event:MenuItemEvent) : void
+      {
+         this.updateServerMapVisibility();
+         this.refreshNetworkMenuRenderers();
+      }
+
+      private function getCampaignChoice() : Object
+      {
+         return this._campaignChoices[this._campaignSaveItem.selectedIndex];
+      }
+
+      private function refreshCampaignSaveOptions(values:Object) : void
+      {
+         var previous:Object = this.getCampaignChoice();
+         var choices:Array = [{action:"new",id:"",label:"New campaign"}];
+         var ids:Array = [0];
+         var labels:Array = ["New campaign"];
+         var selected:int = 0;
+         for(var i:int = 0; i < int(values["campaignSaveCount"]); i++)
+         {
+            var id:String = getObjectString(values,"campaignSave" + i + "Id","");
+            if(id.length == 0) continue;
+            var label:String = getObjectString(values,"campaignSave" + i + "Label","Saved campaign");
+            var level:String = getObjectString(values,"campaignSave" + i + "Level","");
+            choices.push({action:"continue",id:id,label:label});
+            ids.push(choices.length - 1);
+            labels.push("Continue: " + label + (level.length > 0 ? " (" + level + ")" : ""));
+            if(previous != null && previous.action == "continue" && previous.id == id) selected = choices.length - 1;
+         }
+         if(this._developerMode && this._campaignLevelIds.length > 0)
+         {
+            choices.push({action:"level",id:"",label:"Choose level (experimental)"});
+            ids.push(choices.length - 1);
+            labels.push("Choose level (experimental)");
+            if(previous != null && previous.action == "level") selected = choices.length - 1;
+         }
+         this._campaignChoices = choices;
+         this._campaignSaveItem.setItems(ids,labels);
+         this._campaignSaveItem.selectedIndex = selected;
+      }
+
       private function serverMapChangedHandler(param1:MenuItemEvent) : void
       {
       }
@@ -1047,9 +1092,9 @@ package frontend
       
       private function startServerHandler(param1:MenuItemEvent) : void
       {
-         if(!this.mpBeginCommand("create")) return;
+         if(this._mpLobbyRole != "" || !this.mpBeginCommand("create")) return;
          this.show_network_notification("Creating lobby");
-         this._mpBridge.createLobby(String(this._serverModeItem.selectedItem),int(this._serverMaxPlayersItem.selectedItem),String(this._serverVisibilityItem.selectedItem),this.getSelectedSurvivorMapId(),this.getSelectedSurvivorMapName(),String(this._serverAlienItem.selectedItem) != "0" || String(this._serverPvPItem.selectedItem) == "pvp",String(this._serverPvPItem.selectedItem) == "pvp" && String(this._serverModeItem.selectedItem) != "campaign");
+         this._mpBridge.createLobby(String(this._serverModeItem.selectedItem),int(this._serverMaxPlayersItem.selectedItem),String(this._serverVisibilityItem.selectedItem),this.getSelectedSurvivorMapId(),this.getSelectedSurvivorMapName(),String(this._serverAlienItem.selectedItem) != "0" || String(this._serverPvPItem.selectedItem) == "pvp",String(this._serverPvPItem.selectedItem) == "pvp" && String(this._serverModeItem.selectedItem) != "campaign",String(this.getCampaignChoice().action),String(this.getCampaignChoice().id),"medium");
       }
       
       private function readyChangedHandler(param1:MenuItemEvent) : void
@@ -1150,10 +1195,10 @@ package frontend
             if(level.toUpperCase().indexOf("CHALLENGE") != 0 && level.toUpperCase().indexOf("BSPNOSTROMO_") != 0 && level.toUpperCase().indexOf("SALVAGE") != 0)
                this._campaignLevelIds.push(level);
          }
-         this._serverModeItem.setItems(this._developerMode ? ["survival","campaign"] : ["survival"],this._developerMode ? ["Survival","Campaign (experimental)"] : ["Survival"]);
-         this._serverModeItem.selectedIndex = 0;
+         this.refreshCampaignSaveOptions(param1);
          this.refreshSurvivorMapOptions();
          this.mpRefreshServerConfigItems();
+         this.mpUpdateControls();
       }
       
       private function mpRefreshServerConfigItems() : void
@@ -1244,6 +1289,8 @@ package frontend
          this._createServerItem.enabled = idle && outsideLobby;
          this._directIpJoinItem.enabled = idle && outsideLobby;
          this._serverStartItem.enabled = idle && outsideLobby;
+         this._serverModeItem.enabled = idle && outsideLobby;
+         this._campaignSaveItem.enabled = idle && outsideLobby;
          this._serverMapItem.enabled = idle && outsideLobby;
          this._serverAlienItem.enabled = idle && outsideLobby;
          this._serverPvPItem.enabled = idle && outsideLobby;
@@ -1555,11 +1602,18 @@ package frontend
       {
          if(this._serverMapItem != null)
          {
+            var selectedMap:String = this._serverMapItem.selectedItem == null ? "" : String(this._serverMapItem.selectedItem);
             if(this._developerMode && String(this._serverModeItem.selectedItem) == "campaign")
                this._serverMapItem.setItems(this._campaignLevelIds,this._campaignLevelIds);
             else
                this._serverMapItem.setItems(this._survivorMapIds,this._survivorMapLabels,this._survivorMapDescriptions);
             this._serverMapItem.selectedIndex = 0;
+         }
+         if(this._serverMapItem != null)
+         {
+            var maps:Array = String(this._serverModeItem.selectedItem) == "campaign" ? this._campaignLevelIds : this._survivorMapIds;
+            var index:int = maps.indexOf(selectedMap);
+            if(index >= 0) this._serverMapItem.selectedIndex = index;
          }
          this.updateServerMapVisibility();
          this.refreshNetworkMenuRenderers();
@@ -1569,10 +1623,11 @@ package frontend
       {
          if(this._serverMapItem != null && this._serverModeItem != null)
          {
-            this._serverModeItem.visible = this._developerMode;
+            this._serverModeItem.visible = true;
             this._serverPvPItem.visible = String(this._serverModeItem.selectedItem) != "campaign";
             this._serverAlienItem.visible = String(this._serverPvPItem.selectedItem) != "pvp" || !this._serverPvPItem.visible;
-            this._serverMapItem.visible = this._developerMode;
+            this._campaignSaveItem.visible = String(this._serverModeItem.selectedItem) == "campaign";
+            this._serverMapItem.visible = this._developerMode && (!this._campaignSaveItem.visible || this.getCampaignChoice().action == "level");
             this._serverMapItem.name = String(this._serverModeItem.selectedItem) == "campaign" ? "Campaign Level" : "Survivor Map";
          }
       }
@@ -1581,7 +1636,7 @@ package frontend
       {
          if(String(this._serverModeItem.selectedItem) == "campaign")
          {
-            return this._serverMapItem.selectedItem == null ? "" : String(this._serverMapItem.selectedItem);
+            return this.getCampaignChoice().action == "level" && this._developerMode && this._serverMapItem.selectedItem != null ? String(this._serverMapItem.selectedItem) : "";
          }
          if(this._serverMapItem == null || this._serverMapItem.selectedItem == null)
          {
@@ -1594,7 +1649,7 @@ package frontend
       {
          if(String(this._serverModeItem.selectedItem) == "campaign")
          {
-            return this._serverMapItem.selectedItem == null ? "" : String(this._serverMapItem.selectedItem);
+            return this.getCampaignChoice().action == "level" && this._developerMode && this._serverMapItem.selectedItem != null ? String(this._serverMapItem.selectedItem) : "";
          }
          if(this._serverMapItem == null)
          {
@@ -1641,7 +1696,7 @@ package frontend
          return "";
       }
       
-      private function mpBridgeGameStartHandler(mode:String, mapId:String = null, mapName:String = null, sessionId:String = null, engineLevelPath:String = null) : void
+      private function mpBridgeGameStartHandler(mode:String, mapId:String = null, mapName:String = null, sessionId:String = null, engineLevelPath:String = null, campaignAction:String = null, campaignDifficulty:String = null) : void
       {
          this._mpPendingCommand = "start";
          this.mpUpdateControls();
@@ -1658,9 +1713,9 @@ package frontend
          {
             this.startPendingSurvivorMap();
          }
-         else
+         else if(this._mpPendingStartMode == "campaign")
          {
-            this.startPendingCampaignLevel(engineLevelPath);
+            this.startPendingCampaign(engineLevelPath,campaignAction,campaignDifficulty);
          }
       }
       
@@ -1838,6 +1893,39 @@ package frontend
          return this.extractFirstString(data,["modelHint","ModelHint","model","Model","modelName","ModelName","asset","Asset","assetName","AssetName","texture","Texture","icon","Icon"]);
       }
       
+      private function startPendingCampaign(engineLevelPath:String, action:String, difficulty:String) : void
+      {
+         // START_GAME is sent only after the launcher has staged the authorized save.
+         if(action == "level")
+         {
+            this.startPendingCampaignLevel(engineLevelPath);
+            return;
+         }
+         if(action != "new" && action != "continue")
+         {
+            this._mpPendingStartGame = false;
+            this._mpPendingCommand = "";
+            this.mpUpdateControls();
+            this._mpBridge.ackStartGame(this._mpPendingSessionId,"invalid_campaign_action");
+            this.show_network_notification("Campaign start was not authorized by the launcher");
+            return;
+         }
+         this._mpPendingStartGame = false;
+         if(action == "continue")
+         {
+            this._mpBridge.ackStartGame(this._mpPendingSessionId,"loading_campaign_checkpoint");
+            call("load_current_checkpoint");
+            return;
+         }
+         var gameDifficulty:int = GameMenu.DIFFICULTY_MEDIUM;
+         if(difficulty == "novice") gameDifficulty = GameMenu.DIFFICULTY_NOVICE;
+         else if(difficulty == "easy") gameDifficulty = GameMenu.DIFFICULTY_EASY;
+         else if(difficulty == "hard") gameDifficulty = GameMenu.DIFFICULTY_HARD;
+         else if(difficulty == "nightmare") gameDifficulty = GameMenu.DIFFICULTY_IRON;
+         this._mpBridge.ackStartGame(this._mpPendingSessionId,"starting_new_campaign");
+         call("start_game",gameDifficulty);
+      }
+
       private function startPendingCampaignLevel(engineLevelPath:String) : void
       {
          if(this._mpPendingStartMapId == null || this._mpPendingStartMapId.length == 0)
@@ -2152,7 +2240,8 @@ package frontend
          this._serverNameItem.enabled = false;
          this._serverPasswordItem.visible = false;
          this._serverPasswordItem.description = "Configured in the launcher settings";
-         this._serverModeItem.descriptions = ["Create a campaign server","Create a survival server"];
+         this._serverModeItem.descriptions = ["Create a survival server","Start a new campaign or continue a host save"];
+         this._campaignSaveItem.description = "Start a new campaign on Medium or continue a save provided by the launcher";
          this._serverMapItem.descriptions = this._survivorMapDescriptions;
          this._serverAlienItem.descriptions = ["Normal Alien behavior","Disable the Alien to explore and test this level"];
          this._serverMaxPlayersItem.descriptions = ["Two player MVP","Three players experimental","Four players experimental"];
@@ -2206,7 +2295,7 @@ package frontend
          this.updateServerMapVisibility();
          this._playGameItem.visible = false;
          this._joinServerItem.visible = false;
-         this._serverModeItem.visible = this._developerMode;
+         this._serverModeItem.visible = true;
          this._serverMaxPlayersItem.visible = false;
          this._serverVisibilityItem.visible = false;
          this.mpUpdateControls();

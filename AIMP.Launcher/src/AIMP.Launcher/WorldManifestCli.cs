@@ -29,6 +29,7 @@ internal static class WorldManifestCli
             var sourcePath = args[1];
             string? outputPath = null;
             string? jsonPath = null;
+            string? missionCatalogPath = null;
             var useCache = true;
 
             for (var index = 2; index < args.Length; index++)
@@ -53,6 +54,11 @@ internal static class WorldManifestCli
                     jsonPath = RequireValue(args, ref index, current);
                     continue;
                 }
+                if (current.Equals("--mission-catalog", StringComparison.OrdinalIgnoreCase))
+                {
+                    missionCatalogPath = RequireValue(args, ref index, current);
+                    continue;
+                }
 
                 throw new ArgumentException($"Unknown manifest compiler option '{current}'.");
             }
@@ -61,6 +67,19 @@ internal static class WorldManifestCli
                 ? new WorkerProgress(value => Console.WriteLine(WorkerProgressPrefix + value.Percentage))
                 : null;
             var result = new WorldManifestCompiler().Compile(sourcePath, outputPath, jsonPath, useCache, progress);
+            if (missionCatalogPath is not null)
+            {
+                var roots = MissionSyncFrontierCompiler.Compile(result.Manifest);
+                File.WriteAllText(missionCatalogPath, System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    Mode = "Campaign", result.Manifest.MapContentId,
+                    Count = roots.Count, PublicInputs = roots.Count(root => root.PublicInput),
+                    ScheduledInputs = roots.Count(root => root.ScheduledInput),
+                    CatalogSha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+                        MissionSyncFrontierCompiler.Encode(result.Manifest, roots))),
+                    Roots = roots
+                }));
+            }
             if (worker) Console.WriteLine(WorkerResultPrefix + result.BinaryPath);
             else WriteSummary(result);
             return true;

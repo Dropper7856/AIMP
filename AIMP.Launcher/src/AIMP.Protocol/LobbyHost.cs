@@ -18,7 +18,8 @@ public sealed record LobbyHostOptions(
     bool OpaqueRelayEnabled = false,
     bool RequireWorldPreparation = false,
     bool AlienEnabled = true,
-    bool AlienVsSurvivors = false);
+    bool AlienVsSurvivors = false,
+    CampaignLaunchDescriptor? Campaign = null);
 
 public readonly record struct WorldHostAcceptedMutation(
     WorldNetworkMutation Mutation,
@@ -118,6 +119,8 @@ public sealed partial class LobbyHost : IAsyncDisposable
         }
 
         ModelValidation.Validate(options.Compatibility);
+        if (options.Campaign is { } campaignLaunch) CampaignSaveValidation.Validate(campaignLaunch);
+        _campaignLaunch = options.Campaign;
         _options = options with { HostDisplayName = normalized };
         _level = options.Level;
         SessionId = Guid.NewGuid();
@@ -203,15 +206,21 @@ public sealed partial class LobbyHost : IAsyncDisposable
 
     public void Start()
     {
-        if (_acceptLoop is not null)
+        lock (_stateLock)
         {
-            throw new InvalidOperationException("The lobby is already running.");
-        }
+            if (_campaignLaunch?.Action == "continue" && _campaignSaveBundle is null)
+                throw new InvalidOperationException("The selected campaign save bundle must be frozen before lobby startup.");
+            if (_acceptLoop is not null)
+            {
+                throw new InvalidOperationException("The lobby is already running.");
+            }
 
-        _listener.Start(_options.Capacity);
-        _acceptLoop = AcceptLoopAsync(_shutdown.Token);
-        _heartbeatLoop = HeartbeatLoopAsync(_shutdown.Token);
-        _worldMutationBroadcastLoop = WorldMutationBroadcastLoopAsync(_shutdown.Token);
+            _listener.Start(_options.Capacity);
+            _acceptLoop = AcceptLoopAsync(_shutdown.Token);
+            _heartbeatLoop = HeartbeatLoopAsync(_shutdown.Token);
+            _worldMutationBroadcastLoop = WorldMutationBroadcastLoopAsync(_shutdown.Token);
+            _missionInboundLoop = RunMissionInboundAsync();
+        }
         PublishSnapshot();
     }
 
@@ -292,6 +301,7 @@ public sealed partial class LobbyHost : IAsyncDisposable
                         "Every participant must prepare the selected level with the same WorldManifest before launch.");
                 _state = "Starting";
                 _levelGeneration++;
+                ResetMissionCatalogLocked();
                 _sessionPreparedPeers.Clear();
                 _sessionReleasedGeneration = 0;
                 _deadPeers.Clear();
@@ -305,7 +315,8 @@ public sealed partial class LobbyHost : IAsyncDisposable
                     _levelGeneration,
                     _options.AlienEnabled,
                     _options.AlienVsSurvivors,
-                    _alienPeerId);
+                    _alienPeerId,
+                    Campaign: _campaignLaunch);
             }
         }
         finally
@@ -1267,6 +1278,11 @@ public sealed partial class LobbyHost : IAsyncDisposable
             state.Touch();
             switch (frame.Type)
             {
+                case MessageType.CampaignSaveRequest:
+                    QueueCampaignSaveDownload(state, frame.Payload);
+                    break;
+                case MessageType.CampaignSaveChunk:
+                    throw new ProtocolException("Clients may not upload campaign saves.");
                 case MessageType.AISyncExecutionControl:
                     HandleAISyncExecutionControl(state, frame.Payload);
                     break;
@@ -1993,8 +2009,10 @@ public sealed partial class LobbyHost : IAsyncDisposable
         int levelGeneration;
         Guid preparationToken;
         LobbyPreparationPayload[] preparations;
+        CampaignLaunchDescriptor? campaignLaunch;
         lock (_stateLock)
         {
+            campaignLaunch = _campaignLaunch;
             level = _level;
             state = _state;
             levelGeneration = _levelGeneration;
@@ -2033,7 +2051,8 @@ public sealed partial class LobbyHost : IAsyncDisposable
             _options.RequireWorldPreparation,
             _options.AlienEnabled,
             _options.AlienVsSurvivors,
-            _alienPeerId);
+            _alienPeerId,
+            campaignLaunch);
         ModelValidation.Validate(snapshot);
         return snapshot;
     }
@@ -2226,7 +2245,7 @@ public sealed partial class LobbyHost : IAsyncDisposable
             client.Connection.Client.Dispose();
         }
 
-        foreach (var task in new[] { _acceptLoop, _heartbeatLoop, _worldMutationBroadcastLoop }.OfType<Task>())
+        foreach (var task in new[] { _acceptLoop, _heartbeatLoop, _worldMutationBroadcastLoop, _missionInboundLoop }.OfType<Task>())
         {
             try
             {
@@ -2260,6 +2279,7 @@ public sealed partial class LobbyHost : IAsyncDisposable
 
     private sealed class ClientState
     {
+        public int CampaignSaveSending;
         public VoiceReceiveWindow VoiceWindow { get; } = new();
         public PlayerPositionReceiveWindow PositionWindow { get; } = new();
         private int _ready;

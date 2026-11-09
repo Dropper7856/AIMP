@@ -876,15 +876,45 @@ bool DecodeGameCommand(
         }
 
         if (command->stringValue == "SESSION_ROUND_BOUNDARY") {
-            if (output.levelGeneration != 0U || arguments->objectValue.size() != 1U) return false;
+            if (output.levelGeneration != 0U || arguments->objectValue.size() != 2U) return false;
             const auto* session = Field(*arguments, "sessionId", JsonType::String);
+            const auto* generation = Field(*arguments, "generation", JsonType::String);
             if (session == nullptr || session->stringValue.size() != 36U) return false;
+            if (generation == nullptr) return false;
+            const auto parsed = std::from_chars(generation->stringValue.data(),
+                generation->stringValue.data() + generation->stringValue.size(), output.sessionLoadingGeneration);
+            if (parsed.ec != std::errc{} || parsed.ptr != generation->stringValue.data() + generation->stringValue.size()
+                || output.sessionLoadingGeneration == 0U) return false;
             for (std::size_t i = 0U; i < 36U; ++i) {
                 const char c = session->stringValue[i];
                 if (i == 8U || i == 13U || i == 18U || i == 23U) { if (c != '-') return false; }
                 else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return false;
             }
             output.command = command->stringValue;
+            output.sessionLoadingSessionId = session->stringValue;
+            return true;
+        }
+
+        if (command->stringValue == "CAMPAIGN_PROFILE") {
+            if (output.levelGeneration != 0U || arguments->objectValue.size() != 3U) return false;
+            const auto* action = Field(*arguments, "action", JsonType::String);
+            const auto* path = Field(*arguments, "path", JsonType::String);
+            const auto* session = Field(*arguments, "sessionId", JsonType::String);
+            if (action == nullptr || path == nullptr || session == nullptr ||
+                (action->stringValue != "configure" && action->stringValue != "status" &&
+                 action->stringValue != "clear") ||
+                path->stringValue.size() > 1024U ||
+                path->stringValue.find_first_of(std::string_view("\0\r\n", 3)) != std::string::npos ||
+                (action->stringValue == "configure" && path->stringValue.empty()) ||
+                session->stringValue.size() != 36U) return false;
+            for (std::size_t i = 0U; i < 36U; ++i) {
+                const char c = session->stringValue[i];
+                if (i == 8U || i == 13U || i == 18U || i == 23U) { if (c != '-') return false; }
+                else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return false;
+            }
+            output.command = command->stringValue;
+            output.campaignProfileAction = action->stringValue;
+            output.campaignProfilePath = path->stringValue;
             output.sessionLoadingSessionId = session->stringValue;
             return true;
         }
@@ -1042,13 +1072,14 @@ bool DecodeGameCommand(
             return true;
         }
         if (command->stringValue == "MISSION_SYNC_APPLY") {
-            if (arguments->objectValue.size() != 4U) return false;
+            if (arguments->objectValue.size() != 5U) return false;
             const auto* entity = Field(*arguments, "entityId", JsonType::String);
             const auto* port = Field(*arguments, "signal", JsonType::String);
             const auto* selector = Field(*arguments, "selector", JsonType::String);
             const auto* sequence = Field(*arguments, "sequence", JsonType::String);
+            const auto* occurrence = Field(*arguments, "occurrence", JsonType::String);
             if (entity == nullptr || entity->stringValue.size() != 32U || port == nullptr ||
-                selector == nullptr || sequence == nullptr) return false;
+                selector == nullptr || sequence == nullptr || occurrence == nullptr) return false;
             const auto parse = []<typename T>(std::string_view text, T& value, int base) {
                 const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value, base);
                 return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
@@ -1059,8 +1090,9 @@ bool DecodeGameCommand(
                 (value.entityHigh == 0U && value.entityLow == 0U) ||
                 !parse(port->stringValue, value.signal, 10) || value.signal == 0U ||
                 !parse(sequence->stringValue, value.sequence, 10) || value.sequence == 0U ||
-                (selector->stringValue != "1" && selector->stringValue != "2")) return false;
-            value.selector = selector->stringValue == "1" ? 1U : 2U;
+                !parse(occurrence->stringValue, value.occurrence, 10) || value.occurrence > 1000000U ||
+                (selector->stringValue != "1" && selector->stringValue != "2" && selector->stringValue != "3" && selector->stringValue != "4")) return false;
+            value.selector = static_cast<std::uint8_t>(selector->stringValue[0] - '0');
             output.command = command->stringValue;
             return true;
         }
@@ -1204,14 +1236,15 @@ bool DecodeGameCommand(
 
         if (command->stringValue == "CHARACTER_DIRECT_MOVE") {
             const auto argumentCount = arguments->objectValue.size();
-            if (argumentCount < 5U || argumentCount > 16U) {
+            if (argumentCount < 5U || argumentCount > 17U) {
                 return false;
             }
-            constexpr std::array<std::string_view, 16> allowedArguments{
+            constexpr std::array<std::string_view, 17> allowedArguments{
                 "characterAddress", "directionX", "directionZ", "intensity",
                 "frameCount", "directionSpace", "replicationPositionX",
                 "replicationPositionY", "replicationPositionZ", "replicationYaw",
-                "moveType", "playerPosture", "playerTorch", "playerTorchDirection", "playerHiding", "playerHidingPresentation"};
+                "moveType", "playerPosture", "playerTorch", "playerTorchDirection", "playerHiding", "playerHidingPresentation",
+                "playerAnimation"};
             if (std::any_of(
                     arguments->objectValue.begin(),
                     arguments->objectValue.end(),
@@ -1407,6 +1440,12 @@ bool DecodeGameCommand(
                         output.characterDirectMove.playerHidingPresentation)) return false;
                 output.characterDirectMove.hasPlayerHidingPresentation = true;
             } else if (arguments->objectValue.contains("playerHidingPresentation")) return false;
+            if (const auto* animation = Field(*arguments, "playerAnimation", JsonType::String)) {
+                if (!hasReplicationPosition || !hasReplicationYaw || moveType == nullptr ||
+                    !animation_sync::Decode(animation->stringValue, output.characterDirectMove.playerAnimation))
+                    return false;
+                output.characterDirectMove.hasPlayerAnimation = true;
+            } else if (arguments->objectValue.contains("playerAnimation")) return false;
             if (const auto* posture = Field(*arguments, "playerPosture", JsonType::String)) {
                 if (!hasReplicationPosition || !hasReplicationYaw || moveType == nullptr ||
                     !player_posture::Decode(posture->stringValue, output.characterDirectMove.playerPosture))

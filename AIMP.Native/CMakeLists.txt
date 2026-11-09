@@ -26,6 +26,7 @@ set(AIMP_CORE_SOURCES
     src/AlienPvPControlRuntime.cpp
     src/AlienPvPLocalController.cpp
     src/AlienPvPInputIsolation.cpp
+    src/CampaignSaveRuntime.cpp
     src/AlienPvPVisualIsolation.cpp
     src/AISyncTransactions.cpp
     src/AISyncMarkerIdentity.cpp
@@ -94,6 +95,9 @@ set(AIMP_CORE_SOURCES
     src/PlayerHidingPresentationRuntime.cpp
     src/HidingPresentationAudio.cpp
     src/PlayerHidingLocalCapture.cpp
+    src/AnimationSyncRuntime.cpp
+    src/AnimationSyncTimeline.cpp
+    src/AnimationSyncPropsRuntime.cpp
     src/HidingDoorPresentation.cpp
     src/MissionSync.cpp
     src/PlayerLifecycle.cpp

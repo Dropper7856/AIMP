@@ -537,7 +537,7 @@ internal sealed class NativeRuntimeController : IDisposable
         IReadOnlyDictionary<string, string> arguments) => new(
         ProtocolConstants.ExperimentalSchemaVersion,
         Guid.NewGuid(),
-        command is "SESSION_LOADING_HOLD" or "SESSION_ROUND_BOUNDARY" ? 0 : Snapshot.LevelGeneration,
+        command is "SESSION_LOADING_HOLD" or "SESSION_ROUND_BOUNDARY" or "CAMPAIGN_PROFILE" ? 0 : Snapshot.LevelGeneration,
         _runtimeIdentity,
         command,
         arguments);
@@ -675,6 +675,7 @@ internal sealed class NativeRuntimeController : IDisposable
         session.PlayerLifecycleStateChanged += OnPlayerLifecycleStateChanged;
         session.CharacterIncarnationChanged += OnCharacterIncarnationChanged;
         session.PlayerHidingStateChanged += OnPlayerHidingStateChanged;
+        session.PlayerAnimationStateChanged += OnPlayerAnimationStateChanged;
         session.MissionSignalProduced += OnMissionSignalProduced;
         session.ItemSyncPickupProduced += OnItemSyncPickupProduced;
         session.ItemSyncSpawnProduced += OnItemSyncSpawnProduced;
@@ -701,6 +702,7 @@ internal sealed class NativeRuntimeController : IDisposable
         session.PlayerLifecycleStateChanged -= OnPlayerLifecycleStateChanged;
         session.CharacterIncarnationChanged -= OnCharacterIncarnationChanged;
         session.PlayerHidingStateChanged -= OnPlayerHidingStateChanged;
+        session.PlayerAnimationStateChanged -= OnPlayerAnimationStateChanged;
         session.MissionSignalProduced -= OnMissionSignalProduced;
         session.ItemSyncPickupProduced -= OnItemSyncPickupProduced;
         session.ItemSyncSpawnProduced -= OnItemSyncSpawnProduced;
@@ -758,6 +760,11 @@ internal sealed class NativeRuntimeController : IDisposable
     {
         if (sender is not DllIpcSession session || !ReferenceEquals(session, _ipc) || !session.IsReady) return;
         Update(state => state with { LocalHiding = value, LocalHidingReceivedAt = DateTimeOffset.UtcNow });
+    }
+    private void OnPlayerAnimationStateChanged(object? sender, NativePlayerAnimationStatePayload value)
+    {
+        if (sender is not DllIpcSession session || !ReferenceEquals(session, _ipc) || !session.IsReady) return;
+        Update(state => state with { LocalAnimation = value, LocalAnimationReceivedAt = DateTimeOffset.UtcNow });
     }
     private void OnPlayerLifecycleStateChanged(
         object? sender,
@@ -883,7 +890,7 @@ internal sealed class NativeRuntimeController : IDisposable
             ready, current.EngineThreadId, current.EngineThreadSource,
             current.FirstEngineCallbackCounter, current.LastEngineCallbackCounter,
             current.PendingCommandCount, value.LevelGeneration);
-        ApplyEngineState(update);
+        ApplyEngineState(update, value);
     }
 
     private string NormalizeCaptureSource(string source)
@@ -892,11 +899,19 @@ internal sealed class NativeRuntimeController : IDisposable
         return Snapshot.EngineThreadSource;
     }
 
-    private void ApplyEngineState(EngineStateUpdate state)
+    private void ApplyEngineState(EngineStateUpdate state, LevelStatePayload? level = null)
     {
         var wasReady = Snapshot.EngineThreadReady;
-        Update(value => MergeEngineState(
-            ResetRemoteCharacterForGeneration(value, state.Generation), state));
+        Update(value =>
+        {
+            var next = MergeEngineState(
+                ResetRemoteCharacterForGeneration(value, state.Generation), state);
+            return level is null ? next : next with
+            {
+                CurrentLevelName = level.LevelName,
+                LevelTransitioning = level.Transitioning
+            };
+        });
         if (state.Ready && !wasReady)
             Log($"Engine thread ready: {state.ThreadId} ({state.Source})");
     }

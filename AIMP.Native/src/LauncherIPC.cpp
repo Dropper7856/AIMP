@@ -13,6 +13,7 @@
 #include "aimp/CharacterIncarnation.h"
 #include "aimp/PlayerHidingLocalCapture.h"
 #include "aimp/PlayerHidingPresentationRuntime.h"
+#include "aimp/AnimationSyncRuntime.h"
 #include "aimp/HidingDoorPresentation.h"
 #include "aimp/HidingPresentationAudio.h"
 
@@ -31,6 +32,7 @@
 #include "aimp/ThrowableSync.h"
 #include "aimp/MissionSync.h"
 #include "aimp/LevelGenerationTracker.h"
+#include "aimp/MissionLevelObservation.h"
 #include "aimp/MultiplayerPause.h"
 #include "aimp/NetZDiscovery.h"
 #include "aimp/ReplicationCore.h"
@@ -43,6 +45,7 @@
 #include "aimp/ProductVersion.h"
 #include "aimp/PlayerSyncObserver.h"
 #include "aimp/PlayerLifecycle.h"
+#include "aimp/CampaignSaveRuntime.h"
 #include "aimp/UIHeapGuard.h"
 
 #include <bcrypt.h>
@@ -825,6 +828,38 @@ void LauncherIPC::PublishPlayerHidingTraffic() {
     }
 }
 
+// AnimationSync: the local THE_PLAYER's current scripted clip ("0" = none).
+// Same cadence and identity guards as the hiding observation.
+void LauncherIPC::PublishPlayerAnimationTraffic() {
+    if (!sessionConfigured_.load(std::memory_order_acquire) || !netzReadySent_.load(std::memory_order_acquire)) {
+        publishedAnimation_.clear(); lastAnimationPublication_ = 0; return;
+    }
+    const auto now = GetTickCount64();
+    if (now - lastAnimationPublication_ < 16U) return;
+    const auto capture = animation_sync::ReadLocal();
+    if (!capture.valid || now < capture.capturedAt || now - capture.capturedAt > 500U ||
+        !character_incarnations::NativeRegistry().Current(capture.ticket)) return;
+    // Identity without the advancing clock: a new clip or a clear is sent at
+    // once, an unchanged clip only refreshes its elapsed time every 250 ms.
+    std::ostringstream key;
+    key << capture.ticket.generation << ':' << capture.ticket.serial << ':'
+        << capture.state.transition << ':' << capture.state.animation;
+    for (const auto attachment : capture.state.attachments) key << ':' << attachment;
+    if (key.str() == publishedAnimation_ && now - lastAnimationPublication_ < 250U) return;
+    auto state = capture.state;
+    if (animation_sync::Active(state)) state.elapsedMilliseconds = static_cast<std::uint32_t>(now - capture.capturedAt);
+    std::ostringstream json;
+    json << "{\"schemaVersion\":1,\"nativeGeneration\":" << capture.ticket.generation
+        << ",\"character\":" << capture.ticket.character << ",\"serial\":" << capture.ticket.serial
+        << ",\"sampledAtTickMilliseconds\":" << now
+        << ",\"animation\":\"" << animation_sync::Encode(state) << "\"}";
+    const auto payload = json.str();
+    if (Queue(protocol::MessageType::PlayerAnimationState, 0,
+            localSequence_.fetch_add(1U, std::memory_order_relaxed), JsonBytes(payload))) {
+        publishedAnimation_ = key.str(); lastAnimationPublication_ = now;
+    }
+}
+
 void LauncherIPC::PublishMissionSyncTraffic() {
     mission_sync::Signal signal{};
     for (std::size_t i = 0U; i < 16U && mission_sync::TryPeek(signal); ++i) {
@@ -834,7 +869,8 @@ void LauncherIPC::PublishMissionSyncTraffic() {
              << ",\"sequence\":" << signal.sequence
              << ",\"entityId\":\"" << item_sync::EntityIdHex(signal.entity) << '"'
              << ",\"signal\":" << signal.port
-             << ",\"interfaceSelector\":" << static_cast<unsigned>(signal.selector) << '}';
+             << ",\"interfaceSelector\":" << static_cast<unsigned>(signal.selector)
+             << ",\"occurrence\":" << signal.occurrence << '}';
         if (!Queue(protocol::MessageType::MissionSignalProduced, 0,
                 localSequence_.fetch_add(1U, std::memory_order_relaxed), JsonBytes(json.str()))) break;
         mission_sync::Pop();
@@ -1130,14 +1166,17 @@ void LauncherIPC::PublishRuntimeState() {
         lastPublishedGeneration_.load(std::memory_order_acquire);
     const auto previousStability =
         lastPublishedStability_.load(std::memory_order_acquire);
-    const bool levelStateChanged =
+    const auto selectedLevelName = level.stability == LevelStability::Stable
+        ? mission_level_observation::ReadSelectedLevelName(
+            reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr))) : std::string{};
+    const bool levelStateChanged = lastPublishedLevelName_ != selectedLevelName ||
         previousGeneration != level.generation ||
         previousStability !=
             static_cast<std::uint8_t>(level.stability);
     if (levelStateChanged) {
         const auto payload = experimental::EncodeLevelState(
             request,
-            "",
+            selectedLevelName,
             level.stability != LevelStability::Stable,
             engineThread.ready);
         if (!QueueExperimental(
@@ -1148,6 +1187,7 @@ void LauncherIPC::PublishRuntimeState() {
         lastPublishedGeneration_.store(
             level.generation,
             std::memory_order_release);
+        lastPublishedLevelName_ = selectedLevelName;
         lastPublishedStability_.store(
             static_cast<std::uint8_t>(level.stability),
             std::memory_order_release);
@@ -1377,6 +1417,7 @@ void LauncherIPC::Run() {
             PublishPlayerLifecycleTraffic();
             PublishCharacterIncarnationTraffic();
             PublishPlayerHidingTraffic();
+            PublishPlayerAnimationTraffic();
             PublishItemSyncTraffic();
             PublishMissionSyncTraffic();
             PublishItemSyncSpawnTraffic();
@@ -2864,7 +2905,9 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
         const bool performanceSetting = request.command == "PERFORMANCE_ISOLATION_SET";
         const bool loadingSetting = request.command == "SESSION_LOADING_HOLD";
         const bool roundBoundary = request.command == "SESSION_ROUND_BOUNDARY";
-        const bool processSetting = ws3Setting || performanceSetting || loadingSetting || roundBoundary;
+        const bool campaignProfile = request.command == "CAMPAIGN_PROFILE";
+        const bool processSetting = ws3Setting || performanceSetting || loadingSetting || roundBoundary
+            || campaignProfile;
         if (processSetting && request.portableDummyId != localLauncherPlayerId_) return false;
         const auto currentGeneration = processSetting ? 0ULL : generations_->CurrentGeneration();
         if (!processSetting && request.levelGeneration == 0) {
@@ -2924,9 +2967,11 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
         // Idempotent per session so a retried request cannot bump twice.
         if (roundBoundary) {
             GameCommandExecutionResult result{};
-            const bool fresh = request.sessionLoadingSessionId != lastRoundBoundarySessionId_;
+            const bool fresh = request.sessionLoadingSessionId != lastRoundBoundarySessionId_
+                || request.sessionLoadingGeneration > lastRoundBoundaryNetworkGeneration_;
             if (fresh && generations_ != nullptr) {
                 lastRoundBoundarySessionId_ = request.sessionLoadingSessionId;
+                lastRoundBoundaryNetworkGeneration_ = request.sessionLoadingGeneration;
                 const auto previous = generations_->CurrentGeneration();
                 const auto next = generations_->BeginTransition();
                 diagnostics_->Log(
@@ -2942,6 +2987,31 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
             result.message = result.executed
                 ? (fresh ? "Previous level incarnation revoked." : "Round boundary already applied for this session.")
                 : "Level generation tracking is unavailable.";
+            const auto payload = experimental::EncodeGameCommandResult(request, request.command, result);
+            return CompleteExperimentalRequest(request.requestId, reservation.epoch,
+                protocol::MessageType::GameCommandResult, frame.payload, payload);
+        }
+
+        // Profile switches change only isolated file routing; the cached retail
+        // save catalogue is re-enumerated by the main-thread storage poll.
+        if (campaignProfile) {
+            GameCommandExecutionResult result{};
+            std::string error;
+            bool applied = true;
+            if (request.campaignProfileAction == "configure")
+                applied = campaign_save::Configure(request.sessionLoadingSessionId, request.campaignProfilePath, error);
+            else if (request.campaignProfileAction == "clear")
+                applied = campaign_save::Clear(request.sessionLoadingSessionId, error);
+            auto status = campaign_save::Snapshot();
+            if (!error.empty()) status.error = error;
+            result.executed = applied;
+            result.statusCode = applied ? "CAMPAIGN_PROFILE_STATUS" : "CAMPAIGN_PROFILE_REJECTED";
+            result.message = campaign_save::EncodeStatus(status);
+            if (diagnostics_ != nullptr && request.campaignProfileAction != "status")
+                diagnostics_->Log(applied ? "info" : "warning", "campaign_profile",
+                    applied ? "Campaign save profile updated." : "Campaign save profile change rejected.",
+                    {{"action", request.campaignProfileAction}, {"session", request.sessionLoadingSessionId},
+                     {"error", error}});
             const auto payload = experimental::EncodeGameCommandResult(request, request.command, result);
             return CompleteExperimentalRequest(request.requestId, reservation.epoch,
                 protocol::MessageType::GameCommandResult, frame.payload, payload);
@@ -3459,6 +3529,7 @@ bool LauncherIPC::HandleFrame(protocol::Frame frame) {
              {"doorTarget", Diagnostics::Unsigned(hidingDoor.lastTargetShortGuid), true},
              {"doorHierarchy", Diagnostics::Unsigned(hidingDoor.lastHierarchyHash), true}});
         player_animation_clip_capture::Export(*diagnostics_);
+        animation_sync::Export(*diagnostics_, locomotion.characterAddress);
         diagnostics_->Log(
             "info",
             "native_runtime_snapshot",

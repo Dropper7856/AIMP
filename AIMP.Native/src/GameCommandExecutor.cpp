@@ -4,6 +4,7 @@
 #include "aimp/PlayerTorchRuntime.h"
 #include "aimp/PlayerHidingRuntime.h"
 #include "aimp/PlayerHidingPresentationRuntime.h"
+#include "aimp/AnimationSyncRuntime.h"
 #include "aimp/HidingDoorPresentation.h"
 #include "aimp/MissionSync.h"
 
@@ -3698,6 +3699,8 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteCharacterDirectMove(
          (command.playerHidden && !player_hiding::ValidAnchor(command.playerHidingAnchor)))) ||
         (command.hasPlayerHidingPresentation && (!command.hasPlayerHiding ||
          !player_hiding_presentation::Valid(command.playerHidingPresentation))) ||
+        (command.hasPlayerAnimation && (!command.hasReplicationPosition ||
+         !animation_sync::Valid(command.playerAnimation))) ||
         (command.hasPlayerPosture && (!command.hasReplicationPosition ||
          !command.hasReplicationYaw || !command.hasMoveType ||
          !player_posture::Valid(command.playerPosture))) ||
@@ -3754,6 +3757,21 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteCharacterDirectMove(
             if (!player_hiding_presentation::Publish(command.characterAddress, command.playerHidingPresentation, error) ||
                 !hiding_door_presentation::Publish(command.characterAddress, command.playerHidingPresentation, error)) {
                 result.statusCode = "PLAYER_HIDING_PRESENTATION_FAILED";
+                result.message = error;
+                return false;
+            }
+        }
+        if (command.hasPlayerAnimation) {
+            std::string error;
+              auto animation = command.playerAnimation;
+              if (animation_sync::Active(animation)) {
+                  // The movement carrier is newer than an IPC animation
+                  // heartbeat: align to its current replicated transform.
+                  animation.position = {command.replicationPositionX, command.replicationPositionY, command.replicationPositionZ};
+                  animation.yaw = command.replicationYaw;
+              }
+              if (!animation_sync::Publish(command.characterAddress, animation, error)) {
+                result.statusCode = "PLAYER_ANIMATION_PUBLICATION_FAILED";
                 result.message = error;
                 return false;
             }
@@ -4158,7 +4176,7 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteMissionSync(
         result.statusCode = result.executed ? "MISSION_SYNC_CONFIGURED" : "MISSION_SYNC_NOT_READY";
     } else {
         const mission_sync::Signal signal{worldRegistry_->ReplicationContext().levelGeneration, command.sequence,
-            WorldEntityId{command.entityHigh, command.entityLow}, command.signal, command.selector};
+            WorldEntityId{command.entityHigh, command.entityLow}, command.signal, command.selector, command.occurrence};
         result.executed = mission_sync::Apply(signal, result.statusCode, result.message);
     }
     return result;

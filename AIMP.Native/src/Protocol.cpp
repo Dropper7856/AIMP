@@ -100,6 +100,7 @@ bool IsKnownMessageType(const std::uint16_t raw) noexcept {
     case MessageType::AlienPvPNative:
     case MessageType::AlienPvPCommand:
     case MessageType::PlayerHidingState:
+    case MessageType::PlayerAnimationState:
     case MessageType::MissionSignalProduced:
     case MessageType::TestModeConfigure:
     case MessageType::CapabilityQuery:

@@ -166,6 +166,7 @@ public static class GameCommandNames
     public const string SessionLoadingHold = "SESSION_LOADING_HOLD";
     // Internal round lifecycle: revokes the previous level incarnation at a lobby start.
     public const string SessionRoundBoundary = "SESSION_ROUND_BOUNDARY";
+    public const string CampaignProfile = "CAMPAIGN_PROFILE";
     public const string ReturnToFrontend = "RETURN_TO_FRONTEND";
     // Local engine-thread probe only. No remote player can choose a native pointer.
     public const string AlienPvPProbe = "ALIEN_PVP_PROBE";
@@ -207,6 +208,7 @@ public static class GameCommandNames
             AlienPvPVents,
             SessionLoadingHold,
             SessionRoundBoundary,
+            CampaignProfile,
             ItemSyncApply,
             ItemSyncSpawn,
             MissionSyncConfigure,

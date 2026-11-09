@@ -183,7 +183,7 @@ package frontend
          this._lastConnectionError = message;
       }
 
-      public function createLobby(mode:String, maxPlayers:int, visibility:String, mapId:String, mapName:String, alienEnabled:Boolean = true, alienVsSurvivors:Boolean = false) : void
+      public function createLobby(mode:String, maxPlayers:int, visibility:String, mapId:String, mapName:String, alienEnabled:Boolean = true, alienVsSurvivors:Boolean = false, campaignAction:String = "", campaignSaveId:String = "", campaignDifficulty:String = "medium") : void
       {
          var values:Object = {};
          values["mode"] = mode;
@@ -193,6 +193,12 @@ package frontend
          values["mapName"] = mapName;
          values["alienEnabled"] = alienEnabled ? "1" : "0";
          values["alienVsSurvivors"] = alienVsSurvivors ? "1" : "0";
+         if(mode == "campaign")
+         {
+            values["campaignAction"] = campaignAction;
+            values["campaignSaveId"] = campaignSaveId;
+            values["campaignDifficulty"] = campaignDifficulty;
+         }
          this.send("CREATE_LOBBY",values);
       }
       
@@ -368,7 +374,7 @@ package frontend
          {
             if(this.onGameStart != null)
             {
-               this.onGameStart(String(values["mode"]),String(values["mapId"]),String(values["mapName"]),String(values["sessionId"]),String(values["engineLevelPath"]));
+               this.onGameStart(String(values["mode"]),String(values["mapId"]),String(values["mapName"]),String(values["sessionId"]),String(values["engineLevelPath"]),String(values["campaignAction"]),String(values["campaignDifficulty"]));
             }
          }
          else if(type == "CONFIG")

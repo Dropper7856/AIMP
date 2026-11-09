@@ -16,8 +16,14 @@ internal sealed partial class MultiplayerSessionCoordinator
     {
         var level = ResolveLevel(message);
         var mode = message.Get("mode", "survival");
-        if (!settings.DeveloperMode && !mode.Equals("survival", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("Enable Developer mode to create an experimental campaign lobby.");
+        if (mode.Equals("campaign", StringComparison.OrdinalIgnoreCase))
+        {
+            if (message.Get("campaignAction", "new") == "level" && !settings.DeveloperMode)
+                throw new InvalidOperationException("Enable Developer mode to launch an individual campaign level.");
+            return;
+        }
+        if (!mode.Equals("survival", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Invalid game mode.");
         if (settings.DeveloperMode)
             WorldManifestAutoResolver.ResolveLevelSource(settings.GameDirectory, level, includeCampaign: true);
     }

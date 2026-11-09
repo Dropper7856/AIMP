@@ -304,6 +304,8 @@ public static class ModelValidation
         if (value.Posture is not null) Validate(value.Posture);
         if (value.Torch is not null) Validate(value.Torch);
         if (value.Hiding is not null) Validate(value.Hiding);
+        if (value.Animation is not null && !PlayerAnimationCodec.IsValid(value.Animation))
+            throw new ProtocolException("The player-animation snapshot is invalid.");
     }
 
     public static void Validate(PlayerHidingSnapshot? value)
@@ -371,7 +373,9 @@ public static class ModelValidation
         if (value is null || value.SessionId == Guid.Empty || value.PeerId == 0
             || value.PreparationToken == Guid.Empty || !Bounded(value.Level, 1, 128)
             || value.Error is null || value.Error.Length > 2048
-            || value.ManifestSha256 is null || value.ManifestSha256.Length > 64)
+            || value.ManifestSha256 is null || value.ManifestSha256.Length > 64
+            || value.CampaignSaveSha256 is null
+            || (value.CampaignSaveSha256.Length != 0 && !HexDigest(value.CampaignSaveSha256)))
             throw new ProtocolException("Lobby preparation is invalid.");
         if (value.Ready)
         {
@@ -399,13 +403,17 @@ public static class ModelValidation
 
     public static void Validate(LobbyStartPayload? value)
     {
+        if (value?.Campaign is { } campaignLaunch) CampaignSaveValidation.Validate(campaignLaunch);
         if (value is null
             || value.SessionId == Guid.Empty
             || !Bounded(value.Level, 1, 128)
             || value.LevelGeneration < 1
             || value.StartAtUnixMilliseconds <= 0
             || (value.AlienVsSurvivors && (!value.AlienEnabled || value.AlienPeerId == 0))
-            || (!value.AlienVsSurvivors && value.AlienPeerId != 0))
+            || (!value.AlienVsSurvivors && value.AlienPeerId != 0)
+            || value.PreviousMissionSequence > MissionSignalValidation.MaximumSignalsPerGeneration
+            || (!value.CampaignContinuation && value.PreviousMissionSequence != 0)
+            || (value.CampaignContinuation && (value.LevelGeneration < 2 || value.AlienVsSurvivors)))
         {
             throw new ProtocolException("The launch command is invalid.");
         }
@@ -413,6 +421,7 @@ public static class ModelValidation
 
     public static void Validate(LobbySnapshotPayload? value)
     {
+        if (value?.Campaign is { } campaignLaunch) CampaignSaveValidation.Validate(campaignLaunch);
         if (value is null
             || value.SessionId == Guid.Empty
             || !Bounded(value.ServerName, 1, ProtocolConstants.MaximumServerNameLength)
@@ -938,10 +947,26 @@ public static class ModelValidation
         if (string.Equals(value.Command, GameCommandNames.SessionRoundBoundary,
                 StringComparison.Ordinal))
         {
-            if (value.LevelGeneration != 0 || value.Arguments.Count != 1
+            if (value.LevelGeneration != 0 || value.Arguments.Count != 2
                 || !value.Arguments.TryGetValue("sessionId", out var boundaryText)
-                || !Guid.TryParse(boundaryText, out var boundarySession) || boundarySession == Guid.Empty)
+                || !Guid.TryParse(boundaryText, out var boundarySession) || boundarySession == Guid.Empty
+                || !value.Arguments.TryGetValue("generation", out var boundaryGenerationText)
+                || !int.TryParse(boundaryGenerationText, NumberStyles.None, CultureInfo.InvariantCulture,
+                    out var boundaryGeneration) || boundaryGeneration < 1)
                 throw new ProtocolException("SESSION_ROUND_BOUNDARY parameters are invalid.");
+            return;
+        }
+
+        if (value.Command == GameCommandNames.CampaignProfile)
+        {
+            if (value.LevelGeneration != 0 || value.Arguments.Count != 3
+                || !value.Arguments.TryGetValue("action", out var profileAction)
+                || profileAction is not ("configure" or "status" or "clear")
+                || !value.Arguments.TryGetValue("sessionId", out var profileSessionText)
+                || !Guid.TryParse(profileSessionText, out var profileSession) || profileSession == Guid.Empty
+                || !value.Arguments.TryGetValue("path", out var profilePath)
+                || profilePath.Length > 1024 || (profileAction == "configure" && string.IsNullOrWhiteSpace(profilePath)))
+                throw new ProtocolException("CAMPAIGN_PROFILE parameters are invalid.");
             return;
         }
 
@@ -1162,7 +1187,8 @@ public static class ModelValidation
                 "directionSpace", "replicationPositionX", "replicationPositionY",
                 "replicationPositionZ",
                 "replicationYaw",
-                "moveType", "playerPosture", "playerTorch", "playerTorchDirection", "playerHiding", "playerHidingPresentation"
+                "moveType", "playerPosture", "playerTorch", "playerTorchDirection", "playerHiding", "playerHidingPresentation",
+                "playerAnimation"
             };
             var hasDirectionSpace = value.Arguments.TryGetValue(
                 "directionSpace", out var directionSpaceText);
@@ -1183,7 +1209,8 @@ public static class ModelValidation
             var hasTorchDirection = value.Arguments.TryGetValue("playerTorchDirection", out var torchDirection);
             var hasHiding = value.Arguments.TryGetValue("playerHiding", out var hidingText);
             var hasHidingPresentation = value.Arguments.TryGetValue("playerHidingPresentation", out var presentationText);
-            var validCount = value.Arguments.Count is >= 5 and <= 16;
+            var hasAnimation = value.Arguments.TryGetValue("playerAnimation", out var animationText);
+            var validCount = value.Arguments.Count is >= 5 and <= 17;
             if (!validCount
                 || value.Arguments.Keys.Any(key => !allowed.Contains(key))
                 || required.Any(key => !value.Arguments.ContainsKey(key))
@@ -1244,6 +1271,8 @@ public static class ModelValidation
                     || !PlayerHidingCodec.TryDecode(hidingText, out _)))
                 || (hasHidingPresentation && (!hasHiding || (presentationText != "0"
                     && !PlayerHidingPresentationCodec.TryDecode(presentationText, out _, out _))))
+                || (hasAnimation && (!hasReplicationPosition
+                    || !PlayerAnimationCodec.TryDecode(animationText, out _)))
                 || (hasReplicationYaw
                     && (!string.Equals(directionSpaceText, "world", StringComparison.Ordinal)
                         || !float.TryParse(replicationYawText, NumberStyles.Float,

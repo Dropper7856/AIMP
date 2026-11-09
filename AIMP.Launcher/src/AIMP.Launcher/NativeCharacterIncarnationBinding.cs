@@ -17,7 +17,8 @@ internal static class NativeCharacterIncarnationBinding
     {
         LocalCharacterGeneration = 0, LocalCharacterSerial = 0, LocalCharacterBase = 0,
         LocalCharacterRuntimeId = 0, LocalCharacterOrigin = 0, LocalCharacterConnectionIdentity = Guid.Empty,
-        LocalHiding = null, LocalHidingReceivedAt = null
+        LocalHiding = null, LocalHidingReceivedAt = null,
+        LocalAnimation = null, LocalAnimationReceivedAt = null
     };
 
     // The ticket can precede LevelState on IPC. Preserve a matching new-world

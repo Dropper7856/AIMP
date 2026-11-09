@@ -132,6 +132,7 @@ private:
     void PublishPlayerLifecycleTraffic();
     void PublishCharacterIncarnationTraffic();
     void PublishPlayerHidingTraffic();
+    void PublishPlayerAnimationTraffic();
     void PublishItemSyncTraffic();
     void PublishMissionSyncTraffic();
     void PublishItemSyncSpawnTraffic();
@@ -184,6 +185,8 @@ private:
     bool characterIncarnationPublished_{};
     std::string publishedHiding_; // IPC worker only.
     std::uint64_t lastHidingPublication_{};
+    std::string publishedAnimation_; // IPC worker only.
+    std::uint64_t lastAnimationPublication_{};
     bool buildValidated_{};
     std::string profileId_;
     std::string resolutionMode_;
@@ -192,6 +195,7 @@ private:
     std::string worldSyncAuthoritySessionId_;
     std::string worldSyncLastBoundSessionId_;
     std::string lastRoundBoundarySessionId_;
+    std::uint32_t lastRoundBoundaryNetworkGeneration_{};
     std::uint64_t worldSyncAuthorityGeneration_{};
     bool worldSyncAuthorityBound_{};
     bool worldSyncAuthorityHost_{};
@@ -237,6 +241,7 @@ private:
     std::atomic<std::uint64_t> lastPublishedCaptureGeneration_{
         (std::numeric_limits<std::uint64_t>::max)()};
     std::atomic<std::uint8_t> lastPublishedStability_{0xFFU};
+    std::string lastPublishedLevelName_;
     std::atomic<std::uint8_t> lastPublishedGameThreadValidated_{0xFFU};
     std::atomic<std::uint32_t> lastPublishedGameThreadCandidateId_{
         (std::numeric_limits<std::uint32_t>::max)()};
