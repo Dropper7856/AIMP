@@ -34,6 +34,7 @@ internal sealed partial class MultiplayerSessionCoordinator
     // Called with the coordinator state lock, including round restart in the same lobby.
     private void ResetMissionSync()
     {
+        ResetCinematicSync();
         ++_missionEpoch;
         _missionNativeGeneration = 0;
         _missionLastApplied = 0;

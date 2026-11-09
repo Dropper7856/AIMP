@@ -639,6 +639,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             now, positionAvailable, position, yawAvailable, yaw,
             movementProfileAvailable, movementProfile);
         ReportSessionPreparationProgress(runtime, now, positionError);
+        TryScheduleCinematicPoll(runtime, now);
         if (TryQueueLocalPosition(now)) _ = PumpLocalPositionsAsync();
         if (TryQueueLocalEquipment(now)) _ = PumpLocalPlayerSyncAsync();
         _ = TryAdvanceGameplayAsync(runtime);
@@ -2591,6 +2592,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         client.RoundEnded += OnRoundEnded;
         client.RoundProgressReceived += OnRoundProgress;
         client.MissionSignalCommitted += OnMissionSignalCommitted;
+        client.CinematicSkipCommitted += OnCinematicSkipCommitted;
         client.ItemCollected += OnItemCollected;
         client.ItemSpawnDecided += OnItemSpawnDecided;
         client.ThrowableCommitted += OnRemoteThrowableCommitted;
@@ -2621,6 +2623,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         client.RoundEnded -= OnRoundEnded;
         client.RoundProgressReceived -= OnRoundProgress;
         client.MissionSignalCommitted -= OnMissionSignalCommitted;
+        client.CinematicSkipCommitted -= OnCinematicSkipCommitted;
         client.ItemCollected -= OnItemCollected;
         client.ItemSpawnDecided -= OnItemSpawnDecided;
         client.ThrowableCommitted -= OnRemoteThrowableCommitted;
