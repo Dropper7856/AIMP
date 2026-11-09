@@ -31,7 +31,7 @@ std::atomic<int> gCinematicRole{0}; // 0 off, 1 Host, 2 Client
 std::atomic<std::uint64_t> gCinematicHeartbeatUntil{0U},gCinematicLeaseUntil{0U};
 std::uint64_t gCinematicEnterSince{},gCinematicLastHostEdge{};
 bool gCinematicPrompted{};
-HWND gCinematicInjectedWindow{};
+std::atomic<HWND> gCinematicInjectedWindow{nullptr};
 std::atomic<int> gCameraWheel{};
 std::atomic<bool> gMapMode{};
 std::atomic<bool> gMapClicked{};
@@ -81,11 +81,16 @@ bool CinematicBlocked() noexcept {
         gCinematicLeaseUntil.load(std::memory_order_acquire)<=GetTickCount64();
 }
 void ReleaseInjectedEnter() noexcept {
-    if (!gCinematicInjectedWindow) return;
-    static_cast<void>(PostMessageW(gCinematicInjectedWindow,WM_KEYUP,VK_RETURN,0xC0000001L));
-    gCinematicInjectedWindow=nullptr;
+    const auto window=gCinematicInjectedWindow.exchange(nullptr,std::memory_order_acq_rel);
+    if (window)
+        static_cast<void>(PostMessageW(window,WM_KEYUP,VK_RETURN,0xC0000001L));
 }
 void FilterMessage(LPMSG message) noexcept {
+    // A network disconnect can stop the poll loop mid-lease. The game's
+    // ongoing message pump must still retire our synthetic Return key.
+    if (gCinematicInjectedWindow.load(std::memory_order_acquire) &&
+        GetTickCount64()>=gCinematicLeaseUntil.load(std::memory_order_acquire))
+        ReleaseInjectedEnter();
     if (!message) return;
     if (CinematicBlocked() && message->wParam==VK_RETURN &&
         (message->message==WM_KEYDOWN || message->message==WM_KEYUP ||
@@ -109,6 +114,9 @@ void FilterMessage(LPMSG message) noexcept {
         message->message=WM_NULL;
 }
 SHORT WINAPI HookAsync(const int key) noexcept {
+    if (key==VK_RETURN && gCinematicInjectedWindow.load(std::memory_order_acquire) &&
+        GetTickCount64()>=gCinematicLeaseUntil.load(std::memory_order_acquire))
+        ReleaseInjectedEnter();
     const auto original=gOriginalAsync;
     if (!original) return 0;
     if (key==VK_RETURN && CinematicClient())
@@ -316,7 +324,7 @@ CinematicSignal PollCinematic() noexcept {
     const auto now=GetTickCount64();
     gCinematicHeartbeatUntil.store(now+1200U,std::memory_order_release);
     const bool cinematic=CinematicCamera() && GameFocused();
-    if (gCinematicInjectedWindow &&
+    if (gCinematicInjectedWindow.load(std::memory_order_acquire) &&
         (now>=gCinematicLeaseUntil.load(std::memory_order_acquire) || !cinematic))
         ReleaseInjectedEnter();
     if (!cinematic) {
@@ -342,12 +350,12 @@ bool ApplyCinematicSkip() noexcept {
     const auto window=GetForegroundWindow();
     if (!window) return false;
     gCinematicLeaseUntil.store(GetTickCount64()+1650U,std::memory_order_release);
-    gCinematicInjectedWindow=window;
+    gCinematicInjectedWindow.store(window,std::memory_order_release);
     // Never call an unverified retail skip function: wake the input queue
     // and temporarily expose a Host-authorized Enter hold to game polling.
     if (!PostMessageW(window,WM_KEYDOWN,VK_RETURN,1U)) {
         gCinematicLeaseUntil.store(0U,std::memory_order_release);
-        gCinematicInjectedWindow=nullptr;return false;
+        ReleaseInjectedEnter();return false;
     }
     return true;
 }
