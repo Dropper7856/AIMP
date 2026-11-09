@@ -1,4 +1,6 @@
 #include "aimp/PlayerHidingPresentationRuntime.h"
+#include "aimp/AnimationSync.h"
+#include <cmath>
 #include <Windows.h>
 #include <array>
 #include <cstring>
@@ -39,6 +41,18 @@ int main() {
     Check(ClassifyClip(0xCF2A9F36U).phase == 1U && ClassifyClip(0x3FDD3AF4U).phase == 3U,
         "Native clip aliases still identify occupancy phases");
     Check(ClassifyClip(0x12345678U).phase == 0U, "Unrelated animation cannot become hiding");
+    Check(ClipToken(1U, 1U) == 0xCF2A9F36U && ClipToken(2U, 3U) == 0x3FDD3AF4U,
+        "Exact native locker aliases bridge scriptless first-person edges");
+    Check(ClipToken(0U, 1U) == 0U && ClipToken(1U, 0U) == 0U,
+        "Unrelated interactions never synthesize a locker animation");
+    Check(std::abs(ExitYaw(1.0F) - (1.0F - 3.14159265358979F)) < 0.0001F &&
+        std::abs(ExitYaw(-1.0F) - (-1.0F + 3.14159265358979F)) < 0.0001F,
+        "Exit faces out of the locker on either side of the yaw wrap");
+    Check(std::abs(aimp::animation_sync::PosturalHeightOffset(0.03F, 2.0F, 1.85F) - 0.18F) < 0.0001F &&
+        std::abs(aimp::animation_sync::PosturalHeightOffset(0.03F, 2.0F, 2.0F) - 0.03F) < 0.0001F,
+        "A small first-person crouch does not lower the remote actor");
+    Check(std::abs(aimp::animation_sync::PosturalHeightOffset(0.03F, 2.0F, 1.5F) - 0.03F) < 0.0001F,
+        "Real traversal over a larger vertical gap remains synchronized");
     state.hierarchyHash = 123U; state.animate = false;
     Initialize(0U);
     std::string error;

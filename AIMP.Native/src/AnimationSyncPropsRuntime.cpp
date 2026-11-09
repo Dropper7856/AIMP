@@ -208,7 +208,7 @@ void Release(Prop& prop) noexcept {
 }
 }
 
-const char* BuildTag() noexcept { return "AIMP-ANIMATIONSYNC-LOCAL-POSE-472-20261109"; }
+const char* BuildTag() noexcept { return "AIMP-ANIMATIONSYNC-HIDING-ALIGNMENT-473-20261109"; }
 
 bool Install(HookManager& hooks, std::uintptr_t moduleBase, std::string& error) {
     if (!hooks.ExactBuildValidated() || moduleBase == 0U) { error = "AnimationSync props require the exact retail build."; return false; }

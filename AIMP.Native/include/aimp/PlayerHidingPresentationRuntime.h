@@ -25,6 +25,20 @@ struct ClipSelection final { std::uint32_t phase{}, kind{}; };
         (door.elapsedMilliseconds <= 500U || interactionActive || nativePhase == 1U)) return 1U;
     return 0U;
 }
+// Native Hiding_logic_common aliases. These identify an edge only when
+// first-person hiding is not represented by a Character scripted cycle;
+// all actual playback still goes through AnimationSync.
+[[nodiscard]] constexpr std::uint32_t ClipToken(std::uint32_t kind, std::uint32_t phase) noexcept {
+    if (kind == 1U) return phase == 1U ? 0xCF2A9F36U : phase == 2U ? 0x1C440762U : phase == 3U ? 0x5E642560U : 0U;
+    if (kind == 2U) return phase == 1U ? 0x80645982U : phase == 2U ? 0x15691ACEU : phase == 3U ? 0x3FDD3AF4U : 0U;
+    return 0U;
+}
+// Hiding keeps the owner's entry heading. The outgoing clip is authored
+// facing out of the prop, half a turn away from that stored heading.
+[[nodiscard]] constexpr float ExitYaw(float entryYaw) noexcept {
+    constexpr float pi = 3.14159265358979F;
+    return entryYaw > 0.0F ? entryYaw - pi : entryYaw + pi;
+}
 [[nodiscard]] constexpr ClipSelection ClassifyClip(std::uint32_t token) noexcept {
     switch (token) {
     case 0xCF2A9F36U: return {1U, 1U};

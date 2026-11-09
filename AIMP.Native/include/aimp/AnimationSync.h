@@ -30,6 +30,14 @@ struct State final {
     std::array<std::uint32_t, 4> attachments{};
     bool operator==(const State&) const noexcept = default;
 };
+// Retain the proxy's standing height during small vertical movements made by
+// the first-person character while leaning/crouching in an interaction. Large
+// vertical travel (ladders, vents, level changes) is never suppressed.
+[[nodiscard]] inline float PosturalHeightOffset(float baseline, float ownerStartY, float ownerY) noexcept {
+    if (!std::isfinite(baseline) || !std::isfinite(ownerStartY) || !std::isfinite(ownerY)) return baseline;
+    const auto delta = ownerStartY - ownerY;
+    return std::abs(delta) <= 0.25F ? baseline + delta : baseline;
+}
 inline constexpr std::uint32_t kMaximumElapsedMilliseconds = 60000U;
 inline bool Active(const State& value) noexcept { return value.transition != 0U; }
 inline bool Valid(const State& value) noexcept {

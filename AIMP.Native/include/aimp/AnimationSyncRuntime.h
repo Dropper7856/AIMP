@@ -46,7 +46,9 @@ bool InstallMaskHook(HookManager& hooks, std::uintptr_t moduleBase, std::string&
 // occupancy runtime to conceal a settled hidden idle (which may loop).
 [[nodiscard]] bool HidingTransitionPlaying(std::uintptr_t character) noexcept;
 // Height kept while the clip plays: representation ground minus owner position.
-[[nodiscard]] float HeightOffset(std::uintptr_t character) noexcept;
+[[nodiscard]] float HeightOffset(std::uintptr_t character, float ownerY) noexcept;
+// A hiding exit uses its authored outward heading, not the owner network yaw.
+[[nodiscard]] float PlaybackYaw(std::uintptr_t character, float ownerYaw) noexcept;
 // Value-only lifecycle cleanup; pinned clip requests drain on the next pump.
 void Forget(std::uintptr_t character) noexcept;
 void ForgetAll() noexcept;

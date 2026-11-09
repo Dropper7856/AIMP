@@ -8,6 +8,7 @@
 #include "aimp/Diagnostics.h"
 #include "aimp/HookManager.h"
 #include "aimp/PlayerHidingPresentationRuntime.h"
+#include "aimp/PlayerHidingLocalCapture.h"
 
 #include <Windows.h>
 #include <algorithm>
@@ -85,7 +86,7 @@ struct Slot final {
     std::uint64_t holsterStarted{}, unarmedAt{}, holsterWait{};
     // The owner's player position sits a few cm below where a crew
     // representation stands; the clip keeps the representation's grounding.
-    float heightOffset{};
+    float heightOffset{}, ownerStartY{};
     Cycle owned{};
     RemoteDiagnostics diagnostics{};
 };
@@ -95,9 +96,11 @@ struct LocalCapture final {
     std::uint8_t serial{};
     std::uint64_t startedAt{};
     State state{};
+    // Exact local hiding edge already represented by a native or bridged clip.
+    std::uint64_t hidingTransition{};
 };
 struct LocalDiagnostics final {
-    std::uint64_t captured{}, cleared{}, hidingSkipped{}, torn{}, unavailable{};
+    std::uint64_t captured{}, cleared{}, hidingSkipped{}, fallbackCaptured{}, torn{}, unavailable{};
     std::uint32_t animation{}, resource{};
 };
 struct Stream final {
@@ -745,8 +748,10 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
     }
     auto placement = slot.desired.position;
     placement[1] += heightOffset;
+    const auto heading = player_hiding_presentation::ClassifyClip(slot.desired.animation).phase == 3U
+        ? player_hiding_presentation::ExitYaw(slot.desired.yaw) : slot.desired.yaw;
     if (!character_direct_step_runtime::ApplyAIRecoveryTransform(slot.character,
-        placement.data(), slot.desired.yaw)) { ++d.deferred; d.stage = "alignment"; return; }
+        placement.data(), heading)) { ++d.deferred; d.stage = "alignment"; return; }
     slot.heightOffset = heightOffset;
     const auto before = current;
     if (!ReadCycle(slot.character, current) || !SameCycle(before, current) || !RemoteReady(slot.character)) {
@@ -761,7 +766,10 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
         current.resource == d.resource && current.animation == slot.desired.animation;
     // Keep provenance even for a synchronous initializer failure (graph=0),
     // so the next pump neutralizes exactly that constructor result.
-    if (constructed) { slot.owned = current; slot.startedAt = now; slot.ownedLoops = playback.loops; }
+    if (constructed) {
+        slot.owned = current; slot.startedAt = now; slot.ownedLoops = playback.loops;
+        slot.ownerStartY = slot.desired.position[1];
+    }
     if (!invoked || !constructed || (current.flags & 4U) != 0U || current.graph == 0U) {
         ++d.failed; d.stage = "native-admission"; return;
     }
@@ -798,7 +806,7 @@ bool PumpOne(const std::uintptr_t character) noexcept {
     slot->holstered = copy.holstered;
     slot->maskActive = copy.maskActive; slot->crewDriven = copy.crewDriven; slot->crewDisplaced = copy.crewDisplaced;
     slot->holsterStarted = copy.holsterStarted; slot->unarmedAt = copy.unarmedAt; slot->holsterWait = copy.holsterWait;
-    slot->heightOffset = copy.heightOffset;
+    slot->heightOffset = copy.heightOffset; slot->ownerStartY = copy.ownerStartY;
     slot->diagnostics = copy.diagnostics;
     if (slot->desired.transition == copy.desired.transition) slot->handled = copy.handled;
     return true;
@@ -814,16 +822,72 @@ bool CaptureLocal(const std::uintptr_t character, const std::array<std::uint32_t
     Cycle before{}, after{};
     if (gBase.load() == 0U || !ReadCycle(character, before)) return false;
     const auto now = GetTickCount64();
+    // Hiding_logic_common sometimes animates only THE_PLAYER's first-person
+    // camera/hands: Character+36C remains in idle. Use the already-validated
+    // native door edge as an alternate observation, not another remote player.
+    const auto hiding = player_hiding_local::Read();
+    const bool hidingCurrent = hiding.valid && hiding.ticket.character == character &&
+        character_incarnations::NativeRegistry().Current(hiding.ticket);
     if (!Scripted(before)) {
+        if (hidingCurrent && hiding.state.animate &&
+            (hiding.state.phase == 1U || hiding.state.phase == 3U)) {
+            const auto token = player_hiding_presentation::ClipToken(hiding.state.kind, hiding.state.phase);
+            // When this same edge was already captured as a native Character
+            // script, never replay it a second time after that script ends.
+            if (token != 0U && gLocal.character == character &&
+                gLocal.hidingTransition == hiding.state.transition && gLocal.cycle != 0U) {
+                if (Active(gLocal.state)) {
+                    const std::lock_guard lock(gLocalMutex); ++gLocalDiagnostics.cleared;
+                }
+                gLocal.state = {};
+                return true;
+            }
+            if (token != 0U && hiding.state.elapsedMilliseconds <= 2500U) {
+                const bool same = gLocal.character == character && gLocal.cycle == 0U &&
+                    gLocal.runtime == before.runtime && gLocal.animation == token &&
+                    gLocal.hidingTransition == hiding.state.transition && Active(gLocal.state);
+                State candidate{};
+                candidate.transition = same ? gLocal.state.transition : ++gLocalTransition;
+                candidate.animation = token;
+                candidate.position = hiding.state.position;
+                candidate.yaw = hiding.state.yaw;
+                // Hiding's edge clock is not an hkaAnimation graph clock. The
+                // duration is a safe admission envelope, not a fabricated
+                // retail clip duration; the receiver plays its own native clip.
+                candidate.phaseSeconds = (std::min)(1.0F, hiding.state.elapsedMilliseconds * 0.001F);
+                candidate.durationSeconds = 8.0F;
+                candidate.attachments = attachments;
+                if (Valid(candidate)) {
+                    if (!same) {
+                        const std::lock_guard lock(gLocalMutex);
+                        ++gLocalDiagnostics.captured; ++gLocalDiagnostics.fallbackCaptured;
+                        gLocalDiagnostics.animation = token; gLocalDiagnostics.resource = 0U;
+                    }
+                    gLocal = {character, 0U, before.runtime, token, 0U, now,
+                        candidate, hiding.state.transition};
+                    output = candidate;
+                    return true;
+                }
+            }
+        }
         if (gLocal.character == character && Active(gLocal.state)) {
             const std::lock_guard lock(gLocalMutex); ++gLocalDiagnostics.cleared;
         }
         gLocal = {}; gLocal.character = character;
         return true;
     }
-    const bool same = gLocal.character == character && gLocal.cycle == before.address &&
+    const auto classified = player_hiding_presentation::ClassifyClip(before.animation);
+    const auto hidingTransition = hidingCurrent && classified.phase == hiding.state.phase &&
+        classified.kind == hiding.state.kind ? hiding.state.transition : 0U;
+    const bool same = (gLocal.character == character && gLocal.cycle == before.address &&
         gLocal.serial == before.serial && gLocal.runtime == before.runtime &&
-        gLocal.animation == before.animation && Active(gLocal.state);
+        gLocal.animation == before.animation && Active(gLocal.state)) ||
+        // A first-person-only fallback that subsequently gains a Character
+        // script is still the same interaction, not a second remote replay.
+        (gLocal.character == character && gLocal.cycle == 0U &&
+         gLocal.runtime == before.runtime && gLocal.animation == before.animation &&
+         hidingTransition != 0U && gLocal.hidingTransition == hidingTransition &&
+         Active(gLocal.state));
     // +70/+74 are the original bounds. The completion callback 0064F290
     // decrements +A8, not the constructor's +78 count; use the remaining
     // count when joining a finite multi-loop action after it has started.
@@ -856,7 +920,8 @@ bool CaptureLocal(const std::uintptr_t character, const std::array<std::uint32_t
         const std::lock_guard lock(gLocalMutex); ++gLocalDiagnostics.unavailable;
         return false;
     }
-    gLocal = {character, before.address, before.runtime, before.animation, before.serial, now, candidate};
+    gLocal = {character, before.address, before.runtime, before.animation, before.serial, now,
+        candidate, hidingTransition};
     {
         const std::lock_guard lock(gLocalMutex);
         if (!same) ++gLocalDiagnostics.captured;
@@ -979,10 +1044,18 @@ bool OwnsMovement(const std::uintptr_t character) noexcept {
     Cycle current{};
     return slot != nullptr && RemoteReady(character) && ReadCycle(character, current) && Owned(current, slot->owned);
 }
-float HeightOffset(const std::uintptr_t character) noexcept {
+float HeightOffset(const std::uintptr_t character, const float ownerY) noexcept {
     const std::lock_guard lock(gMutex);
     const auto* slot = Find(character);
-    return slot != nullptr && slot->owned.address != 0U ? slot->heightOffset : 0.0F;
+    return slot != nullptr && slot->owned.address != 0U
+        ? PosturalHeightOffset(slot->heightOffset, slot->ownerStartY, ownerY) : 0.0F;
+}
+float PlaybackYaw(const std::uintptr_t character, const float ownerYaw) noexcept {
+    const std::lock_guard lock(gMutex);
+    const auto* slot = Find(character);
+    return slot != nullptr && slot->owned.address != 0U &&
+        player_hiding_presentation::ClassifyClip(slot->owned.animation).phase == 3U
+        ? player_hiding_presentation::ExitYaw(ownerYaw) : ownerYaw;
 }
 bool ClipPlaying(const std::uintptr_t character) noexcept {
     return OwnsMovement(character);
@@ -1133,6 +1206,7 @@ void Export(Diagnostics& diagnostics, const std::uintptr_t remoteCharacter) {
         {{"localCaptured", Diagnostics::Unsigned(local.captured), true},
          {"localCleared", Diagnostics::Unsigned(local.cleared), true},
          {"localHidingSkipped", Diagnostics::Unsigned(local.hidingSkipped), true},
+         {"localHidingFallbackCaptured", Diagnostics::Unsigned(local.fallbackCaptured), true},
          {"localTorn", Diagnostics::Unsigned(local.torn), true},
          {"localUnavailable", Diagnostics::Unsigned(local.unavailable), true},
          {"localAnimation", Diagnostics::Unsigned(local.animation), true},

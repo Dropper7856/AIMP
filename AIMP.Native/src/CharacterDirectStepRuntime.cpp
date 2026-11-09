@@ -2632,7 +2632,7 @@ void FollowAnimationClipPath(MovementSlot& slot, const std::uintptr_t characterA
     float targetX{}, targetY{}, targetZ{}, currentX{}, currentY{}, currentZ{};
     if (!LoadNetworkTarget(slot, targetX, targetY, targetZ) ||
         !ReadTransform(characterAddress, currentX, currentY, currentZ)) return;
-    targetY += animation_sync::HeightOffset(characterAddress);
+    targetY += animation_sync::HeightOffset(characterAddress, targetY);
     const auto dx = targetX - currentX, dy = targetY - currentY, dz = targetZ - currentZ;
     const auto distance = std::sqrt(dx * dx + dy * dy + dz * dz);
     if (!std::isfinite(distance) || distance > kHidingFollowMaximumGap) {
@@ -2650,11 +2650,11 @@ void FollowAnimationClipPath(MovementSlot& slot, const std::uintptr_t characterA
             return;
         }
     }
-    // Unlike a locker, the owner's heading is meaningful here: it turns to
-    // face the panel during convergence. Bounded turn per frame.
+    // Match the owner's heading for ordinary interactions, but preserve the
+    // outward half-turn authored by a hiding exit. Bounded turn per frame.
     if (slot.hasReplicatedYaw.load(std::memory_order_acquire)) {
         float yaw{};
-        const auto target = LoadFloat(slot.replicatedYawBits);
+        const auto target = animation_sync::PlaybackYaw(characterAddress, LoadFloat(slot.replicatedYawBits));
         if (ReadReplicatedYaw(characterAddress, yaw)) {
             constexpr float kMaximumTurn = 0.12F;
             const auto error = std::remainder(target - yaw, 6.28318530717958647692F);
