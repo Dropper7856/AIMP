@@ -48,6 +48,17 @@ internal sealed partial class MultiplayerSessionCoordinator
         }
     }
 
+    // Called with the command gate held, after the lobby (if any) was closed.
+    private async Task ReleaseSteamAfterGameExitAsync()
+    {
+        if (Volatile.Read(ref _steamMenuProcessId) == 0) return;
+        Volatile.Write(ref _steamMenuProcessId, 0);
+        _steamFrontendReady = false;
+        if (SteamLobbies is not { } lobbies) return;
+        try { await lobbies.ReleaseAfterGameExitAsync().ConfigureAwait(false); }
+        catch (Exception exception) { _diagnostics.Log("Steam", $"Releasing Steam after game exit failed: {exception.Message}"); }
+    }
+
     private async Task StopSteamRelayAsync()
     {
         if (_steamRelay is null) return;

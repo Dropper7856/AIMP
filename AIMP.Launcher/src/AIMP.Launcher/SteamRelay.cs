@@ -131,6 +131,15 @@ internal sealed partial class SteamRelay : ISteamRelay, ISteamLobbies
 
     public Task StopHostingAsync() => RunOnPumpAsync(() => { StopHostingOnPump(); return true; });
 
+    public Task ReleaseAfterGameExitAsync() => RunOnPumpAsync(() =>
+    {
+        if (!_menuEnabled) return false;
+        _diagnostics.Log("Steam", $"Alien: Isolation PID={_menuProcessId} exited; releasing Spacewar until the next game menu.");
+        ShutdownOnPump();
+        _menuProcessId = 0;
+        return true;
+    });
+
     /// <summary>Connects to a host over Steam relay and returns a loopback port
     /// that LobbyClient can connect to. Throws when the relay cannot connect.</summary>
     public async Task<int> OpenClientTunnelAsync(ulong hostSteamId, CancellationToken cancellationToken)

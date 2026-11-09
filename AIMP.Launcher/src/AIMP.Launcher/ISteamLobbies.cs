@@ -41,4 +41,7 @@ internal interface ISteamLobbies
     Task<string> InviteFriendAsync(ulong friendId);
     IReadOnlyList<SteamLobbyInvite> GetInvites();
     SteamLobbyInvite? TakeInvite(ulong fromSteamId);
+    /// <summary>Shuts the Spacewar session down after Alien: Isolation exits or crashes, so
+    /// Steam stops showing the player in-game. The next ready game menu activates it again.</summary>
+    Task ReleaseAfterGameExitAsync();
 }
