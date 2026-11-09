@@ -38,6 +38,10 @@ enum Slot : std::size_t {
 };
 
 using StorageFn = void(__fastcall*)(void*);
+// FUN_00A593E0 is __thiscall with one (unused) stack argument: it ends in `ret 4`.
+// Calling it without that argument shifted ESP by 4 inside StoragePoll, so the poll
+// returned to a garbage address (AV with EIP in the heap, ESI = poll return address).
+using EnumerateFn = void(__fastcall*)(void*, void*, std::uint32_t);
 using FileWriteFn = bool(__fastcall*)(void*, void*, const char*, const void*, std::int32_t);
 using FileReadFn = std::int32_t(__fastcall*)(void*, void*, const char*, void*, std::int32_t);
 using NameBoolFn = bool(__fastcall*)(void*, void*, const char*);
@@ -48,7 +52,7 @@ using NameAndSizeFn = const char*(__fastcall*)(void*, void*, int, std::int32_t*)
 
 std::atomic<bool> gInstalled{};
 StorageFn gOriginalPoll{};
-StorageFn gEnumerate{};
+EnumerateFn gEnumerate{};
 std::atomic<void*> gStorage{};
 
 std::mutex gMutex;
@@ -80,7 +84,7 @@ bool StorageIdle(void* storage) noexcept {
 void __fastcall StoragePoll(void* storage) {
     gStorage.store(storage, std::memory_order_release);
     if (gRefresh.load(std::memory_order_acquire) == 1 && StorageIdle(storage)) {
-        gEnumerate(storage);
+        gEnumerate(storage, nullptr, 0U);
         gRefresh.store(2, std::memory_order_release);
     }
     gOriginalPoll(storage);
@@ -373,7 +377,7 @@ bool Install(const std::uintptr_t moduleBase, std::string& error) noexcept {
         return false;
     }
     gOriginalPoll = reinterpret_cast<StorageFn>(poll);
-    gEnumerate = reinterpret_cast<StorageFn>(enumerate);
+    gEnumerate = reinterpret_cast<EnumerateFn>(enumerate);
     if (!WriteSlot(reinterpret_cast<void**>(moduleBase + kStoragePollSlotRva),
             reinterpret_cast<void*>(poll), reinterpret_cast<void*>(&StoragePoll))) {
         error = "Campaign save storage poll slot is already hooked.";
