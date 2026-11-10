@@ -16,6 +16,19 @@ internal static class MissionTestLabReceipts
     // This is *independent* of a MissionSync commit: PlayerLifecycle observes
     // a retail native mission-terminal or level-exit boundary. It cannot be
     // attributed to any particular frontier, and does not prove HUD rendering.
+    // TLC1 identifies the authenticated gameplay session and this launcher's
+    // Host/Client role, only after the native MissionSync configuration succeeds.
+    // It is a diagnostic scope marker, not a cryptographic attestation.
+    internal static string FormatSessionContext(Guid sessionId, int generation, string role)
+    {
+        if (sessionId == Guid.Empty || generation <= 0)
+            throw new ArgumentException("Invalid active session context.", nameof(sessionId));
+        if (role is not ("host" or "client"))
+            throw new ArgumentException("Invalid TestLab peer role.", nameof(role));
+        return FormattableString.Invariant(
+            $"TLC1 v=1 module=TestLab stage=session-context session={Hash(sessionId.ToString("N"))} generation={generation} role={role}");
+    }
+
     internal static string FormatNativeTerminal(Guid sessionId, int generation, string role, ulong nativeSequence)
     {
         if (sessionId == Guid.Empty || generation <= 0 || nativeSequence == 0)

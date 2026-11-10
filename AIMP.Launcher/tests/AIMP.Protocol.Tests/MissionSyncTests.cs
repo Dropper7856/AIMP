@@ -28,6 +28,14 @@ internal static class MissionSyncTests
             "Native terminal witness must join only the same authenticated game session.");
         AssertEx.True(terminal.Contains(" native_seq=7", StringComparison.Ordinal));
         AssertEx.True(!terminal.Contains(valid.SessionId.ToString("N"), StringComparison.OrdinalIgnoreCase));
+        var context = MissionTestLabReceipts.FormatSessionContext(valid.SessionId, 1, "client");
+        AssertEx.True(context.StartsWith("TLC1 v=1 module=TestLab stage=session-context ", StringComparison.Ordinal));
+        AssertEx.True(context.Contains(sessionHash, StringComparison.Ordinal));
+        AssertEx.True(context.EndsWith("generation=1 role=client", StringComparison.Ordinal));
+        AssertEx.True(!context.Contains(valid.SessionId.ToString("N"), StringComparison.OrdinalIgnoreCase));
+        AssertEx.Throws<ArgumentException>(() => MissionTestLabReceipts.FormatSessionContext(Guid.Empty, 1, "client"));
+        AssertEx.Throws<ArgumentException>(() => MissionTestLabReceipts.FormatSessionContext(valid.SessionId, 0, "client"));
+        AssertEx.Throws<ArgumentException>(() => MissionTestLabReceipts.FormatSessionContext(valid.SessionId, 1, "visitor"));
         AssertEx.Throws<ArgumentOutOfRangeException>(() => MissionTestLabReceipts.FormatNativeTerminal(valid.SessionId, 1, "host", 0));
         AssertEx.Throws<ArgumentException>(() => MissionTestLabReceipts.FormatNativeTerminal(valid.SessionId, 1, "visitor", 1));
         AssertEx.Equal(valid, JsonPayload.Deserialize<MissionSignalPayload>(JsonPayload.Serialize(valid)));
