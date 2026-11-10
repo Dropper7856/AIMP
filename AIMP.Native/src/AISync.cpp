@@ -9893,6 +9893,8 @@ void BeginExecutionCarrierScope(const transactions::Scope& scope) noexcept {
     gIncomingUsed.fill(false); gInitialPlacementUsed.fill(false);
     for(auto& pending:gIncomingOutcomes)pending.clear();gIncomingOutcomeCount=0;
     for(auto& actor:gActors)if(actor.character){
+        if(actor.recoveryNativeArmed)
+            static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
         actor.received={};actor.streamRevision=actor.streamBirth=actor.streamCycleState=actor.streamPairRevision=actor.streamCycleType=0U;
         actor.desired={};actor.pendingRemoteShots.clear();actor.initialPlacementReady=false;actor.lastSpawnDiagnostic=0;
         actor.recoveryPose={};actor.recoveryPoseAt=actor.recoveryLastTick=actor.recoveryLastHardSnap=0;
@@ -10421,6 +10423,12 @@ void PumpOnEngineThread() noexcept {
                 static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
             actor.recoveryNativeArmed=actor.recoveryFollowing=false;
         };
+        std::uint32_t liveRuntime{},liveEntityA{},liveEntityB{};
+        if(!Read(actor.character+0x50U,liveRuntime)||liveRuntime!=actor.runtimeId||
+            !Read(actor.character+0x54U,liveEntityA)||liveEntityA!=actor.entityA||
+            !Read(actor.character+0x58U,liveEntityB)||liveEntityB!=actor.entityB) {
+            relinquish();continue;
+        }
         if(!actor.remoteBirth || !actor.initialPlacementReady ||
             actor.directPoseBirth!=actor.remoteBirth ||
             gGeneration!=gGenerations->CurrentGeneration() ||
@@ -10465,6 +10473,7 @@ void ReconcileDirectPoseOnEngineThread() noexcept {
     const auto now=GetTickCount64();
     for(auto& actor:gActors) {
         if(!actor.character||!actor.recoveryNativeArmed||!actor.recoveryFollowing||
+            !character_direct_step_runtime::Snapshot(actor.character).armed||
             actor.duplicate||actor.faulted||!actor.initialPlacementReady||
             actor.directPoseBirth!=actor.remoteBirth||PvPCharacterFenced(actor.character)||
             ExecutionOwnedCharacter(actor.character)||PairSourceBusy(actor.character)||
@@ -10473,6 +10482,10 @@ void ReconcileDirectPoseOnEngineThread() noexcept {
             (actor.received.executionFlags&ExecutionPaired)!=0U ||
             ProxyWithdrawn(actor.desired)||ProxyWithdrawn(actor.recoveryPose)||
             health::Terminal(actor.desired.health)||health::Terminal(actor.recoveryPose.health))continue;
+        std::uint32_t liveRuntime{},liveEntityA{},liveEntityB{};
+        if(!Read(actor.character+0x50U,liveRuntime)||liveRuntime!=actor.runtimeId||
+            !Read(actor.character+0x54U,liveEntityA)||liveEntityA!=actor.entityA||
+            !Read(actor.character+0x58U,liveEntityB)||liveEntityB!=actor.entityB)continue;
         hybrid_motion::Target target{};
         if(!actor.directPoseTimeline.SampleAt(now,target)||target.stale||
             target.nativeAction||target.discontinuity)continue;
