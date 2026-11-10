@@ -185,6 +185,7 @@ internal static class Program
         new("Solo lobby starts alone", SoloLobbyTests.StartsAloneAsync),
         new("Solo lobby rejects joins", SoloLobbyTests.RejectsJoinAsync),
         new("Multiplayer lobby needs a client", SoloLobbyTests.MultiplayerNeedsClientAsync),
+        new("Private lobby starts alone and accepts joins", SoloLobbyTests.PrivateLobbyAcceptsJoinAsync),
         new("Steam helper protocol round-trips lobby data", SteamHostTests.RoundTripsAsync),
         new("Steam helper protocol keeps error kinds", SteamHostTests.KeepsErrorKindsAsync),
         new("Steam helper mode needs its exact arguments", SteamHostTests.IgnoresNormalArgumentsAsync),
