@@ -10,6 +10,7 @@ internal sealed partial class MultiplayerSessionCoordinator
     private bool _cinematicPollRunning, _cinematicProbeWarningLogged;
     private DateTimeOffset _nextCinematicPollUtc, _nextCinematicNoticeUtc;
     private ulong _cinematicNextSequence, _cinematicLastApplied;
+    private string _cinematicLastState = "";
 
     // Called with _stateGate when a campaign level/mission generation changes.
     private void ResetCinematicSync()
@@ -20,6 +21,7 @@ internal sealed partial class MultiplayerSessionCoordinator
         _nextCinematicNoticeUtc = DateTimeOffset.MinValue;
         _cinematicNextSequence = 0UL;
         _cinematicLastApplied = 0UL;
+        _cinematicLastState = "";
     }
 
     private void TryScheduleCinematicPoll(NativeRuntimeSnapshot runtime, DateTimeOffset now)
@@ -63,6 +65,17 @@ internal sealed partial class MultiplayerSessionCoordinator
                     }
                 return;
             }
+            var state=result.StatusCode is "CINEMATIC_SYNC_IDLE" ? "idle" : "cinematic";
+            bool changed;
+            lock (_stateGate)
+            {
+                changed=_cinematicLastState!=state;
+                _cinematicLastState=state;
+            }
+            if (changed)
+                _diagnostics.Log("CinematicSync", state=="cinematic"
+                    ? "Cinematic camera detected; only the Host can skip it (hold Enter)."
+                    : "Gameplay camera restored.");
             if (result.StatusCode=="CINEMATIC_SYNC_HOST_SKIP")
             {
                 LobbyHost? host;

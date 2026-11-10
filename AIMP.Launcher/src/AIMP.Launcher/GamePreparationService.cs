@@ -15,7 +15,7 @@ internal static class GamePreparationSynchronization
 
 public sealed class GamePreparationService
 {
-    private const int RecipeVersion = 15; // Import multiplayer E_RIPLEY into campaign levels as well as compiling their manifests.
+    private const int RecipeVersion = 17; // Never import E_RIPLEY into FRONTEND; roll back the build 487 import (game exited at boot).
     private readonly object _sync = new();
     private readonly LauncherSettingsStore _settings;
     private readonly LauncherDiagnostics _diagnostics;
@@ -256,6 +256,9 @@ public sealed class GamePreparationService
                     Complete(existing);
                     return;
                 }
+                var legacyManifests = WorldManifestCompiler.DeleteLegacyCache();
+                _diagnostics.Log("Preparation", $"World manifest cache: {WorldManifestCompiler.CacheDirectory.Value}" +
+                    (legacyManifests > 0 ? $" ({legacyManifests} old manifests removed from AppData)." : "."));
                 Update("Character", 2, 0, levels.Length, string.Empty, "Preparing multiplayer characters");
                 var timer = Stopwatch.StartNew();
                 // Every discovered campaign level receives a manifest below.

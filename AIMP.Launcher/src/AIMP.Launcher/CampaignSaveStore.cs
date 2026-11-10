@@ -24,14 +24,14 @@ public sealed class CampaignSaveStore
     {
         _root = Path.GetFullPath(rootPath);
         RejectPersonalSavePath(_root);
-        RejectReparseAncestors(_root);
+        RejectReparsePoints(_root);
         Directory.CreateDirectory(_root);
-        RejectReparseAncestors(_root);
+        RejectReparsePoints(_root);
     }
 
     public IReadOnlyList<CampaignSaveMetadata> List()
     {
-        RejectReparseAncestors(_root);
+        RejectReparsePoints(_root);
         var result = new List<CampaignSaveMetadata>();
         foreach (var path in Directory.EnumerateFiles(_root, "*.json"))
         {
@@ -47,7 +47,7 @@ public sealed class CampaignSaveStore
     {
         var profile = Path.GetFullPath(profileDirectory);
         RejectPersonalSavePath(profile);
-        RejectReparseAncestors(profile);
+        RejectReparsePoints(profile);
         var files = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
         string? newestCheckpoint = null;
         var newestWrite = DateTime.MinValue;
@@ -56,7 +56,7 @@ public sealed class CampaignSaveStore
         {
             var name = Path.GetFileName(path);
             if (!SaveName.IsMatch(name)) continue;
-            RejectReparseAncestors(path);
+            RejectReparsePoints(path);
             if ((File.GetAttributes(path) & FileAttributes.Directory) != 0)
                 throw new InvalidDataException("A save entry is a directory.");
             if (files.Count >= MaximumFiles) throw new InvalidDataException("Too many save files.");
@@ -102,7 +102,7 @@ public sealed class CampaignSaveStore
         if (!Guid.TryParseExact(id, "N", out _)) throw new ArgumentException("Invalid snapshot id.", nameof(id));
         var metadataPath = Path.Combine(_root, id + ".json");
         var zipPath = Path.Combine(_root, id + ".zip");
-        RejectReparseAncestors(metadataPath); RejectReparseAncestors(zipPath);
+        RejectReparsePoints(metadataPath); RejectReparsePoints(zipPath);
         if (new FileInfo(metadataPath).Length > 8192) throw new InvalidDataException("Snapshot metadata is too large.");
         var metadata = JsonSerializer.Deserialize<CampaignSaveMetadata>(File.ReadAllText(metadataPath))
             ?? throw new InvalidDataException("Missing snapshot metadata.");
@@ -121,7 +121,7 @@ public sealed class CampaignSaveStore
     public void Delete(string id)
     {
         if (!Guid.TryParseExact(id, "N", out _)) throw new ArgumentException("Invalid snapshot id.", nameof(id));
-        RejectReparseAncestors(_root);
+        RejectReparsePoints(_root);
         // The metadata is the commit marker: remove it first.
         File.Delete(Path.Combine(_root, id + ".json"));
         File.Delete(Path.Combine(_root, id + ".zip"));
@@ -136,9 +136,9 @@ public sealed class CampaignSaveStore
             StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("Staging must remain under the multiplayer storage root.");
         RejectPersonalSavePath(target);
         var parent = Path.GetDirectoryName(target)!;
-        RejectReparseAncestors(parent);
+        RejectReparsePoints(parent);
         if (Directory.Exists(target) || File.Exists(target)) throw new IOException("Staging destination must be fresh.");
-        Directory.CreateDirectory(parent); RejectReparseAncestors(parent);
+        Directory.CreateDirectory(parent); RejectReparsePoints(parent);
         var temporary = Path.Combine(parent, ".campaign-stage-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(temporary);
         try
@@ -209,9 +209,19 @@ public sealed class CampaignSaveStore
             throw new InvalidDataException("Personal Steam save locations are forbidden.");
     }
 
-    private static void RejectReparseAncestors(string path)
+    // Only the store root and what lies beneath it are AIMP-owned. System
+    // ancestors such as %LOCALAPPDATA% can legitimately be junctions (a
+    // relocated AppData), which previously disabled campaign saves entirely.
+    // A path outside the root is still checked across its whole ancestry.
+    private void RejectReparsePoints(string path)
     {
-        for (string? current = Path.GetFullPath(path); current is not null; current = Path.GetDirectoryName(current))
+        var full = Path.GetFullPath(path);
+        var rooted = full.Equals(_root, StringComparison.OrdinalIgnoreCase)
+            || full.StartsWith(Path.TrimEndingDirectorySeparator(_root) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+        var boundary = rooted ? Path.GetDirectoryName(_root) : null;
+        for (string? current = full; current is not null
+            && (boundary is null || !current.Equals(boundary, StringComparison.OrdinalIgnoreCase));
+            current = Path.GetDirectoryName(current))
             if ((Directory.Exists(current) || File.Exists(current)) && (File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
                 throw new InvalidDataException("Reparse points are forbidden in save paths.");
     }

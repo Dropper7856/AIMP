@@ -32,6 +32,7 @@ bool ReplayActive() noexcept;
 // targets are control inputs only; its runtime data reference is not replayed.
 bool Candidate(void* execution, std::uint32_t port, bool& payloadTolerant, std::uint8_t inputKind = 0U) noexcept;
 bool CampaignActive() noexcept;
+bool HostRole() noexcept;
 bool Capture(void* execution, std::uint32_t port, std::uint8_t selector, bool playerInitiated = false) noexcept;
 void Unsupported() noexcept;
 // Shape of a captured frontier call that the commit replay normalizes away:

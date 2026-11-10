@@ -2833,7 +2833,14 @@ void OutputCapture(void* self, void** instance, const std::uint32_t* input,
                 for (std::uint8_t selector = 1U; selector <= 2U; ++selector) {
                     void* definition{};
                     if (OutputDefinition(missionExecution, selector, definition) && definition == self) {
-                        if (worldRemoteMission) return; // Mission commit owns fan-out.
+                        // A Client's world transaction replayed on the Host can
+                        // reach a frontier the Client itself suppressed as an
+                        // autonomous decision (e.g. a cinematic's completion):
+                        // nobody would ever commit it (black screen at the
+                        // second BSP_TORRENS cinematic, build 493). The Host is
+                        // the authority: it captures that output. A Client
+                        // still leaves the fan-out to the Host's commit.
+                        if (worldRemoteMission && !mission_sync::HostRole()) return;
                         captured = mission_sync::Capture(missionExecution, missionPort, selector,
                             CurrentCausalStamp(gEpoch.load(std::memory_order_relaxed)).source == CausalSource::Player);
                         if (captured) mission_sync::NoteCapturedShape(!payloadless, false, false);
@@ -3440,6 +3447,34 @@ bool LevelExitSuppressed(WorldEntityRegistry& registry, void** target, void* ite
         player_lifecycle::DecideLevelExit(*primitive);
 }
 
+// MissionSync scheduled commits (Checkpoint/SwitchLevel/GoToFrontend) are
+// queued through the retail scheduler. Retail builds and delivers the WorkItem
+// later; this engine-thread ledger exempts exactly that delivery from being
+// captured again even if its lineage was not recorded.
+struct PendingMissionSchedule { void* execution; std::uint32_t port; std::uint64_t epoch; };
+std::array<PendingMissionSchedule, 16U> gPendingMissionSchedules{};
+
+void AddPendingMissionSchedule(void* execution, const std::uint32_t port) noexcept {
+    const auto epoch = gEpoch.load(std::memory_order_relaxed);
+    for (auto& entry : gPendingMissionSchedules) {
+        if (entry.execution == nullptr || entry.epoch != epoch) {
+            entry = {execution, port, epoch};
+            return;
+        }
+    }
+}
+
+bool ConsumePendingMissionSchedule(void* execution, const std::uint32_t port) noexcept {
+    const auto epoch = gEpoch.load(std::memory_order_relaxed);
+    for (auto& entry : gPendingMissionSchedules) {
+        if (entry.execution == execution && entry.port == port && entry.epoch == epoch) {
+            entry = {};
+            return true;
+        }
+    }
+    return false;
+}
+
 std::uint8_t __fastcall WorkExecuteDetour(void* manager, void*, void** target,
                                          void** owner, void** itemHolder) {
     const auto original = reinterpret_cast<WorkExecuteFn>(gExecuteTrampoline.load(std::memory_order_acquire));
@@ -3452,6 +3487,7 @@ std::uint8_t __fastcall WorkExecuteDetour(void* manager, void*, void** target,
     // Campaign engine actions (including save stations) are authored once in
     // the manifest. Resolve their scheduled input in each peer's own world;
     // never send a station pointer or invoke the UI's checkpoint update call.
+    bool committedReplay = false;
     if (mission_sync::CampaignActive() && SessionAuthorityBound()) {
         const auto campaignEpoch = gEpoch.load(std::memory_order_relaxed);
         auto campaignOrigin = FindOrigin(item, campaignEpoch);
@@ -3460,16 +3496,18 @@ std::uint8_t __fastcall WorkExecuteDetour(void* manager, void*, void** target,
         MergeParentContext(ParentContext(ReadRetainedParent(item), campaignEpoch),
             campaignOrigin, campaignStamp, campaignCause);
         std::uint32_t campaignInput{};
-        if (!mission_sync::ReplayActive() && CurrentRootKind() != kMissionRootKind
-            && campaignCause.rootKind != kMissionRootKind
-            && ReadPublicInput(static_cast<const std::uint32_t*>(item), campaignInput)) {
+        if (ReadPublicInput(static_cast<const std::uint32_t*>(item), campaignInput)) {
             auto* execution = ExecutionFromShared(ReadWorkHolder(target));
+            committedReplay = ConsumePendingMissionSchedule(execution, campaignInput);
             bool tolerant{};
-            if (mission_sync::Candidate(execution, campaignInput, tolerant, 4U)
+            if (!committedReplay && !mission_sync::ReplayActive()
+                && CurrentRootKind() != kMissionRootKind
+                && campaignCause.rootKind != kMissionRootKind
+                && mission_sync::Candidate(execution, campaignInput, tolerant, 4U)
                 && mission_sync::Capture(execution, campaignInput, 4U)) return 0U;
         }
     }
-    if (LevelExitSuppressed(*registry, target, item)) return 0U;
+    if (!committedReplay && LevelExitSuppressed(*registry, target, item)) return 0U;
     if (!runtime_features::Enabled(runtime_features::Feature::WorldSyncHooks)) {
         return original(manager, target, owner, itemHolder);
     }
@@ -4467,22 +4505,36 @@ LocalCompositeInputInvokeStatus InvokeMissionOutputNoCapture(
     const WorldEntityLease& lease, const std::uint32_t port, const std::uint8_t selector) noexcept {
     if (selector == 4U) {
         if (!lease || port == 0U) return LocalCompositeInputInvokeStatus::InvalidBoundary;
-        cathode_primitives::NativeCallbackLease parent, work;
-        if (cathode_primitives::CreateNativeCallback(lease, 0x10000000U, {}, parent) !=
-                cathode_primitives::ExecuteStatus::Queued
-            || cathode_primitives::CreateNativeContextFrame(lease, port, 0x10000000U, 0U,
-                {}, &parent, work) != cathode_primitives::ExecuteStatus::Queued)
-            return LocalCompositeInputInvokeStatus::RuntimeUnavailable;
+        // Scheduled frontiers are Checkpoint/SwitchLevel/GoToFrontend. Builds
+        // 492-498 handed Checkpoint a WorkItem cloned by AIMP and called the
+        // consumer FUN_00926680 directly. The save writer (FUN_00930A50 ->
+        // FUN_00934FC0) then read a destroyed pause_context_trigger queue
+        // (manager+4) and both peers crashed at 0x934FD3 on every save
+        // station, with or without releasing that WorkItem. Queue the input
+        // through the retail scheduler instead, like any authored edge, so
+        // retail builds, owns and delivers its own WorkItem next drain.
         const auto epoch = gEpoch.load(std::memory_order_relaxed);
         ContextTrace cause{};
         cause.rootKind = kMissionRootKind; cause.epoch = epoch; cause.input = port;
         cause.invocation = gInvocationSerial.fetch_add(1U, std::memory_order_relaxed);
-        StoreTaskCause(parent.Get(), cause, epoch);
-        StoreTaskCause(work.Get(), cause, epoch);
-        BindParentContext(parent.Get(), Origin::RemoteRoot, {}, cause, epoch);
-        Tag(work.Get(), Origin::RemoteRoot, epoch);
-        return cathode_primitives::ExecuteRetainedInput(lease, lease, work)
-            ? LocalCompositeInputInvokeStatus::Invoked : LocalCompositeInputInvokeStatus::NativeFault;
+        struct ScheduledReplay {
+            const WorldEntityLease* lease;
+            std::uint32_t port;
+            cathode_primitives::ExecuteResult result;
+        } replay{&lease, port, {}};
+        const auto invoke = [](void* opaque) noexcept {
+            auto& call = *static_cast<ScheduledReplay*>(opaque);
+            call.result = cathode_primitives::ExecuteInputEdge(
+                call.port, call.port, 0.0F, *call.lease, *call.lease);
+        };
+        AddPendingMissionSchedule(lease.Get(), port);
+        InvokeSchedulerEdgeRetailScoped(Origin::RemoteRoot, cause, invoke, &replay);
+        if (replay.result.status == cathode_primitives::ExecuteStatus::Queued && replay.result.queued)
+            return LocalCompositeInputInvokeStatus::Invoked;
+        static_cast<void>(ConsumePendingMissionSchedule(lease.Get(), port));
+        return replay.result.status == cathode_primitives::ExecuteStatus::RuntimeUnavailable
+            ? LocalCompositeInputInvokeStatus::RuntimeUnavailable
+            : LocalCompositeInputInvokeStatus::NativeFault;
     }
     auto* sharedRef = WorldPublicActionLeaseAccess::SharedRef(lease);
     void* definition{};

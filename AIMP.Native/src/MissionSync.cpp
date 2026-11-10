@@ -188,6 +188,10 @@ bool Configure(WorldEntityRegistry& registry, const std::filesystem::path& path,
 }
 
 bool ReplayActive() noexcept { return gMissionReplayActive; }
+bool HostRole() noexcept {
+    std::scoped_lock lock(gMutex);
+    return gEnabled && gHost;
+}
 bool CampaignActive() noexcept {
     auto* registry = gRegistry.load(std::memory_order_acquire);
     if (registry == nullptr) return false;

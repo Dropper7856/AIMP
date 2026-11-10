@@ -161,8 +161,36 @@ internal sealed partial class MultiplayerSessionCoordinator
 
     private void FailMissionSyncLocked(string reason)
     {
+        var first = !_missionFaulted;
         _missionFaulted = true;
         _diagnostics.Log("MissionSync", reason);
+        if (first) _ = DisableNativeMissionSyncAfterFaultAsync(_missionEpoch, _missionNativeGeneration);
+    }
+
+    // Native MissionSync suppresses each captured mission output until its Host
+    // commit is applied. Once faulted, no commit will ever arrive: keep it
+    // armed and the campaign soft-locks (black screen at the BSP_TORRENS
+    // opening in build 491). Fail open: the mission graph runs locally again.
+    private async Task DisableNativeMissionSyncAfterFaultAsync(long epoch, int nativeGeneration)
+    {
+        try
+        {
+            if (nativeGeneration <= 0) return;
+            var result = await _controller.ExecuteCommandAsync("MISSION_SYNC_CONFIG",
+                new Dictionary<string, string> { ["path"] = "", ["role"] = "off" },
+                _lifetime.Token, waitForExecution: true, expectedLevelGeneration: nativeGeneration)
+                .WaitAsync(TimeSpan.FromSeconds(20), _lifetime.Token).ConfigureAwait(false);
+            lock (_stateGate)
+                if (epoch == _missionEpoch)
+                    _diagnostics.Log("MissionSync", result.Executed
+                        ? "Native MissionSync disabled after the fault; missions now run locally on this machine."
+                        : $"Native MissionSync could not be disabled after the fault: {result.StatusCode} {result.Message}");
+        }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            _diagnostics.Log("MissionSync", "Native MissionSync could not be disabled after the fault: " + exception.Message);
+        }
     }
 
     private async Task RunMissionReportsAsync()

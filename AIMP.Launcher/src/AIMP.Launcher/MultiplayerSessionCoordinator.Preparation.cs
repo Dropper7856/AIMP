@@ -31,7 +31,6 @@ internal sealed partial class MultiplayerSessionCoordinator
     // Campaign levels can open on a retail cinematic during which the held
     // world never materializes remote Characters; they finish after release.
     private static readonly TimeSpan CampaignLoadingHoldMaximumDuration = TimeSpan.FromSeconds(90);
-    private static readonly TimeSpan CampaignCharacterWait = TimeSpan.FromSeconds(20);
     private bool _campaignCharacterWaitLogged;
     // A bootstrap Spawn130 submitted while the native loading hold suspends
     // actor simulation can be acknowledged without ever reaching CharacterCreate.
@@ -360,8 +359,9 @@ internal sealed partial class MultiplayerSessionCoordinator
                 (!current.AlienVsSurvivors || player.PeerId != current.AlienPeerId) &&
                 (!_remoteCharacters.TryGetValue(player.PeerId, out var character) || character == 0U)))
             {
-                if (LevelGameMode(current.Level) != "Campaign"
-                    || DateTimeOffset.UtcNow - _loadingHoldStartedUtc < CampaignCharacterWait) return;
+                // Campaign spawns are gated until after release
+                // (CanSubmitCampaignCharacterSpawnLocked): waiting here is pointless.
+                if (LevelGameMode(current.Level) != "Campaign") return;
                 if (!_campaignCharacterWaitLogged)
                 {
                     _campaignCharacterWaitLogged = true;

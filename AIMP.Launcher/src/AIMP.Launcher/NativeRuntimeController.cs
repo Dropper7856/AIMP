@@ -335,7 +335,7 @@ internal sealed class NativeRuntimeController : IDisposable
         var request = CreateCommandRequest(command, arguments);
         if (expectedLevelGeneration is { } generation)
             request = request with { LevelGeneration = generation };
-        if(command==GameCommandNames.AlienPvPVents)
+        if(command==GameCommandNames.AlienPvPVents || command==GameCommandNames.CinematicSyncStatus)
         {
             // HUD polling is state publication, not a user command/status.
             var completion=new TaskCompletionSource<GameCommandResultPayload>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -974,7 +974,8 @@ internal sealed class NativeRuntimeController : IDisposable
         if (!IsQueuedResult(value)
             && _commandExecutionWaiters.TryGetValue(value.RequestId, out var execution))
             execution.TrySetResult(value);
-        if (_quietCommandIds.TryRemove(value.RequestId, out _) || value.Command==GameCommandNames.AlienPvPVents) return;
+        if (_quietCommandIds.TryRemove(value.RequestId, out _) || value.Command==GameCommandNames.AlienPvPVents
+            || value.Command==GameCommandNames.CinematicSyncStatus) return;
         lock (_commandResultGate)
         {
             if (_awaitingCommandAcks.ContainsKey(value.RequestId))

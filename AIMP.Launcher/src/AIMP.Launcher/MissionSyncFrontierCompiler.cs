@@ -118,17 +118,68 @@ internal static class MissionSyncFrontierCompiler
     {
         var missionGraphs = manifest.Composites.Where(value => !value.AimpNamespace
             && IsMissionGraph(value.Name)).Select(value => value.CompositeShortGuid).ToHashSet();
-        var paths = manifest.InstancePaths.ToDictionary(value => value.PathId, value => value.Steps);
-        var missionPaths = manifest.Entities.Where(value => value.Kind == WorldEntityKind.CompositeInstance
-                && missionGraphs.Contains(value.PrimitiveType) && paths.ContainsKey(value.InstancePathId))
-            .Select(value => paths[value.InstancePathId].Append(value.SourceShortGuid).ToArray()).ToArray();
-        bool InMission(WorldEntityDescriptor value) => missionGraphs.Contains(value.SourceCompositeShortGuid)
-            || paths.TryGetValue(value.InstancePathId, out var path)
-                && missionPaths.Any(prefix => path.Count >= prefix.Length
-                    && path.Take(prefix.Length).SequenceEqual(prefix));
+        // A frontier is an entity authored *directly* in a mission graph, or a
+        // pin of a composite instance placed there. The internals of reusable
+        // composites nested in a mission (Use, 1st_person_animated, FX_FP_EyeLid,
+        // KeyPadKeyCard...) drive the interacting player's own presentation;
+        // replaying them made a Client perform the Host's terminal interaction
+        // (BSP_TORRENS, build 494). They stay local; their pins are replicated.
+        bool InMission(WorldEntityDescriptor value) => missionGraphs.Contains(value.SourceCompositeShortGuid);
+        // Composites that directly own Player-domain entities (first-person
+        // animated camera, keypads, save terminal, hiding door) bind the LOCAL
+        // player. Calling into them on another machine re-runs the interaction
+        // there (Use.used -> KeyPadKeyCard.StartInteraction teleported the
+        // Client). Each machine reaches them through its own graph instead.
+        var playerBound = manifest.Entities.Where(value => value.Domain == WorldDomain.Player)
+            .Select(value => value.SourceCompositeShortGuid).Where(value => !missionGraphs.Contains(value))
+            .ToHashSet();
+        // Logic whose every control output ends on the local player (LogicDelay
+        // -> TriggerBindCharacter(player) -> DespawnPlayer, the suit change)
+        // is that player's own sequence. Replaying the suit Proxy's
+        // anim_finished despawned and respawned the other player too (build
+        // 500). Data links into variables are not control flow.
+        var outgoing = manifest.Connections.GroupBy(edge => edge.SourceEntity)
+            .ToDictionary(group => group.Key, group => group.ToArray());
+        bool DataLink(WorldConnectionDescriptor edge) => entities.TryGetValue(edge.TargetEntity, out var target)
+            && (target.PrimitiveName?.StartsWith("Variable", StringComparison.Ordinal) ?? false);
+        var playerChain = manifest.Entities
+            .Where(value => value.Domain == WorldDomain.Player && value.Kind == WorldEntityKind.Function)
+            .Select(value => value.EntityId).ToHashSet();
+        for (var changed = true; changed;)
+        {
+            changed = false;
+            foreach (var (id, edges) in outgoing)
+            {
+                if (playerChain.Contains(id) || !entities.TryGetValue(id, out var value)
+                    || value.Kind == WorldEntityKind.CompositeInstance) continue;
+                var control = edges.Where(edge => !DataLink(edge)).ToArray();
+                if (control.Length != 0 && control.All(edge => playerChain.Contains(edge.TargetEntity)))
+                    changed = playerChain.Add(id) | changed;
+            }
+        }
+        bool PlayerLocalTarget(WorldEntityDescriptor target) => target.Domain == WorldDomain.Player
+            || playerChain.Contains(target.EntityId)
+            || target.Kind == WorldEntityKind.CompositeInstance && playerBound.Contains(target.PrimitiveType);
         bool Addressable(WorldEntityDescriptor value) => value.EntityId.IsValid
             && value.Domain != WorldDomain.AIMP
             && (value.Flags & WorldEntityFlags.RuntimeAddressable) != 0;
+        // A player's own interaction: a trigger volume, a Use prompt or a pin of
+        // a composite bound to the local player (KeyPadKeyCard, Save_Terminal).
+        bool Interaction(WorldEntityDescriptor value) => value.PrimitiveName is
+                "PlayerTriggerBox" or "PlayerTriggerSphere" or "Interaction" or "MonitorPadInput" or "ButtonMashPrompt"
+            || (value.PrimitiveName?.EndsWith(@"Gameplay\Use", StringComparison.Ordinal) ?? false)
+            || value.Kind == WorldEntityKind.CompositeInstance && playerBound.Contains(value.PrimitiveType);
+        // Only the Host originates autonomous decisions, so a Client that runs an
+        // interaction alone waited forever for the Host to repeat it: the Client's
+        // key_accepted never left its machine, and its suit-change Proxy
+        // (Use.used -> proxy_enable ... anim_finished) kept the Client in the
+        // black locker until the Host changed too (build 498). An output emitted
+        // by an interaction, or by an entity that interaction drives directly,
+        // is proposed by whichever player performs it first.
+        var interactionDriven = manifest.Connections
+            .Where(edge => entities.TryGetValue(edge.SourceEntity, out var source) && Interaction(source))
+            .Select(edge => edge.TargetEntity).ToHashSet();
+        bool PlayerIngress(WorldEntityDescriptor value) => Interaction(value) || interactionDriven.Contains(value.EntityId);
 
         var methods = manifest.CompositePublicInputs
             .GroupBy(value => (value.OwnerCompositeInstance, value.PublicInputShortGuid))
@@ -136,14 +187,25 @@ internal static class MissionSyncFrontierCompiler
             .Select(group => group.Key).ToHashSet();
         bool ControlTarget(WorldConnectionDescriptor edge) =>
             entities.TryGetValue(edge.TargetEntity, out var target) && Addressable(target)
+            && !PlayerLocalTarget(target)
             && (target.Kind == WorldEntityKind.CompositeInstance
                 ? methods.Contains((target.EntityId, edge.TargetParameter))
-                : target.Kind == WorldEntityKind.Function && ControlInputs.Contains(edge.TargetParameter));
+                // A Proxy/Alias forwards the same control input to the entity it
+                // stands for: KeyPadKeyCard.key_accepted -> Proxy(door).force_open.
+                // Rejecting it left the Client's door shut (build 497).
+                : target.Kind is WorldEntityKind.Function or WorldEntityKind.Proxy or WorldEntityKind.Alias
+                    && ControlInputs.Contains(edge.TargetParameter));
 
-        var result = manifest.Connections.GroupBy(edge => (edge.SourceEntity, edge.SourceParameter))
+        var outputs = manifest.Connections.GroupBy(edge => (edge.SourceEntity, edge.SourceParameter))
             .Where(group => group.Key.SourceParameter != 0U
                 && entities.TryGetValue(group.Key.SourceEntity, out var source)
                 && Addressable(source) && InMission(source)
+                // A Variable's on_changed announces a per-machine value that the
+                // commit cannot carry (VariableFloat <- MonitorActionMap
+                // movement_stick_y: the Host's stick enabled nothing on the
+                // Client, whose own movement was suppressed, so it could never
+                // use the first terminal). Each machine runs its own.
+                && !(source.PrimitiveName?.StartsWith("Variable", StringComparison.Ordinal) ?? false)
                 && source.Kind is WorldEntityKind.CompositeInstance or WorldEntityKind.Function or WorldEntityKind.Proxy
                 && group.All(ControlTarget))
             // All authored destinations have been certified as data-free
@@ -154,14 +216,52 @@ internal static class MissionSyncFrontierCompiler
             // it. Never serialize that pointer; only replay the control edge.
             // Previously PayloadTolerant=false left every such campaign output
             // local (657/748 rejected in the BSP_TORRENS diagnostics).
-            .Select(group => new MissionSyncFrontier(entities[group.Key.SourceEntity], group.Key.SourceParameter,
-                PayloadTolerant: true, Repeatable: true, OrderedOccurrences: true,
-                PlayerIngress: entities[group.Key.SourceEntity].PrimitiveName is
-                    "PlayerTriggerBox" or "PlayerTriggerSphere" or "Interaction" or "MonitorPadInput" or "ButtonMashPrompt")).ToList();
+            .Select(group => group.Key).ToHashSet();
         // Intercept a whole nested mission/sequence at its public Method, before
         // dispatch. DataType.NONE is an authored contract, not a guessed name.
-        result.AddRange(methods.Where(method => entities.TryGetValue(method.OwnerCompositeInstance, out var owner)
-                && Addressable(owner) && (InMission(owner) || missionGraphs.Contains(owner.PrimitiveType)))
+        var methodFrontiers = methods.Where(method => entities.TryGetValue(method.OwnerCompositeInstance, out var owner)
+                && Addressable(owner) && !PlayerLocalTarget(owner)
+                && (InMission(owner) || missionGraphs.Contains(owner.PrimitiveType))).ToHashSet();
+
+        // A mission edge into such a player sequence starts a run that only the
+        // performing player executes (it is no longer replicated). Follow it to
+        // where it rejoins the mission: everything the player itself emits on
+        // the way (DespawnPlayer.despawned -> SpawnPositionSelect.SpawnPlayer)
+        // stays local, and the first mission frontier after it (FinishedSpawning:
+        // fade-in, objectives) is proposed by that player instead of waiting for
+        // the Host to change too.
+        var localOutputs = new HashSet<(WorldEntityId, uint)>();
+        var localMethods = new HashSet<(WorldEntityId, uint)>();
+        var chainExits = new HashSet<(WorldEntityId, uint)>();
+        var pending = new Queue<WorldEntityId>(manifest.Connections
+            .Where(edge => playerChain.Contains(edge.TargetEntity)
+                && entities.TryGetValue(edge.SourceEntity, out var source) && InMission(source)
+                && entities.TryGetValue(edge.TargetEntity, out var target) && target.Domain != WorldDomain.Player)
+            .Select(edge => edge.TargetEntity).Distinct());
+        var visited = pending.ToHashSet();
+        while (pending.TryDequeue(out var current))
+        {
+            if (!outgoing.TryGetValue(current, out var edges)) continue;
+            var local = playerChain.Contains(current)
+                || entities.TryGetValue(current, out var currentValue) && currentValue.Domain == WorldDomain.Player;
+            foreach (var group in edges.GroupBy(edge => edge.SourceParameter))
+            {
+                var key = (current, group.Key);
+                if (!local && outputs.Contains(key)) { chainExits.Add(key); continue; }
+                localOutputs.Add(key);
+                foreach (var edge in group)
+                {
+                    if (local) localMethods.Add((edge.TargetEntity, edge.TargetParameter));
+                    if (visited.Add(edge.TargetEntity)) pending.Enqueue(edge.TargetEntity);
+                }
+            }
+        }
+
+        var result = outputs.Where(key => !localOutputs.Contains(key))
+            .Select(key => new MissionSyncFrontier(entities[key.SourceEntity], key.SourceParameter,
+                PayloadTolerant: true, Repeatable: true, OrderedOccurrences: true,
+                PlayerIngress: PlayerIngress(entities[key.SourceEntity]) || chainExits.Contains(key))).ToList();
+        result.AddRange(methodFrontiers.Where(method => !localMethods.Contains(method))
             .Select(method => new MissionSyncFrontier(entities[method.OwnerCompositeInstance],
                 method.PublicInputShortGuid, PayloadTolerant: true, Repeatable: true,
                 PublicInput: true, OrderedOccurrences: true)));

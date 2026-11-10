@@ -77,7 +77,7 @@ internal static partial class RipleyCharacterInstaller
         var levels = WorldManifestLevelDiscovery.Discover(game, includeCampaign)
             .Where(level => level.CanCompile)
             .Select(level => level.LevelDirectory)
-            .Where(p => !p.EndsWith("_PATCH", StringComparison.OrdinalIgnoreCase))
+            .Where(p => !p.EndsWith("_PATCH", StringComparison.OrdinalIgnoreCase) && !IsExcludedLevel(p))
             .Where(p => selectedLevel == null || string.Equals(Path.GetFullPath(p), selectedLevel, StringComparison.OrdinalIgnoreCase))
             .OrderBy(p => Path.GetRelativePath(env, p), StringComparer.OrdinalIgnoreCase).ToArray();
         if (levels.Length == 0) throw new InvalidDataException(selectedLevel == null
@@ -619,8 +619,22 @@ internal static partial class RipleyCharacterInstaller
             if (!SafePath(game, transaction.LevelRelativePath).StartsWith(dlcPrefix, StringComparison.OrdinalIgnoreCase))
                 continue;
             if (transaction.State == "publishing") Restore(game, directory, transaction);
+            // Build 487 also imported E_RIPLEY into FRONTEND, the main menu
+            // level loaded at boot: AI.exe then exits silently within seconds.
+            // Roll that import back. A file changed by anything else (Steam
+            // repair, an older journal) is left untouched.
+            else if (transaction.State == "complete" && IsExcludedLevel(SafePath(game, transaction.LevelRelativePath)))
+            {
+                try { Restore(game, directory, transaction); }
+                catch (Exception error) when (error is IOException or InvalidDataException) { }
+            }
         }
     }
+
+    // Never a gameplay destination; patching it prevents the game from starting.
+    private static bool IsExcludedLevel(string levelDirectory) =>
+        Path.GetFileName(Path.TrimEndingDirectorySeparator(Path.GetFullPath(levelDirectory)))
+            .Equals("FRONTEND", StringComparison.OrdinalIgnoreCase);
 
     private static void Restore(string game, string directory, Transaction transaction)
     {

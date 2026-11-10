@@ -20,6 +20,11 @@ internal static class LauncherResetFiles
         var cacheFiles = CollectFiles(cache);
         var receiptFiles = CollectFiles(preparation);
         var gameManifests = CollectGameManifests(gameDirectory);
+        // Manifests now live beside the installed launcher, outside this root.
+        var installCache = WorldManifestCompiler.CacheDirectory.Value;
+        var installManifests = Path.GetFullPath(installCache).Equals(Path.GetFullPath(cache), StringComparison.OrdinalIgnoreCase)
+            ? [] : CollectFiles(installCache).Where(p => p.EndsWith(".aimpwm", StringComparison.OrdinalIgnoreCase)).ToArray();
+        gameManifests = gameManifests.Concat(installManifests).ToArray();
         EnsureNotLink(settings);
         foreach (var path in cacheFiles.Concat(receiptFiles).Concat(gameManifests))
         {

@@ -60,12 +60,7 @@ internal static class WorldManifestSessionLoader
     internal static PreparedWorldManifest LoadFromCache(WorldNetworkContext hostContext)
     {
         WorldReplicationValidation.Validate(hostContext);
-        var root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        var path = Path.Combine(
-            root,
-            "AIMP",
-            "WorldManifestCache",
-            $"{hostContext.Manifest.MapContentId}.aimpwm");
+        var path = WorldManifestCompiler.GetDefaultCachePath(hostContext.Manifest.MapContentId);
         var prepared = Load(path);
         if (prepared.Identity != hostContext.Manifest
             || !string.Equals(prepared.Sha256, hostContext.ManifestSha256,

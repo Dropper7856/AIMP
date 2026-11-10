@@ -1059,12 +1059,17 @@ public static class ModelValidation
         }
         if (value.Command == GameCommandNames.MissionSyncApply)
         {
-            if (value.Arguments.Count != 4 || !value.Arguments.TryGetValue("entityId", out var entity)
+            // Must match AIMP.Native ExperimentalProtocol: ordered occurrences
+            // added a fifth argument and selectors 3/4 (scheduled inputs).
+            if (value.Arguments.Count != 5 || !value.Arguments.TryGetValue("entityId", out var entity)
                 || !IsWorldEntityIdText(entity) || !value.Arguments.TryGetValue("signal", out var port)
                 || !uint.TryParse(port, NumberStyles.None, CultureInfo.InvariantCulture, out var signal) || signal == 0
                 || !value.Arguments.TryGetValue("sequence", out var text)
                 || !ulong.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var sequence) || sequence == 0
-                || !value.Arguments.TryGetValue("selector", out var selector) || selector is not ("1" or "2"))
+                || !value.Arguments.TryGetValue("occurrence", out var occurrenceText)
+                || !uint.TryParse(occurrenceText, NumberStyles.None, CultureInfo.InvariantCulture, out var occurrence)
+                || occurrence > 1_000_000U
+                || !value.Arguments.TryGetValue("selector", out var selector) || selector is not ("1" or "2" or "3" or "4"))
                 throw new ProtocolException("MISSION_SYNC_APPLY parameters are invalid.");
             return;
         }

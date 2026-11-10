@@ -636,7 +636,8 @@ internal sealed class DllIpcSession : IAsyncDisposable
     {
         var value = JsonPayload.Deserialize<NativeMissionSignalPayload>(frame.Payload.Span);
         if (value.LevelGeneration <= 0 || value.Sequence == 0 || value.Signal == 0
-            || value.InterfaceSelector is not (1 or 2) || !ModelValidation.IsWorldEntityIdText(value.EntityId))
+            // 3 = public input, 4 = scheduled transition (native MissionSync::Capture).
+            || value.InterfaceSelector is not (1 or 2 or 3 or 4) || !ModelValidation.IsWorldEntityIdText(value.EntityId))
             throw new ProtocolException("Invalid native mission signal.");
         MissionSignalProduced?.Invoke(this, value);
     }

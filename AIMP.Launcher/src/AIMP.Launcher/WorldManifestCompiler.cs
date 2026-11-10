@@ -2182,10 +2182,60 @@ internal sealed class WorldManifestCompiler
         throw new DirectoryNotFoundException($"'{fullPath}' does not contain WORLD/COMMANDS.PAK or WORLD/COMMANDS.BIN.");
     }
 
-    internal static string GetDefaultCachePath(WorldEntityId mapContentId)
+    internal static string GetDefaultCachePath(WorldEntityId mapContentId) =>
+        Path.Combine(CacheDirectory.Value, $"{mapContentId}.aimpwm");
+
+    // Former location: several GB on the system drive (%LOCALAPPDATA%).
+    internal static string LegacyCacheDirectory() => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AIMP", "WorldManifestCache");
+
+    // The compiled manifests live beside the installed launcher
+    // (<install>\WorldManifestCache, next to resources\). A read-only install
+    // (e.g. Program Files) falls back to the former per-user location.
+    internal static readonly Lazy<string> CacheDirectory = new(() =>
     {
-        var root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        return Path.Combine(root, "AIMP", "WorldManifestCache", $"{mapContentId}.aimpwm");
+        var baseDirectory = Path.GetFullPath(AppContext.BaseDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var api = new DirectoryInfo(baseDirectory);
+        var install = api.Name.Equals("api", StringComparison.OrdinalIgnoreCase)
+            && api.Parent is { } resources && resources.Name.Equals("resources", StringComparison.OrdinalIgnoreCase)
+            && resources.Parent is { } root ? root.FullName : baseDirectory;
+        var directory = Path.Combine(install, "WorldManifestCache");
+        try
+        {
+            Directory.CreateDirectory(directory);
+            var probe = Path.Combine(directory, $".write-{Environment.ProcessId}-{Guid.NewGuid():N}.tmp");
+            File.WriteAllBytes(probe, []);
+            File.Delete(probe);
+            return directory;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            return LegacyCacheDirectory();
+        }
+    });
+
+    // Removes manifests left in the former per-user cache once the new cache
+    // location is in use. Only *.aimpwm files directly inside it are deleted.
+    internal static int DeleteLegacyCache()
+    {
+        var legacy = LegacyCacheDirectory();
+        if (string.Equals(Path.GetFullPath(legacy), Path.GetFullPath(CacheDirectory.Value), StringComparison.OrdinalIgnoreCase)
+            || !Directory.Exists(legacy)
+            || (File.GetAttributes(legacy) & FileAttributes.ReparsePoint) != 0) return 0;
+        var deleted = 0;
+        foreach (var file in Directory.EnumerateFiles(legacy, "*.aimpwm", SearchOption.TopDirectoryOnly))
+        {
+            try
+            {
+                if ((File.GetAttributes(file) & FileAttributes.ReparsePoint) != 0) continue;
+                File.Delete(file);
+                deleted++;
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+        }
+        try { if (!Directory.EnumerateFileSystemEntries(legacy).Any()) Directory.Delete(legacy); }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+        return deleted;
     }
 
     private static void WriteJson(string path, WorldManifest manifest)

@@ -3,7 +3,7 @@ param(
     [string]$CMakeExe = '',
     [string]$Generator = 'Visual Studio 18 2026',
     [string]$OutputDirectory = 'artifacts/alien-api-471',
-    [string]$SecondPcApi = '\\DESKTOP-2JNROA0\Users\Public\Documents\win-unpacked\resources\api',
+    [string]$SecondPcApi = '\\DESKTOP-2JNROA0\win-unpacked\resources\api',
     [switch]$DeliveryOnly
 )
 
