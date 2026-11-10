@@ -139,6 +139,7 @@ internal sealed partial class MultiplayerSessionCoordinator
                 _start.LevelGeneration, value.Sequence, value.EntityId, value.Signal, value.InterfaceSelector, value.Occurrence);
             if (!_missionReports.Writer.TryWrite((_missionEpoch, _host, _client, signal)))
                 FailMissionSyncLocked("MissionSync local report queue is full; progression stopped.");
+            else LogMissionTestLabReceipt("native-produced", signal);
         }
     }
 
@@ -150,6 +151,7 @@ internal sealed partial class MultiplayerSessionCoordinator
                 || _start?.LevelGeneration != value.LevelGeneration) return;
             if (!_missionCommits.Writer.TryWrite((_missionEpoch, value)))
                 FailMissionSyncLocked("MissionSync commit queue is full; progression stopped.");
+            else LogMissionTestLabReceipt("commit-observed", value);
         }
     }
 
@@ -157,6 +159,15 @@ internal sealed partial class MultiplayerSessionCoordinator
     {
         lock (_stateGate) return !_missionFaulted && epoch == _missionEpoch
             && _start?.SessionId == signal.SessionId && _start.LevelGeneration == signal.LevelGeneration;
+    }
+
+    // Diagnostics only: a hashed, peer-joinable receipt is not proof of a
+    // CATHODE side effect. Never let TestLab become a gameplay authority.
+    private void LogMissionTestLabReceipt(string stage, MissionSignalPayload signal)
+    {
+        var role = _host is not null ? "host" : _client is not null ? "client" : null;
+        if (role is not null)
+            _diagnostics.Log("TestLabReceipt", MissionTestLabReceipts.Format(signal, role, stage));
     }
 
     private void FailMissionSyncLocked(string reason)
@@ -238,7 +249,9 @@ internal sealed partial class MultiplayerSessionCoordinator
         }
         if (!await configured.WaitAsync(_lifetime.Token).ConfigureAwait(false) || !MissionCurrent(epoch, signal)) return;
         if (NextMissionApplyGeneration(signal) is not { } nativeGeneration) return;
+        LogMissionTestLabReceipt("apply-attempted", signal);
         await ExecuteMissionApplyAsync(signal, nativeGeneration).ConfigureAwait(false);
+        LogMissionTestLabReceipt("native-command-executed", signal);
         lock (_stateGate) if (epoch == _missionEpoch) _missionLastApplied = signal.Sequence;
         _diagnostics.Log("MissionSync", $"Applied mission commit #{signal.Sequence} {signal.EntityId}/{signal.Signal:X8}.");
     }
