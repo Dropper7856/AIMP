@@ -21,6 +21,15 @@ internal static class MissionSyncTests
             "A Host-global commit sequence must retain the original proposal identity.");
         AssertEx.True(!produced.Contains(valid.SessionId.ToString("N"), StringComparison.OrdinalIgnoreCase));
         AssertEx.True(!produced.Contains(valid.EntityId, StringComparison.OrdinalIgnoreCase));
+        var terminal = MissionTestLabReceipts.FormatNativeTerminal(valid.SessionId, 1, "client", 7);
+        AssertEx.True(terminal.StartsWith("TLO1 v=1 module=PlayerLifecycle stage=native-terminal-boundary ", StringComparison.Ordinal));
+        var sessionHash = produced.Split(' ').Single(part => part.StartsWith("session=", StringComparison.Ordinal));
+        AssertEx.True(terminal.Contains(sessionHash, StringComparison.Ordinal),
+            "Native terminal witness must join only the same authenticated game session.");
+        AssertEx.True(terminal.Contains(" native_seq=7", StringComparison.Ordinal));
+        AssertEx.True(!terminal.Contains(valid.SessionId.ToString("N"), StringComparison.OrdinalIgnoreCase));
+        AssertEx.Throws<ArgumentOutOfRangeException>(() => MissionTestLabReceipts.FormatNativeTerminal(valid.SessionId, 1, "host", 0));
+        AssertEx.Throws<ArgumentException>(() => MissionTestLabReceipts.FormatNativeTerminal(valid.SessionId, 1, "visitor", 1));
         AssertEx.Equal(valid, JsonPayload.Deserialize<MissionSignalPayload>(JsonPayload.Serialize(valid)));
         MissionSignalValidation.Validate(valid with { InterfaceSelector = 2, Sequence = ulong.MaxValue });
         foreach (var invalid in new[] { valid with { SessionId = Guid.Empty }, valid with { PeerId = 0 },

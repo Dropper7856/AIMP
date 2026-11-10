@@ -69,7 +69,7 @@ internal sealed partial class MultiplayerSessionCoordinator
     {
         var (died, finished) = AcceptLifecycleEdges(value);
         if (died) _ = ReportLocalDeathAsync(value);
-        if (finished) _ = ReportLocalMissionCompleteAsync($"native level exit #{value.LevelExitSequence}");
+        if (finished) _ = ReportLocalMissionCompleteAsync($"native level exit #{value.LevelExitSequence}", value.LevelExitSequence);
     }
 
     private async Task ReportLocalDeathAsync(NativePlayerLifecycleStatePayload value)

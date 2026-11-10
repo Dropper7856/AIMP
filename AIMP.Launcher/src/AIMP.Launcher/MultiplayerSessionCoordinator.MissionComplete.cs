@@ -43,9 +43,28 @@ internal sealed partial class MultiplayerSessionCoordinator
         return true;
     }
 
-    private async Task ReportLocalMissionCompleteAsync(string origin)
+    private async Task ReportLocalMissionCompleteAsync(string origin, ulong nativeSequence = 0)
     {
         if (CaptureMissionCompleteReport() is not { } report) return;
+        // A concrete native PlayerLifecycle edge is a separate witness. The
+        // Scaleform/UI fallback never becomes native evidence. Do not assign
+        // this per-round signal to an individual MissionSync commit.
+        if (nativeSequence != 0)
+        {
+            Guid session = Guid.Empty;
+            string? role = null;
+            lock (_stateGate)
+            {
+                if (_start?.LevelGeneration == report.Generation)
+                {
+                    session = _start.SessionId;
+                    role = report.Host is not null ? "host" : "client";
+                }
+            }
+            if (role is not null)
+                _diagnostics.Log("TestLabOutcome", MissionTestLabReceipts.FormatNativeTerminal(
+                    session, report.Generation, role, nativeSequence));
+        }
         _diagnostics.Log("PlayerLifecycle", $"Local mission complete ({origin}) reported for " +
             $"generation {report.Generation}.");
         await ShowMissionWaitAsync(report.Generation).ConfigureAwait(false);
