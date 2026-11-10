@@ -13,8 +13,8 @@ internal sealed partial class SteamRelay
     private const string MarkerKey = "aimp";
     private const int MaxSearchResults = 50;
     private const int MaxFriends = 24;
-    private const int MaxInvites = 6;
-    private static readonly TimeSpan InviteLifetime = TimeSpan.FromMinutes(30);
+    internal const int MaxInvites = 6;
+    internal static readonly TimeSpan InviteLifetime = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan InviteRepeatWindow = TimeSpan.FromSeconds(10);
     private static readonly string ProtocolTag = ProtocolConstants.Version.ToString(CultureInfo.InvariantCulture);
 

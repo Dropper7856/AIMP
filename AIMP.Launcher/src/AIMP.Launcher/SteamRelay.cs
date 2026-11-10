@@ -33,7 +33,7 @@ internal sealed partial class SteamRelay : ISteamRelay, ISteamLobbies
     private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(25);
     private static readonly TimeSpan InitRetryInterval = TimeSpan.FromSeconds(10);
 
-    private readonly LauncherDiagnostics _diagnostics;
+    private readonly SteamRelayLog _diagnostics;
     private readonly BlockingCollection<Action> _work = new();
     private readonly object _gate = new();
     private readonly List<RelayTunnel> _tunnels = new();
@@ -48,8 +48,14 @@ internal sealed partial class SteamRelay : ISteamRelay, ISteamLobbies
     private int _menuProcessId;
 
     internal SteamRelay(LauncherDiagnostics diagnostics)
+        : this(new SteamRelayLog(diagnostics is null ? throw new ArgumentNullException(nameof(diagnostics)) : diagnostics.Log))
     {
-        _diagnostics = diagnostics ?? throw new ArgumentNullException(nameof(diagnostics));
+    }
+
+    // The Steam helper process forwards its log lines to the launcher instead of writing a launcher log.
+    internal SteamRelay(SteamRelayLog log)
+    {
+        _diagnostics = log ?? throw new ArgumentNullException(nameof(log));
     }
 
     /// <summary>Raised (on a worker thread) when the user accepts a Steam
@@ -620,4 +626,9 @@ internal sealed partial class SteamRelay : ISteamRelay, ISteamLobbies
             }
         }
     }
+}
+
+internal sealed class SteamRelayLog(Action<string, string> write)
+{
+    internal void Log(string category, string message) => write(category, message);
 }
