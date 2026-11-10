@@ -571,6 +571,12 @@ void BeginNativeMove(std::uintptr_t character,std::uintptr_t state) noexcept {
 void BeforeNativeAdmission(std::uintptr_t request,std::uint32_t admission) noexcept {
     if(!gInstalled||!gGuard||!gGuard()||!EngineProducer().Bound())return;
     std::uint32_t kind{};if(!Read(request+0x10,kind))return;
+    // Direct NPC locomotion: do not publish local pathfinding, steering,
+    // placement or scheduler hold instructions to clients. They are per-brain
+    // decisions and can never converge spatially. Kind 5 (native action) and
+    // all observed state/passage/lifecycle events keep their ordered channel.
+    if(kind==1U||kind==2U||kind==3U||kind==4U||kind==6U||
+       kind==7U||kind==8U||kind==9U||kind==11U)return;
     std::uintptr_t scheduler{},character{};transactions::OwnerKey owner{};
     if(!Read(request+0x14,scheduler)||!Read(scheduler,character)||scheduler!=character+0x2CD0||!gContext(character,owner))return;
     if(admission>2){Lost(__LINE__);return;}

@@ -49,6 +49,7 @@ Target Pose(const Sample& sample) noexcept {
     target.yaw = sample.yaw;
     target.tick = sample.tick;
     target.nativeAction = (sample.flags & NativeAction) != 0;
+    target.discontinuity = (sample.flags & Discontinuity) != 0;
     return target;
 }
 } // namespace

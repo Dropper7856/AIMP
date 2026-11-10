@@ -22,7 +22,7 @@ struct Target {
     std::array<float, 3> position{}, velocity{};
     float yaw{};
     std::uint64_t tick{};
-    bool nativeAction{}, stale{};
+    bool nativeAction{}, discontinuity{}, stale{};
 };
 
 // Desired poses only: no actor writes, native actions, speed correction or game calls.

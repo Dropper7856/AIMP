@@ -23,6 +23,7 @@
 #include "aimp/AISyncMarkerIdentity.h"
 #include "aimp/AISyncRouteExecution.h"
 #include "aimp/AISyncRecoveryMotion.h"
+#include "aimp/AISyncHybridMotion.h"
 #include "aimp/AISyncHostProducer.h"
 #include "aimp/AISyncInteraction.h"
 #include "aimp/AISyncInteractionRuntime.h"
@@ -221,6 +222,9 @@ struct Actor {
     // capability execution. Never used for placement or acknowledged as applied.
     State received{};
     State recoveryPose{};
+    // The Host owns NPC spatial truth. This timeline never drives an NPC brain.
+    hybrid_motion::Timeline directPoseTimeline{};
+    std::uint32_t directPoseBirth{};
     movement::ProgressClock recoveryProgress{};
     movement::ObservedTrail observedTrail{};
     ULONGLONG recoveryPoseAt{},recoveryLastTick{},recoveryLastHardSnap{};
@@ -5149,6 +5153,8 @@ bool Release(Actor& actor) noexcept {
     actor.rejectedNavigationRevision = actor.rejectedNavigationRequestRevision = 0U;
     actor.lastNavigationAttempt = 0U;
     actor.poseCount = 0U; actor.poseRevision = 0U; actor.poseInterpolating = false;
+    actor.directPoseTimeline.Reset(); actor.directPoseBirth = 0U;
+    actor.recoveryFollowing = actor.recoveryNativeArmed = false;
     if (actor.character != 0U && Client()) {
         // Dropping replication must not manufacture Idle over an action that
         // owns native motion. The next scope needs a fresh Host sample.
@@ -6468,6 +6474,10 @@ bool DispatchNativeIntent(const std::uintptr_t cycle,const NativeIntentEntry ent
 transactions::NativeOutcome InvokeNativeIntent(const transactions::Record& record,const execution::LocalActorBinding& binding) noexcept {
     using transactions::NativeOutcome;
     if(CheckNativeIntent(record,binding)!=execution::Readiness::Ready)return NativeOutcome::Unknown;
+    // A Host reaction exit must not race the client-side pose motor. Retain
+    // these cycle transitions, but never treat them as navigation requests.
+    if(LocomotionExitIntent(record))
+        static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(binding.character));
     // Constructors destroy the previous cycle before initializing the new one.
     // A readiness probe releases its temporary Ref before that destruction;
     // keep the retail movement resource alive across callbacks and readback.
@@ -9886,6 +9896,7 @@ void BeginExecutionCarrierScope(const transactions::Scope& scope) noexcept {
         actor.received={};actor.streamRevision=actor.streamBirth=actor.streamCycleState=actor.streamPairRevision=actor.streamCycleType=0U;
         actor.desired={};actor.pendingRemoteShots.clear();actor.initialPlacementReady=false;actor.lastSpawnDiagnostic=0;
         actor.recoveryPose={};actor.recoveryPoseAt=actor.recoveryLastTick=actor.recoveryLastHardSnap=0;
+        actor.directPoseTimeline.Reset();actor.directPoseBirth=0U;
         actor.observedTrail.Clear();
         actor.recoveryProgress={};
         actor.recoveryHandoffLifecycleRevision=0;
@@ -9933,6 +9944,25 @@ bool ApplyExecutionCarrier(const State& state,std::uint64_t through,std::uint64_
         } else if((state.motionFlags&6U)!=0U||(state.executionFlags&ExecutionPaired)!=0U||
             ProxyWithdrawn(state)||health::Terminal(state.health))actor->observedTrail.Clear();
         actor->recoveryPose=state;actor->recoveryPoseAt=arrivalTick;
+        // Motion has a Host monotonic clock and an authenticated local arrival
+        // timestamp. Keep only the current incarnation; old segments must
+        // never interpolate across a death, respawn or world transition.
+        if(actor->directPoseBirth!=state.birth) {
+            actor->directPoseTimeline.Reset();
+            actor->directPoseBirth=state.birth;
+        }
+        if((state.motionFlags&hybrid_motion::Valid)!=0U) {
+            hybrid_motion::Sample sample{};
+            sample.tick=state.motionTick;
+            for(std::size_t axis=0;axis<3U;++axis) {
+                sample.position[axis]=state.position[axis];
+                sample.velocity[axis]=state.motionVelocity[axis];
+            }
+            sample.yaw=state.yaw;sample.flags=state.motionFlags;
+            static_cast<void>(actor->directPoseTimeline.Push(sample,arrivalTick));
+        } else {
+            actor->directPoseTimeline.Reset();
+        }
     }
     if(state.executionRevision!=0U&&state.executionRevision!=actor->arrivalExecRevision){
         actor->arrivalExecRevision=state.executionRevision;actor->arrivalExecTick=GetTickCount64();actor->arrivalExecUtc=UtcMs();
@@ -10379,12 +10409,95 @@ void PumpOnEngineThread() noexcept {
             static_cast<void>(ApplyAuthoritativeParticipantDamage(actor, actor.desired));
             static_cast<void>(ApplyAuthoritativeCombat(actor, actor.desired, now));
         }
-    // Locomotion is exclusively CATHODE-owned. A failed path is observable;
-    // it never authorizes a transform, velocity motor or hidden catch-up snap.
+    // Host pose drives ordinary locomotion. Native actions (paired kills,
+    // passages, scripted reactions and terminal states) still own their cycles.
+    // The native follower supplies gait/footsteps; the POST pass commits the
+    // actual authoritative physics + visual transform after retail root motion.
     lock.unlock();
-    for(auto& actor:gActors)if(actor.character&&actor.recoveryNativeArmed) {
-        static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
-        actor.recoveryNativeArmed=false;actor.recoveryFollowing=false;
+    for(auto& actor:gActors) {
+        if(!actor.character || actor.duplicate || actor.faulted)continue;
+        const auto relinquish=[&]() noexcept {
+            if(actor.recoveryNativeArmed)
+                static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
+            actor.recoveryNativeArmed=actor.recoveryFollowing=false;
+        };
+        if(!actor.remoteBirth || !actor.initialPlacementReady ||
+            actor.directPoseBirth!=actor.remoteBirth ||
+            gGeneration!=gGenerations->CurrentGeneration() ||
+            PvPCharacterFenced(actor.character) ||
+            ExecutionOwnedCharacter(actor.character) ||
+            PairReservedCharacter(actor.character) || PairSourceBusy(actor.character) ||
+            (actor.desired.executionFlags&ExecutionPaired)!=0U ||
+            (actor.received.executionFlags&ExecutionPaired)!=0U ||
+            ProxyWithdrawn(actor.desired)||ProxyWithdrawn(actor.recoveryPose) ||
+            health::Terminal(actor.desired.health)||health::Terminal(actor.recoveryPose.health)) {
+            relinquish();continue;
+        }
+        hybrid_motion::Target target{};
+        if(!actor.directPoseTimeline.SampleAt(now,target) || target.stale ||
+            target.nativeAction || target.discontinuity) {
+            relinquish();continue;
+        }
+        const auto& state=actor.recoveryPose;
+        if(state.birth!=actor.remoteBirth || state.sessionCookie!=gCurrent.sessionCookie ||
+            state.worldGeneration!=gCurrent.worldGeneration ||
+            (state.stateFlags&PoseValid)==0U || state.moveType>3U) {
+            relinquish();continue;
+        }
+        const float speed=std::hypot(target.velocity[0],target.velocity[2]);
+        std::string error;
+        if(!character_direct_step_runtime::ArmAIHybridReplication(
+            actor.character,target.velocity[0],target.velocity[2],
+            speed>0.02F?1.0F:0.0F,
+            target.position[0],target.position[1],target.position[2],
+            target.yaw,state.moveType,error)) {
+            relinquish();continue;
+        }
+        actor.recoveryNativeArmed=actor.recoveryFollowing=true;
+    }
+}
+// This runs after retail CharacterManager integration and before presentation.
+// Never snap an authored native action: only an armed ordinary locomotion
+// motor may receive physical + visual authority.
+void ReconcileDirectPoseOnEngineThread() noexcept {
+    if(!Installed()||!EngineThread()||!Stable()||!Client() ||
+        gGeneration!=gGenerations->CurrentGeneration())return;
+    const auto now=GetTickCount64();
+    for(auto& actor:gActors) {
+        if(!actor.character||!actor.recoveryNativeArmed||!actor.recoveryFollowing||
+            actor.duplicate||actor.faulted||!actor.initialPlacementReady||
+            actor.directPoseBirth!=actor.remoteBirth||PvPCharacterFenced(actor.character)||
+            ExecutionOwnedCharacter(actor.character)||PairSourceBusy(actor.character)||
+            PairReservedCharacter(actor.character)||
+            (actor.desired.executionFlags&ExecutionPaired)!=0U ||
+            (actor.received.executionFlags&ExecutionPaired)!=0U ||
+            ProxyWithdrawn(actor.desired)||ProxyWithdrawn(actor.recoveryPose)||
+            health::Terminal(actor.desired.health)||health::Terminal(actor.recoveryPose.health))continue;
+        hybrid_motion::Target target{};
+        if(!actor.directPoseTimeline.SampleAt(now,target)||target.stale||
+            target.nativeAction||target.discontinuity)continue;
+        const auto& state=actor.recoveryPose;
+        if(state.birth!=actor.remoteBirth||state.sessionCookie!=gCurrent.sessionCookie||
+            state.worldGeneration!=gCurrent.worldGeneration||
+            (state.stateFlags&PoseValid)==0U)continue;
+        std::uintptr_t cycle{},table{};
+        std::uint8_t cycleState{};
+        if(!Read(actor.character+0x36CU,cycle)||!cycle||!Read(cycle,table)||
+            table<gBase||!Read(cycle+0x1AU,cycleState)||
+            !HybridLocomotionCycleAllowed(static_cast<std::uint32_t>(table-gBase),cycleState))continue;
+        float local[3]{},yaw{};
+        if(!Read(actor.character+kPositionOffset,local[0])||
+            !Read(actor.character+kPositionOffset+4U,local[1])||
+            !Read(actor.character+kPositionOffset+8U,local[2])||
+            !Read(actor.character+kYawOffset,yaw))continue;
+        const float dx=target.position[0]-local[0];
+        const float dy=target.position[1]-local[1];
+        const float dz=target.position[2]-local[2];
+        const float yawError=std::remainder(target.yaw-yaw,6.2831853071795864769F);
+        if(dx*dx+dy*dy+dz*dz<0.0016F && std::abs(yawError)<0.03F)continue;
+        const float pose[3]{target.position[0],target.position[1],target.position[2]};
+        static_cast<void>(character_direct_step_runtime::ApplyAIRecoveryTransform(
+            actor.character,pose,target.yaw));
     }
 }
 void ObservePlayerRepresentationSpawn(const std::uint32_t spawnKey) noexcept {
