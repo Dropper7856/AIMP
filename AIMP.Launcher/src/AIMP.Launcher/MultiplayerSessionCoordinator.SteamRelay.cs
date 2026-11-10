@@ -15,6 +15,7 @@ internal sealed partial class MultiplayerSessionCoordinator
     {
         if (_steamRelay is null) return;
         _steamRelay.JoinRequested += OnSteamJoinRequested;
+        if (SteamLobbies is { } lobbies) lobbies.InviteReceived += OnSteamInviteReceived;
     }
 
     private async Task ActivateSteamForReadyMenuAsync()
@@ -26,19 +27,20 @@ internal sealed partial class MultiplayerSessionCoordinator
         _steamMenuProcessId = runtime.ProcessId;
     }
 
-    private async Task StartSteamHostingAsync(LobbyHost host)
+    // Private lobbies are solo and skip Steam. Otherwise the lobby is advertised as a
+    // Steam lobby (Friends Only / Public) when the relay supports it.
+    private async Task StartSteamHostingAsync(LobbyHost host, LobbyHostOptions options, SteamLobbyVisibility visibility)
     {
-        if (_steamRelay is null) return;
+        if (await AnnounceSoloLobbyAsync(host).ConfigureAwait(false) || _steamRelay is null) return;
         try
         {
             await ActivateSteamForReadyMenuAsync().ConfigureAwait(false);
-            if (!await _steamRelay.StartHostingAsync(host.BoundPort, "Hosting an AIMP lobby").ConfigureAwait(false))
+            if (!await StartRelayHostingAsync(host, options, visibility).ConfigureAwait(false))
             {
                 _diagnostics.Log("Steam", "Steam is not running; this lobby is reachable by direct IP only.");
                 return;
             }
-            var address = SteamRelay.FormatAddress(_steamRelay.LocalSteamId);
-            await SendStatusAsync($"Lobby created - Steam friends can join {address}").ConfigureAwait(false);
+            await OnSteamHostingStartedAsync(host, visibility).ConfigureAwait(false);
         }
         catch (Exception exception)
         {
@@ -46,9 +48,21 @@ internal sealed partial class MultiplayerSessionCoordinator
         }
     }
 
+    // Called with the command gate held, after the lobby (if any) was closed.
+    private async Task ReleaseSteamAfterGameExitAsync()
+    {
+        if (Volatile.Read(ref _steamMenuProcessId) == 0) return;
+        Volatile.Write(ref _steamMenuProcessId, 0);
+        _steamFrontendReady = false;
+        if (SteamLobbies is not { } lobbies) return;
+        try { await lobbies.ReleaseAfterGameExitAsync().ConfigureAwait(false); }
+        catch (Exception exception) { _diagnostics.Log("Steam", $"Releasing Steam after game exit failed: {exception.Message}"); }
+    }
+
     private async Task StopSteamRelayAsync()
     {
         if (_steamRelay is null) return;
+        DetachSteamAdvert();
         _steamRelay.CloseAllTunnels("lobby closed");
         try { await _steamRelay.StopHostingAsync().ConfigureAwait(false); }
         catch (Exception exception) { _diagnostics.Log("Steam", $"Stop hosting failed: {exception.Message}"); }
@@ -161,6 +175,7 @@ internal sealed partial class MultiplayerSessionCoordinator
     private void DisposeSteamInvites()
     {
         if (_steamRelay is not null) _steamRelay.JoinRequested -= OnSteamJoinRequested;
+        if (SteamLobbies is { } lobbies) lobbies.InviteReceived -= OnSteamInviteReceived;
         Task pending;
         lock (_steamInviteGate) pending = _steamInviteTask;
         pending.GetAwaiter().GetResult();

@@ -808,15 +808,10 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             "START_GAME" => StartGameAsync(message),
             "START_GAME_ACK" => LogOnlyAsync("Start-game UI acknowledgement received."),
             "CHARACTER_SELECTED" => LogCharacterSelectionAsync(message),
-            "REFRESH_SERVERS" or "JOIN_SERVER" => HandleBrowserCommandAsync(message),
+            "REFRESH_SERVERS" or "JOIN_SERVER" or "REFRESH_FRIENDS" or "INVITE_FRIEND" or "JOIN_FRIEND" or "ACCEPT_INVITE" => HandleBrowserCommandAsync(message),
             "LEAVE" => LeaveLobbyFromMenuAsync(),
             _ => LogOnlyAsync($"No multiplayer action is attached to {message.Type}.")
         };
-
-    private Task HandleBrowserCommandAsync(ScaleformBridgeMessage message) =>
-        string.Equals(message.Type, "REFRESH_SERVERS", StringComparison.OrdinalIgnoreCase)
-            ? SendEmptyServerListAsync()
-            : SendErrorAsync("Server discovery is disabled; use Direct Connection.");
 
     private async Task HandleHelloAsync(ScaleformBridgeMessage message)
     {
@@ -877,7 +872,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _diagnostics.Log("Multiplayer", $"Lobby hosted on port {host.BoundPort}. Alien enabled={options.AlienEnabled}.");
         await SendMenuLobbyOpenedAsync("host").ConfigureAwait(false);
         await SendStatusAsync("Lobby created").ConfigureAwait(false);
-        await StartSteamHostingAsync(host).ConfigureAwait(false);
+        await StartSteamHostingAsync(host, options, ReadLobbyVisibility(message)).ConfigureAwait(false);
     }
 
     private async Task<LobbyHost> StartHostAsync(LobbyHostOptions options)
@@ -916,7 +911,9 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         LobbyCompatibility.Create(settings),
         RequireWorldPreparation: true,
         AlienEnabled: ReadLobbyAlienEnabled(message),
-        AlienVsSurvivors: ReadLobbyAlienVsSurvivors(message));
+        // A Private lobby is solo, so it is always Co-op (Alien vs Survivors needs 2+ players).
+        AlienVsSurvivors: ReadLobbyAlienVsSurvivors(message)
+            && ReadLobbyVisibility(message) != SteamLobbyVisibility.Private);
 
     private static string ResolveServerName(
         LauncherSettings settings,
@@ -932,7 +929,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         // The menu stepper defaults to "2 Players", which capped lobbies at two ("Lobby is full").
         // The menu selection is ignored for now: every lobby uses the default capacity (4).
         // Remove this line to honor the menu selection again.
-        ProtocolConstants.DefaultLobbyCapacity;
+        // Private lobbies are solo: one slot, started without waiting for anyone.
+        ReadLobbyVisibility(message) == SteamLobbyVisibility.Private ? 1 : ProtocolConstants.DefaultLobbyCapacity;
 
     // Original menu-driven capacity resolution (currently unused, see ResolveCapacity).
     private static int ResolveRequestedCapacity(ScaleformBridgeMessage message) =>
@@ -2742,7 +2740,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             await ApplyCampaignContinuationAsync(value).ConfigureAwait(false);
             return;
         }
-        var worldSyncEnabled = _performanceIsolation.IsEnabled(PerformanceIsolationModule.WorldSync);
+        var worldSyncEnabled = _performanceIsolation.IsEnabled(PerformanceIsolationModule.WorldSync) && !IsSoloSession();
         uint[] previousCharacters;
         LobbyHost? host;
         LobbyClient? client;
@@ -2785,8 +2783,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         }
         else
         {
-            _diagnostics.Log("WorldSync",
-                "WorldSync is disabled in Settings for this game session. Character spawn and movement replication remain active; no world manifest will be compiled or loaded.");
+            _diagnostics.Log("WorldSync", WorldSyncSkippedMessage());
         }
         await StopRemoteCharactersBestEffortAsync(previousCharacters).ConfigureAwait(false);
         PublishState();
@@ -2807,7 +2804,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _uiGameplayLoaded = false;
         _localGameplayReady = false;
         _localReadySending = false;
-        _remoteGameplayReady = false;
+        _remoteGameplayReady = IsSoloSessionLocked();
         _worldSyncEnabledForSession = true;
         ResetWorldReplicationState();
         ResetRemoteSpawnState();
@@ -2889,7 +2886,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
     }
 
     private bool AreAllRemoteGameplayPlayersReady()
-        => RemoteSpawnPlanner.AllRemotePlayersReady(
+        => IsSoloSessionLocked() || RemoteSpawnPlanner.AllRemotePlayersReady(
             _lobby,
             _host?.HostPeerId ?? _client?.PeerId ?? 0,
             _remoteGameplayReadyPeers);

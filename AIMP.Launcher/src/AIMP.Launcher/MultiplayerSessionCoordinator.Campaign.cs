@@ -104,7 +104,8 @@ internal sealed partial class MultiplayerSessionCoordinator
         lock (_stateGate)
         {
             ResetGameplayState(next);
-            _worldSyncEnabledForSession = _performanceIsolation.IsEnabled(PerformanceIsolationModule.WorldSync);
+            _worldSyncEnabledForSession = _performanceIsolation.IsEnabled(PerformanceIsolationModule.WorldSync)
+                && !IsSoloSessionLocked();
             host = _host; client = _client;
             if (_gamePreparation is null) throw new InvalidOperationException("Campaign preparation is unavailable.");
             _automaticWorldManifestPreparation = PrepareCampaignManifestAsync(next.Level);
