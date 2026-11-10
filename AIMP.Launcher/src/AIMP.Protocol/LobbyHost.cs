@@ -135,13 +135,18 @@ public sealed partial class LobbyHost : IAsyncDisposable
 
     public int BoundPort => (_listener.LocalEndpoint as IPEndPoint)?.Port ?? _options.Port;
 
+    // A one-slot lobby (solo / Private) has no room for clients, so it starts alone.
+    public bool IsSolo => _options.Capacity == 1;
+
+    private int MinimumClientsToStart => IsSolo ? 0 : 1;
+
     public bool CanStart
     {
         get
         {
             lock (_stateLock)
                 return string.Equals(_state, "Lobby", StringComparison.Ordinal)
-                    && _clients.Count >= 1
+                    && _clients.Count >= MinimumClientsToStart
                     && _clients.Values.All(client => client.IsReady)
                     && (!_options.AlienVsSurvivors || (_alienPeerId != 0 &&
                         (_alienPeerId == HostPeerId || _clients.ContainsKey(_alienPeerId))))
@@ -297,7 +302,7 @@ public sealed partial class LobbyHost : IAsyncDisposable
                         "The session has already left the Lobby state.");
                 }
 
-                if (_clients.Count < 1
+                if (_clients.Count < MinimumClientsToStart
                     || _clients.Values.Any(client => !client.IsReady))
                 {
                     throw new InvalidOperationException(

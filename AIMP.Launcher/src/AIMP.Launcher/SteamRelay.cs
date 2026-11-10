@@ -22,17 +22,18 @@ namespace AIMP.Launcher;
 /// All Steam API calls except Connection.SendMessage (thread-safe in
 /// SteamNetworkingSockets) run on one dedicated pump thread.
 /// </summary>
-internal sealed class SteamRelay : ISteamRelay
+internal sealed partial class SteamRelay : ISteamRelay, ISteamLobbies
 {
     internal const string AddressPrefix = "steam:";
     private const uint SpacewarAppId = 480;
     private const int VirtualPort = 7856;
     private const int ChunkSize = 64 * 1024;
     private const int SendBufferBytes = 8 * 1024 * 1024;
+    private const int MaxHostTunnels = 16;
     private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(25);
     private static readonly TimeSpan InitRetryInterval = TimeSpan.FromSeconds(10);
 
-    private readonly LauncherDiagnostics _diagnostics;
+    private readonly SteamRelayLog _diagnostics;
     private readonly BlockingCollection<Action> _work = new();
     private readonly object _gate = new();
     private readonly List<RelayTunnel> _tunnels = new();
@@ -47,8 +48,14 @@ internal sealed class SteamRelay : ISteamRelay
     private int _menuProcessId;
 
     internal SteamRelay(LauncherDiagnostics diagnostics)
+        : this(new SteamRelayLog(diagnostics is null ? throw new ArgumentNullException(nameof(diagnostics)) : diagnostics.Log))
     {
-        _diagnostics = diagnostics ?? throw new ArgumentNullException(nameof(diagnostics));
+    }
+
+    // The Steam helper process forwards its log lines to the launcher instead of writing a launcher log.
+    internal SteamRelay(SteamRelayLog log)
+    {
+        _diagnostics = log ?? throw new ArgumentNullException(nameof(log));
     }
 
     /// <summary>Raised (on a worker thread) when the user accepts a Steam
@@ -106,21 +113,38 @@ internal sealed class SteamRelay : ISteamRelay
     }
 
     /// <summary>Accepts Steam relay connections and bridges them to the local lobby port.</summary>
+    // Without a visibility (no Steam lobby advert) the relay accepts anyone, as before.
     public Task<bool> StartHostingAsync(int lobbyPort, string statusText) => RunOnPumpAsync(() =>
     {
         if (!EnsureInitialized(force: true)) return false;
+        StartHostingOnPump(lobbyPort, SteamLobbyVisibility.Public);
+        var address = FormatAddress(LocalSteamId);
+        SteamFriends.SetRichPresence("connect", address);
+        SteamFriends.SetRichPresence("status", statusText);
+        return true;
+    });
+
+    private void StartHostingOnPump(int lobbyPort, SteamLobbyVisibility visibility)
+    {
         StopHostingOnPump();
+        _lobbyVisibility = visibility; // relay access checks use it from the first connection
         _hostPort = lobbyPort;
         _hostSocket = SteamNetworkingSockets.CreateRelaySocket<HostRelaySocket>(VirtualPort);
         _hostSocket.Owner = this;
         var address = FormatAddress(LocalSteamId);
-        SteamFriends.SetRichPresence("connect", address);
-        SteamFriends.SetRichPresence("status", statusText);
         _diagnostics.Log("Steam", $"Hosting over Steam relay (Spacewar 480). Friends can join with {address} or via your Steam friends list.");
-        return true;
-    });
+    }
 
     public Task StopHostingAsync() => RunOnPumpAsync(() => { StopHostingOnPump(); return true; });
+
+    public Task ReleaseAfterGameExitAsync() => RunOnPumpAsync(() =>
+    {
+        if (!_menuEnabled) return false;
+        _diagnostics.Log("Steam", $"Alien: Isolation PID={_menuProcessId} exited; releasing Spacewar until the next game menu.");
+        ShutdownOnPump();
+        _menuProcessId = 0;
+        return true;
+    });
 
     /// <summary>Connects to a host over Steam relay and returns a loopback port
     /// that LobbyClient can connect to. Throws when the relay cannot connect.</summary>
@@ -153,6 +177,7 @@ internal sealed class SteamRelay : ISteamRelay
         var tunnel = new RelayTunnel(this, manager.Connection, $"host {hostSteamId}") { ClientManager = manager };
         manager.Tunnel = tunnel;
         Track(tunnel);
+        _clientHostSteamId = hostSteamId; // lets a joined player invite friends to this host
         return tunnel;
     }
 
@@ -199,6 +224,8 @@ internal sealed class SteamRelay : ISteamRelay
 
     private void PumpLoop()
     {
+        // Continuations of async Steam calls (lobby search/join/create) resume here.
+        SynchronizationContext.SetSynchronizationContext(new PumpSynchronizationContext(_work));
         while (!_pumpExit)
         {
             try { PumpOnce(); }
@@ -238,6 +265,35 @@ internal sealed class SteamRelay : ISteamRelay
         return completion.Task;
     }
 
+    // Starts an async operation on the pump thread; its awaits resume on the pump.
+    private Task<T> RunOnPumpAwaitAsync<T>(Func<Task<T>> action)
+    {
+        var completion = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_gate)
+        {
+            if (_stopping) return Task.FromException<T>(new ObjectDisposedException(nameof(SteamRelay)));
+            if (_pump is null) return Task.FromException<T>(new InvalidOperationException("Steam relay is waiting for the game menu to be ready."));
+            _work.Add(async () =>
+            {
+                try { completion.TrySetResult(await action()); }
+                catch (Exception exception) { completion.TrySetException(exception); }
+            });
+        }
+        return completion.Task;
+    }
+
+    private sealed class PumpSynchronizationContext(BlockingCollection<Action> work) : SynchronizationContext
+    {
+        public override void Post(SendOrPostCallback callback, object? state)
+        {
+            // After shutdown the queue is closed; late continuations are dropped.
+            try { work.Add(() => callback(state)); }
+            catch (InvalidOperationException) { }
+        }
+
+        public override SynchronizationContext CreateCopy() => this;
+    }
+
     private bool EnsureInitialized(bool force)
     {
         if (!_menuEnabled) return false;
@@ -254,7 +310,7 @@ internal sealed class SteamRelay : ISteamRelay
             if (force) _diagnostics.Log("Steam", $"Steam relay unavailable: {exception.Message}");
             if (SteamClient.IsValid)
             {
-                SteamFriends.OnGameRichPresenceJoinRequested -= OnRichPresenceJoinRequested;
+                UnhookSteamCallbacks();
                 SteamClient.Shutdown();
             }
             _ready = false;
@@ -269,7 +325,9 @@ internal sealed class SteamRelay : ISteamRelay
         SteamNetworkingUtils.SendBufferSize = SendBufferBytes;
         SteamNetworkingUtils.InitRelayNetworkAccess();
         SteamFriends.OnGameRichPresenceJoinRequested += OnRichPresenceJoinRequested;
+        HookLobbyCallbacks();
         _ready = true;
+        ApplyPresence();
         _diagnostics.Log("Steam", $"Steam relay ready as {FormatAddress(LocalSteamId)} ({SteamClient.Name}).");
     }
 
@@ -287,15 +345,17 @@ internal sealed class SteamRelay : ISteamRelay
         if (handler is not null) Task.Run(() => handler(friendName, address));
     }
 
+    // Also leaves the Steam lobby (hosted or joined) and resets rich presence.
     private void StopHostingOnPump()
     {
+        LeaveLobbyOnPump();
         if (_hostSocket is null) return;
         RelayTunnel[] hosted;
         lock (_gate) hosted = _tunnels.Where(t => t.ClientManager is null).ToArray();
         foreach (var tunnel in hosted) tunnel.Close("host stopped");
         try { _hostSocket.Close(); } catch (Exception exception) { _diagnostics.Log("Steam", $"Relay socket close: {exception.Message}"); }
         _hostSocket = null;
-        if (_ready) SteamFriends.ClearRichPresence();
+        if (_ready) ApplyPresence();
         _diagnostics.Log("Steam", "Stopped hosting over Steam relay.");
     }
 
@@ -328,7 +388,7 @@ internal sealed class SteamRelay : ISteamRelay
             StopHostingOnPump();
             if (SteamClient.IsValid)
             {
-                SteamFriends.OnGameRichPresenceJoinRequested -= OnRichPresenceJoinRequested;
+                UnhookSteamCallbacks();
                 SteamFriends.ClearRichPresence();
                 SteamClient.Shutdown();
             }
@@ -383,7 +443,14 @@ internal sealed class SteamRelay : ISteamRelay
 
         public override void OnConnecting(Connection connection, ConnectionInfo info)
         {
-            Owner?._diagnostics.Log("Steam", $"Steam relay peer {info.Identity.SteamId.Value} connecting.");
+            var peer = info.Identity.SteamId;
+            if (Owner?.RejectPeer(peer) is { } reason)
+            {
+                Owner._diagnostics.Log("Steam", $"Rejected Steam relay peer {peer.Value}: {reason}.");
+                connection.Close(false, 0, reason);
+                return;
+            }
+            Owner?._diagnostics.Log("Steam", $"Steam relay peer {peer.Value} connecting.");
             base.OnConnecting(connection, info);
         }
 
@@ -559,4 +626,9 @@ internal sealed class SteamRelay : ISteamRelay
             }
         }
     }
+}
+
+internal sealed class SteamRelayLog(Action<string, string> write)
+{
+    internal void Log(string category, string message) => write(category, message);
 }

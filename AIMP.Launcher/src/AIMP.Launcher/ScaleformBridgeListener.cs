@@ -169,7 +169,7 @@ internal sealed class ScaleformBridgeListener : IDisposable
         var stream = client.GetStream();
         var first = await ReadMessageAsync(stream, token).ConfigureAwait(false);
         if (first is null) return;
-        if (await TryHandlePolicyAsync(stream, first, token).ConfigureAwait(false)) return;
+        if (await TryHandlePolicyAsync(stream, first, token).ConfigureAwait(false) || RejectForeignConnection(channel, first)) return;
         var connectionId = Guid.NewGuid();
         var command = RegisterCommandClient(channel, client, stream);
         AddConnection(channel);
@@ -221,6 +221,25 @@ internal sealed class ScaleformBridgeListener : IDisposable
             .ConfigureAwait(false);
         return true;
     }
+
+    // Web pages can reach loopback ports: a fetch or form POST to 127.0.0.1:12345
+    // arrives as an HTTP request whose body lines would otherwise run as menu
+    // commands (and replace the game's command connection). The game's movies
+    // never send HTTP or binary data, so such connections are dropped unread.
+    private bool RejectForeignConnection(string channel, string first)
+    {
+        if (!LooksForeign(first)) return false;
+        _diagnostics.Log("UI Bridge", $"Rejected a {channel} connection that is not from the game (HTTP or binary data).");
+        return true;
+    }
+
+    internal static bool LooksForeign(string first) =>
+        first.Any(character => char.IsControl(character) && character != '\t')
+        || HttpRequestLine.IsMatch(first);
+
+    private static readonly System.Text.RegularExpressions.Regex HttpRequestLine = new(
+        @"^[A-Za-z]{3,10} +\S+ +HTTP/\d",
+        System.Text.RegularExpressions.RegexOptions.CultureInvariant | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
     private async Task<bool> ProcessMessagesAsync(
         NetworkStream stream,

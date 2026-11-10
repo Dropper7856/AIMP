@@ -52,7 +52,9 @@ package frontend
       
       public var onLobbyReturn:Function;
       public var onLobbyOpened:Function;
-      
+      public var onFriendList:Function;
+      public var onInviteReceived:Function;
+
       public function MultiplayerBridge()
       {
          super();
@@ -220,6 +222,26 @@ package frontend
       {
          this.send("JOIN_DIRECT_IP",{});
       }
+
+      public function refreshFriends() : void
+      {
+         this.send("REFRESH_FRIENDS",{});
+      }
+
+      public function inviteFriend(friendId:String) : void
+      {
+         this.send("INVITE_FRIEND",{"friendId":friendId});
+      }
+
+      public function joinFriend(friendId:String) : void
+      {
+         this.send("JOIN_FRIEND",{"friendId":friendId});
+      }
+
+      public function acceptInvite(from:String) : void
+      {
+         this.send("ACCEPT_INVITE",{"from":from});
+      }
       
       public function setAlienRole(peerId:String) : void
       {
@@ -363,6 +385,14 @@ package frontend
          {
             this.handleServerList(values);
          }
+         else if(type == "FRIEND_LIST")
+         {
+            this.handleFriendList(values);
+         }
+         else if(type == "INVITE_RECEIVED")
+         {
+            if(this.onInviteReceived != null) this.onInviteReceived(String(values["from"]),String(values["name"]));
+         }
          else if(type == "LOBBY_STATE")
          {
             if(this.onLobbyState != null)
@@ -423,6 +453,39 @@ package frontend
          }
       }
       
+      private function handleFriendList(values:Object) : void
+      {
+         var friends:Array = [];
+         var invites:Array = [];
+         var count:int = int(values["count"]);
+         var i:int = 0;
+         while(i < count)
+         {
+            var friend:Object = {};
+            friend.id = String(values["f" + i + "_id"]);
+            friend.name = String(values["f" + i + "_name"]);
+            friend.status = String(values["f" + i + "_status"]);
+            friend.aimp = String(values["f" + i + "_aimp"]);
+            friend.join = String(values["f" + i + "_join"]);
+            friends.push(friend);
+            i++;
+         }
+         var inviteCount:int = int(values["icount"]);
+         i = 0;
+         while(i < inviteCount)
+         {
+            var invite:Object = {};
+            invite.from = String(values["i" + i + "_from"]);
+            invite.name = String(values["i" + i + "_name"]);
+            invites.push(invite);
+            i++;
+         }
+         if(this.onFriendList != null)
+         {
+            this.onFriendList(friends,invites);
+         }
+      }
+
       private function send(type:String, values:Object) : void
       {
          var line:String = type;

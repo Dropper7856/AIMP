@@ -708,7 +708,9 @@ DWORD Bootstrap::RunImpl() {
         const bool installed = validation.hashMatch &&
             campaign_save::Install(moduleBase, campaignError);
         diagnostics.Log(installed ? "info" : "error", "campaign_save_initialized",
-            installed ? "Multiplayer campaign saves can be isolated from personal Steam saves."
+            installed ? (campaign_save::ProfileReloadInstalled()
+                ? "Multiplayer campaign saves can be isolated from personal Steam saves; profile swaps reload the retail save profile."
+                : "Multiplayer campaign saves can be isolated from personal Steam saves (retail profile reload unavailable).")
                 : (campaignError.empty() ? "Campaign save isolation requires the exact executable hash." : campaignError));
     }
 

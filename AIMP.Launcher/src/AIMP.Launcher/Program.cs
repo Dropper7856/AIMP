@@ -8,6 +8,8 @@ public static class Program
 {
     public static void Main(string[] args)
     {
+        if (SteamHostServer.TryRun(args, out var steamExit)) { Environment.ExitCode = steamExit; return; } // Steam child process
+
         if (WorldManifestCli.TryRun(args, out var toolExitCode))
         {
             Environment.ExitCode = toolExitCode;
@@ -61,7 +63,7 @@ public static class Program
             provider.GetRequiredService<ScaleformBridgeListener>(),
             provider.GetRequiredService<PerformanceIsolationState>(),
             provider.GetRequiredService<GamePreparationService>(),
-            new SteamRelay(provider.GetRequiredService<LauncherDiagnostics>())));
+            new SteamRelayProcess(provider.GetRequiredService<LauncherDiagnostics>())));
         services.AddSingleton(provider => new UiPakInstaller(
             provider.GetRequiredService<LauncherDiagnostics>()));
         services.AddSingleton(provider => new GameLaunchCoordinator(
