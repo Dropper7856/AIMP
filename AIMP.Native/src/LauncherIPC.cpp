@@ -841,12 +841,14 @@ void LauncherIPC::PublishPlayerAnimationTraffic() {
     if (!capture.valid || now < capture.capturedAt || now - capture.capturedAt > 500U ||
         !character_incarnations::NativeRegistry().Current(capture.ticket)) return;
     // Identity without the advancing clock: a new clip or a clear is sent at
-    // once, an unchanged clip only refreshes its elapsed time every 250 ms.
+    // once, an unchanged clip only refreshes its elapsed time every 250 ms, or
+    // every 50 ms while it carries the owner's moving body effectors.
     std::ostringstream key;
     key << capture.ticket.generation << ':' << capture.ticket.serial << ':'
         << capture.state.transition << ':' << capture.state.animation;
     for (const auto attachment : capture.state.attachments) key << ':' << attachment;
-    if (key.str() == publishedAnimation_ && now - lastAnimationPublication_ < 250U) return;
+    if (key.str() == publishedAnimation_ &&
+        now - lastAnimationPublication_ < (capture.state.posed ? 50U : 250U)) return;
     auto state = capture.state;
     if (animation_sync::Active(state)) state.elapsedMilliseconds = static_cast<std::uint32_t>(now - capture.capturedAt);
     std::ostringstream json;

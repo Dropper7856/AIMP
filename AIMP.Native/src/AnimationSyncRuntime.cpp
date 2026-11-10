@@ -72,6 +72,19 @@ struct RemoteDiagnostics final {
     std::uint64_t transition{};
     std::uint32_t animation{}, resource{}, clipPath{};
     const char* stage{"pending"};
+    // Owner clock following: seeks back onto the owner's phase, and replays
+    // restarted because ours ended while the owner's same clip still ran.
+    std::uint64_t resynced{}, readmitted{};
+    // Last replays: how and where (our clock vs owner's) each one ended.
+    struct Ending final {
+        std::uint64_t transition{};
+        std::uint32_t animation{};
+        std::int32_t start{}, end{}, loops{};
+        float ours{-1.0F}, owner{-1.0F}, duration{};
+        const char* result{};
+    };
+    std::array<Ending, 12> endings{};
+    std::uint32_t endingNext{};
 };
 struct Slot final {
     std::uintptr_t character{};
@@ -83,6 +96,8 @@ struct Slot final {
     // Crew bones the owned clip drives; the others keep the last idle pose.
     bool maskActive{};
     std::bitset<256> crewDriven{}, crewDisplaced{};
+    // Crew bones the owner's body effectors drive (-1 = no posture rebuild).
+    std::array<std::int16_t, 69> crewPose{};
     // Holster-first: the clip starts once the weapon is away and the unarmed
     // idle has run a few frames, so untouched limbs keep a natural pose. The
     // wait is not counted as owner progress (the replay runs that much later).
@@ -90,6 +105,11 @@ struct Slot final {
     // The owner's player position sits a few cm below where a crew
     // representation stands; the clip keeps the representation's grounding.
     float heightOffset{}, ownerStartY{}, ownedYaw{};
+    // Owner clip clock rate from successive refreshes (-1 = unknown): a
+    // staged interaction may hold its clip while waiting (LEDs, generator).
+    float ownerRate{-1.0F}, rateSamplePhase{};
+    std::uint64_t rateSampleAt{}, resyncAt{};
+    std::uint32_t readmits{};
     Cycle owned{};
     RemoteDiagnostics diagnostics{};
 };
@@ -103,7 +123,7 @@ struct LocalCapture final {
     std::uint64_t hidingTransition{};
 };
 struct LocalDiagnostics final {
-    std::uint64_t captured{}, cleared{}, hidingSkipped{}, fallbackCaptured{}, torn{}, unavailable{};
+    std::uint64_t captured{}, cleared{}, hidingSkipped{}, fallbackCaptured{}, torn{}, unavailable{}, posed{};
     std::uint32_t animation{}, resource{};
 };
 struct Stream final {
@@ -177,12 +197,28 @@ struct MaskMap final { std::uint32_t source{}, target{}, targetBones{}; std::vec
 std::vector<MaskClip> gMaskClips;
 std::vector<MaskMap> gMaskMaps;
 std::int32_t gMaskFile{-1}; // -1 absent/invalid, otherwise clip count
+// FEMALEFP, the first-person Ripley rig (docs/animationsync-bone-mask-analysis.md):
+// HEAD hangs from EXTRACT and carries the shoulders; HIPS carries the pelvis,
+// legs and spine. A first-person clip moves that head/arms rig, not the body.
+constexpr std::uint32_t kFirstPersonSkeleton = 2971063975U;
+constexpr std::size_t kFirstPersonBones = 69U;
+enum FirstPersonBone : std::uint32_t {
+    kFpHead = 1, kFpLeftArm = 4, kFpLeftForearm = 6, kFpLeftHand = 9,
+    kFpRightArm = 27, kFpRightForearm = 29, kFpRightHand = 32, kFpHips = 49,
+    kFpLeftThigh = 51, kFpLeftCalf = 52, kFpLeftFoot = 53, kFpLeftToe = 54,
+    kFpRightThigh = 55, kFpRightCalf = 56, kFpRightFoot = 57, kFpRightToe = 58,
+};
+constexpr std::array<FirstPersonBone, 16> kPoseBones{kFpHead, kFpLeftArm, kFpLeftForearm, kFpLeftHand,
+    kFpRightArm, kFpRightForearm, kFpRightHand, kFpHips, kFpLeftThigh, kFpLeftCalf, kFpLeftFoot, kFpLeftToe,
+    kFpRightThigh, kFpRightCalf, kFpRightFoot, kFpRightToe};
+using CrewBones = std::array<std::int16_t, kFirstPersonBones>;
+std::vector<std::int16_t> gFirstPersonParents; // from bone-masks.bin; empty = unknown
 // Bones that move (rotation) or are held >5 degrees away from the source
 // reference. Translation-only offsets (first-person camera/root height) are not
 // enough: they are what lowers the crew body.
 constexpr float kMovingDegrees = 2.0F, kHeldDegrees = 5.0F, kDisplacedTranslation = 0.2F;
 void LoadMasks() noexcept {
-    gMaskClips.clear(); gMaskMaps.clear(); gMaskFile = -1;
+    gMaskClips.clear(); gMaskMaps.clear(); gMaskFile = -1; gFirstPersonParents.clear();
     std::array<wchar_t, 1024> module{};
     const auto length = GetModuleFileNameW(nullptr, module.data(), static_cast<DWORD>(module.size()));
     if (length == 0U || length >= module.size()) return;
@@ -215,9 +251,14 @@ void LoadMasks() noexcept {
         !u32(skeletons) || skeletons > 256U) return;
     // Skeleton roots (no parent) carry the placement, never a clip pose.
     std::vector<std::pair<std::uint32_t, BoneSet>> roots;
+    std::vector<std::int16_t> firstPerson;
     for (std::uint32_t i = 0; i < skeletons; ++i) {
         std::uint32_t hash{}, bones{};
         if (!u32(hash) || !u32(bones) || bones > 4096U || at + bones * 2ULL > bytes.size()) return;
+        if (hash == kFirstPersonSkeleton && bones == kFirstPersonBones) {
+            firstPerson.resize(bones);
+            std::memcpy(firstPerson.data(), bytes.data() + at, bones * 2U);
+        }
         BoneSet root{};
         for (std::uint32_t b = 0; b < bones && b < kMaskBones; ++b) {
             std::int16_t parent{};
@@ -263,6 +304,7 @@ void LoadMasks() noexcept {
             [](const MaskClip& a, const MaskClip& b) { return a.path < b.path; })) return;
     gMaskClips = std::move(loaded);
     gMaskMaps = std::move(loadedMaps);
+    gFirstPersonParents = std::move(firstPerson);
     gMaskFile = static_cast<std::int32_t>(gMaskClips.size());
 }
 const MaskClip* FindMask(const std::uint32_t path) noexcept {
@@ -292,6 +334,32 @@ BoneSet MapBones(const MaskMap& map, const BoneSet& input) noexcept {
 // (layer 0 bone count) -> this character's own high-res skeleton (layer 7, the
 // final pose; its hash is the clip database's character id, LocalClip's
 // resource). Bones without a source (face, helpers) are not driven.
+// The crew high-res bone of each first-person bone, through the same engine
+// maps (FEMALEFP -> crew low-res -> this character's high-res); -1 = none.
+bool MapCrewBones(const MaskClip& clip, const std::uint32_t lowBones, const std::uint32_t highBones,
+    const std::uint32_t highSkeleton, CrewBones& output) noexcept {
+    output.fill(-1);
+    if (clip.skeleton != kFirstPersonSkeleton) return false;
+    const auto* low = UniqueMap(clip.skeleton, lowBones);
+    if (low == nullptr) return false;
+    const MaskMap* high{};
+    if (lowBones != highBones) {
+        for (const auto& map : gMaskMaps)
+            if (map.source == low->target && map.target == highSkeleton && map.targetBones == highBones) { high = &map; break; }
+        if (high == nullptr) return false;
+    }
+    const auto target = [](const MaskMap& map, const std::int16_t from) -> std::int16_t {
+        for (const auto& [source, to] : map.pairs) if (source == from) return to;
+        return -1;
+    };
+    for (std::size_t b = 0; b < output.size(); ++b) {
+        auto bone = target(*low, static_cast<std::int16_t>(b));
+        if (bone >= 0 && high != nullptr) bone = target(*high, bone);
+        output[b] = bone;
+    }
+    for (const auto bone : kPoseBones) if (output[bone] < 0) return false;
+    return true;
+}
 bool CrewDriven(const MaskClip& clip, const std::uint32_t lowBones, const std::uint32_t highBones,
     const std::uint32_t highSkeleton, BoneSet& output, BoneSet& displaced, std::uint32_t& target) noexcept {
     const auto* low = UniqueMap(clip.skeleton, lowBones);
@@ -353,9 +421,12 @@ bool ReadCycle(const std::uintptr_t character, Cycle& cycle, const std::uintptr_
             Read(cycle.address + 0x6CU, cycle.animation);
     return true;
 }
+// Flag 4 = completed (0064F290 sets 6 at the end). Flag 2 alone is set at
+// start (0066C4C0) from param +0x98 bit 0x20 (early-interruptible clip): the
+// lever/hacking interactions use it, so it must not reject a live clip.
 bool Scripted(const Cycle& cycle) noexcept {
     return cycle.type == gBase.load() + kScriptedType && cycle.state == kScriptedState &&
-        cycle.graph != 0U && cycle.resource != 0U && cycle.animation != 0U && (cycle.flags & 6U) == 0U;
+        cycle.graph != 0U && cycle.resource != 0U && cycle.animation != 0U && (cycle.flags & 4U) == 0U;
 }
 bool SameCycle(const Cycle& a, const Cycle& b) noexcept {
     return a.address == b.address && a.type == b.type && a.owner == b.owner &&
@@ -588,8 +659,39 @@ struct MaskShare final {
     std::atomic<std::uint64_t> offsetFrames{};
     std::atomic<std::uint64_t> applied{}, captured{};
     std::atomic<std::uint32_t> restored{};
+    // Posture rebuild: the owner's body effectors keyed by its clip time for
+    // the transition this representation plays (mutex), and its crew bones.
+    struct PoseSample final { float time{}; std::array<float, 12> effectors{}; };
+    struct PoseTrack final {
+        std::uint64_t transition{};
+        std::uint32_t count{};
+        std::array<PoseSample, 256> samples{};
+    } track{};
+    std::uint64_t playing{};
+    std::array<std::int16_t, 69> crewPose{};
+    std::atomic<std::uint64_t> solved{};
+    // Why the last apply frame did not rebuild the posture (0 = it did): 1 no
+    // owner effectors, 2 other transition, 3 skeleton/idle, 4 crew bones,
+    // 5 clip clock, 6 eased out, 7 pose read, 8 idle feet, 9 non-finite.
+    std::atomic<std::uint32_t> poseSkip{};
 };
 std::array<MaskShare, kSlots> gMaskShares{};
+// The local first-person body, sampled from its own final pose by the layer
+// blend hook (animation workers) and read by the owner capture (engine).
+struct OwnerPose final {
+    std::mutex mutex;
+    std::atomic<std::uintptr_t> controller{};
+    std::atomic<bool> clip{};          // a scripted clip is captured this frame
+    std::atomic<std::uint64_t> frames{};
+    MaskShare* skeleton{};             // parents only (mutex)
+    std::uintptr_t checked{};
+    bool firstPerson{}, calibrated{}, fresh{};
+    float yaw{};                       // standing feet heading in model space
+    std::array<float, 3> idleHips{}, idleHead{};
+    std::array<float, 12> effectors{};
+    std::uint64_t at{};
+};
+OwnerPose gOwnerPose{};
 std::atomic<bool> gMaskHook{};
 
 // hkaSkeleton (Havok 2012, 32-bit) of the final pose: m_parentIndices data
@@ -619,6 +721,7 @@ void PublishMaskState(const Slot& slot, MaskShare& share, const bool starting = 
         share.baseBones.store(0U);
         share.applied.store(0U); share.captured.store(0U); share.restored.store(0U);
         share.offsetActive.store(false); share.parentCount = 0U;
+        share.track.transition = 0U; share.track.count = 0U; share.playing = 0U;
         share.binding = slot.binding;
         share.controller.store(controller);
     }
@@ -636,7 +739,9 @@ void PublishMaskState(const Slot& slot, MaskShare& share, const bool starting = 
         share.driven = slot.crewDriven;
         share.displaced = slot.crewDisplaced;
         share.expected = slot.owned;
+        share.crewPose = slot.crewPose;
         if (starting) {
+            share.playing = slot.desired.transition;
             ReadParents(controller, share);
             ReadCycle(slot.character, share.expected);
             share.expected.serial = static_cast<std::uint8_t>(share.expected.serial + 1U);
@@ -687,6 +792,65 @@ bool Unarmed(const std::uintptr_t character) noexcept {
         pending == 0U && fire == 0U && ready == 0U && equipped == 0U;
 }
 
+// Clip segment [start, end] in seconds, as timeline::Project reads it.
+void Segment(const State& s, float& start, float& end) noexcept {
+    start = (std::max)(0.0F, static_cast<float>(s.startFrame) / 30.0F);
+    end = s.endFrame > 0 ? (std::min)(s.durationSeconds, static_cast<float>(s.endFrame) / 30.0F) : s.durationSeconds;
+}
+// The owner's clip clock now: its latest sample projected by the sample age,
+// or held when the owner's clock is stalled. False once the owner's clip is over.
+bool OwnerPhase(const Slot& slot, const std::uint64_t now, float& phase, float& remaining) noexcept {
+    if (!Active(slot.desired)) return false;
+    auto age = static_cast<std::uint64_t>(slot.desired.elapsedMilliseconds) + now - slot.receivedAt;
+    if (slot.ownerRate >= 0.0F && slot.ownerRate < 0.05F * slot.desired.speed) age = 0U;
+    std::int32_t loops{};
+    if (!timeline::Project(slot.desired, age, phase, loops)) return false;
+    float start{}, end{};
+    Segment(slot.desired, start, end);
+    remaining = loops < 0 ? 1.0e6F : (end - phase) + static_cast<float>((std::max)(0, loops - 1)) * (end - start);
+    return true;
+}
+void NoteEnding(Slot& slot, const char* result, const Cycle& cycle, const std::uint64_t now) noexcept {
+    auto& d = slot.diagnostics;
+    auto& row = d.endings[d.endingNext++ % d.endings.size()];
+    row = {};
+    row.transition = slot.desired.transition; row.animation = slot.owned.animation;
+    row.start = slot.desired.startFrame; row.end = slot.desired.endFrame; row.loops = slot.desired.loops;
+    row.result = result; row.duration = slot.desired.durationSeconds;
+    float duration{}, remaining{};
+    if (cycle.graph != 0U && !timeline::Read(cycle.graph, row.ours, duration)) row.ours = -1.0F;
+    if (!OwnerPhase(slot, now, row.owner, remaining)) row.owner = -1.0F;
+}
+// Our replay of the owner's current clip: same transition, not a locker clip
+// (those follow their recorded path instead).
+bool Following(const Slot& slot) noexcept {
+    return Active(slot.desired) && slot.handled == slot.desired.transition &&
+        slot.desired.animation == slot.owned.animation &&
+        player_hiding_presentation::ClassifyClip(slot.owned.animation).phase == 0U;
+}
+// Ours ended or was taken while the owner still plays it: replay it again at
+// the owner's phase (bounded per transition).
+void Readmit(Slot& slot, const bool following, const std::uint64_t now) noexcept {
+    float phase{}, remaining{};
+    if (!following || slot.readmits >= 4U || !OwnerPhase(slot, now, phase, remaining) || remaining < 0.5F) return;
+    ++slot.readmits; ++slot.diagnostics.readmitted; slot.handled = 0U;
+}
+// Keep our clip on the owner's clock: holds, slow stages and drift.
+void FollowOwnerClock(Slot& slot, const Cycle& current, const std::uint64_t now) noexcept {
+    if (current.graph == 0U || now - slot.startedAt < 400U || now - slot.resyncAt < 250U) return;
+    float ours{}, duration{}, target{}, remaining{};
+    if (!timeline::Read(current.graph, ours, duration) || !OwnerPhase(slot, now, target, remaining)) return;
+    float difference = std::abs(ours - target);
+    if (slot.desired.loops != 1) {
+        float start{}, end{};
+        Segment(slot.desired, start, end);
+        if (end > start) difference = (std::min)(difference, std::abs((end - start) - difference));
+    }
+    if (difference <= 0.3F) return;
+    slot.resyncAt = now;
+    if (timeline::Seek(current.graph, target)) ++slot.diagnostics.resynced;
+}
+
 void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept {
     ProbeLayers(slot);
     auto& d = slot.diagnostics;
@@ -706,18 +870,29 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
         const bool cleared = !Active(slot.desired) && slot.clearedAt != 0U &&
             ownedHiding != 1U && ownedHiding != 3U &&
             (slot.ownedLoops != 1 || now - slot.clearedAt > kClearGraceMs + slot.holsterWait);
+        const bool following = Following(slot);
         if (!Owned(current, slot.owned)) {
+            NoteEnding(slot, "interrupted", Cycle{}, now);
             slot.owned = {}; ++d.interrupted; d.stage = "retail-interrupted";
+            Readmit(slot, following, now);
         } else if ((current.flags & 6U) != 0U) {
-            if (Cancel(slot.character, slot.owned)) { slot.owned = {}; ++d.completed; d.stage = "completed"; }
+            NoteEnding(slot, "completed", current, now);
+            if (Cancel(slot.character, slot.owned)) {
+                slot.owned = {}; ++d.completed; d.stage = "completed";
+                Readmit(slot, following, now);
+            }
         } else if (expired || cleared) {
+            NoteEnding(slot, expired ? "timeout" : "cleared", current, now);
             if (Cancel(slot.character, slot.owned)) {
                 slot.owned = {}; ++d.cancelled; d.stage = expired ? "observation-timeout" : "cancelled";
                 if (expired) slot.handled = 0U; // a fresh sample may resume the ongoing action
             }
             else { ++d.deferred; d.stage = "cancel-deferred"; }
-        } else if (slot.owned.graph == 0U && current.graph != 0U) {
-            slot.owned.graph = current.graph; d.stage = "playing";
+        } else {
+            if (slot.owned.graph == 0U && current.graph != 0U) {
+                slot.owned.graph = current.graph; d.stage = "playing";
+            }
+            if (following) FollowOwnerClock(slot, current, now);
         }
     }
     if (!Active(slot.desired) || slot.handled == slot.desired.transition) {
@@ -773,6 +948,7 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
         if (unarmed && now - slot.unarmedAt < kUnarmedSettleMs) { d.stage = "holstering"; return; }
     }
     slot.maskActive = false;
+    slot.crewPose.fill(-1);
     d.maskTarget = d.maskCrewBones = d.maskCrewDriven = 0U;
     if (const auto* mask = FindMask(d.clipPath)) {
         d.maskStatus = mask->status; d.maskSkeleton = mask->skeleton; d.maskTracks = mask->tracks;
@@ -783,6 +959,7 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
             CrewDriven(*mask, lowBones, highBones, d.resource, slot.crewDriven, slot.crewDisplaced, d.maskTarget)) {
             slot.maskActive = true; d.maskCrewBones = highBones;
             d.maskCrewDriven = static_cast<std::uint32_t>(slot.crewDriven.count());
+            static_cast<void>(MapCrewBones(*mask, lowBones, highBones, d.resource, slot.crewPose));
         }
     } else { d.maskStatus = 0xFFFFFFFFU; d.maskSkeleton = d.maskTracks = d.maskMoving = d.maskHeld = 0U; }
     const character_direct_step_runtime::MovementResourceLease resources(slot.character);
@@ -894,11 +1071,12 @@ bool PumpOne(const std::uintptr_t character) noexcept {
     slot->owned = copy.owned; slot->startedAt = copy.startedAt; slot->ownedLoops = copy.ownedLoops;
     slot->holstered = copy.holstered;
     slot->maskActive = copy.maskActive; slot->crewDriven = copy.crewDriven; slot->crewDisplaced = copy.crewDisplaced;
+    slot->crewPose = copy.crewPose;
     slot->holsterStarted = copy.holsterStarted; slot->unarmedAt = copy.unarmedAt; slot->holsterWait = copy.holsterWait;
     slot->heightOffset = copy.heightOffset; slot->ownerStartY = copy.ownerStartY;
     slot->ownedYaw = copy.ownedYaw;
-    slot->diagnostics = copy.diagnostics;
-    if (slot->desired.transition == copy.desired.transition) slot->handled = copy.handled;
+    slot->diagnostics = copy.diagnostics; slot->resyncAt = copy.resyncAt;
+    if (slot->desired.transition == copy.desired.transition) { slot->handled = copy.handled; slot->readmits = copy.readmits; }
     return true;
 }
 
@@ -914,7 +1092,7 @@ std::atomic<std::uint32_t> gOwnerDatabase{};
 void ObserveRow(const std::uint32_t slot, const Cycle& cycle) noexcept {
     const auto base = gBase.load();
     const OwnerCycleRow row{slot, static_cast<std::uint32_t>(cycle.type - base), cycle.state,
-        Scripted(cycle) ? cycle.animation : 0U, 1U};
+        cycle.animation, 1U};
     const std::lock_guard lock(gLocalMutex);
     for (auto& entry : gOwnerCycles) {
         if (entry.frames == 0U) { entry = row; return; }
@@ -1055,6 +1233,13 @@ bool CaptureLocal(const std::uintptr_t character, const std::array<std::uint32_t
     candidate.attachments = attachments;
     candidate.position = position;
     candidate.yaw = WrapYaw(yaw);
+    {
+        // The first-person body as the pose hook last composed it in this clip.
+        const std::lock_guard lock(gOwnerPose.mutex);
+        if (gOwnerPose.fresh && now >= gOwnerPose.at && now - gOwnerPose.at <= 100U) {
+            candidate.posed = true; candidate.effectors = gOwnerPose.effectors;
+        }
+    }
     // Out-of-contract parameters fall back to the retail defaults rather than
     // dropping the action: the receiver only needs the alias.
     if (candidate.startFrame < -1 || candidate.startFrame > 1000000) candidate.startFrame = -1;
@@ -1071,6 +1256,7 @@ bool CaptureLocal(const std::uintptr_t character, const std::array<std::uint32_t
     {
         const std::lock_guard lock(gLocalMutex);
         if (!same) ++gLocalDiagnostics.captured;
+        if (candidate.posed) ++gLocalDiagnostics.posed;
         gLocalDiagnostics.animation = before.animation; gLocalDiagnostics.resource = before.resource;
     }
     output = candidate;
@@ -1110,9 +1296,15 @@ void PumpLocalOnEngineThread() noexcept {
         capture.valid = CaptureLocal(ticket.character, attachments, capture.state) &&
             registry.Current(ticket) && registry.Local() == ticket;
         capture.capturedAt = GetTickCount64();
+        // The pose hook samples this body: its standing frame between clips,
+        // its effectors during a native scripted clip.
+        gOwnerPose.controller.store(ticket.character + 0x3F0U, std::memory_order_release);
+        gOwnerPose.clip.store(capture.valid && Active(capture.state) && gLocal.cycle != 0U, std::memory_order_release);
     } else {
         gLocal = {};
         static_cast<void>(props::CaptureOnEngineThread(0U));
+        gOwnerPose.controller.store(0U, std::memory_order_release);
+        gOwnerPose.clip.store(false, std::memory_order_release);
     }
     const std::lock_guard lock(gLocalMutex);
     gLocalSnapshot = capture;
@@ -1132,6 +1324,19 @@ void ObserveResolvedAlias(const std::uint32_t database, const std::uint32_t name
 LocalSnapshot ReadLocal() noexcept {
     const std::lock_guard lock(gLocalMutex);
     return gLocalSnapshot;
+}
+
+// Owner body effectors keyed by its clip time (gMutex held; share.mutex nests).
+void RecordPose(const std::size_t index, const State& state) noexcept {
+    if (!state.posed || player_hiding_presentation::ClassifyClip(state.animation).phase != 0U) return;
+    auto& share = gMaskShares[index];
+    const std::lock_guard lock(share.mutex);
+    auto& track = share.track;
+    if (track.transition != state.transition) { track.transition = state.transition; track.count = 0U; }
+    const MaskShare::PoseSample sample{state.phaseSeconds, state.effectors};
+    if (track.count != 0U && (sample.time <= track.samples[track.count - 1U].time + 0.0001F ||
+            track.count == track.samples.size())) track.samples[track.count - 1U] = sample;
+    else track.samples[track.count++] = sample;
 }
 
 bool Publish(const std::uintptr_t character, const State& state, std::string& error) noexcept {
@@ -1163,14 +1368,26 @@ bool Publish(const std::uintptr_t character, const State& state, std::string& er
             error = "Animation sync transition identity changed its clip"; return false;
         }
         if (Active(slot->desired)) {
+            // Owner clock rate between distinct samples (sample time = now - age).
+            const auto sampleAt = now - state.elapsedMilliseconds;
+            if (sampleAt > slot->rateSampleAt + 200U) {
+                const float advanced = state.phaseSeconds - slot->rateSamplePhase;
+                if (advanced >= 0.0F)
+                    slot->ownerRate = advanced * 1000.0F / static_cast<float>(sampleAt - slot->rateSampleAt);
+                slot->rateSamplePhase = state.phaseSeconds; slot->rateSampleAt = sampleAt;
+            }
             slot->desired = state; slot->receivedAt = now; slot->epoch = ++gEpoch;
             Record(static_cast<std::size_t>(slot - gSlots.data()), state);
+            RecordPose(static_cast<std::size_t>(slot - gSlots.data()), state);
         }
         return true;
     }
+    slot->ownerRate = -1.0F; slot->rateSamplePhase = state.phaseSeconds;
+    slot->rateSampleAt = now - state.elapsedMilliseconds; slot->readmits = 0U;
     slot->desired = state; slot->highest = state.transition;
     slot->receivedAt = now; slot->clearedAt = 0U; slot->epoch = ++gEpoch;
     Record(static_cast<std::size_t>(slot - gSlots.data()), state);
+    RecordPose(static_cast<std::size_t>(slot - gSlots.data()), state);
     return true;
 }
 
@@ -1479,6 +1696,256 @@ void GroundFinalPose(const std::uintptr_t transforms, const MaskShare& share, co
     }
 }
 
+// --- Posture rebuild ---------------------------------------------------------
+// Quaternions are x,y,z,w (hkQsTransform), composed parent * local.
+using Vec3 = std::array<float, 3>;
+using Quat = std::array<float, 4>;
+Vec3 Add(const Vec3& a, const Vec3& b) noexcept { return {a[0] + b[0], a[1] + b[1], a[2] + b[2]}; }
+Vec3 Sub(const Vec3& a, const Vec3& b) noexcept { return {a[0] - b[0], a[1] - b[1], a[2] - b[2]}; }
+Vec3 Scale(const Vec3& a, const float s) noexcept { return {a[0] * s, a[1] * s, a[2] * s}; }
+float Dot(const Vec3& a, const Vec3& b) noexcept { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+float Length(const Vec3& a) noexcept { return std::sqrt(Dot(a, a)); }
+Vec3 Cross(const Vec3& a, const Vec3& b) noexcept {
+    return {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+}
+Vec3 Lerp(const Vec3& a, const Vec3& b, const float t) noexcept { return Add(a, Scale(Sub(b, a), t)); }
+Quat Mul(const Quat& a, const Quat& b) noexcept {
+    return {a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+            a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+            a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+            a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]};
+}
+Quat Conjugate(const Quat& q) noexcept { return {-q[0], -q[1], -q[2], q[3]}; }
+Vec3 Rotate(const Quat& q, const Vec3& v) noexcept {
+    const Vec3 u{q[0], q[1], q[2]};
+    const auto t = Scale(Cross(u, v), 2.0F);
+    return Add(Add(v, Scale(t, q[3])), Cross(u, t));
+}
+Quat AxisAngle(const Vec3& axis, const float angle) noexcept {
+    const auto length = Length(axis);
+    if (!(length > 1.0e-6F) || !std::isfinite(angle)) return {0.0F, 0.0F, 0.0F, 1.0F};
+    const auto s = std::sin(angle * 0.5F) / length;
+    return {axis[0] * s, axis[1] * s, axis[2] * s, std::cos(angle * 0.5F)};
+}
+float SafeAcos(const float value) noexcept { return std::acos((std::clamp)(value, -1.0F, 1.0F)); }
+// Shortest rotation taking direction a onto b, limited to maxAngle radians and
+// to the given share of its angle.
+Quat Swing(const Vec3& a, const Vec3& b, const float share, const float maxAngle) noexcept {
+    const auto la = Length(a), lb = Length(b);
+    if (!(la > 1.0e-4F) || !(lb > 1.0e-4F)) return {0.0F, 0.0F, 0.0F, 1.0F};
+    const auto angle = SafeAcos(Dot(a, b) / (la * lb));
+    return AxisAngle(Cross(a, b), (std::min)(angle * share, maxAngle));
+}
+Vec3 ToBodyFrame(const Vec3& p, const float yaw) noexcept {
+    const auto c = std::cos(yaw), s = std::sin(yaw);
+    return {p[0] * c - p[2] * s, p[1], p[2] * c + p[0] * s};
+}
+Vec3 FromBodyFrame(const Vec3& p, const float yaw) noexcept {
+    const auto c = std::cos(yaw), s = std::sin(yaw);
+    return {p[0] * c + p[2] * s, p[1], p[2] * c - p[0] * s};
+}
+// Heading of the standing feet (heel -> toe) in model space.
+bool FeetYaw(const Vec3* at, const std::uint32_t lf, const std::uint32_t lt, const std::uint32_t rf,
+    const std::uint32_t rt, float& yaw) noexcept {
+    const auto x = at[lt][0] - at[lf][0] + at[rt][0] - at[rf][0];
+    const auto z = at[lt][2] - at[lf][2] + at[rt][2] - at[rf][2];
+    if (!(x * x + z * z > 0.0025F)) return false;
+    yaw = std::atan2(x, z);
+    return std::isfinite(yaw);
+}
+
+// Owner side, animation worker: the local first-person final pose gives the
+// standing frame between clips, and the body effectors during a clip.
+void CaptureOwnerPose(const std::uintptr_t controller, void* pose) noexcept {
+    auto& owner = gOwnerPose;
+    std::uint32_t bones{};
+    if (!LayerBones(controller - 0x3F0U, 7U, bones) || bones != kFirstPersonBones) return;
+    const std::lock_guard lock(owner.mutex);
+    if (owner.skeleton == nullptr) owner.skeleton = new (std::nothrow) MaskShare{};
+    if (owner.skeleton == nullptr) return;
+    if (owner.checked != controller) {
+        owner.checked = controller;
+        ReadParents(controller, *owner.skeleton);
+        owner.firstPerson = owner.skeleton->parentCount == kFirstPersonBones &&
+            gFirstPersonParents.size() == kFirstPersonBones &&
+            std::equal(gFirstPersonParents.begin(), gFirstPersonParents.end(), owner.skeleton->parents.begin());
+        owner.calibrated = owner.fresh = false;
+    }
+    // Raw local array (hkaPose +4), not the synced accessor: syncing the
+    // local player's pose here, mid-composition, must not alter what it renders.
+    std::uintptr_t transforms{};
+    if (!owner.firstPerson || !Read(reinterpret_cast<std::uintptr_t>(pose) + 4U, transforms) || transforms < 0x10000U) return;
+    std::array<LocalBone, kFirstPersonBones> local{};
+    std::array<Vec3, kFirstPersonBones> at{};
+    std::array<Quat, kFirstPersonBones> rotation{};
+    if (!crash_guard::TryCopy(local.data(), reinterpret_cast<const void*>(transforms), sizeof(local)) ||
+        !ModelPositions(local.data(), owner.skeleton->parents.data(), kFirstPersonBones, at.data(), rotation.data())) return;
+    if (!owner.clip.load(std::memory_order_acquire)) {
+        float yaw{};
+        if (!FeetYaw(at.data(), kFpLeftFoot, kFpLeftToe, kFpRightFoot, kFpRightToe, yaw)) return;
+        owner.yaw = yaw;
+        owner.idleHips = ToBodyFrame(at[kFpHips], yaw);
+        owner.idleHead = ToBodyFrame(at[kFpHead], yaw);
+        owner.calibrated = true; owner.fresh = false;
+        return;
+    }
+    if (!owner.calibrated) return;
+    const auto hips = Sub(ToBodyFrame(at[kFpHips], owner.yaw), owner.idleHips);
+    const auto head = Sub(ToBodyFrame(at[kFpHead], owner.yaw), owner.idleHead);
+    const auto left = ToBodyFrame(at[kFpLeftHand], owner.yaw), right = ToBodyFrame(at[kFpRightHand], owner.yaw);
+    std::array<float, 12> effectors{hips[0], hips[1], hips[2], head[0], head[1], head[2],
+        left[0], left[1], left[2], right[0], right[1], right[2]};
+    for (const auto value : effectors) if (!std::isfinite(value) || std::abs(value) > 10.0F) return;
+    owner.effectors = effectors; owner.at = GetTickCount64(); owner.fresh = true;
+    owner.frames.fetch_add(1U, std::memory_order_relaxed);
+}
+
+// Observer side, animation worker, after the mask: rebuild the owner's body on
+// the crew skeleton. Hips and head move as the owner's moved from its pose
+// before the clip (crouch, lean), feet stay planted, the spine bends to carry
+// the head, and both arms reach where the owner's hands really are. Each stage
+// is two-bone IK or a distributed swing; fingers and wrists keep the clip.
+void SolvePose(MaskShare& share, const Cycle& current, const std::uintptr_t transforms, const std::uint32_t bones) noexcept {
+    const auto& track = share.track;
+    const auto skip = [&](const std::uint32_t reason) noexcept { share.poseSkip.store(reason, std::memory_order_relaxed); };
+    if (track.count == 0U || track.transition == 0U) return skip(1U);
+    if (track.transition != share.playing) return skip(2U);
+    if (current.graph == 0U || share.parentCount != bones || share.baseBones.load(std::memory_order_acquire) != bones)
+        return skip(3U);
+    for (const auto bone : kPoseBones)
+        if (share.crewPose[bone] < 0 || static_cast<std::uint32_t>(share.crewPose[bone]) >= bones) return skip(4U);
+    float time{}, duration{};
+    if (!timeline::Read(current.graph, time, duration) || !std::isfinite(time)) return skip(5U);
+    // The owner's effectors at our clip time (held at the ends of the track).
+    const auto* samples = track.samples.data();
+    const auto count = track.count;
+    std::array<float, 12> e = samples[count - 1U].effectors;
+    if (time <= samples[0].time) e = samples[0].effectors;
+    else for (std::uint32_t i = 1; i < count; ++i) {
+        if (time > samples[i].time) continue;
+        const auto& a = samples[i - 1U];
+        const auto& b = samples[i];
+        const auto span = b.time - a.time;
+        const auto t = span > 1.0e-5F ? (time - a.time) / span : 1.0F;
+        for (std::size_t k = 0; k < e.size(); ++k) e[k] = a.effectors[k] + (b.effectors[k] - a.effectors[k]) * t;
+        break;
+    }
+    // Ease the rebuilt posture in and out with the clip's own blend.
+    auto weight = (std::clamp)(time / 0.25F, 0.0F, 1.0F);
+    if (duration > 0.5F) weight = (std::min)(weight, (std::clamp)((duration - time) / 0.25F, 0.0F, 1.0F));
+    if (!(weight > 0.001F)) return skip(6U);
+    struct Scratch final {
+        std::array<LocalBone, kMaskBones> local, idle;
+        std::array<Vec3, kMaskBones> at, idleAt;
+        std::array<Quat, kMaskBones> rotation, idleRotation;
+    };
+    thread_local auto* scratch = new (std::nothrow) Scratch{};
+    if (scratch == nullptr) return skip(7U);
+    auto& [local, idle, at, idleAt, rotation, idleRotation] = *scratch;
+    const auto* parents = share.parents.data();
+    if (!crash_guard::TryCopy(local.data(), reinterpret_cast<const void*>(transforms), bones * sizeof(LocalBone))) return skip(7U);
+    for (std::uint32_t b = 0; b < bones; ++b) std::memcpy(idle[b].data(), share.base[b].data(), sizeof(LocalBone));
+    const auto solve = [&]() noexcept { return ModelPositions(local.data(), parents, bones, at.data(), rotation.data()); };
+    if (!ModelPositions(idle.data(), parents, bones, idleAt.data(), idleRotation.data()) || !solve()) return skip(9U);
+    const auto crew = [&](const FirstPersonBone bone) noexcept { return static_cast<std::uint32_t>(share.crewPose[bone]); };
+    float yaw{};
+    if (!FeetYaw(idleAt.data(), crew(kFpLeftFoot), crew(kFpLeftToe), crew(kFpRightFoot), crew(kFpRightToe), yaw)) return skip(8U);
+    const auto setRotation = [&](const std::uint32_t b, const Quat& model) noexcept {
+        const auto p = parents[b];
+        const auto q = p < 0 ? model : Mul(Conjugate(rotation[static_cast<std::uint32_t>(p)]), model);
+        local[b][4] = q[0]; local[b][5] = q[1]; local[b][6] = q[2]; local[b][7] = q[3];
+    };
+    const auto setPosition = [&](const std::uint32_t b, const Vec3& model) noexcept {
+        const auto p = parents[b];
+        const auto t = p < 0 ? model : Rotate(Conjugate(rotation[static_cast<std::uint32_t>(p)]),
+            Sub(model, at[static_cast<std::uint32_t>(p)]));
+        local[b][0] = t[0]; local[b][1] = t[1]; local[b][2] = t[2];
+    };
+    const auto localRotation = [&](const std::uint32_t b) noexcept { return Quat{local[b][4], local[b][5], local[b][6], local[b][7]}; };
+    const auto setLocalRotation = [&](const std::uint32_t b, const Quat& q) noexcept {
+        local[b][4] = q[0]; local[b][5] = q[1]; local[b][6] = q[2]; local[b][7] = q[3];
+    };
+    // Two-bone IK (a: upper limb, b: middle joint, c: end; Holden's analytic
+    // form). The bend plane is the current one, else the idle one.
+    const auto reach = [&](const std::uint32_t a, const std::uint32_t b, const std::uint32_t c, const Vec3& target) noexcept {
+        const auto A = at[a], B = at[b], C = at[c];
+        const auto lab = Length(Sub(B, A)), lcb = Length(Sub(C, B)), ltarget = Length(Sub(target, A));
+        if (!(lab > 0.01F) || !(lcb > 0.01F) || !(ltarget > 0.01F) || !(Length(Sub(C, A)) > 0.01F)) return false;
+        const auto lat = (std::clamp)(ltarget, std::abs(lab - lcb) + 0.005F, lab + lcb - 0.005F);
+        const auto ac = Scale(Sub(C, A), 1.0F / Length(Sub(C, A)));
+        const auto ab = Scale(Sub(B, A), 1.0F / lab);
+        const auto bc = Scale(Sub(C, B), 1.0F / lcb);
+        const auto toward = Scale(Sub(target, A), 1.0F / ltarget);
+        const auto acab0 = SafeAcos(Dot(ac, ab)), babc0 = SafeAcos(Dot(Scale(ab, -1.0F), bc));
+        const auto acat0 = SafeAcos(Dot(ac, toward));
+        const auto acab1 = SafeAcos((lcb * lcb - lab * lab - lat * lat) / (-2.0F * lab * lat));
+        const auto babc1 = SafeAcos((lat * lat - lab * lab - lcb * lcb) / (-2.0F * lab * lcb));
+        auto bend = Cross(ac, ab);
+        if (!(Length(bend) > 1.0e-3F)) bend = Cross(Sub(idleAt[c], idleAt[a]), Sub(idleAt[b], idleAt[a]));
+        if (!(Length(bend) > 1.0e-6F)) return false;
+        const auto aInverse = Conjugate(rotation[a]);
+        const auto r0 = AxisAngle(Rotate(aInverse, bend), acab1 - acab0);
+        const auto r1 = AxisAngle(Rotate(Conjugate(rotation[b]), bend), babc1 - babc0);
+        const auto turn = Cross(ac, toward);
+        const auto r2 = Length(turn) > 1.0e-6F ? AxisAngle(Rotate(aInverse, turn), acat0) : Quat{0.0F, 0.0F, 0.0F, 1.0F};
+        setLocalRotation(a, Mul(localRotation(a), Mul(r0, r2)));
+        setLocalRotation(b, Mul(localRotation(b), r1));
+        return true;
+    };
+    const auto hips = crew(kFpHips), head = crew(kFpHead);
+    const std::array<std::uint32_t, 2> hands{crew(kFpLeftHand), crew(kFpRightHand)};
+    const std::array<std::array<std::uint32_t, 3>, 2> arms{{{crew(kFpLeftArm), crew(kFpLeftForearm), hands[0]},
+        {crew(kFpRightArm), crew(kFpRightForearm), hands[1]}}};
+    const std::array<std::array<std::uint32_t, 3>, 2> legs{{{crew(kFpLeftThigh), crew(kFpLeftCalf), crew(kFpLeftFoot)},
+        {crew(kFpRightThigh), crew(kFpRightCalf), crew(kFpRightFoot)}}};
+    const auto headRotation = rotation[head];
+    const std::array<Quat, 2> handRotation{rotation[hands[0]], rotation[hands[1]]};
+    std::array<Vec3, 2> feet{at[legs[0][2]], at[legs[1][2]]};
+    const std::array<Quat, 2> footRotation{rotation[legs[0][2]], rotation[legs[1][2]]};
+    // 1. Hips (crouch/lean), feet kept where the clip put them.
+    auto hipsShift = FromBodyFrame({e[0], e[1], e[2]}, yaw);
+    if (Length(hipsShift) > 0.9F) hipsShift = Scale(hipsShift, 0.9F / Length(hipsShift));
+    setPosition(hips, Lerp(at[hips], Add(idleAt[hips], hipsShift), weight));
+    if (!solve()) return;
+    for (std::size_t side = 0; side < 2U; ++side) {
+        const auto& [thigh, calf, foot] = legs[side];
+        if (reach(thigh, calf, foot, feet[side]) && solve()) setRotation(foot, footRotation[side]);
+        if (!solve()) return;
+    }
+    // 2. Spine: bend the joints between hips and head toward the owner's head.
+    std::array<std::uint32_t, 8> spine{};
+    std::size_t joints{};
+    auto joint = parents[head];
+    while (joint >= 0 && static_cast<std::uint32_t>(joint) != hips && joints < spine.size()) {
+        spine[joints++] = static_cast<std::uint32_t>(joint); joint = parents[static_cast<std::uint32_t>(joint)];
+    }
+    if (joint >= 0 && static_cast<std::uint32_t>(joint) == hips && joints != 0U) {
+        const auto headShift = FromBodyFrame({e[3], e[4], e[5]}, yaw);
+        const auto target = Lerp(at[head], Add(idleAt[head], headShift), weight);
+        for (auto k = joints; k-- > 0U;) {
+            const auto j = spine[k];
+            const auto swing = Swing(Sub(at[head], at[j]), Sub(target, at[j]), 1.0F / static_cast<float>(k + 1U), 0.6F);
+            setRotation(j, Mul(swing, rotation[j]));
+            if (!solve()) return;
+        }
+    }
+    setRotation(head, headRotation);
+    if (!solve()) return;
+    // 3. Arms: hands where the owner's hands are; wrists keep the clip.
+    for (std::size_t side = 0; side < 2U; ++side) {
+        const auto& [arm, forearm, hand] = arms[side];
+        const auto target = FromBodyFrame({e[6U + side * 3U], e[7U + side * 3U], e[8U + side * 3U]}, yaw);
+        if (reach(arm, forearm, hand, Lerp(at[hand], target, weight)) && solve()) setRotation(hand, handRotation[side]);
+        if (!solve()) return;
+    }
+    for (std::uint32_t b = 0; b < bones; ++b)
+        for (std::size_t i = 0; i < 8U; ++i) if (!std::isfinite(local[b][i])) return skip(9U);
+    for (std::uint32_t b = 0; b < bones; ++b)
+        static_cast<void>(crash_guard::TryWrite(reinterpret_cast<void*>(transforms + b * 0x30U), local[b].data(), 0x20U));
+    share.solved.fetch_add(1U, std::memory_order_relaxed);
+    skip(0U);
+}
+
 void ApplyMask(MaskShare& share, const std::uintptr_t address, void* pose, const std::uint32_t bones) noexcept {
     const auto state = share.state.load(std::memory_order_acquire);
     if (state == kMaskOff) return;
@@ -1507,6 +1974,7 @@ void ApplyMask(MaskShare& share, const std::uintptr_t address, void* pose, const
         }
         share.restored.store(restored, std::memory_order_relaxed);
         GroundFinalPose(transforms, share, bones);
+        SolvePose(share, current, transforms, bones);
         share.applied.fetch_add(1U, std::memory_order_relaxed);
     }
 }
@@ -1546,6 +2014,7 @@ void __fastcall LayerBlendDetour(void* controller, void*, const std::uint32_t fr
     // skeleton reference pose (0x2983D0): the T-posed arm. Fix the final pose.
     if (to != 7U || !gMaskHook.load(std::memory_order_acquire) || pose == nullptr) return;
     const auto address = reinterpret_cast<std::uintptr_t>(controller);
+    if (address == gOwnerPose.controller.load(std::memory_order_acquire)) { CaptureOwnerPose(address, pose); return; }
     for (auto& share : gMaskShares) {
         if (share.controller.load(std::memory_order_acquire) != address) continue;
         const std::lock_guard lock(share.mutex);
@@ -1597,7 +2066,7 @@ void Export(Diagnostics& diagnostics, const std::uintptr_t remoteCharacter) {
     LocalSnapshot snapshot{};
     { const std::lock_guard lock(gLocalMutex); local = gLocalDiagnostics; snapshot = gLocalSnapshot; }
     RemoteDiagnostics remote{};
-    struct { std::uint64_t restored{}, applied{}, captured{}; } share{};
+    struct { std::uint64_t restored{}, applied{}, captured{}, solved{}, skip{}, track{}; } share{};
     bool playing{};
     std::uint32_t slots{};
     {
@@ -1606,12 +2075,25 @@ void Export(Diagnostics& diagnostics, const std::uintptr_t remoteCharacter) {
         if (const auto* slot = Find(remoteCharacter)) {
             remote = slot->diagnostics; playing = slot->owned.address != 0U;
             const auto& found = gMaskShares[static_cast<std::size_t>(slot - gSlots.data())];
-            share = {found.restored.load(), found.applied.load(), found.captured.load()};
+            share = {found.restored.load(), found.applied.load(), found.captured.load(), found.solved.load(),
+                found.poseSkip.load(), found.track.count};
         }
+    }
+    // transition:alias[start..end xloops]=result@ours/owner/duration (s)
+    std::ostringstream endings;
+    endings.imbue(std::locale::classic());
+    endings << std::fixed << std::setprecision(2);
+    for (std::size_t i = 0; i < remote.endings.size(); ++i) {
+        const auto& row = remote.endings[(remote.endingNext + i) % remote.endings.size()];
+        if (row.result == nullptr) continue;
+        endings << row.transition << ':' << row.animation << '[' << row.start << ".." << row.end << " x" << row.loops
+                << "]=" << row.result << '@' << row.ours << '/' << row.owner << '/' << row.duration << ' ';
     }
     diagnostics.Log("info", "native_animation_sync_snapshot",
         "Generic scripted-animation replication: local THE_PLAYER capture and remote representation playback.",
         {{"localCaptured", Diagnostics::Unsigned(local.captured), true},
+         {"localPoseFrames", Diagnostics::Unsigned(gOwnerPose.frames.load()), true},
+         {"localPosed", Diagnostics::Unsigned(local.posed), true},
          {"localCleared", Diagnostics::Unsigned(local.cleared), true},
          {"localHidingSkipped", Diagnostics::Unsigned(local.hidingSkipped), true},
          {"localHidingFallbackCaptured", Diagnostics::Unsigned(local.fallbackCaptured), true},
@@ -1633,6 +2115,9 @@ void Export(Diagnostics& diagnostics, const std::uintptr_t remoteCharacter) {
          {"clipUnavailable", Diagnostics::Unsigned(remote.unavailable), true},
          {"interrupted", Diagnostics::Unsigned(remote.interrupted), true},
          {"completed", Diagnostics::Unsigned(remote.completed), true},
+         {"resynced", Diagnostics::Unsigned(remote.resynced), true},
+         {"readmitted", Diagnostics::Unsigned(remote.readmitted), true},
+         {"endings", endings.str(), false},
          {"cancelled", Diagnostics::Unsigned(remote.cancelled), true},
          {"cancelDeferred", Diagnostics::Unsigned(remote.deferred), true},
          // bones/samples/changes per pose layer; a base layer still changing
@@ -1655,6 +2140,9 @@ void Export(Diagnostics& diagnostics, const std::uintptr_t remoteCharacter) {
          {"maskRestored", Diagnostics::Unsigned(share.restored), true},
          {"maskFrames", Diagnostics::Unsigned(share.applied), true},
          {"maskCaptures", Diagnostics::Unsigned(share.captured), true},
+         {"poseSolved", Diagnostics::Unsigned(share.solved), true},
+         {"poseSkip", Diagnostics::Unsigned(share.skip), true},
+         {"poseTrack", Diagnostics::Unsigned(share.track), true},
          {"maskNoBase", Diagnostics::Unsigned(remote.maskNoBase), true}});
     decltype(gOwnerCycles) cycles{};
     decltype(gOwnerAliases) aliases{};

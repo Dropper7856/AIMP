@@ -295,7 +295,11 @@ public sealed record PlayerAnimationSnapshot(
     [property: JsonRequired] uint Attachment0 = 0,
     [property: JsonRequired] uint Attachment1 = 0,
     [property: JsonRequired] uint Attachment2 = 0,
-    [property: JsonRequired] uint Attachment3 = 0);
+    [property: JsonRequired] uint Attachment3 = 0,
+    // The owner's real first-person body at PhaseSeconds (hips and head
+    // displacement, left and right hand positions; 12 floats in its body
+    // frame). Null when not sampled. Mirrors AnimationSync.h State::effectors.
+    IReadOnlyList<float>? Effectors = null);
 
 public enum PlayerActionKind
 {

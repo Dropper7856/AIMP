@@ -4,11 +4,13 @@ namespace AIMP.Protocol;
 
 // AnimationSync wire form, shared by the DLL observation, the peer snapshot and
 // the CHARACTER_DIRECT_MOVE argument: "0" (no clip) or
-// transition,animation,sampleAge,start,end,loops,speed,blendIn,x,y,z,yaw,phase,duration,attachment0..3.
+// transition,animation,sampleAge,start,end,loops,speed,blendIn,x,y,z,yaw,phase,duration,attachment0..3,
+// then the 12 body effector coordinates when the owner's body was sampled (30 fields).
 // Mirrors AIMP.Native include/aimp/AnimationSync.h.
 public static class PlayerAnimationCodec
 {
     public const uint MaximumElapsedMilliseconds = 60_000;
+    public const int EffectorCount = 12;
     public static readonly PlayerAnimationSnapshot None = new(0, 0, 0, -1, -1, 1, 1F, 0.2F, 0F, 0F, 0F, 0F, 0F, 0F);
 
     public static bool IsValid(PlayerAnimationSnapshot value) =>
@@ -21,7 +23,9 @@ public static class PlayerAnimationCodec
             && Coordinate(value.X) && Coordinate(value.Y) && Coordinate(value.Z)
             && float.IsFinite(value.Yaw) && MathF.Abs(value.Yaw) <= 3.3F
             && float.IsFinite(value.PhaseSeconds) && value.PhaseSeconds is >= 0F and <= 100_000F
-            && float.IsFinite(value.DurationSeconds) && value.DurationSeconds is > 0F and <= 100_000F;
+            && float.IsFinite(value.DurationSeconds) && value.DurationSeconds is > 0F and <= 100_000F
+            && (value.Effectors is null
+                || value.Effectors.Count == EffectorCount && value.Effectors.All(e => float.IsFinite(e) && MathF.Abs(e) <= 10F));
 
     // Time advances without constituting a new ordered transition.
     public static bool SameTransition(PlayerAnimationSnapshot? left, PlayerAnimationSnapshot? right) =>
@@ -38,17 +42,20 @@ public static class PlayerAnimationCodec
     {
         if (!IsValid(value)) throw new ProtocolException("Invalid player animation.");
         if (value.Transition == 0) return "0";
-        return FormattableString.Invariant(
+        var text = FormattableString.Invariant(
             $"{value.Transition},{value.Animation},{value.ElapsedMilliseconds},{value.StartFrame},{value.EndFrame},{value.Loops},{value.Speed:R},{value.BlendIn:R},{value.X:R},{value.Y:R},{value.Z:R},{value.Yaw:R},{value.PhaseSeconds:R},{value.DurationSeconds:R},{value.Attachment0},{value.Attachment1},{value.Attachment2},{value.Attachment3}");
+        return value.Effectors is { } effectors
+            ? text + string.Concat(effectors.Select(e => FormattableString.Invariant($",{e:R}")))
+            : text;
     }
 
     public static bool TryDecode(string? text, out PlayerAnimationSnapshot? value)
     {
         value = null;
         if (text == "0") { value = None; return true; }
-        if (text is null || text.Length > 384) return false;
+        if (text is null || text.Length > 640) return false;
         var fields = text.Split(',');
-        if (fields.Length != 18
+        if (fields.Length is not (18 or 18 + EffectorCount)
             || !ulong.TryParse(fields[0], NumberStyles.None, CultureInfo.InvariantCulture, out var transition)
             || !uint.TryParse(fields[1], NumberStyles.None, CultureInfo.InvariantCulture, out var animation)
             || !uint.TryParse(fields[2], NumberStyles.None, CultureInfo.InvariantCulture, out var elapsed)
@@ -68,8 +75,15 @@ public static class PlayerAnimationCodec
             || !uint.TryParse(fields[16], NumberStyles.None, CultureInfo.InvariantCulture, out var attachment2)
             || !uint.TryParse(fields[17], NumberStyles.None, CultureInfo.InvariantCulture, out var attachment3)
             || transition == 0) return false;
+        float[]? effectors = null;
+        if (fields.Length == 18 + EffectorCount)
+        {
+            effectors = new float[EffectorCount];
+            for (var i = 0; i < EffectorCount; i++)
+                if (!float.TryParse(fields[18 + i], NumberStyles.Float, CultureInfo.InvariantCulture, out effectors[i])) return false;
+        }
         var candidate = new PlayerAnimationSnapshot(transition, animation, elapsed, start, end, loops, speed, blend, x, y, z, yaw, phase, duration,
-            attachment0, attachment1, attachment2, attachment3);
+            attachment0, attachment1, attachment2, attachment3, effectors);
         if (!IsValid(candidate)) return false;
         value = candidate;
         return true;

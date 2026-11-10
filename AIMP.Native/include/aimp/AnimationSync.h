@@ -28,6 +28,13 @@ struct State final {
     float yaw{};
     float phaseSeconds{}, durationSeconds{};
     std::array<std::uint32_t, 4> attachments{};
+    // The owner's real first-person body at phaseSeconds, in its body frame
+    // (model space turned so the standing feet face +Z, metres): hips and head
+    // displacement from its pose just before the clip, then where its left and
+    // right hands are. A first-person clip moves the head/arms rig, not the
+    // body, so observers rebuild the posture from these. Absent = not sampled.
+    bool posed{};
+    std::array<float, 12> effectors{};
     bool operator==(const State&) const noexcept = default;
 };
 // Retain the proxy's standing height during small vertical movements made by
@@ -57,22 +64,29 @@ inline bool Valid(const State& value) noexcept {
         !std::isfinite(value.durationSeconds) || value.durationSeconds <= 0.0F || value.durationSeconds > 100000.0F) return false;
     for (const auto coordinate : value.position)
         if (!std::isfinite(coordinate) || std::abs(coordinate) > 1000000.0F) return false;
+    if (!value.posed) return value.effectors == std::array<float, 12>{};
+    for (const auto coordinate : value.effectors)
+        if (!std::isfinite(coordinate) || std::abs(coordinate) > 10.0F) return false;
     return true;
 }
 // "0" (no clip) or 18 comma-separated fields, matching AIMP.Protocol's
 // PlayerAnimationCodec: transition,animation,elapsed,start,end,loops,speed,
-// blendIn,x,y,z,yaw,phaseSeconds,durationSeconds,attachment0..3.
+// blendIn,x,y,z,yaw,phaseSeconds,durationSeconds,attachment0..3, followed by
+// the 12 effector coordinates when the owner's body was sampled (30 fields).
 std::string Encode(const State& value);
 inline bool Decode(std::string_view text, State& output) noexcept {
     if (text == "0") { output = {}; return true; }
-    if (text.size() > 384U) return false;
-    std::array<std::string_view, 18> fields{};
-    for (std::size_t i = 0; i < fields.size(); ++i) {
+    if (text.size() > 640U) return false;
+    std::array<std::string_view, 30> fields{};
+    std::size_t count{};
+    while (count < fields.size()) {
         const auto comma = text.find(',');
-        if ((i + 1 < fields.size()) != (comma != std::string_view::npos)) return false;
-        fields[i] = text.substr(0, comma);
-        if (comma != std::string_view::npos) text.remove_prefix(comma + 1);
+        fields[count++] = text.substr(0, comma);
+        if (comma == std::string_view::npos) break;
+        text.remove_prefix(comma + 1);
     }
+    if ((count != 18U && count != 30U) || fields[count - 1U].data() + fields[count - 1U].size() != text.data() + text.size())
+        return false;
     const auto parse = [](std::string_view s, auto& value) noexcept {
         const auto result = std::from_chars(s.data(), s.data() + s.size(), value);
         return !s.empty() && result.ec == std::errc{} && result.ptr == s.data() + s.size();
@@ -87,7 +101,13 @@ inline bool Decode(std::string_view text, State& output) noexcept {
         !parse(fields[12], value.phaseSeconds) || !parse(fields[13], value.durationSeconds) ||
         !parse(fields[14], value.attachments[0]) || !parse(fields[15], value.attachments[1]) ||
         !parse(fields[16], value.attachments[2]) || !parse(fields[17], value.attachments[3]) ||
-        value.transition == 0U || !Valid(value)) return false;
+        value.transition == 0U) return false;
+    if (count == 30U) {
+        value.posed = true;
+        for (std::size_t i = 0; i < value.effectors.size(); ++i)
+            if (!parse(fields[18U + i], value.effectors[i])) return false;
+    }
+    if (!Valid(value)) return false;
     output = value;
     return true;
 }
