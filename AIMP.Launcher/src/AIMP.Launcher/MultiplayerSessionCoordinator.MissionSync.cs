@@ -70,6 +70,11 @@ internal sealed partial class MultiplayerSessionCoordinator
             if (enabled) await File.WriteAllBytesAsync(path, catalog, _lifetime.Token).ConfigureAwait(false);
             await SendMissionConfigurationAsync(start, generation, epoch, path, role).ConfigureAwait(false);
             CompleteMissionConfiguration(epoch, enabled, catalog);
+            // A session-scoped witness for offline comparison of existing
+            // Fix3.28 native state snapshots. No gameplay or packet changes.
+            if (enabled)
+                _diagnostics.Log("TestLabContext", MissionTestLabReceipts.FormatSessionContext(
+                    start.SessionId, generation, role));
             LogMissionConfiguration(role, generation, prepared, roots, enabled, mode);
         }
         finally { if (path.Length != 0) File.Delete(path); }
