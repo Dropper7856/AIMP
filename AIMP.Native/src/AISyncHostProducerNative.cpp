@@ -208,14 +208,13 @@ Lease* Capture(std::uintptr_t request) noexcept {
     std::uintptr_t scheduler{}; std::uint32_t kind{};
     if (!Read(request + 0x14,scheduler) || !Read(scheduler,character) ||
         scheduler != character + 0x2CD0U || !gContext(character,owner)) return nullptr;
-    if(Read(request+0x10,kind)&&(kind==1||kind==3)) {
-        // Only a bracketed producer plus pre-admission evidence can construct
-        // a Move bundle. A Move admitted while the source was unbound is not
-        // reconstructed: BootstrapNativeActor cancels it so the brain reissues
-        // a fully observed one. It never closes the other actors' stream.
-        gUncoveredKinds[kind].fetch_add(1U,std::memory_order_relaxed);
-        return nullptr;
-    }
+    // StatusDetour and ObserveNativeAdmission can capture a request even if
+    // BeforeNativeAdmission declined it. Suppress all ordinary navigation at
+    // this central fallback too, not just the pre-admission hook. Otherwise
+    // status1/2 recreates a command lease and restarts Client pathfinding.
+    if(!Read(request+0x10,kind) ||
+       kind==1U||kind==2U||kind==3U||kind==4U||kind==6U||
+       kind==7U||kind==8U||kind==9U||kind==11U)return nullptr;
     if(kind==execution::kPlacementKind&&(!execution::PlacementDedupReady()||
         (EngineProducer().Profiles()&execution::kProfilePlacement)==0)) {
         gUncoveredKinds[kind].fetch_add(1U,std::memory_order_relaxed);return nullptr;
