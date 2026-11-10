@@ -225,6 +225,8 @@ struct Actor {
     // The Host owns NPC spatial truth. This timeline never drives an NPC brain.
     hybrid_motion::Timeline directPoseTimeline{};
     std::uint32_t directPoseBirth{};
+    // Do not teleport at stream frequency: only recover prolonged multi-metre divergence.
+    ULONGLONG directPoseDivergenceSince{}, directPoseLastEmergencyCorrection{};
     movement::ProgressClock recoveryProgress{};
     movement::ObservedTrail observedTrail{};
     ULONGLONG recoveryPoseAt{},recoveryLastTick{},recoveryLastHardSnap{};
@@ -5154,6 +5156,7 @@ bool Release(Actor& actor) noexcept {
     actor.lastNavigationAttempt = 0U;
     actor.poseCount = 0U; actor.poseRevision = 0U; actor.poseInterpolating = false;
     actor.directPoseTimeline.Reset(); actor.directPoseBirth = 0U;
+    actor.directPoseDivergenceSince=actor.directPoseLastEmergencyCorrection=0U;
     actor.recoveryFollowing = actor.recoveryNativeArmed = false;
     if (actor.character != 0U && Client()) {
         // Dropping replication must not manufacture Idle over an action that
@@ -9899,6 +9902,7 @@ void BeginExecutionCarrierScope(const transactions::Scope& scope) noexcept {
         actor.desired={};actor.pendingRemoteShots.clear();actor.initialPlacementReady=false;actor.lastSpawnDiagnostic=0;
         actor.recoveryPose={};actor.recoveryPoseAt=actor.recoveryLastTick=actor.recoveryLastHardSnap=0;
         actor.directPoseTimeline.Reset();actor.directPoseBirth=0U;
+        actor.directPoseDivergenceSince=actor.directPoseLastEmergencyCorrection=0U;
         actor.observedTrail.Clear();
         actor.recoveryProgress={};
         actor.recoveryHandoffLifecycleRevision=0;
@@ -10422,6 +10426,7 @@ void PumpOnEngineThread() noexcept {
             if(actor.recoveryNativeArmed)
                 static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
             actor.recoveryNativeArmed=actor.recoveryFollowing=false;
+            actor.directPoseDivergenceSince=0U;
         };
         std::uint32_t liveRuntime{},liveEntityA{},liveEntityB{};
         if(!Read(actor.character+0x50U,liveRuntime)||liveRuntime!=actor.runtimeId||
@@ -10458,18 +10463,23 @@ void PumpOnEngineThread() noexcept {
             actor.character,target.velocity[0],target.velocity[2],
             speed>0.02F?1.0F:0.0F,
             target.position[0],target.position[1],target.position[2],
-            target.yaw,state.moveType,error)) {
+            target.yaw,state.moveType,error,actor.recoveryPoseAt+hybrid_motion::kStaleAfterMs)) {
             relinquish();continue;
         }
         actor.recoveryNativeArmed=actor.recoveryFollowing=true;
     }
 }
-// This runs after retail CharacterManager integration and before presentation.
-// Never snap an authored native action: only an armed ordinary locomotion
-// motor may receive physical + visual authority.
+// The retail NPC motor owns ordinary frame-by-frame locomotion and animation.
+// Never teleport the physics body for centimetre-size interpolation errors:
+// forcing Character/registry pose after every retail step fights root motion,
+// resetting stride and producing visible Move/Idle hesitation. Authoritative
+// placement is a last-resort, sustained multi-metre recovery only.
 void ReconcileDirectPoseOnEngineThread() noexcept {
     if(!Installed()||!EngineThread()||!Stable()||!Client() ||
         gGeneration!=gGenerations->CurrentGeneration())return;
+    constexpr float kEmergencyDistance=3.5F;
+    constexpr ULONGLONG kEmergencyDwellMs=750ULL;
+    constexpr ULONGLONG kEmergencyCooldownMs=3000ULL;
     const auto now=GetTickCount64();
     for(auto& actor:gActors) {
         if(!actor.character||!actor.recoveryNativeArmed||!actor.recoveryFollowing||
@@ -10481,36 +10491,57 @@ void ReconcileDirectPoseOnEngineThread() noexcept {
             (actor.desired.executionFlags&ExecutionPaired)!=0U ||
             (actor.received.executionFlags&ExecutionPaired)!=0U ||
             ProxyWithdrawn(actor.desired)||ProxyWithdrawn(actor.recoveryPose)||
-            health::Terminal(actor.desired.health)||health::Terminal(actor.recoveryPose.health))continue;
+            health::Terminal(actor.desired.health)||health::Terminal(actor.recoveryPose.health)) {
+            actor.directPoseDivergenceSince=0U;continue;
+        }
         std::uint32_t liveRuntime{},liveEntityA{},liveEntityB{};
         if(!Read(actor.character+0x50U,liveRuntime)||liveRuntime!=actor.runtimeId||
             !Read(actor.character+0x54U,liveEntityA)||liveEntityA!=actor.entityA||
-            !Read(actor.character+0x58U,liveEntityB)||liveEntityB!=actor.entityB)continue;
+            !Read(actor.character+0x58U,liveEntityB)||liveEntityB!=actor.entityB) {
+            actor.directPoseDivergenceSince=0U;continue;
+        }
         hybrid_motion::Target target{};
         if(!actor.directPoseTimeline.SampleAt(now,target)||target.stale||
-            target.nativeAction||target.discontinuity)continue;
+            target.nativeAction||target.discontinuity) {
+            actor.directPoseDivergenceSince=0U;continue;
+        }
         const auto& state=actor.recoveryPose;
         if(state.birth!=actor.remoteBirth||state.sessionCookie!=gCurrent.sessionCookie||
             state.worldGeneration!=gCurrent.worldGeneration||
-            (state.stateFlags&PoseValid)==0U)continue;
+            (state.stateFlags&PoseValid)==0U) {
+            actor.directPoseDivergenceSince=0U;continue;
+        }
         std::uintptr_t cycle{},table{};
         std::uint8_t cycleState{};
         if(!Read(actor.character+0x36CU,cycle)||!cycle||!Read(cycle,table)||
             table<gBase||!Read(cycle+0x1AU,cycleState)||
-            !HybridLocomotionCycleAllowed(static_cast<std::uint32_t>(table-gBase),cycleState))continue;
-        float local[3]{},yaw{};
+            !HybridLocomotionCycleAllowed(static_cast<std::uint32_t>(table-gBase),cycleState)) {
+            actor.directPoseDivergenceSince=0U;continue;
+        }
+        float local[3]{};
         if(!Read(actor.character+kPositionOffset,local[0])||
             !Read(actor.character+kPositionOffset+4U,local[1])||
-            !Read(actor.character+kPositionOffset+8U,local[2])||
-            !Read(actor.character+kYawOffset,yaw))continue;
+            !Read(actor.character+kPositionOffset+8U,local[2])) {
+            actor.directPoseDivergenceSince=0U;continue;
+        }
         const float dx=target.position[0]-local[0];
         const float dy=target.position[1]-local[1];
         const float dz=target.position[2]-local[2];
-        const float yawError=std::remainder(target.yaw-yaw,6.2831853071795864769F);
-        if(dx*dx+dy*dy+dz*dz<0.0016F && std::abs(yawError)<0.03F)continue;
+        const float distance2=dx*dx+dy*dy+dz*dz;
+        if(!std::isfinite(distance2)||distance2<kEmergencyDistance*kEmergencyDistance) {
+            actor.directPoseDivergenceSince=0U;continue;
+        }
+        if(!actor.directPoseDivergenceSince) {
+            actor.directPoseDivergenceSince=now;continue;
+        }
+        if(now-actor.directPoseDivergenceSince<kEmergencyDwellMs ||
+            (actor.directPoseLastEmergencyCorrection &&
+             now-actor.directPoseLastEmergencyCorrection<kEmergencyCooldownMs))continue;
         const float pose[3]{target.position[0],target.position[1],target.position[2]};
-        static_cast<void>(character_direct_step_runtime::ApplyAIRecoveryTransform(
-            actor.character,pose,target.yaw));
+        if(character_direct_step_runtime::ApplyAIRecoveryTransform(actor.character,pose,target.yaw)) {
+            actor.directPoseLastEmergencyCorrection=now;
+            actor.directPoseDivergenceSince=0U;
+        }
     }
 }
 void ObservePlayerRepresentationSpawn(const std::uint32_t spawnKey) noexcept {

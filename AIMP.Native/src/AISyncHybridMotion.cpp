@@ -46,6 +46,9 @@ float Wrap(float yaw) noexcept {
 Target Pose(const Sample& sample) noexcept {
     Target target{};
     target.position = sample.position;
+    // Retain ordinary linear velocity even before a second sample arrives.
+    // A zero-velocity first frame otherwise forces retail Move -> Idle -> Move.
+    if ((sample.flags & kBoundary) == 0U) target.velocity = sample.velocity;
     target.yaw = sample.yaw;
     target.tick = sample.tick;
     target.nativeAction = (sample.flags & NativeAction) != 0;
@@ -99,6 +102,7 @@ bool Timeline::SampleAt(std::uint64_t now, Target& out) const noexcept {
     const auto hostAge = hostNow >= latest.tick ? hostNow - latest.tick : 0;
     if (arrivalAge >= kStaleAfterMs || hostAge >= kStaleAfterMs) {
         out = Pose(latest);
+        out.velocity = {};
         out.stale = true;
         return true;
     }
@@ -111,7 +115,6 @@ bool Timeline::SampleAt(std::uint64_t now, Target& out) const noexcept {
     const auto& earliest = history_[first_];
     if (renderTick <= earliest.tick) {
         out = Pose(earliest);
-        if (renderTick == earliest.tick) out.velocity = earliest.velocity;
         return true;
     }
     for (std::size_t i = 1; i < count_; ++i) {

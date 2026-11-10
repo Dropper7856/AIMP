@@ -238,6 +238,14 @@ bool UsesAIHybridReplication(const MovementSlot& slot) noexcept {
         FollowerPolicy::AIHybridNativeOnly;
 }
 
+bool CanForceReplicatedYaw(const MovementSlot& slot) noexcept {
+    // When walking, CATHODE's native stride/turn integrator must own yaw.
+    // Reapplying Host yaw on PRE and POST fights its heading and causes sliding.
+    return !UsesAIHybridReplication(slot) ||
+        (!slot.moveActive.load(std::memory_order_acquire) &&
+         !slot.driveRequested.load(std::memory_order_acquire));
+}
+
 bool ReplicationLeaseExpired(const MovementSlot& slot) noexcept {
     const auto lease = slot.leaseExpiresAtTickMs.load(std::memory_order_acquire);
     return lease != 0U && GetTickCount64() >= lease;
@@ -2428,7 +2436,9 @@ bool ArmCore(
     const auto previousPolicy = slot->followerPolicy.exchange(
         followerPolicy, std::memory_order_acq_rel);
     const auto policyChanged = previousPolicy != followerPolicy;
-    if (hybrid || policyChanged) {
+    if (policyChanged) {
+        // Retain prepared native demand across frames in the same AI policy.
+        // Clearing it every frame creates redundant native graph work.
         slot->aiReplicationProfile.store(hybrid, std::memory_order_release);
         slot->initialPlacementPending.store(false, std::memory_order_release);
         slot->aiDivergenceSinceTickMs.store(0U, std::memory_order_release);
@@ -2914,7 +2924,8 @@ void PumpSlotOnEngineThread(
             // for a converged idle proxy: retail may touch Character orientation.
             // This is now one direct SEH-guarded scalar write, not a
             // VirtualQuery-backed TryWrite plus a second full follower pass.
-            if ((!kHybridAnimatedFacing || !UsesAIHybridReplication(slot)) && !hybridLeaseExpired && slot.hasReplicatedYaw.load(std::memory_order_acquire)) {
+            if ((!kHybridAnimatedFacing || !UsesAIHybridReplication(slot)) && CanForceReplicatedYaw(slot) &&
+                !hybridLeaseExpired && slot.hasReplicatedYaw.load(std::memory_order_acquire)) {
                 const auto yaw = LoadFloat(slot.replicatedYawBits);
                 if (!WriteReplicatedYaw(characterAddress, yaw)) {
                     slot.protectedFailures.fetch_add(
@@ -2937,7 +2948,8 @@ void PumpSlotOnEngineThread(
         slot.idleConverged.store(false, std::memory_order_release);
     }
 
-    if ((!kHybridAnimatedFacing || !UsesAIHybridReplication(slot)) && !hybridLeaseExpired && slot.hasReplicatedYaw.load(std::memory_order_acquire)) {
+    if ((!kHybridAnimatedFacing || !UsesAIHybridReplication(slot)) && CanForceReplicatedYaw(slot) &&
+                !hybridLeaseExpired && slot.hasReplicatedYaw.load(std::memory_order_acquire)) {
         const auto yaw = LoadFloat(slot.replicatedYawBits);
         if (!WriteReplicatedYaw(characterAddress, yaw)) {
             slot.protectedFailures.fetch_add(1U, std::memory_order_relaxed);
