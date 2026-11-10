@@ -27,7 +27,7 @@ internal static class MissionSyncTests
             valid with { LevelGeneration = 0 }, valid with { Sequence = 0 }, valid with { Signal = 0 },
             valid with { EntityId = "123" }, valid with { EntityId = new string('0', 32) },
             valid with { EntityId = new string('G', 32) }, valid with { InterfaceSelector = 0 },
-            valid with { InterfaceSelector = 3 } })
+            valid with { InterfaceSelector = 5 } })
             AssertEx.Throws<ProtocolException>(() => MissionSignalValidation.Validate(invalid));
         var json = Encoding.UTF8.GetString(JsonPayload.Serialize(valid));
         foreach (var missing in new[] { "\"sequence\":1,", "\"signal\":123,", "\"interfaceSelector\":1" })
