@@ -9,6 +9,8 @@ param(
 
 # Build and deploy the complete API: native AIMP.NetZ, Launcher, Protocol, Injector32 and UI resources.
 # No unit tests and no Electron rebuild.
+# Full builds always discard old generated native/.NET files before compilation.
+# -DeliveryOnly may reuse only a previously verified build of this exact revision.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
@@ -23,6 +25,28 @@ New-Item -ItemType Directory -Path $output -Force | Out-Null
 function Run([string]$Executable, [string[]]$Arguments) {
     & $Executable @Arguments
     if ($LASTEXITCODE -ne 0) { throw "$Executable failed ($LASTEXITCODE)." }
+}
+
+function Assert-BinaryVersion([string]$Path, [string]$ExpectedVersion, [string]$TextEncoding) {
+    if (!(Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Build output is missing: $Path"
+    }
+    # x86 AIMP.NetZ cannot be loaded into x64 PowerShell. Inspect its compiled
+    # version string without loading or executing the DLL.
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($TextEncoding -eq 'Unicode') {
+        $actual = [Text.Encoding]::Unicode.GetString($bytes)
+    } else {
+        $actual = [Text.Encoding]::ASCII.GetString($bytes)
+    }
+    if (!$actual.Contains($ExpectedVersion)) {
+        throw "Stale or incompatible binary: $Path does not contain version $ExpectedVersion. Deployment cancelled."
+    }
+}
+
+function Assert-CompiledApi {
+    Assert-BinaryVersion -Path (Join-Path $api 'AIMP.NetZ.dll') -ExpectedVersion $dllVersion -TextEncoding 'ASCII'
+    Assert-BinaryVersion -Path (Join-Path $api 'AIMP.Launcher.dll') -ExpectedVersion $dllVersion -TextEncoding 'Unicode'
 }
 
 function Copy-Api([string]$Destination) {
@@ -48,6 +72,9 @@ try {
         throw 'Unable to read Launcher/Native version constants.'
     }
     $revision = $revisionMatch.Groups[1].Value
+    if ([int]$revision -lt 511) {
+        throw "Source revision $revision is outdated. Pull feature/aisync-direct-locomotion (511 or newer) before rebuilding."
+    }
     $dllVersion = $dllVersionMatch.Groups[1].Value
     $expectedDllVersion = $expectedMatch.Groups[1].Value + $revision + $expectedMatch.Groups[2].Value
     if ($dllVersion -cne $expectedDllVersion) {
@@ -55,6 +82,21 @@ try {
     }
     Write-Host "Building/delivering AIMP API 0.8.4.$revision (native $dllVersion)"
     if (!$DeliveryOnly) {
+      # A successful incremental build could still ship stale binaries when the
+      # output path/cache was reused. Recreate isolated outputs every full build.
+      # Never wipe the installed API destination or any source directory.
+      foreach ($stalePath in @($native, $api, (Join-Path $output 'dotnet'))) {
+          if (Test-Path -LiteralPath $stalePath) {
+              Write-Host "Removing old build output: $stalePath"
+              Remove-Item -LiteralPath $stalePath -Recurse -Force -ErrorAction Stop
+          }
+      }
+      foreach ($manifest in @($buildInfoPath, (Join-Path $output 'delivery.json'))) {
+          if (Test-Path -LiteralPath $manifest) {
+              Remove-Item -LiteralPath $manifest -Force -ErrorAction Stop
+          }
+      }
+      New-Item -ItemType Directory -Path $api -Force | Out-Null
       if (!$CMakeExe) {
         $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
         if (Test-Path -LiteralPath $vswhere) {
@@ -76,6 +118,9 @@ try {
     foreach ($name in $required) {
         if (!(Test-Path -LiteralPath (Join-Path $api $name) -PathType Leaf)) { throw "Incomplete build artifacts: $name" }
     }
+    # Never bless a stale output based solely on matching source constants.
+    # This check runs for both fresh builds and -DeliveryOnly.
+    Assert-CompiledApi
     if ($DeliveryOnly) {
         if (!(Test-Path -LiteralPath $buildInfoPath -PathType Leaf)) {
             throw 'Missing build-info.json: build the API at least once before -DeliveryOnly.'
@@ -113,7 +158,7 @@ try {
     if (!$delivery.localDelivered -or !$delivery.secondPcDelivered) {
         throw "Delivery incomplete. See $(Join-Path $output 'delivery.json')."
     }
-    Write-Host 'Complete AIMP API (Native + Launcher + Protocol + Injector32 + UI) delivered to both PCs; SHA-256 verified.'
+    Write-Host "AIMP API revision $revision (native $dllVersion) deployed to both PCs; compiled-version and SHA-256 checks passed."
     # robocopy returns 1 when it copied files successfully. Do not leak that
     # success code as a build failure to callers inspecting LASTEXITCODE.
     $global:LASTEXITCODE = 0
