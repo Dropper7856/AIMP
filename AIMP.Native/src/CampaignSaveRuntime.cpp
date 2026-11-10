@@ -31,6 +31,27 @@ constexpr std::uintptr_t kStoragePollRva = 0x006637C0U;
 constexpr std::uintptr_t kStorageStateOffset = 0x0CU;
 constexpr std::uintptr_t kStorageWorkerOffset = 0x2F4U;
 
+// Retail save manager S = [[0x016F0C88] + 0x78]. Its per-frame update (0x007C7A50)
+// runs right after the save system update that polls the storage above, on the
+// same thread. The frontend's load_current_checkpoint (0x00813B60 -> 0x007A8F60)
+// loads the checkpoint slot at +0xACE, which only S's own profile load (states
+// 3 -> 4 -> 5 reads PROGRESSION -> 0) computes, never a bare storage enumeration,
+// so a swapped profile directory must rerun that load. +0x824 is the signed-in /
+// saving-enabled flag set once at boot (0x007C1033) and must stay untouched
+// (0 = saving disabled, Continue shows the retail error). +0x820 is S's state (0 idle);
+// FUN_0077B770 sets it (__thiscall, 3 stack arguments, ret 0Ch) and shows retail
+// dialogs for states 7..0x20 only while +0x824 is set.
+constexpr std::uintptr_t kGameGlobalsRefRva = 0x00413BF1U;   // imm32 of mov ecx,[0x016F0C88] at 0x00813BEF
+constexpr std::uintptr_t kGameGlobalsRva = 0x012F0C88U;
+constexpr std::uintptr_t kSaveManagerLoadRva = 0x00413BF7U;  // mov esi,[ecx+78h] at 0x00813BF7
+constexpr std::uintptr_t kSaveManagerOffset = 0x78U;
+constexpr std::uintptr_t kSetStateRva = 0x0037B770U;
+constexpr std::uintptr_t kSetStateBodyRva = 0x0037B78FU;
+constexpr std::uintptr_t kSetStateReturnRva = 0x0037C541U;
+constexpr std::uintptr_t kManagerStateOffset = 0x820U;
+constexpr std::uintptr_t kManagerProfilePresentOffset = 0x824U;
+constexpr int kManagerLoadProfileState = 3;
+
 // ISteamRemoteStorage012 slots used by AI.exe (verified at every call site).
 enum Slot : std::size_t {
     kFileWrite = 0, kFileRead = 1, kFileForget = 2, kFileDelete = 3,
@@ -40,6 +61,7 @@ enum Slot : std::size_t {
 
 using StorageFn = void(__fastcall*)(void*);
 using EnumerateFn = void(__fastcall*)(void*, void*, std::uintptr_t);
+using SetStateFn = void(__fastcall*)(void*, void*, int, int, int);
 using FileWriteFn = bool(__fastcall*)(void*, void*, const char*, const void*, std::int32_t);
 using FileReadFn = std::int32_t(__fastcall*)(void*, void*, const char*, void*, std::int32_t);
 using NameBoolFn = bool(__fastcall*)(void*, void*, const char*);
@@ -52,6 +74,31 @@ std::atomic<bool> gInstalled{};
 StorageFn gOriginalPoll{};
 EnumerateFn gEnumerate{};
 std::atomic<void*> gStorage{};
+// Null when the save manager could not be verified: fall back to a bare enumeration.
+SetStateFn gSetState{};
+std::uintptr_t gGameGlobals{};
+bool gProfileReloadIssued{};       // Engine thread only (StoragePoll).
+
+// Diagnostics for the profile reload: save manager state changes and isolated
+// Steam storage calls, reported as "Trace" in the status JSON (launcher log).
+// Save system = [[0x01BE4684] + 0x4F8]; +0x2D8 is the KB its space check finds
+// missing (state 4 goes to dialog state 0x0C when non-zero).
+constexpr std::uintptr_t kSaveSystemRootRva = 0x017E4684U;
+constexpr std::size_t kTraceLimit = 1500U;
+std::mutex gTraceMutex;
+std::string gTrace;
+std::uintptr_t gModuleBase{};
+std::uint32_t gTracedState = 0xFFFFFFFFU; // Engine thread only.
+
+std::string CurrentTrace() {
+    std::lock_guard lock(gTraceMutex);
+    return gTrace;
+}
+
+void Trace(const std::string& entry) {
+    std::lock_guard lock(gTraceMutex);
+    if (gTrace.size() + entry.size() + 1U <= kTraceLimit) gTrace.append(gTrace.empty() ? "" : " ").append(entry);
+}
 
 std::mutex gMutex;
 bool gSteamPatched{};
@@ -79,14 +126,77 @@ bool StorageIdle(void* storage) noexcept {
         && state == 0U && worker == 0U;
 }
 
+std::uintptr_t SaveManager() noexcept {
+    std::uintptr_t globals{}, manager{};
+    return gSetState && Read32(gGameGlobals, globals) && Read32(globals + kSaveManagerOffset, manager) ? manager : 0U;
+}
+
+std::uint32_t Byte(const std::uintptr_t at) noexcept {
+    std::uintptr_t value{};
+    return Read32(at, value) ? static_cast<std::uint32_t>(value & 0xFFU) : 0xFFFFFFFFU;
+}
+
+bool ManagerIdle(const std::uintptr_t manager) noexcept {
+    std::uintptr_t state{};
+    return Read32(manager + kManagerStateOffset, state) && state == 0U;
+}
+
+// Engine thread. Reruns the save manager's own profile load (state 3 enumerates
+// the storage, state 4 onwards reads PROGRESSION and the checkpoints) from a
+// clean "no profile" state, exactly as at boot, so its profile flag and current
+// checkpoint slot describe the directory that is now active. Returns false while
+// the manager is busy (e.g. an autosave): the caller retries next frame.
+bool RequestProfileReload(void* storage) noexcept {
+    const auto manager = SaveManager();
+    if (!manager) {
+        gEnumerate(storage, nullptr, 0U);
+        gProfileReloadIssued = false;
+        return true;
+    }
+    if (!ManagerIdle(manager)) return false;
+    {
+        std::lock_guard lock(gTraceMutex);
+        gTrace.clear();
+    }
+    gTracedState = 0xFFFFFFFFU;
+    Trace("reload,p" + std::to_string(Byte(manager + kManagerProfilePresentOffset)) + ",d"
+        + std::to_string(Byte(manager + 0xACCU)));
+    // +0x824 is left alone: it is the signed-in/saving-enabled flag set once at boot
+    // (0x007C1033); clearing it makes the reload end with saving disabled.
+    gSetState(reinterpret_cast<void*>(manager), nullptr, kManagerLoadProfileState, 0, 0);
+    gProfileReloadIssued = true;
+    return true;
+}
+
+bool ReloadFinished(void* storage) noexcept {
+    if (!StorageIdle(storage)) return false;
+    if (!gProfileReloadIssued) return true;
+    const auto manager = SaveManager();
+    return !manager || ManagerIdle(manager);
+}
+
+// Engine thread. One entry per save manager state change while a reload is traced:
+// s=state p=+0x824 profile d=+0xACC saves disabled c=+0xACE slot q=missing KB.
+void TraceManager() {
+    const auto manager = SaveManager();
+    std::uintptr_t state{}, root{}, system{}, missing{};
+    if (!manager || !gProfileReloadIssued || !Read32(manager + kManagerStateOffset, state) || state == gTracedState)
+        return;
+    gTracedState = static_cast<std::uint32_t>(state);
+    if (Read32(gModuleBase + kSaveSystemRootRva, root) && Read32(root + 0x4F8U, system)) Read32(system + 0x2D8U, missing);
+    std::ostringstream entry;
+    entry << "s" << std::hex << state << std::dec << ",p" << Byte(manager + kManagerProfilePresentOffset)
+          << ",d" << Byte(manager + 0xACCU) << ",c" << Byte(manager + 0xACEU) << ",q" << missing;
+    Trace(entry.str());
+}
+
 void __fastcall StoragePoll(void* storage) {
     gStorage.store(storage, std::memory_order_release);
-    if (gRefresh.load(std::memory_order_acquire) == 1 && StorageIdle(storage)) {
-        gEnumerate(storage, nullptr, 0U);
+    TraceManager();
+    if (gRefresh.load(std::memory_order_acquire) == 1 && StorageIdle(storage) && RequestProfileReload(storage))
         gRefresh.store(2, std::memory_order_release);
-    }
     gOriginalPoll(storage);
-    if (gRefresh.load(std::memory_order_acquire) == 2 && StorageIdle(storage))
+    if (gRefresh.load(std::memory_order_acquire) == 2 && ReloadFinished(storage))
         gRefresh.store(0, std::memory_order_release);
 }
 
@@ -169,6 +279,7 @@ std::int32_t __fastcall FileRead(void* self, void* edx, const char* name, void* 
     DWORD read{};
     const bool ok = ReadFile(file, data, static_cast<DWORD>(size), &read, nullptr);
     CloseHandle(file);
+    Trace(std::string("read:") + name + "=" + std::to_string(ok ? read : 0U) + "/" + std::to_string(size));
     return ok ? static_cast<std::int32_t>(read) : 0;
 }
 
@@ -272,6 +383,7 @@ std::int32_t __fastcall GetFileCount(void* self, void* edx) {
         } while (gListing.size() < 1024U && FindNextFileW(find, &entry));
         FindClose(find);
     }
+    Trace("files=" + std::to_string(gListing.size()));
     return static_cast<std::int32_t>(gListing.size());
 }
 
@@ -363,6 +475,31 @@ bool ValidDirectory(const std::wstring& path) {
         && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
 }
 
+bool BytesMatch(const std::uintptr_t at, const std::uint8_t* expected, const std::size_t count) noexcept {
+    std::uint8_t actual[32]{};
+    return count <= sizeof(actual) && crash_guard::TryCopy(actual, reinterpret_cast<const void*>(at), count)
+        && std::memcmp(actual, expected, count) == 0;
+}
+
+// The save manager reload is optional: when this executable's code differs,
+// saves still isolate and only the frontend checkpoint state stays stale.
+void InstallProfileReload(const std::uintptr_t moduleBase) noexcept {
+    static constexpr std::uint8_t kManagerLoad[] = {0x8B, 0x71, 0x78};
+    // push ebx; push esi; mov esi,ecx; xor ebx,ebx; mov [esi+820h],eax; cmp [esi+824h],bl
+    static constexpr std::uint8_t kSetStateBody[] = {0x53, 0x56, 0x8B, 0xF1, 0x33, 0xDB, 0x89, 0x86, 0x20, 0x08,
+        0x00, 0x00, 0x38, 0x9E, 0x24, 0x08, 0x00, 0x00};
+    static constexpr std::uint8_t kSetStateReturn[] = {0xC2, 0x0C, 0x00};
+    std::uintptr_t globalsRef{};
+    if (!Read32(moduleBase + kGameGlobalsRefRva, globalsRef) || globalsRef != moduleBase + kGameGlobalsRva
+        || !BytesMatch(moduleBase + kSaveManagerLoadRva, kManagerLoad, sizeof(kManagerLoad))
+        || !BytesMatch(moduleBase + kSetStateBodyRva, kSetStateBody, sizeof(kSetStateBody))
+        || !BytesMatch(moduleBase + kSetStateReturnRva, kSetStateReturn, sizeof(kSetStateReturn)))
+        return;
+    gModuleBase = moduleBase;
+    gGameGlobals = moduleBase + kGameGlobalsRva;
+    gSetState = reinterpret_cast<SetStateFn>(moduleBase + kSetStateRva);
+}
+
 } // namespace
 
 bool Install(const std::uintptr_t moduleBase, std::string& error) noexcept {
@@ -376,6 +513,7 @@ bool Install(const std::uintptr_t moduleBase, std::string& error) noexcept {
     }
     gOriginalPoll = reinterpret_cast<StorageFn>(poll);
     gEnumerate = reinterpret_cast<EnumerateFn>(enumerate);
+    InstallProfileReload(moduleBase);
     if (!WriteSlot(reinterpret_cast<void**>(moduleBase + kStoragePollSlotRva),
             reinterpret_cast<void*>(poll), reinterpret_cast<void*>(&StoragePoll))) {
         error = "Campaign save storage poll slot is already hooked.";
@@ -386,6 +524,8 @@ bool Install(const std::uintptr_t moduleBase, std::string& error) noexcept {
 }
 
 bool Installed() noexcept { return gInstalled.load(std::memory_order_acquire); }
+
+bool ProfileReloadInstalled() noexcept { return Installed() && gSetState != nullptr; }
 
 bool Configure(const std::string& sessionId, const std::string& utf8Directory, std::string& error) {
     if (!Installed()) { error = "Campaign save storage is not installed."; return false; }
@@ -447,7 +587,7 @@ std::string EncodeStatus(const Status& status) {
          << "\",\"ProfilePath\":\"" << Escape(status.profilePath)
          << "\",\"SaveSequence\":" << status.saveSequence
          << ",\"WriteRevision\":" << status.writeRevision
-         << ",\"Error\":\"" << Escape(status.error) << "\"}";
+         << ",\"Error\":\"" << Escape(status.error) << "\",\"Trace\":\"" << Escape(CurrentTrace()) << "\"}";
     return json.str();
 }
 

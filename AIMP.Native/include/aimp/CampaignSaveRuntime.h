@@ -17,6 +17,9 @@ namespace aimp::campaign_save {
 // and is where the cached native save catalogue is re-enumerated.
 bool Install(std::uintptr_t moduleBase, std::string& error) noexcept;
 [[nodiscard]] bool Installed() noexcept;
+// True when a profile swap also reruns the retail save manager's profile load
+// (frontend Continue then sees the staged checkpoint).
+[[nodiscard]] bool ProfileReloadInstalled() noexcept;
 
 struct Status {
     bool ready{};

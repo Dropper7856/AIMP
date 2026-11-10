@@ -149,11 +149,12 @@ internal sealed partial class MultiplayerSessionCoordinator
         await SendStatusAsync($"Connected to {invite.Friend} through Steam").ConfigureAwait(false);
     }
 
+    // Runs for every MENU_STATE, also without Steam: it carries the campaign start watchdog.
     private void ScheduleSteamMenuResume()
     {
         lock (_steamInviteGate)
         {
-            if (Volatile.Read(ref _disposed) != 0 || _steamRelay is null) return;
+            if (Volatile.Read(ref _disposed) != 0) return;
             _steamInviteTask = ProcessSteamActionAfterAsync(_steamInviteTask, ResumeSteamInvitesFromMenuAsync);
         }
     }
@@ -164,6 +165,7 @@ internal sealed partial class MultiplayerSessionCoordinator
         await _commandGate.WaitAsync(_lifetime.Token).ConfigureAwait(false);
         try
         {
+            if (await CloseCampaignStartStuckAtMenuAsync().ConfigureAwait(false)) return;
             lock (_stateGate)
                 _steamFrontendReady = !_uiGameplayLoaded && _start is null && _controller.Snapshot.IpcConnected;
             await ActivateSteamForReadyMenuAsync().ConfigureAwait(false);

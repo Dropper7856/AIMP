@@ -188,6 +188,8 @@ internal static class Program
         new("Steam helper protocol round-trips lobby data", SteamHostTests.RoundTripsAsync),
         new("Steam helper protocol keeps error kinds", SteamHostTests.KeepsErrorKindsAsync),
         new("Steam helper mode needs its exact arguments", SteamHostTests.IgnoresNormalArgumentsAsync),
+        new("Campaign start stuck at the menu is detected", StartWatchdogTests.DetectsCampaignStuckAtMenuAsync),
+        new("Start watchdog ignores Survival and loaded gameplay", StartWatchdogTests.IgnoresSurvivalAndGameplayAsync),
         new("Generic native IPC", IpcTests.GenericHandshakeAndQueuedCommandAsync),
         new("AISync rejection preserves IPC", IpcTests.AISyncRejectionPreservesConnectionAsync),
         new("Manifest cache identity casing", LauncherTests.ManifestCacheIdentityAsync),
