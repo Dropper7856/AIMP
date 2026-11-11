@@ -1703,52 +1703,44 @@ bool ModelPositions(const LocalBone* local, const std::int16_t* parents, const s
 // own idle pose by moving the skeleton roots (the placement) along the body's
 // up axis. Only deep bones (depth >= 3: feet, toes, hands) count, never the
 // roots or helpers hanging from them.
-void GroundFinalPose(const std::uintptr_t transforms, const MaskShare& share, const std::uint32_t bones) noexcept {
+// The FP camera/root offset must never be mistaken for the body floor.
+// Only the mapped FOOT and TOE bones define the grounded contact reference.
+// Y is the engine's physical up axis (Character model space).
+void GroundFinalPose(const std::uintptr_t transforms, MaskShare& share, const std::uint32_t bones) noexcept {
     if (share.parentCount != bones || bones == 0U) return;
-    // Animation workers: keep ~30 KB of scratch off their stacks.
     struct Scratch final {
         std::array<LocalBone, kMaskBones> idle, pose;
         std::array<std::array<float, 3>, kMaskBones> idleAt, poseAt;
         std::array<std::array<float, 4>, kMaskBones> rotation;
-        std::array<std::uint8_t, kMaskBones> depth;
     };
     thread_local auto* scratch = new (std::nothrow) Scratch{};
     if (scratch == nullptr) return;
-    auto& [idle, pose, idleAt, poseAt, rotation, depth] = *scratch;
-    if (!crash_guard::TryCopy(pose.data(), reinterpret_cast<const void*>(transforms), bones * sizeof(LocalBone))) return;
-    for (std::uint32_t b = 0; b < bones; ++b) std::memcpy(idle[b].data(), share.base[b].data(), sizeof(LocalBone));
+    auto& [idle, pose, idleAt, poseAt, rotation] = *scratch;
+    if (!crash_guard::TryCopy(pose.data(), reinterpret_cast<const void*>(transforms),
+        bones * sizeof(LocalBone))) return;
+    for (std::uint32_t b = 0; b < bones; ++b)
+        std::memcpy(idle[b].data(), share.base[b].data(), sizeof(LocalBone));
     if (!ModelPositions(idle.data(), share.parents.data(), bones, idleAt.data(), rotation.data()) ||
         !ModelPositions(pose.data(), share.parents.data(), bones, poseAt.data(), rotation.data())) return;
-    for (std::uint32_t b = 0; b < bones; ++b)
-        depth[b] = share.parents[b] < 0 ? 0U : static_cast<std::uint8_t>((std::min)(depth[share.parents[b]] + 1, 255));
-    // Up axis: the body's longest extent; a skeleton's face, fingers and spine
-    // put most bones above the middle of that extent.
-    std::size_t axis{};
-    float best{-1.0F}, sign{1.0F};
-    for (std::size_t a = 0; a < 3U; ++a) {
-        float low{std::numeric_limits<float>::max()}, high{-low}, sum{};
-        for (std::uint32_t b = 0; b < bones; ++b) {
-            low = (std::min)(low, idleAt[b][a]); high = (std::max)(high, idleAt[b][a]); sum += idleAt[b][a];
-        }
-        if (high - low > best) { best = high - low; axis = a; sign = sum / bones > (low + high) * 0.5F ? 1.0F : -1.0F; }
-    }
-    if (best < 0.5F) return;
     float idleFloor{std::numeric_limits<float>::max()}, poseFloor{idleFloor};
-    for (std::uint32_t b = 0; b < bones; ++b) {
-        if (depth[b] < 3U) continue;
-        idleFloor = (std::min)(idleFloor, sign * idleAt[b][axis]);
-        poseFloor = (std::min)(poseFloor, sign * poseAt[b][axis]);
+    for (const auto bone : {kFpLeftFoot, kFpLeftToe, kFpRightFoot, kFpRightToe}) {
+        const auto mapped = share.crewPose[bone];
+        if (mapped < 0 || static_cast<std::uint32_t>(mapped) >= bones) return;
+        idleFloor = (std::min)(idleFloor, idleAt[static_cast<std::size_t>(mapped)][1]);
+        poseFloor = (std::min)(poseFloor, poseAt[static_cast<std::size_t>(mapped)][1]);
     }
-    if (idleFloor == std::numeric_limits<float>::max()) return;
-    // Lift a sunk body fully; lowering is bounded (a climbing clip may
-    // legitimately leave the floor while the owner's position rises).
-    const auto lift = (std::max)(-0.10F, (std::min)(0.8F, idleFloor - poseFloor));
+    if (!std::isfinite(idleFloor) || !std::isfinite(poseFloor)) return;
+    // Limit visual correction to a modest foot-contact adjustment. The old
+    // 0.8m root lift (including hands and prop contacts) made bodies jump.
+    const auto lift = (std::clamp)(idleFloor - poseFloor, -0.05F, 0.20F);
     if (!std::isfinite(lift) || std::abs(lift) < 0.003F) return;
     for (std::uint32_t b = 0; b < bones; ++b) {
         if (share.parents[b] >= 0) continue;
-        const auto value = pose[b][axis] + sign * lift;
-        static_cast<void>(crash_guard::TryWrite(reinterpret_cast<void*>(transforms + b * 0x30U + axis * 4U), &value, sizeof(value)));
+        const auto value = pose[b][1] + lift;
+        static_cast<void>(crash_guard::TryWrite(
+            reinterpret_cast<void*>(transforms + b * 0x30U + 4U), &value, sizeof(value)));
     }
+    share.lifted.fetch_add(1U, std::memory_order_relaxed);
 }
 
 // --- Posture rebuild ---------------------------------------------------------
@@ -2007,15 +1999,8 @@ void SolvePose(MaskShare& share, const Cycle& current, const std::uintptr_t tran
         if (reach(arm, forearm, hand, Lerp(at[hand], target, weight)) && solve()) setRotation(hand, handRotation[side]);
         if (!solve()) return;
     }
-    // 4. The body never goes through the floor: if any bone ended below it,
-    // lift the whole skeleton (its roots) until the lowest bone rests on it.
-    auto lowest = std::numeric_limits<float>::max();
-    for (std::uint32_t b = 0; b < bones; ++b) if (parents[b] >= 0) lowest = (std::min)(lowest, at[b][1]);
-    const auto lift = (std::min)(0.8F, floor - 0.02F - lowest);
-    if (std::isfinite(lift) && lift > 0.0F) {
-        for (std::uint32_t b = 0; b < bones; ++b) if (parents[b] < 0) local[b][1] += lift;
-        share.lifted.fetch_add(1U, std::memory_order_relaxed);
-    }
+    // The root is grounded once, after the posture solve, using feet only.
+    // Hand/finger contact with a vent or terminal must not lift the body.
     for (std::uint32_t b = 0; b < bones; ++b)
         for (std::size_t i = 0; i < 8U; ++i) if (!std::isfinite(local[b][i])) return skip(9U);
     for (std::uint32_t b = 0; b < bones; ++b)
@@ -2051,8 +2036,8 @@ void ApplyMask(MaskShare& share, const std::uintptr_t address, void* pose, const
                 ++restored;
         }
         share.restored.store(restored, std::memory_order_relaxed);
-        GroundFinalPose(transforms, share, bones);
         SolvePose(share, current, transforms, bones);
+        GroundFinalPose(transforms, share, bones);
         share.applied.fetch_add(1U, std::memory_order_relaxed);
     }
 }
