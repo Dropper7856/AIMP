@@ -207,12 +207,24 @@ internal sealed partial class SteamRelay
             .FilterDistanceWorldwide()
             .WithMaxResults(MaxSearchResults)
             .RequestAsync();
-        var listings = new Dictionary<ulong, SteamLobbyListing>();
-        foreach (var lobby in found ?? Array.Empty<Lobby>())
-            if (ReadListing(lobby) is { } listing && listing.HostSteamId != LocalSteamId)
-                listings[listing.LobbyId] = listing;
+        var raw = found ?? Array.Empty<Lobby>();
+        var listings = ReadSearchListings(raw, out var unreadable);
+        var fromSearch = listings.Count;
         AddFriendListings(listings);
+        _diagnostics.Log("Steam", $"Lobby search: Steam returned {raw.Length} lobb{(raw.Length == 1 ? "y" : "ies")} " +
+            $"({unreadable} unreadable, {fromSearch} listed), {listings.Count - fromSearch} more from friends' presence.");
         return SortListings(listings.Values);
+    }
+
+    // Own lobby is skipped; lobbies without a readable AIMP listing are counted for the log.
+    private Dictionary<ulong, SteamLobbyListing> ReadSearchListings(IEnumerable<Lobby> found, out int unreadable)
+    {
+        var listings = new Dictionary<ulong, SteamLobbyListing>();
+        unreadable = 0;
+        foreach (var lobby in found)
+            if (ReadListing(lobby) is not { } listing) unreadable++;
+            else if (listing.HostSteamId != LocalSteamId) listings[listing.LobbyId] = listing;
+        return listings;
     }
 
     // Friends-only lobbies never show up in a search; friends advertise them in rich presence.

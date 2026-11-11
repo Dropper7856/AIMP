@@ -307,7 +307,7 @@ internal sealed partial class SteamRelay : ISteamRelay, ISteamLobbies
         }
         catch (Exception exception)
         {
-            if (force) _diagnostics.Log("Steam", $"Steam relay unavailable: {exception.Message}");
+            if (force) _diagnostics.Log("Steam", $"Steam relay unavailable: {exception.Message} ({DescribeInitEnvironment()})");
             if (SteamClient.IsValid)
             {
                 UnhookSteamCallbacks();
@@ -317,6 +317,21 @@ internal sealed partial class SteamRelay : ISteamRelay, ISteamLobbies
             return false;
         }
         return true;
+    }
+
+    // Why SteamAPI_Init can fail: no Steam process for this Windows user, or an admin/non-admin mismatch
+    // between Steam and this process (Steam IPC refuses it).
+    private static string DescribeInitEnvironment()
+    {
+        try
+        {
+            var steamRunning = System.Diagnostics.Process.GetProcessesByName("steam").Length > 0;
+            using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+            var elevated = new System.Security.Principal.WindowsPrincipal(identity)
+                .IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+            return $"steam.exe running={steamRunning}, this process elevated={elevated}, pid={Environment.ProcessId}";
+        }
+        catch (Exception exception) { return $"environment check failed: {exception.Message}"; }
     }
 
     private void ConfigureAfterInit()

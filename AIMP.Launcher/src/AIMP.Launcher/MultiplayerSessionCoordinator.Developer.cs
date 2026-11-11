@@ -15,7 +15,7 @@ internal sealed partial class MultiplayerSessionCoordinator
     private static void ValidateDeveloperLobby(LauncherSettings settings, ScaleformBridgeMessage message)
     {
         var level = ResolveLevel(message);
-        var mode = message.Get("mode", "survival");
+        var mode = ReadLobbyMode(message);
         if (mode.Equals("campaign", StringComparison.OrdinalIgnoreCase))
         {
             if (message.Get("campaignAction", "new") == "level" && !settings.DeveloperMode)
@@ -26,6 +26,15 @@ internal sealed partial class MultiplayerSessionCoordinator
             throw new InvalidOperationException("Invalid game mode.");
         if (settings.DeveloperMode)
             WorldManifestAutoResolver.ResolveLevelSource(settings.GameDirectory, level, includeCampaign: true);
+    }
+
+    // The menu's Game Mode stepper has no initial selection, so until the player
+    // steps it the GFX sends String(undefined) = "undefined". Unset values mean the
+    // stepper's first (displayed) entry, Survival; anything else is still rejected.
+    internal static string ReadLobbyMode(ScaleformBridgeMessage message)
+    {
+        var mode = message.Get("mode").Trim();
+        return mode.Length == 0 || mode is "undefined" or "null" ? "survival" : mode;
     }
 
     private static string LevelGameMode(string level) =>
