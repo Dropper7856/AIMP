@@ -10275,6 +10275,10 @@ bool FollowGait(std::uintptr_t character,std::uint32_t gait) noexcept {
         return true;
     } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
 }
+// The declaration lives in the file's original unnamed namespace.
+// Reopen it so this definition refers to that same function: otherwise
+// the enclosing ai_sync namespace adds a second overload and C2668 fires.
+namespace {
 void ReleaseNativeFollow(Actor& actor,bool cancel) noexcept {
     if(!actor.follow.object)return;
     FollowNativeRelease({actor.follow.object,actor.follow.control},cancel);
@@ -10282,6 +10286,7 @@ void ReleaseNativeFollow(Actor& actor,bool cancel) noexcept {
     const auto failures=actor.follow.failures;const auto retry=actor.follow.retryAt;
     actor.follow={};actor.follow.failures=failures;actor.follow.retryAt=retry;
 }
+} // namespace
 void FollowIdleFacing(Actor& actor,const hybrid_motion::Target& target,const float* local,float yaw,ULONGLONG now) noexcept {
     // Standing still on both peers: keep the Host facing with a bounded turn.
     auto& f=actor.follow;
