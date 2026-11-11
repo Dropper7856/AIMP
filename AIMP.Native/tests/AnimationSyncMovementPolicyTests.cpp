@@ -1,5 +1,6 @@
 #include "aimp/AnimationSyncMovementPolicy.h"
 #include <cassert>
+#include <initializer_list>
 #include <iostream>
 
 using aimp::animation_sync::MovementPolicy;

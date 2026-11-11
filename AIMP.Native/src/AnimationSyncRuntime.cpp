@@ -1557,9 +1557,11 @@ MovementPolicy MovementPolicyFor(const std::uintptr_t character) noexcept {
     const std::lock_guard lock(gMutex);
     const auto* slot = Find(character);
     Cycle current{};
+    // Keep ownership through the completed-but-not-yet-retired native
+    // cycle. The next AnimationSync pump cancels it before PlayerSync resumes.
     if (slot == nullptr || !RemoteReady(character) ||
-        !ReadCycle(character, current) || !Owned(current, slot->owned) ||
-        (current.flags & 4U) != 0U) return MovementPolicy::None;
+        !ReadCycle(character, current) || !Owned(current, slot->owned))
+        return MovementPolicy::None;
     return SelectMovementPolicy(true, slot->nativeClip,
         player_hiding_presentation::ClassifyClip(slot->owned.animation).phase != 0U);
 }

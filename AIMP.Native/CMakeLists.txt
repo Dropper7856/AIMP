@@ -463,6 +463,12 @@ if(BUILD_TESTING)
     target_compile_options(AIMP.AISyncTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
     add_test(NAME AISyncOwnershipAndNavigation COMMAND AIMP.AISyncTests
         "${CMAKE_CURRENT_SOURCE_DIR}/../tests/fixtures/aisync-participant-config-v3.hex")
+    add_executable(AIMP.AnimationSyncTimelineTests tests/AnimationSyncTimelineTests.cpp)
+    target_include_directories(AIMP.AnimationSyncTimelineTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_options(AIMP.AnimationSyncTimelineTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.AnimationSyncTimelineTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME AnimationSyncNativeTimeline COMMAND AIMP.AnimationSyncTimelineTests)
     add_executable(AIMP.AnimationSyncMovementPolicyTests tests/AnimationSyncMovementPolicyTests.cpp)
     target_include_directories(AIMP.AnimationSyncMovementPolicyTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     target_compile_options(AIMP.AnimationSyncMovementPolicyTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)

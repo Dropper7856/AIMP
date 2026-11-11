@@ -1,4 +1,4 @@
-# AnimationSync native root-motion isolation (531)
+# AnimationSync native root-motion isolation (532)
 
 Status: experimental; requires **two live game instances** to verify visual
 alignment. This change is deliberately scoped to AnimationSync's own scripted
@@ -68,5 +68,8 @@ move. An actual model-space/root-bone trace is the next investigation if so.
    root motion**; do not revert to blanket per-frame FP teleporting.
 
 The source-level policy test is registered as
-`AnimationSyncMovementPolicy` in CTest. The native build requires Windows MSVC
-x86; this commit is not an in-game visual proof.
+`AnimationSyncMovementPolicy` in CTest, alongside
+`AnimationSyncNativeTimeline`: eight native-clock projection cases adapted
+from the previous standalone Claude analysis, using explicit failure checks
+even when NDEBUG is defined. Both tests are header-only. The native build
+requires Windows MSVC x86; this commit is not an in-game visual proof.
