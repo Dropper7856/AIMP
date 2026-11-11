@@ -1,6 +1,7 @@
 #include "aimp/AnimationSyncRuntime.h"
 #include "aimp/AnimationSyncTimeline.h"
 #include "aimp/AnimationSyncVisualRoot.h"
+#include "aimp/AnimationSyncVentGround.h"
 #include "aimp/AnimationSyncPropsRuntime.h"
 #include "aimp/AISyncNativeIntent.h"
 #include "aimp/CharacterDirectStepRuntime.h"
@@ -692,6 +693,13 @@ struct MaskShare final {
     std::array<std::array<float, 3>, kMaskBones> rootReference{};
     std::uint64_t stableFrames{}, idleReferences{}, liveReferences{};
     float maxSuppressedRootDeltaY{};
+    // Native vent only: probe the mapped high-res feet & hips, and apply
+    // bounded visual-root support without modifying collision or limbs.
+    bool ventMapped{};
+    float ventRise{}, ventProgress{}, ventGroundLift{};
+    float ventLastFootY{}, ventIdleFootY{}, ventLastHipDeltaY{};
+    float ventMaxGroundLift{}, ventMaxDepthBeforeGround{}, ventMaxHipDrop{};
+    std::uint64_t ventGroundFrames{}, ventGroundSkipped{}, ventGroundMapped{};
     std::atomic<std::uint64_t> applied{}, captured{};
     std::atomic<std::uint32_t> restored{};
     // Posture rebuild: the owner's body effectors keyed by its clip time for
@@ -761,6 +769,11 @@ void PublishMaskState(const Slot& slot, MaskShare& share, const bool starting = 
         share.stableRoot = false; share.rootReferenceReady = false;
         share.stableFrames = share.idleReferences = share.liveReferences = 0U;
         share.maxSuppressedRootDeltaY = 0.0F;
+        share.ventMapped = false;
+        share.ventGroundLift = share.ventRise = share.ventProgress = 0.0F;
+        share.ventLastFootY = share.ventIdleFootY = share.ventLastHipDeltaY = 0.0F;
+        share.ventMaxGroundLift = share.ventMaxDepthBeforeGround = share.ventMaxHipDrop = 0.0F;
+        share.ventGroundFrames = share.ventGroundSkipped = share.ventGroundMapped = 0U;
         share.track.transition = 0U; share.track.count = 0U; share.playing = 0U;
         share.binding = slot.binding;
         share.controller.store(controller);
@@ -1637,11 +1650,24 @@ bool HidingEntryPlaying(const std::uintptr_t character) noexcept {
 bool SetVisualOffset(const std::uintptr_t character, const bool active,
     const std::array<float, 3>& offset, const float yaw, const bool stableRoot) noexcept {
     std::size_t index{};
+    std::uint32_t resource{};
+    float ownerStartY{};
+    bool hasOwnerStart{};
+    float ownerPhase{};
     {
         const std::lock_guard lock(gMutex);
         const auto* slot = Find(character);
         if (slot == nullptr) return false;
         index = static_cast<std::size_t>(slot - gSlots.data());
+        if (active && stableRoot) {
+            resource = slot->diagnostics.resource;
+            ownerStartY = slot->firstOwnerPosition[1];
+            hasOwnerStart = slot->hasFirstOwnerPosition;
+            if (Active(slot->desired) && slot->desired.durationSeconds > 0.0F)
+                ownerPhase = (std::clamp)(
+                    slot->desired.phaseSeconds / slot->desired.durationSeconds, 0.0F, 1.0F);
+            else ownerPhase = 1.0F; // owner already cleared its clip
+        }
     }
     auto& share = gMaskShares[index];
     const std::lock_guard lock(share.mutex);
@@ -1650,6 +1676,7 @@ bool SetVisualOffset(const std::uintptr_t character, const bool active,
     if (!active) {
         share.offsetActive.store(false, std::memory_order_release);
         share.stableRoot = false; share.rootReferenceReady = false;
+        share.ventGroundLift = 0.0F; share.ventMapped = false;
         return true;
     }
     if (!gMaskHook.load(std::memory_order_acquire)) return false;
@@ -1657,12 +1684,35 @@ bool SetVisualOffset(const std::uintptr_t character, const bool active,
     if (share.parentCount == 0U || !LayerBones(character, 7U, bones) || bones != share.parentCount)
         ReadParents(controller, share);
     if (share.parentCount == 0U) return false;
-    // The same transition refreshes this offset every frame. Preserve its
-    // stable baseline until the visual episode ends or changes policy.
     if (share.stableRoot != stableRoot ||
-        !share.offsetActive.load(std::memory_order_acquire))
+        !share.offsetActive.load(std::memory_order_acquire)) {
         share.rootReferenceReady = false;
+        share.ventGroundLift = 0.0F;
+        share.ventMapped = false;
+    }
     share.stableRoot = stableRoot;
+    if (stableRoot) {
+        float actorY{};
+        if (hasOwnerStart && Read(character + 0x74U, actorY) &&
+            std::isfinite(actorY) && std::isfinite(offset[1]))
+            share.ventRise = (std::clamp)(
+                actorY + offset[1] - ownerStartY, 0.0F, 1.0F);
+        share.ventProgress = ownerPhase;
+        // The launcher already exports retail FEMALEFP->FEMALE->crew maps.
+        // Avoid any guessed bone indices; fail closed if the mapping is not
+        // unique or the current representation has a different skeleton.
+        if (!share.ventMapped && resource != 0U) {
+            std::uint32_t lowBones{}, highBones{};
+            MaskClip firstPerson{};
+            firstPerson.skeleton = kFirstPersonSkeleton;
+            if (LayerBones(character, 0U, lowBones) &&
+                LayerBones(character, 7U, highBones) &&
+                highBones == share.parentCount &&
+                MapCrewBones(firstPerson, lowBones, highBones,
+                    resource, share.crewPose))
+                share.ventMapped = true;
+        }
+    }
     share.offset = {offset[0], offset[1], offset[2], yaw};
     share.offsetActive.store(true, std::memory_order_release);
     return true;
@@ -1679,7 +1729,10 @@ VisualRootStats VisualRootSnapshot(const std::uintptr_t character) noexcept {
     const std::lock_guard lock(share.mutex);
     return {share.offsetFrames.load(std::memory_order_relaxed),
         share.stableFrames, share.idleReferences, share.liveReferences,
-        share.maxSuppressedRootDeltaY};
+        share.maxSuppressedRootDeltaY,
+        share.ventGroundFrames, share.ventGroundSkipped, share.ventGroundMapped,
+        share.ventMaxGroundLift, share.ventMaxDepthBeforeGround,
+        share.ventMaxHipDrop, share.ventLastFootY, share.ventIdleFootY};
 }
 std::uint64_t VisualOffsetFrames(const std::uintptr_t character) noexcept {
     std::size_t index{};
@@ -2192,6 +2245,74 @@ void ApplyMask(MaskShare& share, const std::uintptr_t address, void* pose, const
         share.applied.fetch_add(1U, std::memory_order_relaxed);
     }
 }
+// Rig-space floor support for native vent entry. The 535 diagnostic showed
+// zero native-root Y delta despite visible sinking, so use actual high-res
+// feet/toe model positions rather than guessing an offset on the skeleton root.
+// This function only measures/returns a bounded visual lift; it never edits
+// character world position, physics, or individual limb transforms.
+float VentVisualFloorLift(MaskShare& share, const std::uintptr_t transforms,
+    const std::uint32_t bones) noexcept {
+    bool valid = share.ventMapped && share.parentCount == bones &&
+        share.baseBones.load(std::memory_order_acquire) == bones;
+    for (const auto fp : {kFpHips, kFpLeftFoot, kFpLeftToe, kFpRightFoot, kFpRightToe}) {
+        const auto mapped = share.crewPose[fp];
+        valid = valid && mapped >= 0 && static_cast<std::uint32_t>(mapped) < bones;
+    }
+    if (!valid) { ++share.ventGroundSkipped; return 0.0F; }
+    std::array<LocalBone, kMaskBones> current{}, idle{};
+    std::array<Vec3, kMaskBones> currentAt{}, idleAt{};
+    std::array<Quat, kMaskBones> currentRot{}, idleRot{};
+    for (std::uint32_t b = 0; b < bones; ++b) {
+        if (!Read(transforms + b * 0x30U, current[b])) {
+            ++share.ventGroundSkipped; return 0.0F;
+        }
+        std::memcpy(idle[b].data(), share.base[b].data(), 0x30U);
+    }
+    if (!ModelPositions(current.data(), share.parents.data(), bones,
+            currentAt.data(), currentRot.data()) ||
+        !ModelPositions(idle.data(), share.parents.data(), bones,
+            idleAt.data(), idleRot.data())) {
+        ++share.ventGroundSkipped; return 0.0F;
+    }
+    float currentFoot = std::numeric_limits<float>::max();
+    float idleFoot = std::numeric_limits<float>::max();
+    for (const auto fp : {kFpLeftFoot, kFpLeftToe, kFpRightFoot, kFpRightToe}) {
+        const auto bone = static_cast<std::uint32_t>(share.crewPose[fp]);
+        currentFoot = (std::min)(currentFoot, currentAt[bone][1]);
+        idleFoot = (std::min)(idleFoot, idleAt[bone][1]);
+    }
+    const auto hip = static_cast<std::uint32_t>(share.crewPose[kFpHips]);
+    const float hipDrop = idleAt[hip][1] - currentAt[hip][1];
+    float rootShift{};
+    for (std::uint32_t b = 0; b < bones; ++b)
+        if (share.parents[b] < 0) {
+            const auto referenceY = share.rootReferenceReady
+                ? share.rootReference[b][1]
+                : share.baseBones.load(std::memory_order_acquire) == bones
+                    ? std::bit_cast<float>(share.base[b][1]) : current[b][1];
+            rootShift = referenceY - current[b][1];
+            break;
+        }
+    if (!std::isfinite(currentFoot) || !std::isfinite(idleFoot) ||
+        !std::isfinite(hipDrop) || !std::isfinite(rootShift)) {
+        ++share.ventGroundSkipped; return 0.0F;
+    }
+    share.ventLastFootY = currentFoot;
+    share.ventIdleFootY = idleFoot;
+    share.ventLastHipDeltaY = hipDrop;
+    share.ventMaxHipDrop = (std::max)(share.ventMaxHipDrop, hipDrop);
+    const auto depth = VentFootDepth(idleFoot, currentFoot, rootShift,
+        share.ventRise, share.ventProgress);
+    share.ventMaxDepthBeforeGround = (std::max)(share.ventMaxDepthBeforeGround, depth);
+    const auto lift = VentGroundLift(idleFoot, currentFoot, rootShift,
+        share.ventRise, share.ventProgress, share.ventGroundLift);
+    share.ventGroundLift = lift;
+    share.ventMaxGroundLift = (std::max)(share.ventMaxGroundLift, lift);
+    ++share.ventGroundMapped;
+    if (lift > 0.005F) ++share.ventGroundFrames;
+    return lift;
+}
+
 // Render-only root displacement (Character model space: Y up, heading 0 = +Z):
 // skeleton roots are turned by `yaw` about the Character origin, then moved by
 // `offset`. The Character entity itself does not move.
@@ -2201,6 +2322,8 @@ void ApplyVisualOffset(MaskShare& share, void* pose, const std::uint32_t bones) 
     if (transforms < 0x10000U) return;
     const auto [ox, oy, oz, yaw] = share.offset;
     const std::array<float, 3> localOffset{ox, oy, oz};
+    const float ventLift = share.stableRoot
+        ? VentVisualFloorLift(share, transforms, bones) : 0.0F;
     const std::array<float, 4> turn{0.0F, std::sin(yaw * 0.5F), 0.0F, std::cos(yaw * 0.5F)};
     const bool firstStableFrame = share.stableRoot && !share.rootReferenceReady;
     const bool idleAvailable = share.baseBones.load(std::memory_order_acquire) == bones;
@@ -2227,7 +2350,7 @@ void ApplyVisualOffset(MaskShare& share, void* pose, const std::uint32_t bones) 
         }
         const auto target = VisualRootPosition(nativeRoot, share.rootReference[b],
             localOffset, yaw, share.stableRoot);
-        root[0] = target[0]; root[1] = target[1]; root[2] = target[2];
+        root[0] = target[0]; root[1] = target[1] + ventLift; root[2] = target[2];
         const std::array<float, 4> q{root[4], root[5], root[6], root[7]};
         root[4] = turn[3] * q[0] + turn[1] * q[2];
         root[5] = turn[3] * q[1] + turn[1] * q[3];
@@ -2438,7 +2561,15 @@ void Export(Diagnostics& diagnostics, const std::uintptr_t remoteCharacter) {
          {"stableRootFramesApplied", Diagnostics::Unsigned(visualRoot.stableFrames), true},
          {"stableRootIdleReferences", Diagnostics::Unsigned(visualRoot.idleReferences), true},
          {"stableRootLiveReferences", Diagnostics::Unsigned(visualRoot.liveReferences), true},
-         {"maxSuppressedRootDeltaYMeters", std::to_string(visualRoot.maxSuppressedRootDeltaY), true}});
+         {"maxSuppressedRootDeltaYMeters", std::to_string(visualRoot.maxSuppressedRootDeltaY), true},
+         {"ventMappedFootSamples", Diagnostics::Unsigned(visualRoot.ventGroundMapped), true},
+         {"ventFootProbeSkipped", Diagnostics::Unsigned(visualRoot.ventGroundSkipped), true},
+         {"ventFloorSupportFrames", Diagnostics::Unsigned(visualRoot.ventGroundFrames), true},
+         {"maxVisualFloorLiftMeters", std::to_string(visualRoot.ventMaxGroundLift), true},
+         {"maxDetectedFootDepthMeters", std::to_string(visualRoot.ventMaxDepthBeforeGround), true},
+         {"maxAnimatedHipDropMeters", std::to_string(visualRoot.ventMaxHipDrop), true},
+         {"lastAnimatedFootY", std::to_string(visualRoot.ventLastFootY), true},
+         {"idleFootReferenceY", std::to_string(visualRoot.ventIdleFootY), true}});
     decltype(gOwnerCycles) cycles{};
     decltype(gOwnerAliases) aliases{};
     { const std::lock_guard lock(gLocalMutex); cycles = gOwnerCycles; aliases = gOwnerAliases; }

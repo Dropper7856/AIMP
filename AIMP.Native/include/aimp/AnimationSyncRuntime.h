@@ -66,6 +66,9 @@ bool SetVisualOffset(std::uintptr_t character, bool active, const std::array<flo
 struct VisualRootStats final {
     std::uint64_t renderedFrames{}, stableFrames{}, idleReferences{}, liveReferences{};
     float maxSuppressedRootDeltaY{};
+    std::uint64_t ventGroundFrames{}, ventGroundSkipped{}, ventGroundMapped{};
+    float ventMaxGroundLift{}, ventMaxDepthBeforeGround{}, ventMaxHipDrop{};
+    float ventLastFootY{}, ventIdleFootY{};
 };
 [[nodiscard]] VisualRootStats VisualRootSnapshot(std::uintptr_t character) noexcept;
 // Native clock of an owned locker entry clip, 0..1. Engine thread only.

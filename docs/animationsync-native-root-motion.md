@@ -1,4 +1,4 @@
-# AnimationSync native root-motion isolation (535)
+# AnimationSync native root-motion isolation (536)
 
 Status: experimental; requires **two live game instances** to verify visual
 alignment. This change is deliberately scoped to AnimationSync's own scripted
@@ -192,3 +192,50 @@ A header-only portable math test `AnimationSyncVisualRoot` covers the
 additive-vs-anchored vertical path, world yaw transform and unchanged
 identity. The native MSVC x86 build and real visual behavior still require
 validation; no global Y clamp or arbitrary 50cm lift was introduced.
+
+## 536 — Native vent floor support from mapped high-resolution feet
+
+The receiving 535 build (November 11, 2026, PID 1212) confirms both
+native interactions completed with no admission failure. In the vent clip,
+87 render offsets were requested **and 87 were actually applied**; the
+stable root used one retail idle reference, and
+`maxSuppressedRootDeltaYMeters=0.0`. This **disproves** the theory that
+duplicate native ROOT Y translation caused the remaining sink. The physical
+Character still drops from Y=27.63 at phase 1.25 to Y=27.32 at phase 1.37,
+then Y=27.05 by phase 2.00 while the owner is approximately Y=27.79.
+The native NPC has no replicated vent traversal/collision state.
+
+536 leaves all physics, AI, actual Character transforms, and the native
+full-body clip untouched. It uses the launcher's existing signed retarget
+mapping from `FEMALEFP` to the remote crew low/high-res skeleton to find
+hips, feet and toes **without hardcoded crew bone indices**. In the final
+pose only, an explicit forward-kinematics model-space probe measures the
+lowest animated foot and hip against the last idle pose. A *vent-only* visual
+root lift is then calculated from measured foot penetration and the owner's
+upward progress. Feet may trail on the original floor during the first part
+of entry; support gradually transitions toward the raised vent floor.
+The added lift is bounded to **0.45m total**, and changes are rate-limited
+to 0.06m upward / 0.035m downward per rendered frame. An unavailable
+skeleton map, missing idle pose, or invalid pose skips the correction.
+All other animations and locker offsets continue to use their old policies.
+
+`native_animation_vent_visual` now also exports
+`ventMappedFootSamples`, `ventFootProbeSkipped`,
+`ventFloorSupportFrames`, `maxVisualFloorLiftMeters`,
+`maxDetectedFootDepthMeters`, `maxAnimatedHipDropMeters`,
+`lastAnimatedFootY`, and `idleFootReferenceY`.
+If foot probes are skipped or depth is zero, this correction will have no
+vertical effect: do not raise the body by an arbitrary constant. If the
+foot probe finds depth and corrects it yet the model still sinks, the
+remaining problem is the visual/physics transform boundary or the placement
+of the native clip relative to the intended vent target.
+
+Registered standalone math regression: `AnimationSyncVentGround`.
+It was exercised with an independent C++20 compiler. The complete
+Windows MSVC x86 build and in-game rendering have not been verified.
+
+Minimum test: first do normal walking and one button interaction to check
+for regressions. Then enter the same vent twice, retaining both screenshots
+or video and both 536 diagnostic ZIPs. Compare the new floor counters with
+the movement at native clip phases 1.25–2.00, and check that neither entrance
+nor handoff causes a sudden upward float or jump.
