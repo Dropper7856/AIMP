@@ -1,6 +1,7 @@
 #pragma once
 
 #include "aimp/AnimationSync.h"
+#include "aimp/AnimationSyncMovementPolicy.h"
 #include "aimp/CharacterIncarnation.h"
 #include <cstdint>
 #include <string>
@@ -43,6 +44,9 @@ void ApplyMasksOnEngineThread() noexcept;
 bool InstallMaskHook(HookManager& hooks, std::uintptr_t moduleBase, std::string& error) noexcept;
 // True while a replicated clip owns the representation (movement must hold).
 [[nodiscard]] bool OwnsMovement(std::uintptr_t character) noexcept;
+// Exact owned cycle only: native body root, FP network follower, or visual locker.
+// Unadmitted/deferred states return None, never freezing normal locomotion.
+[[nodiscard]] MovementPolicy MovementPolicyFor(std::uintptr_t character) noexcept;
 // Our clip is the current cycle: carry the actor along the owner's path.
 [[nodiscard]] bool ClipPlaying(std::uintptr_t character) noexcept;// Keep the actor visible through native locker entry/exit, but allow the
 // occupancy runtime to conceal a settled hidden idle (which may loop).

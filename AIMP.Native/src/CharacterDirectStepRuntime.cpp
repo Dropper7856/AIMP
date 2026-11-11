@@ -95,6 +95,9 @@ constexpr float kAiFollowerMaximumSettlingMagnitude = 2.5F;
 constexpr float kAiFollowerHardResyncDistance = 3.50F;
 constexpr std::uint64_t kAiFollowerHardResyncGraceMilliseconds = 500U;
 constexpr std::uint64_t kFollowerHardResyncCooldownMilliseconds = 250U;
+// After a native full-body interaction, allow the regular retail follower to
+// converge before its emergency snap logic is eligible again.
+constexpr std::uint64_t kNativeAnimationFollowerGraceMilliseconds = 1500U;
 constexpr std::uint64_t kFollowerHardResyncProbeIntervalMilliseconds = 100U;
 constexpr std::uint64_t kMoveTypeValidationIntervalMilliseconds = 250U;
 constexpr std::uint64_t kIdleValidationIntervalMilliseconds = 250U;
@@ -167,6 +170,8 @@ struct MovementSlot final {
     std::atomic<bool> stopPending{false};
     std::atomic<bool> initialPlacementPending{false};
     std::atomic<bool> hidingOwned{false};
+    std::atomic<bool> nativeAnimationOwned{false};
+    std::atomic<std::uint64_t> nativeAnimationReleasedAt{0U};
     std::atomic<std::uint64_t> hidingResumeAt{0U};
     std::atomic<std::uint64_t> hidingResumeDeadline{0U};
     std::atomic<std::uint32_t> hidingSettleXBits{0U};
@@ -700,6 +705,8 @@ void ResetPayload(MovementSlot& slot) noexcept {
     slot.stopPending.store(false, std::memory_order_release);
     slot.initialPlacementPending.store(false, std::memory_order_release);
     slot.hidingOwned.store(false, std::memory_order_release);
+    slot.nativeAnimationOwned.store(false, std::memory_order_release);
+    slot.nativeAnimationReleasedAt.store(0U, std::memory_order_release);
     slot.hidingResumeAt.store(0U, std::memory_order_release);
     slot.hidingResumeDeadline.store(0U, std::memory_order_release);
     slot.idleConverged.store(false, std::memory_order_release);
@@ -807,6 +814,8 @@ void ReleaseSlot(MovementSlot& slot) noexcept {
     slot.aiDivergenceSinceTickMs.store(0U, std::memory_order_release);
     slot.hasReplicatedYaw.store(false, std::memory_order_release);
     slot.applyPhysicalStep.store(false, std::memory_order_release);
+    slot.nativeAnimationOwned.store(false, std::memory_order_release);
+    slot.nativeAnimationReleasedAt.store(0U, std::memory_order_release);
     slot.stopPending.store(false, std::memory_order_release);
     slot.initialPlacementPending.store(false, std::memory_order_release);
     slot.idleConverged.store(false, std::memory_order_release);
@@ -2773,10 +2782,25 @@ void PumpSlotOnEngineThread(
         return;
     }
 
-    // A replicated interaction clip owns the representation: no Move/Idle;
-    // the follower re-places it once the clip ends.
-    if (animation_sync::OwnsMovement(characterAddress)) {
-        slot.initialPlacementPending.store(true, std::memory_order_release);
+    // A replicated clip owns this Character. Native full-body clips retain
+    // their own engine root motion and MUST NOT also chase the FP network
+    // path. The FP fallback still follows the network; hiding remains visual.
+    const auto clipPolicy = animation_sync::MovementPolicyFor(characterAddress);
+    if (clipPolicy == animation_sync::MovementPolicy::NativeRoot) {
+        slot.nativeAnimationOwned.store(true, std::memory_order_release);
+    } else if (slot.nativeAnimationOwned.exchange(false, std::memory_order_acq_rel)) {
+        slot.nativeAnimationReleasedAt.store(GetTickCount64(), std::memory_order_release);
+        slot.initialPlacementPending.store(false, std::memory_order_release);
+        slot.idleConverged.store(false, std::memory_order_release);
+        slot.preparedTargetRevision.store(0U, std::memory_order_release);
+    }
+    if (clipPolicy != animation_sync::MovementPolicy::None) {
+        // The admission path already placed a native clip at its interaction
+        // anchor. A pending initial-placement teleport would snap it after
+        // the clip ends; natural locomotion must reacquire from its final pose.
+        slot.initialPlacementPending.store(
+            clipPolicy != animation_sync::MovementPolicy::NativeRoot,
+            std::memory_order_release);
         slot.nativeStateActive.store(false, std::memory_order_release);
         slot.moveActive.store(false, std::memory_order_release);
         slot.driveRequested.store(false, std::memory_order_release);
@@ -2784,7 +2808,7 @@ void PumpSlotOnEngineThread(
         slot.preparedTargetRevision.store(0U, std::memory_order_release);
         // A locker clip shows the owner's recorded path on the body instead.
         if (phase == EnginePumpPhase::PostCharacterManager) {
-            if (!animation_sync::HidingClipOwned(characterAddress) && animation_sync::ClipPlaying(characterAddress))
+            if (animation_sync::FollowNetworkPath(clipPolicy))
                 FollowAnimationClipPath(slot, characterAddress);
         }
         return;
@@ -3014,7 +3038,10 @@ void PumpSlotOnEngineThread(
     // Emergency divergence correction is still retained, but this call now
     // happens once in the normal PRE pass (or only when POST actually has new
     // work), rather than twice unconditionally per CharacterManager frame.
-    static_cast<void>(ApplyHardNetworkResync(slot, characterAddress));
+    const auto nativeReleasedAt = slot.nativeAnimationReleasedAt.load(std::memory_order_acquire);
+    if (nativeReleasedAt == 0U || GetTickCount64() - nativeReleasedAt >=
+        kNativeAnimationFollowerGraceMilliseconds)
+        static_cast<void>(ApplyHardNetworkResync(slot, characterAddress));
 
     std::uintptr_t cycleAddress = 0U;
     std::uint8_t cycleState = 0U;

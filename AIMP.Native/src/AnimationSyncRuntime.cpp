@@ -76,6 +76,10 @@ struct RemoteDiagnostics final {
     // Owner clock following: seeks back onto the owner's phase, and replays
     // restarted because ours ended while the owner's same clip still ran.
     std::uint64_t resynced{}, readmitted{};
+    // Native Character displacement, measured before each engine animation tick.
+    // This detects whether retail actually applies the clip's reference motion.
+    std::uint64_t nativeRootSamples{}, nativeRootDiscontinuities{};
+    float nativeRootDistance{}, nativeOwnerGap{}, nativeOwnerGapMax{}, nativeAnchorDrift{};
     // Last replays: how and where (our clock vs owner's) each one ended.
     struct Ending final {
         std::uint64_t transition{};
@@ -98,6 +102,12 @@ struct Slot final {
     // (ReplayAlias) when the representation's database has it, else desired's.
     std::uint32_t play{};
     bool nativeClip{}; // Distinct original, full-body NPC animation.
+    // Retain the earliest observation of an action. A later stream-ready
+    // admission must not place the NPC at the owner's already-traversed
+    // position and then play that same root-motion path a second time.
+    std::array<float, 3> firstOwnerPosition{}, nativeRootLastPosition{};
+    float firstOwnerYaw{};
+    bool hasFirstOwnerPosition{}, nativeRootLastValid{};
     // Crew bones the owned clip drives; the others keep the last idle pose.
     bool maskActive{};
     std::bitset<256> crewDriven{}, crewDisplaced{};
@@ -878,6 +888,35 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
         ++d.deferred; // temporary traversal/paired/streaming state can clear
         return;
     }
+    if (slot.owned.address != 0U && slot.nativeClip &&
+        Owned(current, slot.owned) && (current.flags & 4U) == 0U) {
+        std::array<float, 3> position{};
+        if (Read(slot.character + 0x70U, position)) {
+            if (slot.nativeRootLastValid) {
+                const auto dx = position[0] - slot.nativeRootLastPosition[0];
+                const auto dy = position[1] - slot.nativeRootLastPosition[1];
+                const auto dz = position[2] - slot.nativeRootLastPosition[2];
+                const auto distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+                // A large step is a teleport or an engine discontinuity,
+                // not evidence of smooth reference-frame displacement.
+                if (std::isfinite(distance)) {
+                    if (distance <= 0.35F) d.nativeRootDistance += distance;
+                    else ++d.nativeRootDiscontinuities;
+                }
+            }
+            slot.nativeRootLastPosition = position;
+            slot.nativeRootLastValid = true;
+            ++d.nativeRootSamples;
+            if (Active(slot.desired)) {
+                const auto dx = position[0] - slot.desired.position[0];
+                const auto dy = position[1] - slot.desired.position[1];
+                const auto dz = position[2] - slot.desired.position[2];
+                d.nativeOwnerGap = std::sqrt(dx * dx + dy * dy + dz * dz);
+                if (std::isfinite(d.nativeOwnerGap))
+                    d.nativeOwnerGapMax = (std::max)(d.nativeOwnerGapMax, d.nativeOwnerGap);
+            }
+        }
+    }
     if (slot.owned.address != 0U) {
         const bool expired = Active(slot.desired) &&
             now - slot.receivedAt + slot.desired.elapsedMilliseconds > kObservationTimeoutMs;
@@ -1044,17 +1083,32 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
     }
     // One placement at the start; afterwards the actor follows the owner's
     // own network path (the owner's Character is the one converging).
+    // For an original NPC clip, start at the first observed interaction
+    // transform, not the owner's current in-flight position after streaming,
+    // holstering or network latency. Subsequent root movement belongs to retail.
+    // A first observation already late into the clip remains an approximation,
+    // reported as nativeAnchorDrift until full reference-frame reconstruction.
+    const auto& initial = slot.nativeClip && slot.hasFirstOwnerPosition
+        ? slot.firstOwnerPosition : slot.desired.position;
     float groundY{};
     auto heightOffset = slot.owned.address != 0U ? slot.heightOffset : 0.0F;
     if (slot.owned.address == 0U && Read(slot.character + 0x74U, groundY) && std::isfinite(groundY)) {
-        heightOffset = groundY - slot.desired.position[1];
-        if (std::abs(heightOffset) > 0.3F) heightOffset = 0.0F; // a real level change, not grounding
+        heightOffset = groundY - initial[1];
+        if (std::abs(heightOffset) > 0.3F) heightOffset = 0.0F; // a real level change
     }
-    auto placement = slot.desired.position;
+    auto placement = initial;
     placement[1] += heightOffset;
-    // Inside the locker the first-person owner already faces out: the exit
-    // clip starts on the owner's own heading, like every other clip.
-    auto heading = slot.desired.yaw;
+    const auto heading = slot.nativeClip && slot.hasFirstOwnerPosition
+        ? slot.firstOwnerYaw : slot.desired.yaw;
+    if (slot.nativeClip) {
+        const auto dx = slot.desired.position[0] - initial[0];
+        const auto dy = slot.desired.position[1] - initial[1];
+        const auto dz = slot.desired.position[2] - initial[2];
+        d.nativeAnchorDrift = std::sqrt(dx * dx + dy * dy + dz * dz);
+    }
+    // Locker exits preserve the Character's current position; the visual
+    // hiding track owns the pose inside the prop instead.
+    auto mutableHeading = heading;
     // Retail keeps the Character entity in front of a locker; only its
     // rendered body is inside (CharacterDirectStepRuntime). Hidden idle and
     // exit play where the entity is; the exit turns it out of the prop.
@@ -1064,10 +1118,10 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
             ++d.deferred; d.stage = "alignment"; return;
         }
         heightOffset = 0.0F;
-        if (hidingPhase == 2U) heading = static_cast<float>(std::remainder(yaw, 6.28318530717958647692F));
+        if (hidingPhase == 2U) mutableHeading = static_cast<float>(std::remainder(yaw, 6.28318530717958647692F));
     }
     if (!character_direct_step_runtime::ApplyAIRecoveryTransform(slot.character,
-        placement.data(), heading)) { ++d.deferred; d.stage = "alignment"; return; }
+        placement.data(), mutableHeading)) { ++d.deferred; d.stage = "alignment"; return; }
     slot.heightOffset = heightOffset;
     const auto before = current;
     if (!ReadCycle(slot.character, current) || !SameCycle(before, current) || !RemoteReady(slot.character)) {
@@ -1085,7 +1139,8 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
     if (constructed) {
         slot.owned = current; slot.startedAt = now; slot.ownedLoops = playback.loops;
         slot.ownerStartY = slot.desired.position[1];
-        slot.ownedYaw = heading;
+        slot.ownedYaw = mutableHeading;
+        slot.nativeRootLastValid = false;
     }
     if (!invoked || !constructed || (current.flags & 4U) != 0U || current.graph == 0U) {
         ++d.failed; d.stage = "native-admission"; return;
@@ -1126,6 +1181,10 @@ bool PumpOne(const std::uintptr_t character) noexcept {
     slot->holstered = copy.holstered;
     slot->maskActive = copy.maskActive; slot->crewDriven = copy.crewDriven; slot->crewDisplaced = copy.crewDisplaced;
     slot->crewPose = copy.crewPose; slot->play = copy.play; slot->nativeClip = copy.nativeClip;
+    if (slot->desired.transition == copy.desired.transition) {
+        slot->nativeRootLastPosition = copy.nativeRootLastPosition;
+        slot->nativeRootLastValid = copy.nativeRootLastValid;
+    }
     slot->holsterStarted = copy.holsterStarted; slot->unarmedAt = copy.unarmedAt; slot->holsterWait = copy.holsterWait;
     slot->heightOffset = copy.heightOffset; slot->ownerStartY = copy.ownerStartY;
     slot->ownedYaw = copy.ownedYaw;
@@ -1437,6 +1496,8 @@ bool Publish(const std::uintptr_t character, const State& state, std::string& er
         }
         return true;
     }
+    slot->firstOwnerPosition = state.position; slot->firstOwnerYaw = state.yaw;
+    slot->hasFirstOwnerPosition = true; slot->nativeRootLastValid = false;
     slot->ownerRate = -1.0F; slot->rateSamplePhase = state.phaseSeconds;
     slot->rateSampleAt = now - state.elapsedMilliseconds; slot->readmits = 0U;
     slot->desired = state; slot->highest = state.transition;
@@ -1491,6 +1552,16 @@ float PlaybackYaw(const std::uintptr_t character, const float ownerYaw) noexcept
     // An interaction bound to a locker handle needs the heading captured at
     // admission, not the moving first-person camera while inside the locker.
     return phase == 1U || phase == 3U ? slot->ownedYaw : ownerYaw;
+}
+MovementPolicy MovementPolicyFor(const std::uintptr_t character) noexcept {
+    const std::lock_guard lock(gMutex);
+    const auto* slot = Find(character);
+    Cycle current{};
+    if (slot == nullptr || !RemoteReady(character) ||
+        !ReadCycle(character, current) || !Owned(current, slot->owned) ||
+        (current.flags & 4U) != 0U) return MovementPolicy::None;
+    return SelectMovementPolicy(true, slot->nativeClip,
+        player_hiding_presentation::ClassifyClip(slot->owned.animation).phase != 0U);
 }
 bool ClipPlaying(const std::uintptr_t character) noexcept {
     return OwnsMovement(character);
@@ -2181,6 +2252,12 @@ void Export(Diagnostics& diagnostics, const std::uintptr_t remoteCharacter) {
          {"completed", Diagnostics::Unsigned(remote.completed), true},
          {"resynced", Diagnostics::Unsigned(remote.resynced), true},
          {"readmitted", Diagnostics::Unsigned(remote.readmitted), true},
+         {"nativeRootSamples", Diagnostics::Unsigned(remote.nativeRootSamples), true},
+         {"nativeRootDistanceMeters", std::to_string(remote.nativeRootDistance), true},
+         {"nativeRootDiscontinuities", Diagnostics::Unsigned(remote.nativeRootDiscontinuities), true},
+         {"nativeOwnerGapMeters", std::to_string(remote.nativeOwnerGap), true},
+         {"nativeOwnerMaxGapMeters", std::to_string(remote.nativeOwnerGapMax), true},
+         {"nativeAnchorDriftMeters", std::to_string(remote.nativeAnchorDrift), true},
          {"endings", endings.str(), false},
          {"cancelled", Diagnostics::Unsigned(remote.cancelled), true},
          {"cancelDeferred", Diagnostics::Unsigned(remote.deferred), true},
