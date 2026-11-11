@@ -261,6 +261,7 @@ struct Actor {
     struct NativeFollow {
         std::uintptr_t object{},control{};
         ULONGLONG createdAt{},stillSince{},retryAt{},divergedSince{},idleYawSince{};
+        float divergedAnchorX{},divergedAnchorZ{};
         std::uint32_t failures{};
         bool stopping{};
     } follow{};
@@ -10308,18 +10309,24 @@ void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uin
     const float dx=target.position[0]-local[0],dz=target.position[2]-local[2];
     const float planar=std::sqrt(dx*dx+dz*dz);
     const float speed=std::hypot(target.velocity[0],target.velocity[2]);
-    // A persistent navigation divergence is NOT permission to teleport the
-    // Alien several metres onto a survivor. Retire the stuck local route and
-    // let retail build a new one from the actor's actual position. The network
-    // pose stays an aim/goal, never an unconditional physical placement.
-    if(planar>3.5F) {
-        if(!f.divergedSince)f.divergedSince=now;
-        else if(now-f.divergedSince>=750U) {
-            ReleaseNativeFollow(actor);
-            f.retryAt=now+250U;
-            f.divergedSince=0U;
-            gFollowDivergenceReplans.fetch_add(1U,std::memory_order_relaxed);
-            return;
+    // Distance alone is not a stuck route: the Host may be several metres
+    // ahead while the local Alien is still walking. Only retire a native
+    // follow that has failed to translate 0.15 m over 750 ms despite that
+    // large error. With no live route, allow creation/retry normally.
+    if(planar>3.5F && f.object) {
+        if(!f.divergedSince) {
+            f.divergedSince=now;
+            f.divergedAnchorX=local[0];f.divergedAnchorZ=local[2];
+        } else if(now-f.divergedSince>=750U) {
+            const float moved=std::hypot(local[0]-f.divergedAnchorX,local[2]-f.divergedAnchorZ);
+            if(moved<0.15F) {
+                ReleaseNativeFollow(actor);
+                f.retryAt=now+250U;
+                gFollowDivergenceReplans.fetch_add(1U,std::memory_order_relaxed);
+                return;
+            }
+            f.divergedSince=now;
+            f.divergedAnchorX=local[0];f.divergedAnchorZ=local[2];
         }
     } else f.divergedSince=0U;
     // Observe the live request: 3 done, 4 failed, 5 removed, 6 released.
