@@ -87,6 +87,8 @@ constexpr float kFollowerHardResyncDistance = 1.50F;
 // AISync can carry faster NPC motion than PlayerSync's human follower. Give
 // native locomotion time to absorb transient drift before an emergency snap.
 constexpr float kAiFollowerMaximumMagnitude = 20.0F;
+// Direct Host-pose locomotion: above the Alien sprint, below noise spikes.
+constexpr float kAiHybridMaximumMagnitude = 10.0F;
 constexpr float kAiFollowerPositionGain = 2.5F;
 constexpr float kAiFollowerMaximumCorrectionSpeed = 4.0F;
 constexpr float kAiFollowerMaximumSettlingMagnitude = 2.5F;
@@ -238,12 +240,12 @@ bool UsesAIHybridReplication(const MovementSlot& slot) noexcept {
         FollowerPolicy::AIHybridNativeOnly;
 }
 
-bool CanForceReplicatedYaw(const MovementSlot& slot) noexcept {
-    // When walking, CATHODE's native stride/turn integrator must own yaw.
-    // Reapplying Host yaw on PRE and POST fights its heading and causes sliding.
-    return !UsesAIHybridReplication(slot) ||
-        (!slot.moveActive.load(std::memory_order_acquire) &&
-         !slot.driveRequested.load(std::memory_order_acquire));
+bool CanForceReplicatedYaw(const MovementSlot&) noexcept {
+    // 511 left yaw to retail while walking: diag 194257 shows the Client Alien
+    // stuck at yaw 0 while the Host turned to -0.27/1.18/-0.94 (retail only
+    // turns while translating fast), so it slid sideways. The interpolated Host
+    // facing is the only authority for direct locomotion.
+    return true;
 }
 
 bool ReplicationLeaseExpired(const MovementSlot& slot) noexcept {
@@ -1635,21 +1637,42 @@ bool BuildFollowerDemand(
     demand.planarError = planarError;
 
     if (demand.inputMoving) {
-        if (slot.aiReplicationProfile.load(std::memory_order_acquire) &&
-            !UsesAIHybridReplication(slot) && hasTarget) {
+        // Remote players too (513 diag 182335): the forward-only human policy
+        // capped catch-up at x1.35, the Host replica trailed its player by
+        // >1.5 m (7 teleports in 30 s) and the Alien killed it 3 m away from
+        // the real player, so the Client's kill slid the Alien 6 m.
+        if (hasTarget) {
             // NPC intent is sampled native displacement, rather than human
             // input. Follow the buffered path with bounded positional feedback
             // in both axes; the human forward-only/lateral-blend policy leaves
             // an NPC behind at corners until its emergency resync fires.
+            // Direct AI locomotion uses it too: with the human policy the 511
+            // Client Alien lagged 1.4 m behind a slow Host walk (speed x1.35
+            // max, retail never translated below ~0.8) and never recovered.
             const auto correctionSpeed = std::min(planarError * kAiFollowerPositionGain,
                 kAiFollowerMaximumCorrectionSpeed);
             const auto correctionScale = planarError > kMoveRequestEpsilon ? correctionSpeed / planarError : 0.0F;
             auto velocityX = inputX + errorX * correctionScale;
             auto velocityZ = inputZ + errorZ * correctionScale;
+            const auto aiFollower = slot.aiReplicationProfile.load(std::memory_order_acquire);
+            if (!aiFollower) {
+                // A human proxy never walks backwards while its player moves:
+                // keep at least a quarter of the input speed along its travel.
+                const auto along = (velocityX * inputX + velocityZ * inputZ) / inputMagnitude;
+                const auto minimumAlong = inputMagnitude * 0.25F;
+                if (along < minimumAlong) {
+                    velocityX += inputX / inputMagnitude * (minimumAlong - along);
+                    velocityZ += inputZ / inputMagnitude * (minimumAlong - along);
+                }
+            }
             const auto magnitude = std::hypot(velocityX, velocityZ);
-            if (magnitude > kAiFollowerMaximumMagnitude) {
-                velocityX *= kAiFollowerMaximumMagnitude / magnitude;
-                velocityZ *= kAiFollowerMaximumMagnitude / magnitude;
+            // A 15 m/s Host sample (511, t=7 s) drove magnitude 20 and the
+            // Client Alien stalled in Move for 0.5 s. Keep demands physical.
+            const auto maximum = UsesAIHybridReplication(slot) ? kAiHybridMaximumMagnitude
+                : aiFollower ? kAiFollowerMaximumMagnitude : kFollowerMaximumMagnitude;
+            if (magnitude > maximum) {
+                velocityX *= maximum / magnitude;
+                velocityZ *= maximum / magnitude;
             }
             demand.drive = magnitude > kMoveRequestEpsilon;
             demand.branch = 5U;

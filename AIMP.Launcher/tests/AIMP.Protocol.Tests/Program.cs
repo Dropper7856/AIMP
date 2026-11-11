@@ -22,6 +22,7 @@ internal static class Program
         new("MissionSync authored completion frontier", MissionFrontierTests.SelectionAsync),
         new("MissionSync survival objective frontiers", MissionFrontierTests.SurvivalAsync),
         new("MissionSync proxied composite milestone frontiers", MissionFrontierTests.ProxyAsync),
+        new("MissionSync survival NPC spawn frontiers", MissionFrontierTests.NpcSpawnAsync),
         new("MissionSync nested mission start frontiers", MissionFrontierTests.MissionStartAsync),
         new("MissionSync generic retail graph coverage", MissionFrontierTests.RetailMissionGraphAsync),
         new("MissionSync canonical native configuration", MissionFrontierTests.BinaryAsync),

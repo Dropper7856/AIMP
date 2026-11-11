@@ -8,7 +8,7 @@ inline constexpr std::uint32_t Valid = 1U;
 inline constexpr std::uint32_t NativeAction = 2U;
 inline constexpr std::uint32_t Discontinuity = 4U;
 inline constexpr std::size_t kHistoryCapacity = 128;
-inline constexpr std::uint64_t kInterpolationDelayMs = 50;
+inline constexpr std::uint64_t kInterpolationDelayMs = 100;
 inline constexpr std::uint64_t kMaxExtrapolationMs = 150;
 inline constexpr std::uint64_t kStaleAfterMs = 600;
 
@@ -40,7 +40,7 @@ public:
     [[nodiscard]] bool Push(const Sample&, std::uint64_t arrivalMs) noexcept;
     // Empty: false, out unchanged. Stale: latest accepted pose, zero velocity;
     // repeated stale queries never extrapolate. NativeAction poses also hold.
-    // Normal motion interpolates with 50ms delay and extrapolates at most 150ms.
+    // Normal motion interpolates with 100ms delay and extrapolates at most 150ms.
     // A Discontinuity pose holds until an ordinary successor starts its segment.
     // The follower must honor stale/nativeAction rather than chase those poses.
     [[nodiscard]] bool SampleAt(std::uint64_t now, Target& out) const noexcept;
