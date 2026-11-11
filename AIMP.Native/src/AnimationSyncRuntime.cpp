@@ -1602,8 +1602,11 @@ MovementPolicy MovementPolicyFor(const std::uintptr_t character) noexcept {
     if (slot == nullptr || !RemoteReady(character) ||
         !ReadCycle(character, current) || !Owned(current, slot->owned))
         return MovementPolicy::None;
+    // enter_vent is the sole native clip known to lose physical convergence
+    // around 1.41 seconds: retain its animation and correct the render root.
     return SelectMovementPolicy(true, slot->nativeClip,
-        player_hiding_presentation::ClassifyClip(slot->owned.animation).phase != 0U);
+        player_hiding_presentation::ClassifyClip(slot->owned.animation).phase != 0U,
+        slot->nativeClip && slot->owned.animation == 256590389U);
 }
 bool ClipPlaying(const std::uintptr_t character) noexcept {
     return OwnsMovement(character);
@@ -2353,6 +2356,14 @@ void Export(Diagnostics& diagnostics, const std::uintptr_t remoteCharacter) {
          {"poseTrack", Diagnostics::Unsigned(share.track), true},
          {"poseLifted", Diagnostics::Unsigned(share.lifted), true},
          {"maskNoBase", Diagnostics::Unsigned(remote.maskNoBase), true}});
+    const auto vent = character_direct_step_runtime::VentVisualSnapshot();
+    diagnostics.Log("info", "native_animation_vent_visual",
+        "Native vent body follows owner visually; Character retains retail collision.",
+        {{"frames", Diagnostics::Unsigned(vent.frames), true},
+         {"rejected", Diagnostics::Unsigned(vent.rejected), true},
+         {"relocations", Diagnostics::Unsigned(vent.relocations), true},
+         {"relocationFailures", Diagnostics::Unsigned(vent.relocationFailures), true},
+         {"maxOffsetMillimeters", Diagnostics::Unsigned(vent.maxOffsetMm), true}});
     decltype(gOwnerCycles) cycles{};
     decltype(gOwnerAliases) aliases{};
     { const std::lock_guard lock(gLocalMutex); cycles = gOwnerCycles; aliases = gOwnerAliases; }

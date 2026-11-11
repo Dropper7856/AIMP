@@ -3,20 +3,23 @@
 
 namespace aimp::animation_sync {
 
-// The observer's Character owns one scripted playback at a time. Native
-// full-body clips keep the retail translation/rotation; only FP fallback
-// clips chase the player's replicated Character path. Locker clips have an
-// independent render-only path and never physically chase the owner.
+// Ordinary full-body clips retain native Character translation, FP fallbacks
+// follow the player's network path and lockers retain their own visual path.
+// Vent entry is special: the remote physical Character can be moved back by
+// retail collision, while the owner is already traversing the vent.
 enum class MovementPolicy : std::uint8_t {
     None = 0U,
     NativeRoot = 1U,
     FirstPersonPath = 2U,
     LockerVisual = 3U,
+    NativeVentVisual = 4U,
 };
 [[nodiscard]] constexpr MovementPolicy SelectMovementPolicy(
-    const bool ownsCycle, const bool nativeClip, const bool lockerClip) noexcept {
+    const bool ownsCycle, const bool nativeClip, const bool lockerClip,
+    const bool nativeVentEntry = false) noexcept {
     if (!ownsCycle) return MovementPolicy::None;
     if (lockerClip) return MovementPolicy::LockerVisual;
+    if (nativeClip && nativeVentEntry) return MovementPolicy::NativeVentVisual;
     return nativeClip ? MovementPolicy::NativeRoot : MovementPolicy::FirstPersonPath;
 }
 [[nodiscard]] constexpr bool FollowNetworkPath(const MovementPolicy policy) noexcept {

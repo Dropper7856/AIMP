@@ -1,4 +1,4 @@
-# AnimationSync native root-motion isolation (533)
+# AnimationSync native root-motion isolation (534)
 
 Status: experimental; requires **two live game instances** to verify visual
 alignment. This change is deliberately scoped to AnimationSync's own scripted
@@ -114,3 +114,40 @@ completion, repair the player follower reacquisition separately.
 Do not assume an animation must be corrected by new teleporting while the
 native world-space direction and the rendered skeleton path remain
 unmeasured.
+
+## 534 — Vent-only visual root compensation
+
+The two November 11, 2026 diagnostics confirm that the native `enter_vent`
+clip runs successfully. Its remote Character's native world movement agrees
+with the owner's rising/forward motion until around phase 1.26 seconds, then
+the Character abruptly drops approximately 0.47 metres at phase 1.41 and
+stops moving into the vent. The owner continues forward from Z=-19.14 to
+approximately Z=-21.28. The headings at +3.14/-3.14 are equivalent, not
+a confirmed reversed yaw. Ten hard-resync applications preceded the vent
+entry and therefore do not explain the in-clip collision/drop.
+
+Only native `enter_vent` (hash 256590389) receives the new policy
+`NativeVentVisual`. The retail native NPC animation and physical Character
+are retained, but a render-only root translation is applied to the
+high-resolution final pose using the latest owner network position and the
+existing locker visual offset mechanism. Physics is not teleported every
+frame. A network gap beyond 3m rejects the correction rather than creating
+a massive visible jump.
+
+When this specifically owned clip ends, one physical relocation to the last
+visual world location is attempted, then the offset is released, and ordinary
+PlayerSync resumes. Because the remote NPC is not necessarily inside the
+owner's vent traversal state, physics may still reject this relocation in the
+next retail update: this behavior is explicitly experimental.
+
+Diagnostics event `native_animation_vent_visual` reports: `frames`,
+`rejected`, `relocations`, `relocationFailures`, and
+`maxOffsetMillimeters`. All other NPC native animations remain on the 533
+NativeRoot policy, FP-replayed fallback clips retain FirstPersonPath, and
+lockers retain LockerVisual.
+
+Minimum test: reproduce two vent entries in ChallengeMap16, record a video,
+and capture both 534 diagnostics. Verify whether the *rendered body* moves
+through the vent despite the physical Character dropping near 1.41 seconds,
+and whether the end-of-clip relocation visibly snaps or is undone by physics.
+This is not proven correct without the game.

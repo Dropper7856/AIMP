@@ -2723,6 +2723,12 @@ struct HidingVisual final {
 };
 std::array<HidingVisual, 40> gHidingVisuals{};
 std::atomic<std::uintptr_t> gHidingVisualLast{};
+// Physical vent traversal is not replicated to the NPC. Correct its rendered
+// root only while the native body clip plays; avoid per-frame teleports.
+std::array<HidingVisual, 40> gVentVisuals{};
+std::atomic<std::uint64_t> gVentVisualFrames{}, gVentVisualRejected{};
+std::atomic<std::uint64_t> gVentVisualRelocations{}, gVentVisualRelocationFailures{};
+std::atomic<std::uint32_t> gVentVisualMaxOffsetMm{};
 HidingVisual* FindHidingVisual(const std::uintptr_t characterAddress, const bool create) noexcept {
     for (auto& visual : gHidingVisuals) if (visual.character == characterAddress) return &visual;
     if (!create) return nullptr;
@@ -2749,6 +2755,57 @@ void ShowHidingPath(const std::uintptr_t characterAddress) noexcept {
     gHidingVisualLast.store(characterAddress);
     if (animation_sync::SetVisualOffset(characterAddress, true, offset, turn))
         gHidingEntryApproachFrames.fetch_add(1U, std::memory_order_relaxed);
+}
+HidingVisual* FindVentVisual(const std::uintptr_t character, const bool create) noexcept {
+    for (auto& v : gVentVisuals) if (v.character == character) return &v;
+    if (!create) return nullptr;
+    for (auto& v : gVentVisuals)
+        if (v.character == 0U) { v = {}; v.character = character; return &v; }
+    return nullptr;
+}
+void ShowVentVisualPath(MovementSlot& slot, const std::uintptr_t character) noexcept {
+    float tx{}, ty{}, tz{}, x{}, y{}, z{}, yaw{};
+    if (!LoadNetworkTarget(slot, tx, ty, tz) ||
+        !ReadTransform(character, x, y, z) ||
+        !ReadReplicatedYaw(character, yaw)) {
+        gVentVisualRejected.fetch_add(1U, std::memory_order_relaxed); return;
+    }
+    const float wx = tx-x, wy = ty-y, wz = tz-z;
+    const float gap = std::sqrt(wx*wx + wy*wy + wz*wz);
+    if (!std::isfinite(gap) || gap > kHidingFollowMaximumGap) {
+        gVentVisualRejected.fetch_add(1U, std::memory_order_relaxed); return;
+    }
+    auto* visual = FindVentVisual(character, true);
+    if (visual == nullptr) {
+        gVentVisualRejected.fetch_add(1U, std::memory_order_relaxed); return;
+    }
+    // Reuse the already verified locker world-to-model convention.
+    const auto c = std::cos(yaw), s = std::sin(yaw);
+    const std::array<float,3> offset{wx*c-wz*s, wy, wz*c+wx*s};
+    const float ownerYaw = slot.hasReplicatedYaw.load(std::memory_order_acquire)
+        ? LoadFloat(slot.replicatedYawBits) : yaw;
+    const float turn = static_cast<float>(std::remainder(ownerYaw-yaw, 6.28318530717958647692F));
+    if (!animation_sync::SetVisualOffset(character, true, offset, turn)) {
+        gVentVisualRejected.fetch_add(1U, std::memory_order_relaxed); return;
+    }
+    visual->last = {tx,ty,tz}; visual->lastYaw = ownerYaw;
+    gVentVisualFrames.fetch_add(1U, std::memory_order_relaxed);
+    const auto mm = static_cast<std::uint32_t>(gap * 1000.0F);
+    auto previous = gVentVisualMaxOffsetMm.load(std::memory_order_relaxed);
+    while (mm > previous && !gVentVisualMaxOffsetMm.compare_exchange_weak(
+        previous, mm, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+}
+void FinishVentVisualPath(const std::uintptr_t character) noexcept {
+    auto* visual = FindVentVisual(character, false);
+    if (visual == nullptr) return;
+    // One endpoint placement after native cycle ownership ends. Its physics
+    // outcome remains experimental and is tracked separately.
+    if (ApplyAIRecoveryTransform(character, visual->last.data(), visual->lastYaw))
+        gVentVisualRelocations.fetch_add(1U, std::memory_order_relaxed);
+    else
+        gVentVisualRelocationFailures.fetch_add(1U, std::memory_order_relaxed);
+    static_cast<void>(animation_sync::SetVisualOffset(character, false, {}, 0.0F));
+    *visual = {};
 }
 // The locker sequence is over: put the entity where the body is shown (the
 // owner's real position once out of the prop), then drop the offset.
@@ -2786,7 +2843,12 @@ void PumpSlotOnEngineThread(
     // their own engine root motion and MUST NOT also chase the FP network
     // path. The FP fallback still follows the network; hiding remains visual.
     const auto clipPolicy = animation_sync::MovementPolicyFor(characterAddress);
-    if (clipPolicy == animation_sync::MovementPolicy::NativeRoot) {
+    if (clipPolicy != animation_sync::MovementPolicy::NativeVentVisual)
+        FinishVentVisualPath(characterAddress);
+    else if (phase == EnginePumpPhase::PostCharacterManager)
+        ShowVentVisualPath(slot, characterAddress);
+    if (clipPolicy == animation_sync::MovementPolicy::NativeRoot ||
+        clipPolicy == animation_sync::MovementPolicy::NativeVentVisual) {
         slot.nativeAnimationOwned.store(true, std::memory_order_release);
     } else if (slot.nativeAnimationOwned.exchange(false, std::memory_order_acq_rel)) {
         slot.nativeAnimationReleasedAt.store(GetTickCount64(), std::memory_order_release);
@@ -2799,7 +2861,8 @@ void PumpSlotOnEngineThread(
         // anchor. A pending initial-placement teleport would snap it after
         // the clip ends; natural locomotion must reacquire from its final pose.
         slot.initialPlacementPending.store(
-            clipPolicy != animation_sync::MovementPolicy::NativeRoot,
+            clipPolicy != animation_sync::MovementPolicy::NativeRoot &&
+                clipPolicy != animation_sync::MovementPolicy::NativeVentVisual,
             std::memory_order_release);
         slot.nativeStateActive.store(false, std::memory_order_release);
         slot.moveActive.store(false, std::memory_order_release);
@@ -3548,6 +3611,13 @@ bool Install(
 
 bool Installed() noexcept {
     return gInstalled.load(std::memory_order_acquire);
+}
+VentVisualStats VentVisualSnapshot() noexcept {
+    return {gVentVisualFrames.load(std::memory_order_relaxed),
+        gVentVisualRejected.load(std::memory_order_relaxed),
+        gVentVisualRelocations.load(std::memory_order_relaxed),
+        gVentVisualRelocationFailures.load(std::memory_order_relaxed),
+        gVentVisualMaxOffsetMm.load(std::memory_order_relaxed)};
 }
 
 void SetNativeAIIntentObserver(const NativeAIIntentObserver observer) noexcept {
