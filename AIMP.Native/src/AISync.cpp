@@ -10230,7 +10230,7 @@ void PumpHostImpacts() noexcept {
 // moves its goal every frame; retail replans or edits the terminal in place.
 // A Host stop becomes a final goal: retail brakes and plays its own stop.
 std::atomic<std::uint64_t> gFollowCreated{},gFollowCreateFailures{},gFollowCompleted{},gFollowCancelled{},
-    gFollowEmergencies{},gFollowIdleTurns{};
+    gFollowEmergencies{},gFollowIdleTurns{},gFollowDivergenceReplans{},gSpectateFallbackCandidates{};
 struct FollowRef {std::uintptr_t object,control;};
 bool FollowNativeCreate(std::uintptr_t character,const float* goal,FollowRef& out) noexcept {
     out={};
@@ -10308,15 +10308,18 @@ void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uin
     const float dx=target.position[0]-local[0],dz=target.position[2]-local[2];
     const float planar=std::sqrt(dx*dx+dz*dz);
     const float speed=std::hypot(target.velocity[0],target.velocity[2]);
-    // Last resort only: sustained multi-metre divergence (blocked path, etc.).
+    // A persistent navigation divergence is NOT permission to teleport the
+    // Alien several metres onto a survivor. Retire the stuck local route and
+    // let retail build a new one from the actor's actual position. The network
+    // pose stays an aim/goal, never an unconditional physical placement.
     if(planar>3.5F) {
         if(!f.divergedSince)f.divergedSince=now;
         else if(now-f.divergedSince>=750U) {
             ReleaseNativeFollow(actor);
-            const float pose[3]{target.position[0],target.position[1],target.position[2]};
-            if(character_direct_step_runtime::ApplyAIRecoveryTransform(actor.character,pose,target.yaw))
-                gFollowEmergencies.fetch_add(1U,std::memory_order_relaxed);
-            f.divergedSince=0U;return;
+            f.retryAt=now+250U;
+            f.divergedSince=0U;
+            gFollowDivergenceReplans.fetch_add(1U,std::memory_order_relaxed);
+            return;
         }
     } else f.divergedSince=0U;
     // Observe the live request: 3 done, 4 failed, 5 removed, 6 released.
@@ -10390,7 +10393,19 @@ static void PumpPlayerSpectate(const std::uint32_t generation, const bool camera
             const auto peer = gCurrent.participants[i].peer;
             if (peer == 0U || peer == gCurrent.localPeer || peer == alienOwner) continue;
             const auto character = ParticipantForPeer(peer);
-            if (LivingCharacter(character)) candidates[count++] = {peer, character};
+            if (LivingCharacter(character)) {
+                candidates[count++] = {peer, character};
+            } else if (character != 0U && RegisteredPlayerRepresentation(character)) {
+                // A replicated player may temporarily have its activation
+                // flag cleared while its HP and native lifetime remain valid.
+                // Do not discard the only living spectate target on that flag
+                // alone; ParticipantForPeer already certified the incarnation.
+                std::uint16_t hp{};std::uint32_t health{};
+                if(Read(character+0x33CU,hp)&&hp!=0U&&Read(character+0x32CU,health)&&health<3U) {
+                    candidates[count++] = {peer, character};
+                    gSpectateFallbackCandidates.fetch_add(1U,std::memory_order_relaxed);
+                }
+            }
         }
         std::sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(count),
             [](const auto& a, const auto& b) { return a.peer < b.peer; });
@@ -10827,9 +10842,10 @@ bool FollowHostActionPose(Actor& actor) noexcept {
     const float distance=std::sqrt(dx*dx+dy*dy+dz*dz);
     // Generic actions keep their native root motion inside 0.25 m.
     if(!std::isfinite(distance)||distance<(action?0.25F:0.03F))return true;
-    // Visible clips: at most 0.15 m/frame (~9 m/s). Inside a passage the body
-    // is in the vent: track closely, and jump straight to a far Host pose.
-    const float cap=passage?(distance>3.0F?distance:0.35F):(action?0.10F:0.15F);
+    // Never jump the physics body over several metres in a single frame,
+    // even inside a vent. A delayed passage must approach at bounded steps;
+    // the old uncapped jump could materialize the Alien on a living survivor.
+    const float cap=passage?0.35F:(action?0.10F:0.15F);
     const float scale=std::min(1.0F,cap/distance);
     const float pose[3]{local[0]+dx*scale,local[1]+dy*scale,local[2]+dz*scale};
     if(character_direct_step_runtime::ApplyAIRecoveryTransform(actor.character,pose,target.yaw))
@@ -12178,6 +12194,8 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"nativeFollowCompleted", Diagnostics::Unsigned(gFollowCompleted.load()), true},
          {"nativeFollowCancelled", Diagnostics::Unsigned(gFollowCancelled.load()), true},
          {"nativeFollowEmergencies", Diagnostics::Unsigned(gFollowEmergencies.load()), true},
+         {"nativeFollowDivergenceReplans", Diagnostics::Unsigned(gFollowDivergenceReplans.load()), true},
+         {"spectateFallbackCandidates", Diagnostics::Unsigned(gSpectateFallbackCandidates.load()), true},
          {"nativeFollowIdleTurns", Diagnostics::Unsigned(gFollowIdleTurns.load()), true},
          {"directPoseEmergencyCorrections", Diagnostics::Unsigned(gDirectPoseEmergencyCorrections.load()), true},
          {"clientCycleCallsReplayFailed", Diagnostics::Unsigned(gCycleCallsReplayFailed.load()), true},

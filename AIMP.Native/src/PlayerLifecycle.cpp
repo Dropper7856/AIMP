@@ -50,6 +50,8 @@ std::atomic<std::uint64_t> gSpectateTarget{0};
 std::atomic<std::uint32_t> gSpectateCandidates{0};
 std::atomic<std::uint64_t> gSpectateChanges{0}, gSpectateChangesDrained{0};
 std::atomic<std::uint64_t> gSpectateBindFailures{0}, gSpectateBindFailuresDrained{0};
+std::atomic<std::uint64_t> gSpectateNoCandidates{0}, gSpectateNoCandidatesDrained{0};
+std::atomic<std::uint64_t> gSpectateCameraAttempts{0}, gSpectateCameraAttemptsDrained{0};
 // Living participants that can be watched, refreshed every engine pump, dead or alive.
 std::atomic<std::uint32_t> gSpectateLivingTeammates{0};
 std::atomic<std::uint64_t> gDeathFadeSuppressed{0}, gDeathFadeSuppressedDrained{0};
@@ -503,7 +505,9 @@ void PumpSpectateOnEngineThread(const SpectateContext& context) noexcept {
     const auto next = step != 0 ? spectate::Cycle(s.target, peers.data(), count, step)
                                 : spectate::KeepOrNext(s.target, peers.data(), count);
     if (next == 0U) {
-        // Nobody left alive: hold the last view (the round is about to end).
+        // A dead player without a certified camera target previously failed
+        // silently, leaving the game on its retail black death screen.
+        gSpectateNoCandidates.fetch_add(1U, std::memory_order_relaxed);
         PublishSpectate(s.target, 0U);
         return;
     }
@@ -516,6 +520,7 @@ void PumpSpectateOnEngineThread(const SpectateContext& context) noexcept {
         const bool owned = !changed && s.camera.saved &&
             ReadAt(s.camera.manager + 0x1D8U, active) && active == s.camera.follow;
         if (!owned) {
+            gSpectateCameraAttempts.fetch_add(1U, std::memory_order_relaxed);
             if (BindSpectateCamera(context.moduleBase, s.camera) &&
                 ActivateFollowOn(context.moduleBase, s.camera, character, true)) {
                 s.target = next;
@@ -687,6 +692,22 @@ void DrainDiagnostics(Diagnostics& diagnostics) {
         diagnostics.Log("info", "playerlifecycle_death_presentation_suppressed",
             "[PlayerLifecycle] death fade/DOF suppressed so the spectate view stays visible",
             {{"suppressed", Diagnostics::Unsigned(fades), true}});
+    }
+    const auto noCandidates = gSpectateNoCandidates.load(std::memory_order_relaxed);
+    if (noCandidates != gSpectateNoCandidatesDrained.exchange(noCandidates, std::memory_order_relaxed)) {
+        diagnostics.Log("warning", "playerlifecycle_spectate_no_candidate",
+            "[PlayerLifecycle] dead player has no qualified living spectator target; camera remains unbound.",
+            {{"frames", Diagnostics::Unsigned(noCandidates), true},
+             {"cameraAttempts", Diagnostics::Unsigned(gSpectateCameraAttempts.load(std::memory_order_relaxed)), true}});
+    }
+    const auto attempts = gSpectateCameraAttempts.load(std::memory_order_relaxed);
+    if (attempts != gSpectateCameraAttemptsDrained.exchange(attempts, std::memory_order_relaxed)) {
+        const auto state = SpectateSnapshot();
+        diagnostics.Log("info", "playerlifecycle_spectate_camera_attempts",
+            "[PlayerLifecycle] spectate camera binding attempts and current state.",
+            {{"attempts", Diagnostics::Unsigned(attempts), true},
+             {"targetPeer", Diagnostics::Unsigned(state.targetPeer), true},
+             {"candidates", Diagnostics::Unsigned(state.candidates), true}});
     }
     const auto bindFailures = gSpectateBindFailures.load(std::memory_order_relaxed);
     if (bindFailures != gSpectateBindFailuresDrained.exchange(bindFailures, std::memory_order_relaxed)) {
