@@ -71,6 +71,7 @@ struct RemoteDiagnostics final {
     std::uint64_t applied{}, failed{}, stale{}, unavailable{}, interrupted{}, completed{}, cancelled{}, deferred{};
     std::uint64_t transition{};
     std::uint32_t animation{}, resource{}, clipPath{};
+    const char* clipSource{"none"};
     const char* stage{"pending"};
     // Owner clock following: seeks back onto the owner's phase, and replays
     // restarted because ours ended while the owner's same clip still ran.
@@ -96,6 +97,7 @@ struct Slot final {
     // The alias our replay of desired plays: the player's exact clip
     // (ReplayAlias) when the representation's database has it, else desired's.
     std::uint32_t play{};
+    bool nativeClip{}; // Distinct original, full-body NPC animation.
     // Crew bones the owned clip drives; the others keep the last idle pose.
     bool maskActive{};
     std::bitset<256> crewDriven{}, crewDisplaced{};
@@ -840,11 +842,21 @@ void Readmit(Slot& slot, const bool following, const std::uint64_t now) noexcept
     if (!following || slot.readmits >= 4U || !OwnerPhase(slot, now, phase, remaining) || remaining < 0.5F) return;
     ++slot.readmits; ++slot.diagnostics.readmitted; slot.handled = 0U;
 }
+// A full-body NPC animation may differ in duration/trim from the FP action.
+float TargetClipPhase(const Slot& slot, const float ownerPhase, const float npcDuration) noexcept {
+    if (!slot.nativeClip || !(npcDuration > 0.0F) || !std::isfinite(npcDuration) ||
+        !std::isfinite(ownerPhase)) return ownerPhase;
+    float first{}, last{};
+    Segment(slot.desired, first, last);
+    if (!(last > first)) return 0.0F;
+    return (std::clamp)((ownerPhase - first) / (last - first), 0.0F, 1.0F) * npcDuration;
+}
 // Keep our clip on the owner's clock: holds, slow stages and drift.
 void FollowOwnerClock(Slot& slot, const Cycle& current, const std::uint64_t now) noexcept {
     if (current.graph == 0U || now - slot.startedAt < 400U || now - slot.resyncAt < 250U) return;
     float ours{}, duration{}, target{}, remaining{};
     if (!timeline::Read(current.graph, ours, duration) || !OwnerPhase(slot, now, target, remaining)) return;
+    target = TargetClipPhase(slot, target, duration);
     float difference = std::abs(ours - target);
     if (slot.desired.loops != 1) {
         float start{}, end{};
@@ -932,14 +944,22 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
     if (!Owned(current, slot.owned) && current.state != 1U && current.state != 3U && current.state != 0x38U) {
         ++d.deferred; d.stage = "cycle-busy"; return;
     }
-    // The owner's exact clip: a crew database may hold its own, different clip
-    // under the player's alias; the PAK patch adds the player's under ReplayAlias.
-    slot.play = slot.desired.animation;
-    if (hidingPhase == 0U && LocalClip(slot.character, ReplayAlias(slot.desired.animation), d.resource, d.clipPath))
-        slot.play = ReplayAlias(slot.desired.animation);
-    if (!LocalClip(slot.character, slot.play, d.resource, d.clipPath)) {
+    // Use native third-person actions when their clip differs from the FP
+    // alias. The Launcher retains the retail base alias and adds its FP
+    // counterpart under ReplayAlias for actions missing a body clip.
+    std::uint32_t npcResource{}, npcPath{}, fpResource{}, fpPath{};
+    const bool hasNpc = LocalClip(slot.character, slot.desired.animation, npcResource, npcPath);
+    const bool hasFp = hidingPhase == 0U &&
+        LocalClip(slot.character, ReplayAlias(slot.desired.animation), fpResource, fpPath);
+    if (!hasNpc && !hasFp) {
         slot.handled = slot.desired.transition; ++d.unavailable; d.stage = "clip-unavailable"; return;
     }
+    // Locker aliases are injected FP fallbacks, never original NPC clips.
+    slot.nativeClip = hidingPhase == 0U && hasNpc && (!hasFp || npcPath != fpPath);
+    slot.play = hasFp && !slot.nativeClip ? ReplayAlias(slot.desired.animation) : slot.desired.animation;
+    d.resource = hasFp && !slot.nativeClip ? fpResource : npcResource;
+    d.clipPath = hasFp && !slot.nativeClip ? fpPath : npcPath;
+    d.clipSource = slot.nativeClip ? "npc-native" : "fp-retargeted";
     if (slot.holstered < 0 && slot.holsterStarted == 0U && !Unarmed(slot.character)) {
         std::int32_t holstered{-1};
         if (EquipmentTransition(slot.character, false, holstered)) {
@@ -960,7 +980,12 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
     slot.maskActive = false;
     slot.crewPose.fill(-1);
     d.maskTarget = d.maskCrewBones = d.maskCrewDriven = 0U;
-    if (const auto* mask = FindMask(d.clipPath)) {
+    if (slot.nativeClip) {
+        // The game's own full-body skeleton and root motion must not be
+        // overwritten by first-person bone masks, IK and floor correction.
+        d.maskStatus = 0xFFFFFFFDU;
+        d.maskSkeleton = d.maskTracks = d.maskMoving = d.maskHeld = 0U;
+    } else if (const auto* mask = FindMask(d.clipPath)) {
         d.maskStatus = mask->status; d.maskSkeleton = mask->skeleton; d.maskTracks = mask->tracks;
         d.maskMoving = mask->moving; d.maskHeld = mask->held;
         std::uint32_t lowBones{}, highBones{};
@@ -1003,9 +1028,11 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
     // owner's recorded path at this clip's own time, so lateness costs nothing.
     auto projectedAge = age;
     if (hidingPhase == 1U || hidingPhase == 3U) { playback.phaseSeconds = 0.0F; projectedAge = 0U; }
-    if (!timeline::Project(playback, projectedAge, phase, playback.loops)) {
+    if (!timeline::Project(slot.desired, projectedAge, phase, playback.loops)) {
         slot.handled = slot.desired.transition; ++d.stale; d.stage = "finished-before-admission"; return;
     }
+    // FP trim frames do not correspond to an NPC animation's native frames.
+    if (slot.nativeClip) playback.startFrame = playback.endFrame = -1;
     if (!BuildIntent(playback, d.resource, intent)) {
         slot.handled = slot.desired.transition; ++d.failed; d.stage = "parameters"; return;
     }
@@ -1066,6 +1093,9 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
     // Project the owner's live native clock through local IPC/network/stream
     // waiting time. Seek keeps the original trim interval for future repeats;
     // shifting startFrame would incorrectly shorten every subsequent loop.
+    float nativeNow{}, nativeDuration{};
+    if (slot.nativeClip && timeline::Read(current.graph, nativeNow, nativeDuration))
+        phase = TargetClipPhase(slot, phase, nativeDuration);
     if (!timeline::Seek(current.graph, phase)) {
         if (Cancel(slot.character, slot.owned)) slot.owned = {};
         ++d.failed; d.stage = "phase-seek"; return;
@@ -1095,7 +1125,7 @@ bool PumpOne(const std::uintptr_t character) noexcept {
     slot->owned = copy.owned; slot->startedAt = copy.startedAt; slot->ownedLoops = copy.ownedLoops;
     slot->holstered = copy.holstered;
     slot->maskActive = copy.maskActive; slot->crewDriven = copy.crewDriven; slot->crewDisplaced = copy.crewDisplaced;
-    slot->crewPose = copy.crewPose; slot->play = copy.play;
+    slot->crewPose = copy.crewPose; slot->play = copy.play; slot->nativeClip = copy.nativeClip;
     slot->holsterStarted = copy.holsterStarted; slot->unarmedAt = copy.unarmedAt; slot->holsterWait = copy.holsterWait;
     slot->heightOffset = copy.heightOffset; slot->ownerStartY = copy.ownerStartY;
     slot->ownedYaw = copy.ownedYaw;
@@ -2156,6 +2186,7 @@ void Export(Diagnostics& diagnostics, const std::uintptr_t remoteCharacter) {
          {"animation", Diagnostics::Unsigned(remote.animation), true},
          {"resource", Diagnostics::Unsigned(remote.resource), true},
          {"clipPath", Diagnostics::Unsigned(remote.clipPath), true},
+         {"clipSource", remote.clipSource, false},
          {"playing", Diagnostics::Boolean(playing), true},
          {"applied", Diagnostics::Unsigned(remote.applied), true},
          {"failed", Diagnostics::Unsigned(remote.failed), true},
