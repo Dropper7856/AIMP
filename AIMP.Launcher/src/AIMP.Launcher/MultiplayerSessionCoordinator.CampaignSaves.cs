@@ -55,7 +55,7 @@ internal sealed partial class MultiplayerSessionCoordinator
     private (ScaleformBridgeMessage Selection, CampaignLaunchDescriptor? Campaign, byte[]? Bundle)
         ResolveCampaignLobby(ScaleformBridgeMessage message)
     {
-        if (!message.Get("mode", "survival").Equals("campaign", StringComparison.OrdinalIgnoreCase))
+        if (!ReadLobbyMode(message).Equals("campaign", StringComparison.OrdinalIgnoreCase))
             return (message, null, null);
         var difficulty = message.Get("campaignDifficulty", "medium").ToLowerInvariant();
         if (!CampaignDifficulties.Contains(difficulty)) throw new InvalidOperationException("Invalid campaign difficulty.");
