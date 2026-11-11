@@ -58,8 +58,16 @@ bool InstallMaskHook(HookManager& hooks, std::uintptr_t moduleBase, std::string&
 // own model space (Y up, heading 0 = +Z): the final pose's skeleton roots are
 // turned by `yaw` about the Character origin, then moved by `offset`. The
 // Character entity, its physics and AI position stay where retail keeps them.
-bool SetVisualOffset(std::uintptr_t character, bool active, const std::array<float, 3>& offset, float yaw) noexcept;
+// stableRoot=true (native vent only) uses the rig's idle root translation as
+// its visual anchor instead of adding owner motion to a moving native root.
+bool SetVisualOffset(std::uintptr_t character, bool active, const std::array<float, 3>& offset,
+    float yaw, bool stableRoot = false) noexcept;
 [[nodiscard]] std::uint64_t VisualOffsetFrames(std::uintptr_t character) noexcept;
+struct VisualRootStats final {
+    std::uint64_t renderedFrames{}, stableFrames{}, idleReferences{}, liveReferences{};
+    float maxSuppressedRootDeltaY{};
+};
+[[nodiscard]] VisualRootStats VisualRootSnapshot(std::uintptr_t character) noexcept;
 // Native clock of an owned locker entry clip, 0..1. Engine thread only.
 [[nodiscard]] bool HidingEntryProgress(std::uintptr_t character, float& progress) noexcept;
 // One of our locker entry/idle/exit clips is the current cycle.

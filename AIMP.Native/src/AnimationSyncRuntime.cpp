@@ -1,5 +1,6 @@
 #include "aimp/AnimationSyncRuntime.h"
 #include "aimp/AnimationSyncTimeline.h"
+#include "aimp/AnimationSyncVisualRoot.h"
 #include "aimp/AnimationSyncPropsRuntime.h"
 #include "aimp/AISyncNativeIntent.h"
 #include "aimp/CharacterDirectStepRuntime.h"
@@ -684,6 +685,13 @@ struct MaskShare final {
     std::atomic<bool> offsetActive{};
     std::array<float, 4> offset{};
     std::atomic<std::uint64_t> offsetFrames{};
+    // Only native vent entry uses a stable visual root. The body clip keeps
+    // its limb rotations and local animation; its moving root translation
+    // must not be added to the replicated owner trajectory a second time.
+    bool stableRoot{}, rootReferenceReady{};
+    std::array<std::array<float, 3>, kMaskBones> rootReference{};
+    std::uint64_t stableFrames{}, idleReferences{}, liveReferences{};
+    float maxSuppressedRootDeltaY{};
     std::atomic<std::uint64_t> applied{}, captured{};
     std::atomic<std::uint32_t> restored{};
     // Posture rebuild: the owner's body effectors keyed by its clip time for
@@ -750,6 +758,9 @@ void PublishMaskState(const Slot& slot, MaskShare& share, const bool starting = 
         share.baseBones.store(0U);
         share.applied.store(0U); share.captured.store(0U); share.restored.store(0U);
         share.offsetActive.store(false); share.parentCount = 0U;
+        share.stableRoot = false; share.rootReferenceReady = false;
+        share.stableFrames = share.idleReferences = share.liveReferences = 0U;
+        share.maxSuppressedRootDeltaY = 0.0F;
         share.track.transition = 0U; share.track.count = 0U; share.playing = 0U;
         share.binding = slot.binding;
         share.controller.store(controller);
@@ -1624,7 +1635,7 @@ bool HidingEntryPlaying(const std::uintptr_t character) noexcept {
     return HidingClipPlaying(character, 1U);
 }
 bool SetVisualOffset(const std::uintptr_t character, const bool active,
-    const std::array<float, 3>& offset, const float yaw) noexcept {
+    const std::array<float, 3>& offset, const float yaw, const bool stableRoot) noexcept {
     std::size_t index{};
     {
         const std::lock_guard lock(gMutex);
@@ -1636,15 +1647,39 @@ bool SetVisualOffset(const std::uintptr_t character, const bool active,
     const std::lock_guard lock(share.mutex);
     const auto controller = character + 0x3F0U;
     if (share.controller.load() != controller) return false;
-    if (!active) { share.offsetActive.store(false, std::memory_order_release); return true; }
+    if (!active) {
+        share.offsetActive.store(false, std::memory_order_release);
+        share.stableRoot = false; share.rootReferenceReady = false;
+        return true;
+    }
     if (!gMaskHook.load(std::memory_order_acquire)) return false;
     std::uint32_t bones{};
     if (share.parentCount == 0U || !LayerBones(character, 7U, bones) || bones != share.parentCount)
         ReadParents(controller, share);
     if (share.parentCount == 0U) return false;
+    // The same transition refreshes this offset every frame. Preserve its
+    // stable baseline until the visual episode ends or changes policy.
+    if (share.stableRoot != stableRoot ||
+        !share.offsetActive.load(std::memory_order_acquire))
+        share.rootReferenceReady = false;
+    share.stableRoot = stableRoot;
     share.offset = {offset[0], offset[1], offset[2], yaw};
     share.offsetActive.store(true, std::memory_order_release);
     return true;
+}
+VisualRootStats VisualRootSnapshot(const std::uintptr_t character) noexcept {
+    std::size_t index{};
+    {
+        const std::lock_guard lock(gMutex);
+        const auto* slot = Find(character);
+        if (slot == nullptr) return {};
+        index = static_cast<std::size_t>(slot - gSlots.data());
+    }
+    auto& share = gMaskShares[index];
+    const std::lock_guard lock(share.mutex);
+    return {share.offsetFrames.load(std::memory_order_relaxed),
+        share.stableFrames, share.idleReferences, share.liveReferences,
+        share.maxSuppressedRootDeltaY};
 }
 std::uint64_t VisualOffsetFrames(const std::uintptr_t character) noexcept {
     std::size_t index{};
@@ -2165,14 +2200,34 @@ void ApplyVisualOffset(MaskShare& share, void* pose, const std::uint32_t bones) 
     const auto transforms = LocalPoseTransforms(pose, true);
     if (transforms < 0x10000U) return;
     const auto [ox, oy, oz, yaw] = share.offset;
-    const auto c = std::cos(yaw), s = std::sin(yaw);
+    const std::array<float, 3> localOffset{ox, oy, oz};
     const std::array<float, 4> turn{0.0F, std::sin(yaw * 0.5F), 0.0F, std::cos(yaw * 0.5F)};
+    const bool firstStableFrame = share.stableRoot && !share.rootReferenceReady;
+    const bool idleAvailable = share.baseBones.load(std::memory_order_acquire) == bones;
+    bool wrote = false;
     for (std::uint32_t b = 0; b < bones; ++b) {
         if (share.parents[b] >= 0) continue;
         LocalBone root{};
         if (!crash_guard::TryCopy(root.data(), reinterpret_cast<const void*>(transforms + b * 0x30U), 0x20U)) continue;
-        const auto x = root[0], z = root[2];
-        root[0] = x * c + z * s + ox; root[1] += oy; root[2] = z * c - x * s + oz;
+        const std::array<float, 3> nativeRoot{root[0], root[1], root[2]};
+        if (firstStableFrame) {
+            // Prefer the captured retail idle pose. If the proxy had no idle
+            // sample before streaming, freeze the first rendered root instead.
+            bool fromIdle = idleAvailable;
+            if (fromIdle) {
+                for (std::size_t axis = 0; axis < 3U; ++axis) {
+                    const auto candidate = std::bit_cast<float>(share.base[b][axis]);
+                    if (!std::isfinite(candidate)) { fromIdle = false; break; }
+                    share.rootReference[b][axis] = candidate;
+                }
+            }
+            if (!fromIdle) share.rootReference[b] = nativeRoot;
+            if (fromIdle) ++share.idleReferences;
+            else ++share.liveReferences;
+        }
+        const auto target = VisualRootPosition(nativeRoot, share.rootReference[b],
+            localOffset, yaw, share.stableRoot);
+        root[0] = target[0]; root[1] = target[1]; root[2] = target[2];
         const std::array<float, 4> q{root[4], root[5], root[6], root[7]};
         root[4] = turn[3] * q[0] + turn[1] * q[2];
         root[5] = turn[3] * q[1] + turn[1] * q[3];
@@ -2180,9 +2235,23 @@ void ApplyVisualOffset(MaskShare& share, void* pose, const std::uint32_t bones) 
         root[7] = turn[3] * q[3] - turn[1] * q[1];
         bool finite = true;
         for (std::size_t i = 0; i < 8U; ++i) finite = finite && std::isfinite(root[i]);
-        if (finite) static_cast<void>(crash_guard::TryWrite(reinterpret_cast<void*>(transforms + b * 0x30U), root.data(), 0x20U));
+        if (finite && crash_guard::TryWrite(
+                reinterpret_cast<void*>(transforms + b * 0x30U), root.data(), 0x20U)) {
+            wrote = true;
+            if (share.stableRoot) {
+                const float rawDifference = std::abs(nativeRoot[1] - share.rootReference[b][1]);
+                if (std::isfinite(rawDifference))
+                    share.maxSuppressedRootDeltaY = (std::max)(share.maxSuppressedRootDeltaY, rawDifference);
+            }
+        }
     }
-    share.offsetFrames.fetch_add(1U, std::memory_order_relaxed);
+    if (wrote) {
+        if (share.stableRoot) {
+            share.rootReferenceReady = true;
+            ++share.stableFrames;
+        }
+        share.offsetFrames.fetch_add(1U, std::memory_order_relaxed);
+    }
 }
 
 void __fastcall LayerBlendDetour(void* controller, void*, const std::uint32_t from, const std::uint32_t to, void* pose) noexcept {
@@ -2357,13 +2426,19 @@ void Export(Diagnostics& diagnostics, const std::uintptr_t remoteCharacter) {
          {"poseLifted", Diagnostics::Unsigned(share.lifted), true},
          {"maskNoBase", Diagnostics::Unsigned(remote.maskNoBase), true}});
     const auto vent = character_direct_step_runtime::VentVisualSnapshot();
+    const auto visualRoot = VisualRootSnapshot(remoteCharacter);
     diagnostics.Log("info", "native_animation_vent_visual",
         "Native vent body follows owner visually; Character retains retail collision.",
         {{"frames", Diagnostics::Unsigned(vent.frames), true},
          {"rejected", Diagnostics::Unsigned(vent.rejected), true},
          {"relocations", Diagnostics::Unsigned(vent.relocations), true},
          {"relocationFailures", Diagnostics::Unsigned(vent.relocationFailures), true},
-         {"maxOffsetMillimeters", Diagnostics::Unsigned(vent.maxOffsetMm), true}});
+         {"maxOffsetMillimeters", Diagnostics::Unsigned(vent.maxOffsetMm), true},
+         {"renderFramesApplied", Diagnostics::Unsigned(visualRoot.renderedFrames), true},
+         {"stableRootFramesApplied", Diagnostics::Unsigned(visualRoot.stableFrames), true},
+         {"stableRootIdleReferences", Diagnostics::Unsigned(visualRoot.idleReferences), true},
+         {"stableRootLiveReferences", Diagnostics::Unsigned(visualRoot.liveReferences), true},
+         {"maxSuppressedRootDeltaYMeters", std::to_string(visualRoot.maxSuppressedRootDeltaY), true}});
     decltype(gOwnerCycles) cycles{};
     decltype(gOwnerAliases) aliases{};
     { const std::lock_guard lock(gLocalMutex); cycles = gOwnerCycles; aliases = gOwnerAliases; }

@@ -2785,7 +2785,7 @@ void ShowVentVisualPath(MovementSlot& slot, const std::uintptr_t character) noex
     const float ownerYaw = slot.hasReplicatedYaw.load(std::memory_order_acquire)
         ? LoadFloat(slot.replicatedYawBits) : yaw;
     const float turn = static_cast<float>(std::remainder(ownerYaw-yaw, 6.28318530717958647692F));
-    if (!animation_sync::SetVisualOffset(character, true, offset, turn)) {
+    if (!animation_sync::SetVisualOffset(character, true, offset, turn, true)) {
         gVentVisualRejected.fetch_add(1U, std::memory_order_relaxed); return;
     }
     visual->last = {tx,ty,tz}; visual->lastYaw = ownerYaw;

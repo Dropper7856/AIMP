@@ -469,6 +469,12 @@ if(BUILD_TESTING)
     set_target_properties(AIMP.AnimationSyncTimelineTests PROPERTIES
         VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
     add_test(NAME AnimationSyncNativeTimeline COMMAND AIMP.AnimationSyncTimelineTests)
+    add_executable(AIMP.AnimationSyncVisualRootTests tests/AnimationSyncVisualRootTests.cpp)
+    target_include_directories(AIMP.AnimationSyncVisualRootTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_options(AIMP.AnimationSyncVisualRootTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.AnimationSyncVisualRootTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME AnimationSyncVisualRoot COMMAND AIMP.AnimationSyncVisualRootTests)
     add_executable(AIMP.AnimationSyncMovementPolicyTests tests/AnimationSyncMovementPolicyTests.cpp)
     target_include_directories(AIMP.AnimationSyncMovementPolicyTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     target_compile_options(AIMP.AnimationSyncMovementPolicyTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)

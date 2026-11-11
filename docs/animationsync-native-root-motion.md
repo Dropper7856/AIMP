@@ -1,4 +1,4 @@
-# AnimationSync native root-motion isolation (534)
+# AnimationSync native root-motion isolation (535)
 
 Status: experimental; requires **two live game instances** to verify visual
 alignment. This change is deliberately scoped to AnimationSync's own scripted
@@ -151,3 +151,44 @@ and capture both 534 diagnostics. Verify whether the *rendered body* moves
 through the vent despite the physical Character dropping near 1.41 seconds,
 and whether the end-of-clip relocation visibly snaps or is undone by physics.
 This is not proven correct without the game.
+
+## 535 — Stable model-root anchor for native vent replay
+
+The receiving machine's 534 diagnostics (November 11, 2026, remote PID
+5884) show two complete native `enter_vent` clips with no failed starts:
+218 `ShowVentVisualPath` successes, zero rejections, two successful
+endpoint placements and a maximum requested render offset of 1.809m.
+Those calls only prove the visual offset was **published**, not that the
+final high-resolution pose consumed it. The physically simulated Character
+still falls to Y≈27.25 at phases around 1.32–1.38 while the owner stays
+near Y≈27.73–27.80. Its gap remains up to 1.81m.
+
+The 534 final-pose hook added the owner-vs-Character offset to the **current
+animated root translation**. If the native skeleton translates its own
+root, this double-applies the clip's local root displacement. 535 changes
+only `NativeVentVisual`: at the first actual final-pose application,
+capture a stable root position from the previously captured idle pose.
+If the idle final pose is unavailable, latch the first native rendered
+root for this entry instead. Subsequent frames keep all animated body
+joint rotations/limb animations intact, but the **root translation** is
+formed from that stable reference plus the current replicated owner
+correction. On clip completion, release the reference together with the
+render-only offset. Other full-body NPC actions and locker hiding retain
+the exact previous additive behavior.
+
+The new `native_animation_vent_visual` diagnostic distinguishes:
+`frames` (offset requests accepted by SetVisualOffset),
+`renderFramesApplied` (high-res pose actually modified by the hook),
+`stableRootFramesApplied` (pose writes using an anchored reference),
+`stableRootIdleReferences` / `stableRootLiveReferences`
+(which reference source was available), and
+`maxSuppressedRootDeltaYMeters` (largest local native-root Y deviation
+that would otherwise have been compounded). If renderFramesApplied is
+zero, do **not** adjust root heights further: investigate the layer blend
+render path instead. If the suppressed delta stays close to zero, the
+root-motion-doubling hypothesis was not responsible for the visual drop.
+
+A header-only portable math test `AnimationSyncVisualRoot` covers the
+additive-vs-anchored vertical path, world yaw transform and unchanged
+identity. The native MSVC x86 build and real visual behavior still require
+validation; no global Y clamp or arbitrary 50cm lift was introduced.
