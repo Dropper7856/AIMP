@@ -80,6 +80,17 @@ struct RemoteDiagnostics final {
     // This detects whether retail actually applies the clip's reference motion.
     std::uint64_t nativeRootSamples{}, nativeRootDiscontinuities{};
     float nativeRootDistance{}, nativeOwnerGap{}, nativeOwnerGapMax{}, nativeAnchorDrift{};
+    // Spatial flight samples are diagnostic-only, retained per remote actor.
+    // TickMs shares the native locomotion flight recorder's timebase.
+    struct SpatialSample final {
+        std::uint64_t tickMs{}, transition{};
+        std::uint32_t clipPath{};
+        float phase{-1.0F}, characterYaw{}, ownerYaw{};
+        std::array<float, 3> character{}, owner{};
+        bool hasOwner{};
+    };
+    std::array<SpatialSample, 64> spatial{};
+    std::uint32_t spatialNext{};
     // Last replays: how and where (our clock vs owner's) each one ended.
     struct Ending final {
         std::uint64_t transition{};
@@ -108,6 +119,7 @@ struct Slot final {
     std::array<float, 3> firstOwnerPosition{}, nativeRootLastPosition{};
     float firstOwnerYaw{};
     bool hasFirstOwnerPosition{}, nativeRootLastValid{};
+    std::uint64_t lastSpatialAt{};
     // Crew bones the owned clip drives; the others keep the last idle pose.
     bool maskActive{};
     std::bitset<256> crewDriven{}, crewDisplaced{};
@@ -907,6 +919,32 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
             slot.nativeRootLastPosition = position;
             slot.nativeRootLastValid = true;
             ++d.nativeRootSamples;
+            // Record one point every 125 ms, preserving the Character's
+            // physical path, the latest Host position, both headings and
+            // native graph time. This is intentionally observation-only:
+            // never change the root motion, graph or Character here.
+            if (slot.lastSpatialAt == 0U || now - slot.lastSpatialAt >= 125U) {
+                float facing{}, phase{-1.0F}, duration{};
+                if (Read(slot.character + 0x174U, facing) && std::isfinite(facing)) {
+                    if (current.graph != 0U &&
+                        !timeline::Read(current.graph, phase, duration)) phase = -1.0F;
+                    auto& spatial = d.spatial[d.spatialNext++ % d.spatial.size()];
+                    spatial = {};
+                    spatial.tickMs = now;
+                    spatial.transition = slot.desired.transition != 0U
+                        ? slot.desired.transition : slot.highest;
+                    spatial.clipPath = d.clipPath;
+                    spatial.phase = phase;
+                    spatial.character = position;
+                    spatial.characterYaw = facing;
+                    spatial.hasOwner = Active(slot.desired);
+                    if (spatial.hasOwner) {
+                        spatial.owner = slot.desired.position;
+                        spatial.ownerYaw = slot.desired.yaw;
+                    }
+                    slot.lastSpatialAt = now;
+                }
+            }
             if (Active(slot.desired)) {
                 const auto dx = position[0] - slot.desired.position[0];
                 const auto dy = position[1] - slot.desired.position[1];
@@ -1141,6 +1179,7 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
         slot.ownerStartY = slot.desired.position[1];
         slot.ownedYaw = mutableHeading;
         slot.nativeRootLastValid = false;
+        slot.lastSpatialAt = 0U;
     }
     if (!invoked || !constructed || (current.flags & 4U) != 0U || current.graph == 0U) {
         ++d.failed; d.stage = "native-admission"; return;
@@ -1498,6 +1537,7 @@ bool Publish(const std::uintptr_t character, const State& state, std::string& er
     }
     slot->firstOwnerPosition = state.position; slot->firstOwnerYaw = state.yaw;
     slot->hasFirstOwnerPosition = true; slot->nativeRootLastValid = false;
+    slot->lastSpatialAt = 0U;
     slot->ownerRate = -1.0F; slot->rateSamplePhase = state.phaseSeconds;
     slot->rateSampleAt = now - state.elapsedMilliseconds; slot->readmits = 0U;
     slot->desired = state; slot->highest = state.transition;
@@ -2225,6 +2265,29 @@ void Export(Diagnostics& diagnostics, const std::uintptr_t remoteCharacter) {
         endings << row.transition << ':' << row.animation << '[' << row.start << ".." << row.end << " x" << row.loops
                 << "]=" << row.result << '@' << row.ours << '/' << row.owner << '/' << row.duration << ' ';
     }
+    // The prior build recorded total distance but not its direction. These
+    // points distinguish a root that advances in the wrong world direction
+    // from one that only shifts the rendered mesh inside a stationary actor.
+    std::ostringstream spatialText;
+    spatialText.imbue(std::locale::classic());
+    spatialText << std::fixed << std::setprecision(2);
+    const auto available = (std::min)(static_cast<std::size_t>(remote.spatialNext),
+        remote.spatial.size());
+    for (std::size_t i = 0; i < available; ++i) {
+        const auto& point = remote.spatial[
+            (static_cast<std::size_t>(remote.spatialNext) + remote.spatial.size() - available + i)
+                % remote.spatial.size()];
+        if (point.tickMs == 0U) continue;
+        spatialText << point.tickMs << '#' << point.transition << ':' << point.clipPath
+            << '@' << point.phase << " c(" << point.character[0] << ','
+            << point.character[1] << ',' << point.character[2] << ')';
+        if (point.hasOwner)
+            spatialText << " o(" << point.owner[0] << ',' << point.owner[1]
+                << ',' << point.owner[2] << ')';
+        else spatialText << " o(-)";
+        spatialText << " h(" << point.characterYaw << ','
+            << (point.hasOwner ? point.ownerYaw : 0.0F) << ") ; ";
+    }
     diagnostics.Log("info", "native_animation_sync_snapshot",
         "Generic scripted-animation replication: local THE_PLAYER capture and remote representation playback.",
         {{"localCaptured", Diagnostics::Unsigned(local.captured), true},
@@ -2260,6 +2323,8 @@ void Export(Diagnostics& diagnostics, const std::uintptr_t remoteCharacter) {
          {"nativeOwnerGapMeters", std::to_string(remote.nativeOwnerGap), true},
          {"nativeOwnerMaxGapMeters", std::to_string(remote.nativeOwnerGapMax), true},
          {"nativeAnchorDriftMeters", std::to_string(remote.nativeAnchorDrift), true},
+         {"nativeSpatialSampleCount", Diagnostics::Unsigned(remote.spatialNext), true},
+         {"nativeSpatialTrace", spatialText.str(), false},
          {"endings", endings.str(), false},
          {"cancelled", Diagnostics::Unsigned(remote.cancelled), true},
          {"cancelDeferred", Diagnostics::Unsigned(remote.deferred), true},

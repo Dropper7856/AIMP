@@ -1,4 +1,4 @@
-# AnimationSync native root-motion isolation (532)
+# AnimationSync native root-motion isolation (533)
 
 Status: experimental; requires **two live game instances** to verify visual
 alignment. This change is deliberately scoped to AnimationSync's own scripted
@@ -73,3 +73,44 @@ The source-level policy test is registered as
 from the previous standalone Claude analysis, using explicit failure checks
 even when NDEBUG is defined. Both tests are header-only. The native build
 requires Windows MSVC x86; this commit is not an in-game visual proof.
+
+
+## 533: Spatial forensics of vent-entry mismatches
+
+The November 11, 2026 532 Host/client diagnostics confirm `enter_vent`
+used `clipSource=npc-native` and completed twice with no admission failures:
+`nativeRootSamples=246`, `nativeRootDistanceMeters=5.55`,
+`nativeRootDiscontinuities=5`, and `nativeOwnerMaxGapMeters=3.24`.
+The other peer captured `enter_vent` three times without remote
+replays. The receiving peer's locomotion flight trace also showed
+**12 hard-resync applications** after normal follower reacquisition.
+That is distinct from native clip admission and can produce visible snaps
+after the interaction.
+
+Offline examination of the original Havok reference frames found that the
+native `FEMALE/VENT_ENTRY_UNARMED` clip traverses approximately +0.555 m
+in model Y and +2.651 m in model Z over 2.333 seconds; the FP version
+travels +0.510 m and +2.543 m over 2.267 seconds. These are clip-space
+reference trajectories, not proof of their world-space direction or of the
+rendered mesh's motion.
+
+533 adds **no new gameplay correction**; it captures up to the last 64
+engine-thread spatial samples in `native_animation_sync_snapshot`
+under `nativeSpatialTrace` (tickMs, transition, clip path, graph time,
+world Character XYZ, latest owner XYZ, and each heading). Samples are
+recorded at approximately 125 ms intervals only while a full-body native
+clip is owned. `nativeSpatialSampleCount` counts all samples collected.
+The tickMs can be correlated with the existing
+`remote-locomotion-flight.jsonl` hard-resync events.
+
+For the next short two-player vent test, compare the initial and final
+native Character displacement vector with the initial and final owner
+displacement vector for the same transition, and compare both headings.
+If world direction differs, fix the spatial basis/heading or interaction
+anchor. If their directions agree but mesh enters the wall, instrument the
+visual skeleton root relative to Character. If drift begins only on cycle
+completion, repair the player follower reacquisition separately.
+
+Do not assume an animation must be corrected by new teleporting while the
+native world-space direction and the rendered skeleton path remain
+unmeasured.
