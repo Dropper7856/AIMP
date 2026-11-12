@@ -1,4 +1,5 @@
 using System.Text;
+using AIMP.Launcher;
 
 namespace AIMP.Protocol.Tests;
 
@@ -10,13 +11,23 @@ internal static class MissionSyncTests
     {
         var valid = new MissionSignalPayload(Guid.NewGuid(), 42, 1, 1, Entity, 123, 1);
         MissionSignalValidation.Validate(valid);
+        var produced = MissionTestLabReceipts.Format(valid, "client", "native-produced");
+        var committed = MissionTestLabReceipts.Format(valid with { Sequence = 999 }, "host", "commit-observed");
+        AssertEx.True(produced.StartsWith("TLR1 v=1 module=MissionSync stage=native-produced ", StringComparison.Ordinal));
+        AssertEx.True(produced.Contains(" order=0", StringComparison.Ordinal));
+        AssertEx.True(committed.Contains(" order=999", StringComparison.Ordinal));
+        var observedId = produced.Split(' ').Single(part => part.StartsWith("operation=", StringComparison.Ordinal));
+        AssertEx.True(committed.Contains(observedId, StringComparison.Ordinal),
+            "A Host-global commit sequence must retain the original proposal identity.");
+        AssertEx.True(!produced.Contains(valid.SessionId.ToString("N"), StringComparison.OrdinalIgnoreCase));
+        AssertEx.True(!produced.Contains(valid.EntityId, StringComparison.OrdinalIgnoreCase));
         AssertEx.Equal(valid, JsonPayload.Deserialize<MissionSignalPayload>(JsonPayload.Serialize(valid)));
         MissionSignalValidation.Validate(valid with { InterfaceSelector = 2, Sequence = ulong.MaxValue });
         foreach (var invalid in new[] { valid with { SessionId = Guid.Empty }, valid with { PeerId = 0 },
             valid with { LevelGeneration = 0 }, valid with { Sequence = 0 }, valid with { Signal = 0 },
             valid with { EntityId = "123" }, valid with { EntityId = new string('0', 32) },
             valid with { EntityId = new string('G', 32) }, valid with { InterfaceSelector = 0 },
-            valid with { InterfaceSelector = 3 } })
+            valid with { InterfaceSelector = 5 } })
             AssertEx.Throws<ProtocolException>(() => MissionSignalValidation.Validate(invalid));
         var json = Encoding.UTF8.GetString(JsonPayload.Serialize(valid));
         foreach (var missing in new[] { "\"sequence\":1,", "\"signal\":123,", "\"interfaceSelector\":1" })
