@@ -49,15 +49,22 @@ internal sealed class GameLaunchCoordinator
 
     private int InstallAndLaunch(GameInstallationPaths game, LauncherSettings settings)
     {
-        _diagnostics.Log("Launch", "Installing the multiplayer UI bridge into UI.PAK.");
-        _uiInstaller.Install(game);
-        _diagnostics.Log("Launch", "Launching Alien: Isolation.");
-        using var process = Process.Start(CreateStartInfo(game))
-            ?? throw new InvalidOperationException("AI.exe could not be started.");
-        _diagnostics.Log("Launch", $"AI.exe started with PID={process.Id}; " +
+        int processId;
+        // Another launcher (split-screen) may be preparing or launching the same installation.
+        using (GameFilesLock.Acquire(CancellationToken.None))
+        {
+            _diagnostics.Log("Launch", "Installing the multiplayer UI bridge into UI.PAK.");
+            _uiInstaller.Install(game);
+            _diagnostics.Log("Launch", "Launching Alien: Isolation.");
+            using var process = Process.Start(CreateStartInfo(game))
+                ?? throw new InvalidOperationException("AI.exe could not be started.");
+            processId = process.Id;
+        }
+        LauncherInstances.ClaimGame(processId);
+        _diagnostics.Log("Launch", $"AI.exe started with PID={processId} (launcher instance {LauncherInstances.Slot}); " +
             $"child {WorldSync3LauncherOptions.EmptyCallbackEnvironmentVariable}=1 " +
             "(ProbeDirect callback path; explicit process environment).");
-        return process.Id;
+        return processId;
     }
 
     private static ProcessStartInfo CreateStartInfo(GameInstallationPaths game)
@@ -77,11 +84,14 @@ internal sealed class GameLaunchCoordinator
 
     private static void EnsureGameIsNotRunning()
     {
+        // Games started by other launcher instances (split-screen) are not ours.
         var processes = Process.GetProcessesByName("AI");
         try
         {
-            if (processes.Any(process => !process.HasExited))
-                throw new InvalidOperationException("Alien: Isolation is already running.");
+            var others = LauncherInstances.GamesClaimedByOthers();
+            if (processes.Any(process => !process.HasExited && !others.Contains(process.Id)))
+                throw new InvalidOperationException("Alien: Isolation is already running. " +
+                    "For split-screen, start the second game from another AI-MP Launcher window.");
         }
         finally
         {

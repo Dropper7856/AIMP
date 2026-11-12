@@ -130,6 +130,25 @@ internal static class RemoteCrouchAnimationInstaller
 
     private sealed record State(int PatchVersion, string OriginalSha256, string PatchedSha256);
 
+    // Read-only: true when Install would find nothing to patch.
+    internal static bool IsInstalled(string game)
+    {
+        var target = Path.Combine(game, "DATA", "GLOBAL", "ANIMATION.PAK");
+        var root = Path.Combine(game, "AIMP", "PreparationBackups", "Animation");
+        var backup = Path.Combine(root, "ANIMATION.PAK.original");
+        var statePath = Path.Combine(root, "state.json");
+        try
+        {
+            var state = File.Exists(statePath) ? JsonSerializer.Deserialize<State>(File.ReadAllText(statePath)) : null;
+            return state != null && state.PatchVersion == PatchVersion && File.Exists(target) && File.Exists(backup)
+                && Hash(target) == state.PatchedSha256 && Hash(backup) == state.OriginalSha256;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
+        {
+            return false;
+        }
+    }
+
     public static void Install(string game, CancellationToken token)
     {
         var target = Path.Combine(game, "DATA", "GLOBAL", "ANIMATION.PAK");

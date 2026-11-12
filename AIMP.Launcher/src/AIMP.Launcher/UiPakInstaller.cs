@@ -34,6 +34,16 @@ internal sealed class UiPakInstaller
     {
         var assets = UiBridgeAssetCatalog.Resolve(AppContext.BaseDirectory);
         ValidateAssets(assets);
+        // Split-screen: another game runs from this installation and has UI.PAK
+        // loaded. It must already hold this build's bridge; never rewrite it.
+        if (GamePreparationService.IsAnyGameRunning())
+        {
+            if (!IsCurrent(game.UiPakPath, assets))
+                throw new InvalidOperationException("Another Alien: Isolation is running with a different multiplayer UI. " +
+                    "Close it, then launch the games again.");
+            _diagnostics.Log("UI Install", "UI.PAK already holds this build's bridge GFX files; left unchanged (another game is running).");
+            return;
+        }
         var backup = EnsureBackup(game.UiPakPath);
         try { InstallCore(game.UiPakPath, assets); }
         catch { RestoreAfterFailure(backup, game.UiPakPath); throw; }
@@ -85,6 +95,28 @@ internal sealed class UiPakInstaller
         ReplaceEntryData(target, File.ReadAllBytes(asset.SourcePath));
         _diagnostics.Log("UI Install", $"Prepared UI.PAK entry: {asset.PakPath}");
     }
+
+    private static bool IsCurrent(string uiPakPath, IReadOnlyList<UiBridgeAsset> assets)
+    {
+        try
+        {
+            var pakType = LoadCathodeAssembly().GetType("CATHODE.PAK2")
+                ?? throw new InvalidOperationException("CATHODE.PAK2 was not found in CathodeLib.");
+            var entries = GetMemberValue(CreateAndLoadPak2(pakType, uiPakPath), "Entries")
+                ?? throw new InvalidOperationException("CATHODE.PAK2 does not expose Entries.");
+            return assets.All(asset => FindEntry(entries, asset.PakPath) is { } entry
+                && ReadEntryData(entry) is { } data && data.AsSpan().SequenceEqual(File.ReadAllBytes(asset.SourcePath)));
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
+            or TargetInvocationException)
+        {
+            return false;
+        }
+    }
+
+    private static byte[]? ReadEntryData(object entry) =>
+        new[] { "Content", "Data", "Bytes", "RawData", "FileData" }
+            .Select(name => GetMemberValue(entry, name)).OfType<byte[]>().FirstOrDefault();
 
     private static Assembly LoadCathodeAssembly()
     {

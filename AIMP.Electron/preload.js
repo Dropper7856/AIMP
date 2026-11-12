@@ -1,6 +1,7 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
-contextBridge.exposeInMainWorld('AIMP_API_BASE_URL', 'http://127.0.0.1:5127');
+// Each launcher instance (split-screen) has its own API port.
+contextBridge.exposeInMainWorld('AIMP_API_BASE_URL', ipcRenderer.sendSync('aimp:api-base-url') || 'http://127.0.0.1:5127');
 contextBridge.exposeInMainWorld('aimpWindow', {
   minimize: () => ipcRenderer.send('window:minimize'),
   maximize: () => ipcRenderer.send('window:toggle-maximize'),

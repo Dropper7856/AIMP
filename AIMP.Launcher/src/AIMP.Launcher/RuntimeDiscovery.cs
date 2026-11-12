@@ -11,7 +11,11 @@ internal static class AiProcessDiscovery
         try
         {
             var candidates = processes.Select(TryRead).OfType<AiProcessTarget>().ToArray();
-            return SelectCandidate(candidates);
+            // Split-screen: this launcher's own game first; never another launcher's.
+            var own = candidates.Where(value => value.ProcessId == LauncherInstances.GameProcessId).ToArray();
+            if (own.Length > 0) return SelectCandidate(own);
+            var claimed = LauncherInstances.GamesClaimedByOthers();
+            return SelectCandidate(candidates.Where(value => !claimed.Contains(value.ProcessId)).ToArray());
         }
         finally
         {

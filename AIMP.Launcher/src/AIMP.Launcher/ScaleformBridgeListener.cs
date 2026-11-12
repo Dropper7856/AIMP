@@ -20,11 +20,10 @@ internal sealed class ScaleformBridgeListener : IDisposable
     private readonly object _commandGate = new();
     private readonly SemaphoreSlim _sendGate = new(1, 1);
     private CancellationTokenSource? _cancellation;
-    private TcpListener? _commandListener;
-    private TcpListener? _eventListener;
+    private readonly List<TcpListener> _listeners = new();
     private TcpClient? _commandClient;
     private NetworkStream? _commandStream;
-    private Task[] _acceptTasks = Array.Empty<Task>();
+    private readonly List<Task> _loops = new();
     private int _connectedClients;
     private int _disposed;
 
@@ -52,10 +51,19 @@ internal sealed class ScaleformBridgeListener : IDisposable
         {
             if (_cancellation is not null) return;
             ThrowIfDisposed();
-            CreateListeners();
-            StartAcceptLoops();
+            var cancellation = new CancellationTokenSource();
+            var slot = LauncherInstances.Slot;
+            var command = new TcpListener(IPAddress.Loopback, LauncherInstances.PrivateCommandPort(slot));
+            var events = new TcpListener(IPAddress.Loopback, LauncherInstances.PrivateEventPort(slot));
+            try { command.Start(); events.Start(); }
+            catch { command.Stop(); events.Stop(); cancellation.Dispose(); throw; }
+            _cancellation = cancellation;
+            AddListener(command, "command", routed: false, cancellation.Token);
+            AddListener(events, "event", routed: false, cancellation.Token);
+            _loops.Add(AcquirePublicPortsAsync(cancellation.Token));
         }
-        LogStarted();
+        _diagnostics.Log("UI Bridge", $"Launcher instance {LauncherInstances.Slot}: private bridge on 127.0.0.1:" +
+            $"{LauncherInstances.PrivateCommandPort(LauncherInstances.Slot)}/{LauncherInstances.PrivateEventPort(LauncherInstances.Slot)}.");
         PublishState();
     }
 
@@ -75,9 +83,7 @@ internal sealed class ScaleformBridgeListener : IDisposable
     {
         var stopped = DetachRuntime();
         if (stopped is null) return;
-        stopped.Value.Cancellation.Cancel();
-        stopped.Value.Command.Stop();
-        stopped.Value.Event.Stop();
+        foreach (var listener in stopped.Value.Listeners) listener.Stop();
         CloseCommandClient();
         await AwaitLoopsAsync(stopped.Value.Tasks).ConfigureAwait(false);
         stopped.Value.Cancellation.Dispose();
@@ -91,43 +97,94 @@ internal sealed class ScaleformBridgeListener : IDisposable
         _sendGate.Dispose();
     }
 
-    private void CreateListeners()
+    // Caller holds _gate.
+    private void AddListener(TcpListener listener, string channel, bool routed, CancellationToken token)
+    {
+        _listeners.Add(listener);
+        _loops.Add(AcceptLoopAsync(listener, channel, routed, token));
+    }
+
+    // The game's movies always connect to 12345/12346. Only one launcher can
+    // hold them; the others retry so one of them takes over when it closes.
+    private async Task AcquirePublicPortsAsync(CancellationToken token)
+    {
+        var waiting = false;
+        while (!token.IsCancellationRequested)
+        {
+            if (TryListenPublic(token)) return;
+            if (!waiting)
+                _diagnostics.Log("UI Bridge", $"127.0.0.1:{CommandPort}/{EventPort} are in use (another AI-MP Launcher?). " +
+                    "Its launcher forwards this launcher's game; retrying every 2 s.");
+            waiting = true;
+            try { await Task.Delay(TimeSpan.FromSeconds(2), token).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+        }
+    }
+
+    private bool TryListenPublic(CancellationToken token)
     {
         var command = new TcpListener(IPAddress.Loopback, CommandPort);
         var events = new TcpListener(IPAddress.Loopback, EventPort);
-        command.Start();
-        try { events.Start(); }
-        catch { command.Stop(); throw; }
-        _cancellation = new CancellationTokenSource();
-        _commandListener = command;
-        _eventListener = events;
-    }
-
-    private void StartAcceptLoops()
-    {
-        var token = _cancellation!.Token;
-        _acceptTasks = new[]
+        try { command.Start(); events.Start(); }
+        catch (SocketException) { command.Stop(); events.Stop(); return false; }
+        lock (_gate)
         {
-            AcceptLoopAsync(_commandListener!, "command", token),
-            AcceptLoopAsync(_eventListener!, "event", token)
-        };
-    }
-
-    private void LogStarted()
-    {
+            if (token.IsCancellationRequested) { command.Stop(); events.Stop(); return true; }
+            AddListener(command, "command", routed: true, token);
+            AddListener(events, "event", routed: true, token);
+        }
         _diagnostics.Log("UI Bridge", $"Command bridge listening on 127.0.0.1:{CommandPort}.");
         _diagnostics.Log("UI Bridge", $"Event bridge listening on 127.0.0.1:{EventPort}.");
+        return true;
     }
 
     private async Task AcceptLoopAsync(
         TcpListener listener,
         string channel,
+        bool routed,
         CancellationToken token)
     {
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
         while (!token.IsCancellationRequested)
         {
             var client = await TryAcceptAsync(listener, channel, token).ConfigureAwait(false);
-            if (client is not null) _ = HandleClientAsync(client, channel, token);
+            if (client is null) continue;
+            _ = routed ? RouteClientAsync(client, channel, port, token) : HandleClientAsync(client, channel, token);
+        }
+    }
+
+    // A connection on the public ports from another launcher's game goes to
+    // that launcher's private port; everything else is handled here.
+    private async Task RouteClientAsync(TcpClient client, string channel, int port, CancellationToken token)
+    {
+        int? slot = null;
+        try { slot = LauncherInstances.ForwardSlotFor(client.Client.RemoteEndPoint as IPEndPoint, port); }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        { _diagnostics.Log("UI Bridge", $"{channel} owner lookup failed: {exception.Message}"); }
+        if (slot is null) await HandleClientAsync(client, channel, token).ConfigureAwait(false);
+        else await ForwardClientAsync(client, channel, slot.Value, token).ConfigureAwait(false);
+    }
+
+    private async Task ForwardClientAsync(TcpClient client, string channel, int slot, CancellationToken token)
+    {
+        using (client)
+        using (var upstream = new TcpClient())
+        {
+            var port = channel == "command"
+                ? LauncherInstances.PrivateCommandPort(slot) : LauncherInstances.PrivateEventPort(slot);
+            try
+            {
+                await upstream.ConnectAsync(IPAddress.Loopback, port, token).ConfigureAwait(false);
+                _diagnostics.Log("UI Bridge", $"Forwarding a {channel} connection to launcher instance {slot} (port {port}).");
+                using var linked = CancellationTokenSource.CreateLinkedTokenSource(token);
+                var up = client.GetStream().CopyToAsync(upstream.GetStream(), linked.Token);
+                var down = upstream.GetStream().CopyToAsync(client.GetStream(), linked.Token);
+                await Task.WhenAny(up, down).ConfigureAwait(false);
+                linked.Cancel();
+                await Task.WhenAll(up, down).ConfigureAwait(false);
+            }
+            catch (Exception exception) when (exception is IOException or SocketException
+                or OperationCanceledException or ObjectDisposedException) { }
         }
     }
 
@@ -360,27 +417,26 @@ internal sealed class ScaleformBridgeListener : IDisposable
     private void LogClientFailure(string channel, Exception exception) =>
         _diagnostics.Log("UI Bridge", $"{channel} client failed: {exception.Message}");
 
-    private (CancellationTokenSource Cancellation, TcpListener Command,
-        TcpListener Event, Task[] Tasks)? DetachRuntime()
+    // Cancels under _gate so the public-port retry cannot add listeners after detach.
+    private (CancellationTokenSource Cancellation, TcpListener[] Listeners, Task[] Tasks)? DetachRuntime()
     {
         lock (_gate)
         {
             var cancellation = _cancellation;
-            var command = _commandListener;
-            var events = _eventListener;
-            if (cancellation is null || command is null || events is null) return null;
-            var tasks = _acceptTasks;
+            if (cancellation is null) return null;
+            cancellation.Cancel();
+            var listeners = _listeners.ToArray();
+            var tasks = _loops.ToArray();
             ClearRuntimeReferences();
-            return (cancellation, command, events, tasks);
+            return (cancellation, listeners, tasks);
         }
     }
 
     private void ClearRuntimeReferences()
     {
         _cancellation = null;
-        _commandListener = null;
-        _eventListener = null;
-        _acceptTasks = Array.Empty<Task>();
+        _listeners.Clear();
+        _loops.Clear();
     }
 
     private async Task AwaitLoopsAsync(IEnumerable<Task> tasks)

@@ -59,6 +59,36 @@ internal sealed class LauncherSettingsStore
         _steamPersona = steamPersona;
     }
 
+    // Each launcher instance (split-screen) has its own settings and player
+    // identity. A new instance starts from the default instance's settings.
+    internal static LauncherSettingsStore ForInstance(bool developerModeAvailable, Func<string?> steamPersona)
+    {
+        var slot = LauncherInstances.Slot;
+        if (slot == 1) return new LauncherSettingsStore(developerModeAvailable: developerModeAvailable, steamPersona: steamPersona);
+        var primary = new LauncherSettingsStore(developerModeAvailable: developerModeAvailable);
+        var store = new LauncherSettingsStore(
+            Path.Combine(Path.GetDirectoryName(DefaultPath())!, LauncherInstances.SlotFileName(Path.GetFileName(DefaultPath()), slot)),
+            developerModeAvailable, () => steamPersona() is { } name ? InstanceName(name, slot) : null);
+        if (!File.Exists(store.SettingsPath) && File.Exists(primary.SettingsPath))
+        {
+            try
+            {
+                var seed = primary.Load();
+                store.Save(seed with { PlayerName = InstanceName(seed.PlayerName, slot), PlayerId = Guid.NewGuid() });
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException) { }
+        }
+        return store;
+    }
+
+    // Both players share one Steam account: tell them apart in the lobby.
+    internal static string InstanceName(string name, int slot)
+    {
+        var suffix = $" ({slot})";
+        var limit = ProtocolConstants.MaximumPlayerNameLength - suffix.Length;
+        return (name.Length > limit ? name[..limit].TrimEnd() : name) + suffix;
+    }
+
     internal string SettingsPath => _path;
     internal bool DeveloperModeAvailable { get; }
 

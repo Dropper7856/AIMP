@@ -21,10 +21,18 @@ public static class Program
             Environment.GetEnvironmentVariable("AIMP_FRONTEND_ORIGIN"), Environment.GetEnvironmentVariable("AIMP_API_TOKEN"));
         Environment.SetEnvironmentVariable("AIMP_API_TOKEN", null);
         var builder = WebApplication.CreateBuilder(hostArguments);
+        // appsettings' Kestrel endpoint wins over ASPNETCORE_URLS: each launcher
+        // instance (split-screen) listens on its own port, 5127 for the first.
+        builder.Configuration.AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["Kestrel:Endpoints:Http:Url"] = $"http://127.0.0.1:{LauncherInstances.ApiPort(LauncherInstances.Slot)}"
+        });
         ConfigureServices(builder.Services, developerModeAvailable, accessPolicy);
 
         var app = builder.Build();
         ConfigurePipeline(app, accessPolicy);
+        app.Lifetime.ApplicationStarted.Register(LauncherInstances.Register);
+        app.Lifetime.ApplicationStopped.Register(LauncherInstances.Unregister);
         app.Run();
     }
 
@@ -45,8 +53,7 @@ public static class Program
             options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 
         services.AddSingleton(_ => new LauncherDiagnostics());
-        services.AddSingleton(_ => new LauncherSettingsStore(developerModeAvailable: developerModeAvailable,
-            steamPersona: SteamPersona.Resolve));
+        services.AddSingleton(_ => LauncherSettingsStore.ForInstance(developerModeAvailable, SteamPersona.Resolve));
         services.AddSingleton(provider => new GamePreparationService(
             provider.GetRequiredService<LauncherSettingsStore>(),
             provider.GetRequiredService<LauncherDiagnostics>(),

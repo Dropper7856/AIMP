@@ -105,6 +105,7 @@ internal sealed class NativeRuntimeController : IDisposable
         Log("Searching for AI.exe");
         var target = AiProcessDiscovery.Find();
         Log($"Found AI.exe PID={target.ProcessId}");
+        LauncherInstances.ClaimGame(target.ProcessId);
         await AttachProcessAsync(target).ConfigureAwait(false);
         var dllPath = NativeDllResolver.Resolve(AppContext.BaseDirectory);
         Update(value => value with { DllPath = dllPath });

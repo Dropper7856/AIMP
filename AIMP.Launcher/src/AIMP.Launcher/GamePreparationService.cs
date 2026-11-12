@@ -238,11 +238,26 @@ public sealed class GamePreparationService
         try
         {
             lock (GamePreparationSynchronization.Gate)
+            using (GameFilesLock.Acquire(token, () => Update("Checking", 0, 0, 0, string.Empty,
+                "Waiting for another AI-MP Launcher to finish preparing")))
             {
                 token.ThrowIfCancellationRequested();
-                AssertGameStopped();
                 var levels = WorldManifestLevelDiscovery.Discover(game, includeCampaign).Where(l => l.CanCompile).ToArray();
                 if (levels.Length == 0) throw new InvalidDataException("No playable levels were found.");
+                // Split-screen: another game already runs from this installation.
+                // Accept the prepared files as they are; never rewrite them under it.
+                if (IsAnyGameRunning())
+                {
+                    Update("Checking", 1, 0, levels.Length, string.Empty, "Checking multiplayer assets");
+                    var shared = TryReadReceipt(ReceiptPath(game));
+                    if (shared != null && RemoteCrouchAnimationInstaller.IsInstalled(game) && ReceiptCovers(game, shared, levels))
+                    {
+                        _diagnostics.Log("Preparation", "Another Alien: Isolation is running; using the existing preparation without changes.");
+                        Complete(shared);
+                        return;
+                    }
+                    throw new InvalidOperationException("Close Alien: Isolation before preparing its files.");
+                }
                 // Global, not level-bound: verified (and re-applied after a game
                 // file repair) on every preparation, even with a valid receipt.
                 Update("Checking", 1, 0, levels.Length, string.Empty, "Checking multiplayer assets");
@@ -422,12 +437,13 @@ public sealed class GamePreparationService
         a.TrimEnd('\\', '/'), b.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase);
     private static void AssertGameStopped()
     {
+        if (IsAnyGameRunning())
+            throw new InvalidOperationException("Close Alien: Isolation before preparing its files.");
+    }
+    internal static bool IsAnyGameRunning()
+    {
         var processes = Process.GetProcessesByName("AI");
-        try
-        {
-            if (processes.Any(p => !p.HasExited))
-                throw new InvalidOperationException("Close Alien: Isolation before preparing its files.");
-        }
+        try { return processes.Any(p => !p.HasExited); }
         finally { foreach (var process in processes) process.Dispose(); }
     }
     private static GamePreparationDto EmptyStatus(string directory) => new(string.Empty, directory,

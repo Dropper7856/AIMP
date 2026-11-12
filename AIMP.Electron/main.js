@@ -6,7 +6,28 @@ const path = require('node:path');
 const { createApiSecurity } = require('./api-security');
 const { runStartupUpdate } = require('./startup-updater');
 
-const API_URL = 'http://127.0.0.1:5127';
+// Split-screen: several launchers may run at once, each controlling its own
+// game. Slot 1 is the usual launcher; slots 2+ get their own user data
+// (profile, logs) and API port. "--new-instance" skips the confirmation.
+const MAX_INSTANCES = 4;
+const NEW_INSTANCE_ARGUMENT = '--new-instance';
+const DEFAULT_USER_DATA = app.getPath('userData');
+
+function userDataForSlot(slot) {
+  return slot === 1 ? DEFAULT_USER_DATA : `${DEFAULT_USER_DATA}-instance-${slot}`;
+}
+
+function acquireInstanceSlot() {
+  for (let slot = 1; slot <= MAX_INSTANCES; slot += 1) {
+    app.setPath('userData', userDataForSlot(slot));
+    if (app.requestSingleInstanceLock({ probe: true })) return slot;
+  }
+  app.setPath('userData', userDataForSlot(1));
+  return 0;
+}
+
+const instanceSlot = acquireInstanceSlot();
+const API_URL = `http://127.0.0.1:${5127 + Math.max(instanceSlot, 1) - 1}`;
 const API_HEALTH_URL = `${API_URL}/`;
 const API_SHUTDOWN_URL = `${API_URL}/api/v1/application/shutdown`;
 const API_EXECUTABLE = 'AIMP.Launcher.exe';
@@ -98,6 +119,7 @@ function startApi(frontendOrigin) {
       AIMP_ELECTRON_ROOT: electronExecutableDirectory(),
       AIMP_FRONTEND_ORIGIN: frontendOrigin,
       AIMP_API_TOKEN: apiSecurity.token,
+      AIMP_INSTANCE: String(instanceSlot),
     },
   });
 
@@ -348,41 +370,134 @@ async function createWindow(frontendUrl) {
   }
 }
 
-const singleInstance = app.requestSingleInstanceLock();
-if (!singleInstance) {
-  app.quit();
-} else {
-  app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.show();
-      mainWindow.focus();
-    }
-  });
+function focusRunningLauncher() {
+  // Notify slot 1 the way a plain second launch always did.
+  app.releaseSingleInstanceLock();
+  app.setPath('userData', userDataForSlot(1));
+  app.requestSingleInstanceLock({ focus: true });
+}
 
-  app.whenReady().then(async () => {
+// Split-screen: a new launcher starts with the default launcher's frontend
+// storage (onboarding, preferences). Locked or cache files are skipped.
+function seedInstanceUserData() {
+  const partition = path.join('Partitions', 'aimp-launcher');
+  const source = path.join(DEFAULT_USER_DATA, partition);
+  const target = path.join(app.getPath('userData'), partition);
+  if (instanceSlot <= 1 || fs.existsSync(target) || !fs.existsSync(source)) return;
+  const skipped = new Set(['LOCK', 'lockfile', 'Cache', 'Code Cache', 'GPUCache', 'DawnCache', 'DawnGraphiteCache', 'DawnWebGPUCache']);
+  const copy = (from, to) => {
+    fs.mkdirSync(to, { recursive: true });
+    for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
+      if (skipped.has(entry.name)) continue;
+      try {
+        if (entry.isDirectory()) copy(path.join(from, entry.name), path.join(to, entry.name));
+        else if (entry.isFile()) fs.copyFileSync(path.join(from, entry.name), path.join(to, entry.name));
+      } catch (error) {
+        logElectron(`Instance ${instanceSlot}: could not copy ${entry.name} from the default launcher: ${error.message}`);
+      }
+    }
+  };
+  try {
+    copy(source, target);
+  } catch (error) {
+    logElectron(`Instance ${instanceSlot}: frontend storage was not copied: ${error.message}`);
+  }
+}
+
+// The launcher API registers each running instance (LauncherInstances.cs).
+function otherInstancesRunning() {
+  const directory = path.join(process.env.LOCALAPPDATA || '', 'AIMP', 'Instances');
+  for (let slot = 2; slot <= MAX_INSTANCES; slot += 1) {
     try {
-      logElectron(`Desktop launcher starting: version=${app.getVersion()}; executable=${process.execPath}`);
-      const updateOutcome = await runStartupUpdate({ app, BrowserWindow, log: logElectron });
-      if (updateOutcome !== 'continue') return;
-      const config = loadLauncherConfiguration();
-      startApi(config.frontendOrigin);
-      await waitForApi();
-      await createWindow(config.frontendUrl);
-    } catch (error) {
-      dialog.showErrorBox(
-        'Unable to start AI-MP Launcher',
-        `${error.stack || error.message}\n\nAPI log: ${apiLogPath()}`,
-      );
-      quitting = true;
-      await stopApi();
+      const entry = JSON.parse(fs.readFileSync(path.join(directory, `slot-${slot}.json`), 'utf8'));
+      process.kill(entry.LauncherProcessId, 0);
+      return true;
+    } catch {
+      // Missing entry or exited launcher.
+    }
+  }
+  return false;
+}
+
+// True when this launcher should keep running.
+async function confirmAdditionalInstance() {
+  if (instanceSlot === 1) return true;
+  if (instanceSlot === 0) {
+    await dialog.showMessageBox({
+      type: 'info',
+      title: 'AI-MP Launcher',
+      message: `${MAX_INSTANCES} AI-MP Launchers are already running.`,
+      detail: 'Close one of them to start another game.',
+      buttons: ['OK'],
+    });
+    focusRunningLauncher();
+    return false;
+  }
+  if (process.argv.some((argument) => argument.toLowerCase() === NEW_INSTANCE_ARGUMENT)) return true;
+  const { response } = await dialog.showMessageBox({
+    type: 'question',
+    title: 'AI-MP Launcher',
+    message: 'AI-MP Launcher is already running.',
+    detail: 'Open another launcher to play split-screen? Each launcher starts and controls its own game. '
+      + 'Join the first player\'s lobby by direct IP (127.0.0.1).',
+    buttons: ['Open another launcher', 'Show the running launcher'],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true,
+  });
+  if (response === 0) return true;
+  focusRunningLauncher();
+  return false;
+}
+
+if (instanceSlot > 1) seedInstanceUserData();
+
+app.on('second-instance', (_event, _argv, _workingDirectory, additionalData) => {
+  // Another launcher probing for a free slot must not steal the focus.
+  if (additionalData?.probe) return;
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  }
+});
+
+app.whenReady().then(async () => {
+  try {
+    if (!(await confirmAdditionalInstance())) {
       shutdownComplete = true;
       app.quit();
-    } finally {
-      startupInProgress = false;
+      return;
     }
-  });
-}
+    logElectron(`Desktop launcher starting: version=${app.getVersion()}; instance=${instanceSlot}; `
+      + `api=${API_URL}; executable=${process.execPath}`);
+    // Updating replaces files the other running launchers use.
+    const updateOutcome = instanceSlot === 1 && !otherInstancesRunning()
+      ? await runStartupUpdate({ app, BrowserWindow, log: logElectron })
+      : 'continue';
+    if (updateOutcome === 'continue' && instanceSlot !== 1) logElectron('Automatic update skipped in an additional launcher.');
+    if (updateOutcome !== 'continue') return;
+    const config = loadLauncherConfiguration();
+    startApi(config.frontendOrigin);
+    await waitForApi();
+    await createWindow(config.frontendUrl);
+  } catch (error) {
+    dialog.showErrorBox(
+      'Unable to start AI-MP Launcher',
+      `${error.stack || error.message}\n\nAPI log: ${apiLogPath()}`,
+    );
+    quitting = true;
+    await stopApi();
+    shutdownComplete = true;
+    app.quit();
+  } finally {
+    startupInProgress = false;
+  }
+});
+
+ipcMain.on('aimp:api-base-url', (event) => {
+  event.returnValue = API_URL;
+});
 
 ipcMain.on('window:minimize', () => mainWindow?.minimize());
 ipcMain.on('window:toggle-maximize', () => {

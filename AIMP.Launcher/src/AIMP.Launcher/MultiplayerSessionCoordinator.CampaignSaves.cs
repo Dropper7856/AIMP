@@ -141,7 +141,8 @@ internal sealed partial class MultiplayerSessionCoordinator
     private void DeleteStaleCampaignProfiles(string current)
     {
         var root = Path.GetDirectoryName(current)!;
-        if (!Directory.Exists(root)) return;
+        // Another launcher instance (split-screen) may be using its own profile.
+        if (!Directory.Exists(root) || LauncherInstances.OthersRunning()) return;
         foreach (var directory in Directory.EnumerateDirectories(root))
         {
             if (string.Equals(directory, current, StringComparison.OrdinalIgnoreCase)) continue;
