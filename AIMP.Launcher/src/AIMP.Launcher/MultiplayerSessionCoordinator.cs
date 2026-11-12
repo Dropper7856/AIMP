@@ -867,6 +867,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         ValidateDeveloperLobby(settings, message);
         var (selection, campaign, bundle) = ResolveCampaignLobby(message);
         var options = CreateHostOptions(settings, selection) with { Campaign = campaign };
+        if (options.AlienVsSurvivors && !SurvivalAlienLevels.HasAlien(options.Level))
+            throw new InvalidOperationException(SurvivalAlienLevels.UnsupportedMessage);
         _hostCampaignBundle = bundle;
         var host = await StartMenuHostAsync(options).ConfigureAwait(false);
         _diagnostics.Log("Multiplayer", $"Lobby hosted on port {host.BoundPort}. Alien enabled={options.AlienEnabled}.");
@@ -911,9 +913,9 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         LobbyCompatibility.Create(settings),
         RequireWorldPreparation: true,
         AlienEnabled: ReadLobbyAlienEnabled(message),
-        // A Private lobby is solo, so it is always Co-op (Alien vs Survivors needs 2+ players).
-        AlienVsSurvivors: ReadLobbyAlienVsSurvivors(message)
-            && ReadLobbyVisibility(message) != SteamLobbyVisibility.Private);
+        AlienVsSurvivors: ReadLobbyAlienVsSurvivors(message),
+        // Private lobbies are not listed but stay joinable; the host may start alone.
+        AllowSoloStart: ReadLobbyVisibility(message) == SteamLobbyVisibility.Private);
 
     private static string ResolveServerName(
         LauncherSettings settings,
@@ -929,8 +931,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         // The menu stepper defaults to "2 Players", which capped lobbies at two ("Lobby is full").
         // The menu selection is ignored for now: every lobby uses the default capacity (4).
         // Remove this line to honor the menu selection again.
-        // Private lobbies are solo: one slot, started without waiting for anyone.
-        ReadLobbyVisibility(message) == SteamLobbyVisibility.Private ? 1 : ProtocolConstants.DefaultLobbyCapacity;
+        ProtocolConstants.DefaultLobbyCapacity;
 
     // Original menu-driven capacity resolution (currently unused, see ResolveCapacity).
     private static int ResolveRequestedCapacity(ScaleformBridgeMessage message) =>
@@ -5088,7 +5089,8 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             ["gameMode"] = "Survival",
             ["visibility"] = "Private",
             ["survivorMapId"] = "ChallengeMap16",
-            ["survivorMapName"] = "ChallengeMap16"
+            ["survivorMapName"] = "ChallengeMap16",
+            ["alienVsSurvivorsLevels"] = string.Join(",", SurvivalAlienLevels.Levels)
         }));
 
     private async Task SendCurrentLobbyAsync()

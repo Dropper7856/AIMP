@@ -116,6 +116,8 @@ internal sealed partial class MultiplayerSessionCoordinator
             if (_gamePreparation is null) throw new InvalidOperationException("Game preparation is unavailable. Complete launcher setup first.");
             if (lobby.AlienVsSurvivors && LevelGameMode(lobby.Level) != "Survival")
                 throw new InvalidOperationException("Alien vs Survivors currently supports survival maps only.");
+            if (lobby.AlienVsSurvivors && !SurvivalAlienLevels.HasAlien(lobby.Level))
+                throw new InvalidOperationException(SurvivalAlienLevels.UnsupportedMessage);
             prepared = await _gamePreparation.PrepareLevelAsync(lobby.Level, token,
                 allowCampaign: LevelGameMode(lobby.Level) == "Campaign").ConfigureAwait(false);
             // Every peer stages/validates the same behavior bytes in its own lobby.
