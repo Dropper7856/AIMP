@@ -337,7 +337,7 @@ package frontend
          this._voiceVolumeItem = new MenuItem("Voice volume",this.voiceVolumeChanged);
          this._developerItem = new MenuItem("Developer mode: Off",this.developerToggle);
          this._developerItem.visible = false;
-         this._developerItem.description = "Unlocks the Campaign game mode and level selection. Campaign levels are prepared after restarting the game.";
+         this._developerItem.description = "Unlocks the Campaign game mode, Alien vs Survivors and level selection. Campaign levels are prepared after restarting the game.";
          this._voicePage.page.addItem(this._developerItem);
          this._voicePage.page.addItem(this._voiceEnabledItem);
          this._voicePage.page.addItem(this._voiceModeItem);
@@ -1071,8 +1071,8 @@ package frontend
          this.refreshSurvivorMapOptions();
       }
 
-      // Campaign is a Developer mode game mode. Without it, Survival (Co-op or
-      // Alien vs Survivors through Match Type) is the only choice.
+      // Campaign is a Developer mode game mode. Without it, Survival Co-op is the
+      // only choice (the Alien vs Survivors Match Type is Developer mode too).
       private function refreshServerModeOptions() : void
       {
          var campaign:Boolean = this._developerMode && this._serverModeItem.selectedItem != null && String(this._serverModeItem.selectedItem) == "campaign";
@@ -1414,7 +1414,7 @@ package frontend
 
       private function serverPvPSelected() : Boolean
       {
-         return String(this._serverPvPItem.selectedItem) == "pvp" && String(this._serverModeItem.selectedItem) != "campaign";
+         return this._developerMode && String(this._serverPvPItem.selectedItem) == "pvp" && String(this._serverModeItem.selectedItem) != "campaign";
       }
       
       private function readyChangedHandler(param1:MenuItemEvent) : void
@@ -1984,7 +1984,7 @@ package frontend
          if(this._serverMapItem != null && this._serverModeItem != null)
          {
             this._serverModeItem.visible = true;
-            this._serverPvPItem.visible = String(this._serverModeItem.selectedItem) != "campaign";
+            this._serverPvPItem.visible = this._developerMode && String(this._serverModeItem.selectedItem) != "campaign";
             this._serverAlienItem.visible = String(this._serverPvPItem.selectedItem) != "pvp" || !this._serverPvPItem.visible;
             this._campaignSaveItem.visible = String(this._serverModeItem.selectedItem) == "campaign";
             this._serverMapItem.visible = this._developerMode && (!this._campaignSaveItem.visible || this.getCampaignChoice().action == "level");

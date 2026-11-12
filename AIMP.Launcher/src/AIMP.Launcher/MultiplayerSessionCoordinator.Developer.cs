@@ -25,6 +25,9 @@ internal sealed partial class MultiplayerSessionCoordinator
         }
         if (!mode.Equals("survival", StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("Invalid game mode.");
+        // Alien vs Survivors is a Developer mode match type as well.
+        if (ReadLobbyAlienVsSurvivors(message) && !settings.DeveloperMode)
+            throw new InvalidOperationException(AlienVsSurvivorsDisabledMessage);
         if (settings.DeveloperMode)
             WorldManifestAutoResolver.ResolveLevelSource(settings.GameDirectory, level, includeCampaign: true);
     }
@@ -40,6 +43,9 @@ internal sealed partial class MultiplayerSessionCoordinator
 
     internal const string CampaignDisabledMessage =
         "Campaign is only available in Developer mode. Enable it, then restart the game to prepare the campaign levels.";
+
+    internal const string AlienVsSurvivorsDisabledMessage =
+        "Alien vs Survivors is only available in Developer mode.";
 
     private static string LevelGameMode(string level) =>
         level.StartsWith("Challenge", StringComparison.OrdinalIgnoreCase)
