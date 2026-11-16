@@ -137,6 +137,7 @@ internal sealed partial class SteamRelay
         var friend = new Friend(peer);
         if (HasAddress(friend.Name)) return "Steam name contains a web or IP address";
         if (_lobbyVisibility == SteamLobbyVisibility.Public) return null;
+        if (peer.Value == 0) return $"Steam did not report the player's SteamID and the lobby is {_lobbyVisibility}";
         return friend.IsFriend ? null : $"not a Steam friend and the lobby is {_lobbyVisibility}";
     }
 
