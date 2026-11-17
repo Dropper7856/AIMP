@@ -31,7 +31,32 @@ constexpr std::array<std::uint8_t, 5U> kPass{0xB0, 0x01, 0x90, 0x90, 0x90};
 bool SiteEquals(const std::uintptr_t base, const Site& site, const std::array<std::uint8_t, 5U>& bytes) {
     return std::memcmp(reinterpret_cast<const void*>(base + site.rva), bytes.data(), bytes.size()) == 0;
 }
+
+// OpenCAGE "current-gen script fixes" (CathodeLib DisableCurrentGenOptimisations):
+// at 008D7BD5 the retail exe calls FUN_00630590, which drops entities whose
+// requires_script_for_current_gen is false; OpenCAGE retargets the CALL to a
+// MOV AL,1;RET stub. Levels edited with OpenCAGE (the developer test levels)
+// rely on it, and the dev PC's exe has it on disk while retail does not.
+constexpr Site kCurrentGenSite{0x004D7BD5U, {0xE8, 0xB6, 0x89, 0xD5, 0xFF}, {0xE8, 0x16, 0xF5, 0x5C, 0x00}};
+std::atomic<bool> gCurrentGenScripts{};
+
+void InstallCurrentGenScripts(const std::uintptr_t base, HookManager& hooks) {
+    if (SiteEquals(base, kCurrentGenSite, kCurrentGenSite.openCage)) {
+        gCurrentGenScripts.store(true, std::memory_order_release);
+        return;
+    }
+    std::array<BytePatchRequest, 1U> patch{};
+    patch[0].target = reinterpret_cast<void*>(base + kCurrentGenSite.rva);
+    for (const auto value : kCurrentGenSite.retail) patch[0].expected.push_back(static_cast<std::byte>(value));
+    for (const auto value : kPass) patch[0].replacement.push_back(static_cast<std::byte>(value));
+    // Optional: a refusal leaves only edited levels' extra scripts off.
+    std::string ignored;
+    if (hooks.InstallPatchBatch("LevelIntegrityGuard.CurrentGenScripts", patch, ignored))
+        gCurrentGenScripts.store(true, std::memory_order_release);
 }
+}
+
+bool CurrentGenScriptsEnabled() noexcept { return gCurrentGenScripts.load(std::memory_order_acquire); }
 
 bool Install(const std::uintptr_t base, HookManager& hooks, std::string& error) {
     if (Installed()) return true;
@@ -41,6 +66,7 @@ bool Install(const std::uintptr_t base, HookManager& hooks, std::string& error) 
     }
     if (SiteEquals(base, kSites[0], kSites[0].openCage) && SiteEquals(base, kSites[1], kSites[1].openCage)) {
         gAlreadyBypassed.store(true, std::memory_order_release);
+        InstallCurrentGenScripts(base, hooks);
         gInstalled.store(true, std::memory_order_release);
         return true;
     }
@@ -51,6 +77,7 @@ bool Install(const std::uintptr_t base, HookManager& hooks, std::string& error) 
         for (const auto value : kPass) patches[i].replacement.push_back(static_cast<std::byte>(value));
     }
     if (!hooks.InstallPatchBatch("LevelIntegrityGuard.FingerprintBypass", patches, error)) return false;
+    InstallCurrentGenScripts(base, hooks);
     gInstalled.store(true, std::memory_order_release);
     return true;
 }

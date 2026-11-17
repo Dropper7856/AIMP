@@ -663,7 +663,8 @@ DWORD Bootstrap::RunImpl() {
                        : "MODELS_LEVEL.BIN and DLC fingerprints bypassed in memory (2 retail CALL sites).")
                 : (integrityError.empty()
                        ? "Prepared levels require the exact executable hash; retail will quit on load."
-                       : integrityError));
+                       : integrityError),
+            {{"currentGenScripts", std::string(level_integrity_guard::CurrentGenScriptsEnabled() ? "1" : "0")}});
     }
 
     {

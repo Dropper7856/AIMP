@@ -14,4 +14,6 @@ bool Install(std::uintptr_t base, HookManager& hooks, std::string& error);
 bool Installed() noexcept;
 // True when the executable already carried the OpenCAGE bypass.
 bool AlreadyBypassed() noexcept;
+// OpenCAGE's current-gen script fix (008D7BD5), applied in memory on retail.
+bool CurrentGenScriptsEnabled() noexcept;
 }
