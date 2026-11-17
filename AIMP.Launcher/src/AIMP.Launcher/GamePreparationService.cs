@@ -242,6 +242,14 @@ public sealed class GamePreparationService
                 "Waiting for another AI-MP Launcher to finish preparing")))
             {
                 token.ThrowIfCancellationRequested();
+                // Developer test levels are copied under PRODUCTION first, so the
+                // discovery below prepares them like any other level.
+                if (includeCampaign && !IsAnyGameRunning())
+                {
+                    var installedTestLevels = TestLevels.Install(game, token);
+                    if (installedTestLevels.Count > 0)
+                        _diagnostics.Log("Preparation", $"Test levels installed: {string.Join(", ", installedTestLevels)}.");
+                }
                 var levels = WorldManifestLevelDiscovery.Discover(game, includeCampaign).Where(l => l.CanCompile).ToArray();
                 if (levels.Length == 0) throw new InvalidDataException("No playable levels were found.");
                 // Split-screen: another game already runs from this installation.

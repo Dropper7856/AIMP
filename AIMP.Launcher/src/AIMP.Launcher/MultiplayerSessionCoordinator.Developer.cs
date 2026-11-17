@@ -47,8 +47,14 @@ internal sealed partial class MultiplayerSessionCoordinator
     internal const string AlienVsSurvivorsDisabledMessage =
         "Alien vs Survivors is only available in Developer mode.";
 
+    // Test levels play as Survival, but the frontend has no survivor-map entry
+    // for them: it loads them by engine path like an individual campaign level.
+    private static string FrontendStartMode(string level) =>
+        TestLevels.IsTestLevel(level) ? "campaign" : LevelGameMode(level);
+
     private static string LevelGameMode(string level) =>
-        level.StartsWith("Challenge", StringComparison.OrdinalIgnoreCase)
+        TestLevels.IsTestLevel(level)
+        || level.StartsWith("Challenge", StringComparison.OrdinalIgnoreCase)
         || level.StartsWith("BSPNOSTROMO_", StringComparison.OrdinalIgnoreCase)
         || level.StartsWith("Salvage", StringComparison.OrdinalIgnoreCase) ? "Survival" : "Campaign";
 

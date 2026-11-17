@@ -5151,7 +5151,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
             ["sessionGeneration"] = start.LevelGeneration.ToString(CultureInfo.InvariantCulture),
             ["lobbyId"] = start.SessionId.ToString("N"),
             ["syncProtocol"] = ProtocolConstants.Version.ToString(CultureInfo.InvariantCulture),
-            ["mode"] = LevelGameMode(start.Level),
+            ["mode"] = FrontendStartMode(start.Level),
             ["alienVsSurvivors"] = start.AlienVsSurvivors ? "1" : "0",
             ["alienPeerId"] = start.AlienPeerId.ToString(CultureInfo.InvariantCulture),
             ["mapId"] = start.Level,
