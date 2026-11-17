@@ -23,13 +23,16 @@ internal static class TestLevels
 
     /// <summary>Installs or refreshes every shipped test level. Returns the names installed now.</summary>
     internal static IReadOnlyList<string> Install(string gameDirectory, CancellationToken token)
+        => Install(gameDirectory, SourceRoot, token);
+
+    internal static IReadOnlyList<string> Install(string gameDirectory, string sourceRoot, CancellationToken token)
     {
         var production = WorldManifestLevelDiscovery.GetProductionDirectory(gameDirectory);
         var installed = new List<string>();
         foreach (var name in Names)
         {
             token.ThrowIfCancellationRequested();
-            var source = Path.Combine(SourceRoot, name);
+            var source = Path.Combine(sourceRoot, name);
             var sourceStamp = ReadStamp(source);
             if (sourceStamp is null) continue;
             var target = Path.Combine(production, name);
@@ -37,7 +40,22 @@ internal static class TestLevels
             CopyLevel(source, target, token);
             installed.Add(name);
         }
+        // Never edit MAIN.PKG: the retail Steam AI.exe checks the integrity of its
+        // package files at boot, before AIMP is injected, and exits (code 0)
+        // before the menu when MAIN.PKG differs (build 552 regression). Undo the
+        // edit that build made, from the backup it kept.
+        RestoreOriginalPackage(gameDirectory);
         return installed;
+    }
+
+    internal static bool RestoreOriginalPackage(string gameDirectory)
+    {
+        var path = Path.Combine(gameDirectory, "DATA", "PACKAGES", "MAIN.PKG");
+        var backup = path + ".aimp-backup";
+        if (!File.Exists(backup)) return false;
+        File.Copy(backup, path, overwrite: true);
+        File.Delete(backup);
+        return true;
     }
 
     private static string? ReadStamp(string directory)

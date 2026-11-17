@@ -4,6 +4,7 @@ internal static class Program
 {
     private static readonly TestCase[] Tests =
     {
+        new("Developer test levels install without editing MAIN.PKG", TestLevelInstallationTests.RegistrationAsync),
         new("Steam relay bounded receive stream", SteamRelayTests.ReceiveBoundsAsync),
         new("Steam relay game process environment isolation", SteamRelayTests.EnvironmentAsync),
         new("Steam relay address validation and shutdown", SteamRelayTests.AddressesAndDisposalAsync),

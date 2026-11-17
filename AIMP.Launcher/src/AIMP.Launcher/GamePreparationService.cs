@@ -244,6 +244,8 @@ public sealed class GamePreparationService
                 token.ThrowIfCancellationRequested();
                 // Developer test levels are copied under PRODUCTION first, so the
                 // discovery below prepares them like any other level.
+                if (!IsAnyGameRunning() && TestLevels.RestoreOriginalPackage(game))
+                    _diagnostics.Log("Preparation", "MAIN.PKG restored from .aimp-backup (build 552 had edited it; retail AI.exe exits before the menu).");
                 if (includeCampaign && !IsAnyGameRunning())
                 {
                     var installedTestLevels = TestLevels.Install(game, token);
