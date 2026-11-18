@@ -4,6 +4,10 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <string>
+#include <vector>
+
+#include <Windows.h>
 
 namespace aimp::level_integrity_guard {
 namespace {
@@ -84,4 +88,58 @@ bool Install(const std::uintptr_t base, HookManager& hooks, std::string& error) 
 
 bool Installed() noexcept { return gInstalled.load(std::memory_order_acquire); }
 bool AlreadyBypassed() noexcept { return gAlreadyBypassed.load(std::memory_order_acquire); }
+}
+
+namespace aimp::level_integrity_guard {
+namespace {
+// FUN_007e3b60 parses MAIN.PKG <game_data><levels>: for each <level id path>
+// it calls FUN_0077b340 (lookup by id) on the level registry
+// *(*(0x016F0C88)+0x3C) and, when absent, FUN_0079a6b0(id, "STD_LEVEL", path)
+// (both __thiscall; the registry copies the strings). load_level only accepts
+// registered ids, and editing MAIN.PKG makes retail quit at boot, so the
+// developer test levels are registered here, in memory, the same way.
+constexpr std::uintptr_t kRegistryRootRva = 0x012F0C88U;
+constexpr std::uintptr_t kLookupRva = 0x0037B340U;
+constexpr std::uintptr_t kRegisterRva = 0x0039A6B0U;
+constexpr std::uintptr_t kStdLevelRva = 0x00EF4C4CU;   // "STD_LEVEL"
+constexpr int kRegistryCapacity = 160;                 // slots 0x50..0x2D0
+using LookupFn = void*(__thiscall*)(void*, const char*);
+using RegisterFn = void(__thiscall*)(void*, const char*, const char*, const char*);
+
+int RegisterLevelGuarded(const std::uintptr_t base, const char* id, const char* path) noexcept {
+    __try {
+        const auto root = *reinterpret_cast<const std::uintptr_t*>(base + kRegistryRootRva);
+        if (root == 0U) return -1;
+        auto* registry = *reinterpret_cast<void* const*>(root + 0x3CU);
+        if (registry == nullptr) return -2;
+        const auto count = *reinterpret_cast<const int*>(reinterpret_cast<std::uintptr_t>(registry) + 0x2D0U);
+        if (std::strncmp(reinterpret_cast<const char*>(base + kStdLevelRva), "STD_LEVEL", 10) != 0) return -5;
+        if (reinterpret_cast<LookupFn>(base + kLookupRva)(registry, id) != nullptr) return 0;
+        if (count < 0 || count >= kRegistryCapacity - 1) return -3;
+        reinterpret_cast<RegisterFn>(base + kRegisterRva)(
+            registry, id, reinterpret_cast<const char*>(base + kStdLevelRva), path);
+        return reinterpret_cast<LookupFn>(base + kLookupRva)(registry, id) != nullptr ? 1 : -6;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -4;
+    }
+}
+}
+
+std::vector<TestLevelRegistration> RegisterTestLevels(const std::uintptr_t base) noexcept {
+    std::vector<TestLevelRegistration> results;
+    if (base == 0U) return results;
+    char exe[MAX_PATH]{};
+    const auto length = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    if (length == 0U || length >= MAX_PATH) return results;
+    std::string game(exe, length);
+    game.resize(game.find_last_of("\\/") + 1U);
+    for (const char* name : {"WORLDSYNC_TEST_LEVEL", "AISYNC_TEST_LEVEL"}) {
+        const auto commands = game + "DATA\\ENV\\PRODUCTION\\" + name + "\\WORLD\\COMMANDS.PAK";
+        if (GetFileAttributesA(commands.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+        const auto id = std::string("Production\\") + name;
+        const auto path = std::string("DATA\\ENV\\Production\\") + name;
+        results.push_back({name, RegisterLevelGuarded(base, id.c_str(), path.c_str())});
+    }
+    return results;
+}
 }

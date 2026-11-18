@@ -1321,6 +1321,19 @@ DWORD Bootstrap::RunImpl() {
         const auto engineThread = gameThreadDispatcher->Snapshot();
         if (engineThread.ready &&
             engineThread.engineThreadId != lastLoggedEngineThreadId) {
+            if (lastLoggedEngineThreadId == 0 && validation.hashMatch && moduleBase != 0) {
+                auto* testLevelLog = &diagnostics;
+                const auto testLevelBase = moduleBase;
+                gameThreadDispatcher->Enqueue([testLevelLog, testLevelBase] {
+                    for (const auto& level : level_integrity_guard::RegisterTestLevels(testLevelBase)) {
+                        testLevelLog->Log(level.result >= 0 ? "info" : "error", "test_level_registered",
+                            level.result == 1 ? "Developer test level registered in the engine level registry."
+                            : level.result == 0 ? "Developer test level already registered (MAIN.PKG)."
+                                                : "Developer test level registration refused.",
+                            {{"level", level.name}, {"result", std::to_string(level.result)}});
+                    }
+                });
+            }
             lastLoggedEngineThreadId = engineThread.engineThreadId;
             diagnostics.Log(
                 "info",

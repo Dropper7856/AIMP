@@ -17,3 +17,12 @@ bool AlreadyBypassed() noexcept;
 // OpenCAGE's current-gen script fix (008D7BD5), applied in memory on retail.
 bool CurrentGenScriptsEnabled() noexcept;
 }
+
+#include <vector>
+namespace aimp::level_integrity_guard {
+// Registers the installed developer test levels in the engine's level
+// registry (as MAIN.PKG would), so load_level accepts them on the retail exe.
+// Engine thread only. result: 1 registered, 0 already known, <0 refused.
+struct TestLevelRegistration { std::string name; int result{}; };
+std::vector<TestLevelRegistration> RegisterTestLevels(std::uintptr_t base) noexcept;
+}
