@@ -364,7 +364,13 @@ internal static class MissionSyncFrontierCompiler
         // chain re-emits during the replay and must stay a local consequence.
         return candidates.Where(value => !candidates.Any(other => other.Key != value.Key
                 && other.Reach.Reached.Contains(value.Key.SourceEntity)))
-            .Select(value => new MissionSyncFrontier(sources[value.Key.SourceEntity], value.Key.SourceParameter))
+            // A composite/proxy pin (the test level's Wall_Control_Package.Interacted)
+            // carries the interacting Character as data; its targets are control
+            // inputs (LogicOnce.trigger, spawn_npc) that never read it. Without the
+            // tolerance the native capture refused it as an unsafe payload (558).
+            .Select(value => new MissionSyncFrontier(sources[value.Key.SourceEntity], value.Key.SourceParameter,
+                PayloadTolerant: sources[value.Key.SourceEntity].Kind is WorldEntityKind.Proxy
+                    or WorldEntityKind.CompositeInstance))
             .ToArray();
     }
 
