@@ -45,6 +45,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 #include <deque>
 #include <initializer_list>
 #include <mutex>
@@ -262,6 +263,18 @@ struct Actor {
         float divergedAnchorX{},divergedAnchorZ{};
         std::uint32_t failures{};
         bool stopping{};
+        // Last goal deposited on THIS request (558): edits are rate limited.
+        float goal[3]{};
+        ULONGLONG lastEditAt{};
+        bool goalValid{};
+        // Survives request release/recreation (gait pacing, corrections, flight).
+        struct Keep {
+            bool boosted{};
+            ULONGLONG boostSince{},unboostSince{},farSince{},hardSince{},lastCorrection{};
+            ULONGLONG lastFlightAt{},speedAt{};
+            float speedX{},speedZ{},measuredSpeed{};
+            std::uint32_t actions{},edits{},editRefusals{},creates{},releases{},corrections{};
+        } keep{};
     } follow{};
     // Latest Host state in causal stream order (never an older queued carrier).
     std::uint32_t streamRevision{}, streamBirth{}, streamCycleState{}, streamPairRevision{}, streamCycleType{};
@@ -3066,6 +3079,7 @@ bool OrdinaryLocomotionCycle(const std::uint32_t type,const std::uint32_t state)
         // Its actual request and native animation retain heading authority.
         (type==0xEAC040U&&state==0x39U);
 }
+void RecordHostFlight(Actor& actor,const float* position,float yaw,float speed) noexcept;
 void CapturePose(Actor& actor, ULONGLONG now) noexcept {
     // Physical observations bound the Client's native navigation goals. The
     // typed Host command still owns permission; no Character transform is set.
@@ -3150,6 +3164,7 @@ void CapturePose(Actor& actor, ULONGLONG now) noexcept {
     if(speed>0.02F)actor.desired.stateFlags|=Moving;else actor.desired.stateFlags&=~Moving;
     ++actor.desired.locomotionRevision;if(!actor.desired.locomotionRevision)++actor.desired.locomotionRevision;
     gPoseCaptured.fetch_add(1U, std::memory_order_relaxed);
+    RecordHostFlight(actor,position,yaw,speed);
 }
 
 Actor* Find(const std::uintptr_t c) noexcept {
@@ -10230,6 +10245,57 @@ void PumpHostImpacts() noexcept {
 // A Host stop becomes a final goal: retail brakes and plays its own stop.
 std::atomic<std::uint64_t> gFollowCreated{},gFollowCreateFailures{},gFollowCompleted{},gFollowCancelled{},
     gFollowEmergencies{},gFollowIdleTurns{},gFollowDivergenceReplans{};
+std::atomic<std::uint64_t> gFollowEdits{},gFollowEditRefusals{},gFollowHiddenCorrections{},gFollowHardCorrections{},
+    gFollowBoostFrames{};
+// ---- Locomotion flight recorder (558) -------------------------------------
+// 10 Hz per AI on both roles, so ONE two-PC test shows where Client locomotion
+// leaves the Host: pose, newest Host pose, goal, request status/phase, native
+// movement mode, gait and the driver's actions. Engine thread records only;
+// the Bootstrap 250 ms loop drains into native.log (event aisync_locomotion).
+constexpr std::uint32_t kFlightCreate=1U,kFlightCreateFail=2U,kFlightEdit=4U,kFlightEditRefused=8U,
+    kFlightRelease=16U,kFlightStuckReplan=32U,kFlightHiddenCorrection=64U,kFlightHardCorrection=128U,
+    kFlightIdleTurn=256U,kFlightBoost=512U,kFlightCompleted=1024U,kFlightFailed=2048U,
+    kFlightRelinquish=4096U,kFlightActionFollow=8192U;
+constexpr std::uint8_t kFlightNavPoly=1U,kFlightPendingEdit=2U,kFlightSeen=4U,kFlightLive=8U,
+    kFlightStale=16U,kFlightBoosted=32U,kFlightNoTarget=64U;
+struct LocomotionFlight {
+    std::uint64_t utc{};
+    std::uint32_t entityA{},actions{},edits{},refusals{},creates{},releases{},corrections{};
+    std::uint8_t role{},cycleState{},mode{},hostGait{},gait{},effGait{},status{},phase{},flags{};
+    float lx{},ly{},lz{},lyaw{},tx{},tz{},hx{},hz{},hs{},gx{},gz{},err{},along{},ms{};
+};
+std::mutex gFlightGate;
+std::array<LocomotionFlight,4096> gFlight{};
+std::size_t gFlightRead{},gFlightCount{};
+std::uint64_t gFlightDropped{};
+void RecordFlight(const LocomotionFlight& sample) noexcept {
+    const std::lock_guard lock(gFlightGate);
+    if(gFlightCount==gFlight.size()){++gFlightDropped;return;}
+    gFlight[(gFlightRead+gFlightCount++)%gFlight.size()]=sample;
+}
+void ReadMovementInternals(const std::uintptr_t character,LocomotionFlight& sample) noexcept {
+    std::uintptr_t cycle{},movement{};std::uint8_t state{};std::uint32_t mode{},gait{},poly{};
+    if(Read(character+0x36CU,cycle)&&cycle&&Read(cycle+0x1AU,state))sample.cycleState=state;
+    if(Read(character+0x42A8U,movement)&&movement) {
+        if(Read(movement+8U,mode))sample.mode=static_cast<std::uint8_t>((std::min)(mode,255U));
+        if(Read(movement+0x198U,gait))sample.effGait=static_cast<std::uint8_t>((std::min)(gait,255U));
+        // 007C67B0 clamps root motion through M+138 only while M+1C4 holds a
+        // navigation polygon; without it the body is re-placed on M+138.
+        if(Read(movement+0x1C4U,poly)&&poly)sample.flags|=kFlightNavPoly;
+    }
+}
+// The local viewer's facing approximates the first-person camera. Unknown
+// viewer state counts as seen: a correction is never made on a guess.
+bool LocalViewerSees(const float* point) noexcept {
+    const auto player=LocalPlayer();
+    float viewer[3]{},yaw{};
+    if(!player||!Read(player+kPositionOffset,viewer[0])||!Read(player+kPositionOffset+8U,viewer[2])||
+        !Read(player+kYawOffset,yaw)||!std::isfinite(viewer[0])||!std::isfinite(viewer[2])||!std::isfinite(yaw))return true;
+    const float dx=point[0]-viewer[0],dz=point[2]-viewer[2],distance=std::hypot(dx,dz);
+    if(!std::isfinite(distance)||distance<8.0F)return true;
+    if(distance>45.0F)return false;
+    return (dx*std::sin(yaw)+dz*std::cos(yaw))/distance>0.2588F; // inside 75 degrees of facing
+}
 struct FollowRef {std::uintptr_t object,control;};
 bool FollowNativeCreate(std::uintptr_t character,const float* goal,FollowRef& out) noexcept {
     out={};
@@ -10283,7 +10349,10 @@ void ReleaseNativeFollow(Actor& actor,bool cancel) noexcept {
     FollowNativeRelease({actor.follow.object,actor.follow.control},cancel);
     if(cancel)gFollowCancelled.fetch_add(1U,std::memory_order_relaxed);
     const auto failures=actor.follow.failures;const auto retry=actor.follow.retryAt;
+    auto keep=actor.follow.keep;keep.actions|=kFlightRelease;++keep.releases;
+    const auto stillSince=actor.follow.stillSince;
     actor.follow={};actor.follow.failures=failures;actor.follow.retryAt=retry;
+    actor.follow.keep=keep;actor.follow.stillSince=stillSince;
 }
 } // namespace
 void FollowIdleFacing(Actor& actor,const hybrid_motion::Target& target,const float* local,float yaw,ULONGLONG now) noexcept {
@@ -10296,17 +10365,71 @@ void FollowIdleFacing(Actor& actor,const hybrid_motion::Target& target,const flo
     if(!f.idleYawSince){f.idleYawSince=now;return;}
     if(now-f.idleYawSince<400U)return;
     const float step=std::clamp(delta,-0.05F,0.05F); // ~3 rad/s at 60 fps
-    if(character_direct_step_runtime::ApplyAIRecoveryTransform(actor.character,local,yaw+step))
+    if(character_direct_step_runtime::ApplyAIRecoveryTransform(actor.character,local,yaw+step)) {
         gFollowIdleTurns.fetch_add(1U,std::memory_order_relaxed);
+        f.keep.actions|=kFlightIdleTurn;
+    }
+}
+// ---- Native follow driver (558) -------------------------------------------
+// The engine owns locomotion: route, steering, start/turn/stop cycles, gait
+// animation, root motion and the navmesh clamp (007C67B0 -> 0044B420). The
+// driver only chooses WHERE the local retail Move goes and HOW FAST (gait).
+// 524-556 deposited a new goal every frame: each consumed edit can replan the
+// route (0044D320), so a running Alien replanned up to 60 times a second.
+// Goals now follow the NEWEST Host pose (not the 100 ms delayed one) with a
+// lead, and an edit is only deposited when it moved enough or aged.
+constexpr float kFollowEditDistance2=0.5F*0.5F;      // deposit when the goal moved 0.5 m
+constexpr float kFollowEditMinimum2=0.1F;            // 0044D320 ignores deltaXZ^2 < 0.1
+constexpr ULONGLONG kFollowEditPeriodMs=250U;
+constexpr float kFollowBoostAlong=2.5F,kFollowUnboostAlong=1.2F;
+// Divergence recovery: the body is re-placed on the Host pose only while the
+// local viewer cannot see it; the hard bound is a last resort (lost route,
+// wrong floor) and is counted separately.
+constexpr float kHiddenCorrectionDistance=2.5F,kHardCorrectionDistance=12.0F;
+constexpr ULONGLONG kHiddenCorrectionDwellMs=1200U,kHardCorrectionDwellMs=3000U,kCorrectionCooldownMs=2000U;
+bool FollowGoalDeposited(std::uintptr_t request,const float* goal) noexcept {
+    std::uint8_t flags{};float deposited[3]{};
+    return Read(request+0xB8U,flags)&&(flags&0x40U)!=0U&&
+        Read(request+0x34U,deposited[0])&&Read(request+0x38U,deposited[1])&&Read(request+0x3CU,deposited[2])&&
+        deposited[0]==goal[0]&&deposited[1]==goal[1]&&deposited[2]==goal[2];
 }
 void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uint32_t hostGait,ULONGLONG now) noexcept {
     auto& f=actor.follow;
     float local[3]{},yaw{};
     if(!Read(actor.character+kPositionOffset,local[0])||!Read(actor.character+kPositionOffset+4U,local[1])||
         !Read(actor.character+kPositionOffset+8U,local[2])||!Read(actor.character+kYawOffset,yaw)){ReleaseNativeFollow(actor);return;}
+    // The delayed target measures error; goals use the freshest Host truth.
+    hybrid_motion::Target latest{};
+    if(!actor.directPoseTimeline.Latest(PreciseTickMs(),latest)||latest.stale||latest.nativeAction||latest.discontinuity)
+        latest=target;
     const float dx=target.position[0]-local[0],dz=target.position[2]-local[2];
     const float planar=std::sqrt(dx*dx+dz*dz);
     const float speed=std::hypot(target.velocity[0],target.velocity[2]);
+    const float latestSpeed=std::hypot(latest.velocity[0],latest.velocity[2]);
+    float along=0.0F; // >0: the Client is behind the newest Host pose
+    if(latestSpeed>0.25F)along=((latest.position[0]-local[0])*latest.velocity[0]+
+        (latest.position[2]-local[2])*latest.velocity[2])/latestSpeed;
+    // Divergence recovery, never in view (see constants above).
+    {
+        auto& k=f.keep;
+        if(planar>kHiddenCorrectionDistance){if(!k.farSince)k.farSince=now;}else k.farSince=0U;
+        if(planar>kHardCorrectionDistance){if(!k.hardSince)k.hardSince=now;}else k.hardSince=0U;
+        const bool cooled=!k.lastCorrection||now-k.lastCorrection>=kCorrectionCooldownMs;
+        const bool hidden=k.farSince&&now-k.farSince>=kHiddenCorrectionDwellMs&&
+            !LocalViewerSees(local)&&!LocalViewerSees(target.position.data());
+        const bool hard=k.hardSince&&now-k.hardSince>=kHardCorrectionDwellMs;
+        if(cooled&&(hidden||hard)) {
+            ReleaseNativeFollow(actor);
+            auto& kept=actor.follow.keep;
+            const float pose[3]{target.position[0],target.position[1],target.position[2]};
+            if(character_direct_step_runtime::ApplyAIRecoveryTransform(actor.character,pose,target.yaw)) {
+                kept.lastCorrection=now;kept.farSince=kept.hardSince=0U;++kept.corrections;
+                kept.actions|=hidden?kFlightHiddenCorrection:kFlightHardCorrection;
+                (hidden?gFollowHiddenCorrections:gFollowHardCorrections).fetch_add(1U,std::memory_order_relaxed);
+            } else kept.lastCorrection=now;
+            return;
+        }
+    }
     // Distance alone is not a stuck route: the Host may be several metres
     // ahead while the local Alien is still walking. Only retire a native
     // follow that has failed to translate 0.15 m over 750 ms despite that
@@ -10319,7 +10442,7 @@ void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uin
             const float moved=std::hypot(local[0]-f.divergedAnchorX,local[2]-f.divergedAnchorZ);
             if(moved<0.15F) {
                 ReleaseNativeFollow(actor);
-                f.retryAt=now+250U;
+                actor.follow.retryAt=now+250U;actor.follow.keep.actions|=kFlightStuckReplan;
                 gFollowDivergenceReplans.fetch_add(1U,std::memory_order_relaxed);
                 return;
             }
@@ -10331,23 +10454,32 @@ void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uin
     if(f.object) {
         std::uint32_t status{};
         if(!Read(f.object+0xCU,status)||status>2U) {
-            if(status==3U)gFollowCompleted.fetch_add(1U,std::memory_order_relaxed);
-            else if(status==4U){++f.failures;f.retryAt=now+std::min<ULONGLONG>(2000U,150U*f.failures);}
+            if(status==3U){gFollowCompleted.fetch_add(1U,std::memory_order_relaxed);f.keep.actions|=kFlightCompleted;}
+            else if(status==4U){++f.failures;f.retryAt=now+std::min<ULONGLONG>(2000U,150U*f.failures);f.keep.actions|=kFlightFailed;}
             ReleaseNativeFollow(actor,false);
         }
     }
-    const bool hostMoving=speed>0.25F;
+    auto& k=f.keep;
+    const bool hostMoving=speed>0.25F||latestSpeed>0.25F;
     if(hostMoving)f.stillSince=0U;else if(!f.stillSince)f.stillSince=now;
     const bool hostStopped=!hostMoving&&now-f.stillSince>=150U;
-    // Gait: the Host's effective gait; one step faster when clearly behind.
+    // Gait: the Host's effective gait; one step faster while clearly behind
+    // the newest Host pose, with hysteresis so the cycle does not flicker.
     std::uint32_t gait=hostGait<=3U?hostGait:1U;
-    if(planar>2.0F&&gait<3U)++gait;
-    float goal[3]{target.position[0],target.position[1],target.position[2]};
-    if(!hostStopped&&speed>0.05F) {
+    if(hostMoving&&along>kFollowBoostAlong) {
+        k.unboostSince=0U;if(!k.boostSince)k.boostSince=now;
+        if(now-k.boostSince>=150U)k.boosted=true;
+    } else if(!hostMoving||along<kFollowUnboostAlong) {
+        k.boostSince=0U;if(!k.unboostSince)k.unboostSince=now;
+        if(now-k.unboostSince>=300U)k.boosted=false;
+    }
+    if(k.boosted&&gait<3U){++gait;k.actions|=kFlightBoost;gFollowBoostFrames.fetch_add(1U,std::memory_order_relaxed);}
+    float goal[3]{latest.position[0],latest.position[1],latest.position[2]};
+    if(!hostStopped&&latestSpeed>0.05F) {
         // Through-goal ahead of the Host so retail never reaches its braking
         // distance while the Host keeps moving.
-        const float lead=std::clamp(speed*0.6F,1.2F,4.0F);
-        goal[0]+=target.velocity[0]/speed*lead;goal[2]+=target.velocity[2]/speed*lead;
+        const float lead=std::clamp(latestSpeed*0.5F,1.5F,4.0F);
+        goal[0]+=latest.velocity[0]/latestSpeed*lead;goal[2]+=latest.velocity[2]/latestSpeed*lead;
     }
     const bool needsMove=hostMoving||planar>0.6F;
     if(!f.object) {
@@ -10357,21 +10489,105 @@ void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uin
         static_cast<void>(FollowGait(actor.character,gait));
         FollowRef ref{};
         // A failed far goal (off-mesh extrapolation) retries on the Host pose.
-        const float* initial=(f.failures&1U)?target.position.data():goal;
+        const float* initial=(f.failures&1U)?latest.position.data():goal;
         if(!FollowNativeCreate(actor.character,initial,ref)) {
             if(ref.object)FollowNativeRelease(ref,true);
             ++f.failures;f.retryAt=now+std::min<ULONGLONG>(2000U,150U*f.failures);
+            k.actions|=kFlightCreateFail;
             gFollowCreateFailures.fetch_add(1U,std::memory_order_relaxed);return;
         }
-        f.object=ref.object;f.control=ref.control;f.createdAt=now;f.stopping=false;f.idleYawSince=0U;
+        f.object=ref.object;f.control=ref.control;f.createdAt=now;f.stopping=hostStopped;f.idleYawSince=0U;
+        std::copy_n(initial,3U,f.goal);f.goalValid=true;f.lastEditAt=now;
+        k.actions|=kFlightCreate;++k.creates;
         gFollowCreated.fetch_add(1U,std::memory_order_relaxed);return;
     }
     f.failures=0U;
     static_cast<void>(FollowGait(actor.character,gait));
-    f.stopping=hostStopped;
-    // Every frame: 006C7550 accepts only in phase3 without a pending edit.
-    static_cast<void>(FollowNativeGoal(f.object,goal));
+    const float gdx=goal[0]-f.goal[0],gdz=goal[2]-f.goal[2];
+    const float moved2=gdx*gdx+gdz*gdz;
+    const bool due=!f.goalValid||hostStopped!=f.stopping||moved2>=kFollowEditDistance2||
+        std::abs(goal[1]-f.goal[1])>=0.75F||(now-f.lastEditAt>=kFollowEditPeriodMs&&moved2>=kFollowEditMinimum2);
+    if(!due)return;
+    // 006C7550 accepts only in phase 3 without a pending edit, and is void:
+    // deposition is verified from the request itself.
+    std::uint8_t pending{};
+    if(!Read(f.object+0xB8U,pending)||(pending&0x40U)!=0U)return;
+    if(FollowNativeGoal(f.object,goal)&&FollowGoalDeposited(f.object,goal)) {
+        std::copy_n(goal,3U,f.goal);f.goalValid=true;f.lastEditAt=now;f.stopping=hostStopped;
+        ++k.edits;k.actions|=kFlightEdit;gFollowEdits.fetch_add(1U,std::memory_order_relaxed);
+    } else {
+        ++k.editRefusals;k.actions|=kFlightEditRefused;gFollowEditRefusals.fetch_add(1U,std::memory_order_relaxed);
+    }
 }
+// 10 Hz Client record for every remotely driven AI, whether the follow driver,
+// an action follow, a pair or a passage owns it this frame.
+void RecordClientFlight(Actor& actor,const ULONGLONG now) noexcept {
+    auto& k=actor.follow.keep;
+    if(!actor.character||actor.duplicate||!actor.remoteBirth)return;
+    if(k.lastFlightAt&&now-k.lastFlightAt<100U)return;
+    LocomotionFlight sample{};
+    sample.utc=UtcMs();sample.entityA=actor.entityA;sample.role=2U;
+    float local[3]{},yaw{};
+    if(!Read(actor.character+kPositionOffset,local[0])||!Read(actor.character+kPositionOffset+4U,local[1])||
+        !Read(actor.character+kPositionOffset+8U,local[2])||!Read(actor.character+kYawOffset,yaw))return;
+    sample.lx=local[0];sample.ly=local[1];sample.lz=local[2];sample.lyaw=yaw;
+    if(k.speedAt&&now>k.speedAt&&now-k.speedAt<1000U)
+        k.measuredSpeed=std::hypot(local[0]-k.speedX,local[2]-k.speedZ)*1000.0F/static_cast<float>(now-k.speedAt);
+    k.speedX=local[0];k.speedZ=local[2];k.speedAt=now;sample.ms=k.measuredSpeed;
+    ReadMovementInternals(actor.character,sample);
+    hybrid_motion::Target target{},latest{};
+    const auto precise=PreciseTickMs();
+    if(actor.directPoseTimeline.SampleAt(precise,target)) {
+        sample.tx=target.position[0];sample.tz=target.position[2];
+        sample.err=std::hypot(target.position[0]-local[0],target.position[2]-local[2]);
+        if(target.stale)sample.flags|=kFlightStale;
+    } else sample.flags|=kFlightNoTarget;
+    if(actor.directPoseTimeline.Latest(precise,latest)) {
+        sample.hx=latest.position[0];sample.hz=latest.position[2];
+        sample.hs=std::hypot(latest.velocity[0],latest.velocity[2]);
+        if(sample.hs>0.25F)sample.along=((latest.position[0]-local[0])*latest.velocity[0]+
+            (latest.position[2]-local[2])*latest.velocity[2])/sample.hs;
+    }
+    sample.hostGait=static_cast<std::uint8_t>((std::min)(actor.recoveryPose.moveType,255U));
+    std::uintptr_t movement{};std::uint32_t requested{};
+    if(Read(actor.character+0x42A8U,movement)&&movement&&Read(movement+0x194U,requested))
+        sample.gait=static_cast<std::uint8_t>((std::min)(requested,255U));
+    const auto& f=actor.follow;
+    if(f.object) {
+        std::uint32_t status{},phase{};std::uint8_t pending{};
+        sample.flags|=kFlightLive;
+        if(Read(f.object+0xCU,status))sample.status=static_cast<std::uint8_t>((std::min)(status,255U));
+        if(Read(f.object+0x68U,phase))sample.phase=static_cast<std::uint8_t>((std::min)(phase,255U));
+        if(Read(f.object+0xB8U,pending)&&(pending&0x40U))sample.flags|=kFlightPendingEdit;
+        sample.gx=f.goal[0];sample.gz=f.goal[2];
+    }
+    if(LocalViewerSees(local))sample.flags|=kFlightSeen;
+    if(k.boosted)sample.flags|=kFlightBoosted;
+    sample.actions=k.actions;k.actions=0U;
+    sample.edits=k.edits;sample.refusals=k.editRefusals;sample.creates=k.creates;
+    sample.releases=k.releases;sample.corrections=k.corrections;
+    k.lastFlightAt=now;
+    RecordFlight(sample);
+}
+namespace {
+// Host side of the same record: the pose the Client follows, plus the native
+// movement state that produced it (cycle, M+8 mode, effective gait).
+void RecordHostFlight(Actor& actor,const float* position,float yaw,float speed) noexcept {
+    if(gRole.load(std::memory_order_acquire)!=Role::Host||!actor.character||actor.duplicate)return;
+    auto& k=actor.follow.keep;
+    const auto now=GetTickCount64();
+    if(k.lastFlightAt&&now-k.lastFlightAt<100U)return;
+    k.lastFlightAt=now;
+    LocomotionFlight sample{};
+    sample.utc=UtcMs();sample.entityA=actor.entityA;sample.role=1U;
+    sample.lx=position[0];sample.ly=position[1];sample.lz=position[2];sample.lyaw=yaw;sample.hs=speed;
+    ReadMovementInternals(actor.character,sample);
+    std::uintptr_t movement{};std::uint32_t requested{};
+    if(Read(actor.character+0x42A8U,movement)&&movement&&Read(movement+0x194U,requested))
+        sample.gait=static_cast<std::uint8_t>((std::min)(requested,255U));
+    RecordFlight(sample);
+}
+} // namespace
 void PublishLocalIncarnation() noexcept {
     auto& registry=character_incarnations::NativeRegistry();
     character_incarnations::Ticket ticket{};
@@ -10703,7 +10919,9 @@ void PumpOnEngineThread() noexcept {
     lock.unlock();
     for(auto& actor:gActors) {
         if(!actor.character || actor.duplicate || actor.faulted)continue;
+        RecordClientFlight(actor,GetTickCount64());
         const auto relinquish=[&]() noexcept {
+            if(actor.follow.object)actor.follow.keep.actions|=kFlightRelinquish;
             ReleaseNativeFollow(actor);
             if(actor.recoveryNativeArmed)
                 static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
@@ -10820,8 +11038,10 @@ bool FollowHostActionPose(Actor& actor) noexcept {
     const float cap=passage?0.35F:(action?0.10F:0.15F);
     const float scale=std::min(1.0F,cap/distance);
     const float pose[3]{local[0]+dx*scale,local[1]+dy*scale,local[2]+dz*scale};
-    if(character_direct_step_runtime::ApplyAIRecoveryTransform(actor.character,pose,target.yaw))
+    if(character_direct_step_runtime::ApplyAIRecoveryTransform(actor.character,pose,target.yaw)) {
         gDirectPoseActionFollowFrames.fetch_add(1U,std::memory_order_relaxed);
+        actor.follow.keep.actions|=kFlightActionFollow;
+    }
     return true;
 }
 void ReconcileDirectPoseOnEngineThread() noexcept {
@@ -11839,8 +12059,44 @@ Counters DiagnosticsSnapshot() noexcept {
     value.stable = gGenerations != nullptr && gGenerations->IsStableGeneration(value.nativeGeneration);
     return value;
 }
+void DrainLocomotionFlight(Diagnostics& diagnostics) noexcept {
+    const auto number=[](float value){
+        if(!std::isfinite(value))return std::string("null");
+        char text[32]{};std::snprintf(text,sizeof(text),"%.3f",static_cast<double>(value));return std::string(text);
+    };
+    for(std::size_t i=0;i<gFlight.size();++i) {
+        LocomotionFlight s{};
+        {const std::lock_guard lock(gFlightGate);if(!gFlightCount)break;
+            s=gFlight[gFlightRead];gFlightRead=(gFlightRead+1)%gFlight.size();--gFlightCount;}
+        try {
+            diagnostics.Log("info","aisync_locomotion","",
+                {{"role",Diagnostics::Unsigned(s.role),true},{"utcMs",Diagnostics::Unsigned(s.utc),true},
+                 {"entityA",Diagnostics::Unsigned(s.entityA),true},
+                 {"x",number(s.lx),true},{"y",number(s.ly),true},{"z",number(s.lz),true},{"yaw",number(s.lyaw),true},
+                 {"tx",number(s.tx),true},{"tz",number(s.tz),true},{"hx",number(s.hx),true},{"hz",number(s.hz),true},
+                 {"hostSpeed",number(s.hs),true},{"speed",number(s.ms),true},{"err",number(s.err),true},{"along",number(s.along),true},
+                 {"gx",number(s.gx),true},{"gz",number(s.gz),true},
+                 {"cycle",Diagnostics::Unsigned(s.cycleState),true},{"mode",Diagnostics::Unsigned(s.mode),true},
+                 {"hostGait",Diagnostics::Unsigned(s.hostGait),true},{"gait",Diagnostics::Unsigned(s.gait),true},
+                 {"effGait",Diagnostics::Unsigned(s.effGait),true},{"status",Diagnostics::Unsigned(s.status),true},
+                 {"phase",Diagnostics::Unsigned(s.phase),true},{"flags",Diagnostics::Unsigned(s.flags),true},
+                 {"actions",Diagnostics::Unsigned(s.actions),true},{"edits",Diagnostics::Unsigned(s.edits),true},
+                 {"refusals",Diagnostics::Unsigned(s.refusals),true},{"creates",Diagnostics::Unsigned(s.creates),true},
+                 {"releases",Diagnostics::Unsigned(s.releases),true},{"corrections",Diagnostics::Unsigned(s.corrections),true}});
+        } catch(...) {return;}
+    }
+}
 void LogDiagnostics(Diagnostics& diagnostics) {
     pvp_actions::LogVent(diagnostics);
+    {
+        static bool legendLogged{};
+        if(!legendLogged) {
+            legendLogged=true;
+            diagnostics.Log("info","aisync_locomotion_legend",
+                "aisync_locomotion: 10 Hz per AI. role1 Host (x,y,z = Host pose, hostSpeed = its speed), role2 Client (x,y,z = local body; tx,tz = Host pose rendered 100 ms late; hx,hz/hostSpeed = newest Host pose; err = |target-body| XZ; along = lag behind newest Host pose along its velocity; gx,gz = goal on the live follow Move; speed = measured body speed). cycle = locomotion cycle state (1 idle, 55 start, 56 move, 59 stop), mode = MovementAction+8, gait = requested M+194, effGait = M+198, hostGait = Host effective gait, status/phase = follow request +C/+68. flags: 1 navmesh polygon, 2 goal edit pending, 4 seen by local viewer, 8 follow Move live, 16 stale Host pose, 32 gait boosted, 64 no Host pose. actions (since previous record): 1 create, 2 create failed, 4 goal edit, 8 edit refused, 16 release, 32 stuck replan, 64 hidden correction, 128 hard correction, 256 idle turn, 512 boosted gait, 1024 Move completed, 2048 Move failed, 4096 relinquished (action/pair/passage/stale), 8192 action pose follow. edits..corrections are cumulative per AI.",
+                {});
+        }
+    }
     pvp_actions::LogAttack(diagnostics);
     {
         static std::uint64_t lastGateCount{};
@@ -12168,6 +12424,12 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"nativeFollowEmergencies", Diagnostics::Unsigned(gFollowEmergencies.load()), true},
          {"nativeFollowDivergenceReplans", Diagnostics::Unsigned(gFollowDivergenceReplans.load()), true},
          {"nativeFollowIdleTurns", Diagnostics::Unsigned(gFollowIdleTurns.load()), true},
+         {"nativeFollowGoalEdits", Diagnostics::Unsigned(gFollowEdits.load()), true},
+         {"nativeFollowGoalEditRefusals", Diagnostics::Unsigned(gFollowEditRefusals.load()), true},
+         {"nativeFollowHiddenCorrections", Diagnostics::Unsigned(gFollowHiddenCorrections.load()), true},
+         {"nativeFollowHardCorrections", Diagnostics::Unsigned(gFollowHardCorrections.load()), true},
+         {"nativeFollowBoostFrames", Diagnostics::Unsigned(gFollowBoostFrames.load()), true},
+         {"locomotionFlightDropped", Diagnostics::Unsigned(gFlightDropped), true},
          {"directPoseEmergencyCorrections", Diagnostics::Unsigned(gDirectPoseEmergencyCorrections.load()), true},
          {"clientCycleCallsReplayFailed", Diagnostics::Unsigned(gCycleCallsReplayFailed.load()), true},
          {"endedSourceExitsDeferred", Diagnostics::Unsigned(gEndedSourceExitsDeferred.load()), true},

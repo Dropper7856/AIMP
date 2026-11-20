@@ -413,5 +413,7 @@ bool SnapshotAlienVents(std::uint32_t page,std::string& json,int goTo=-1,std::ui
 std::uintptr_t ResolveLivingParticipant(std::uint64_t peer, std::uint32_t nativeGeneration) noexcept;
 // Call only from IPC/bootstrap workers, never from an engine detour.
 void LogDiagnostics(Diagnostics& diagnostics);
+// 10 Hz locomotion flight records (aisync_locomotion); bootstrap worker only.
+void DrainLocomotionFlight(Diagnostics& diagnostics) noexcept;
 } // namespace ai_sync
 } // namespace aimp

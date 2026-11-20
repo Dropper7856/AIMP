@@ -1108,6 +1108,7 @@ DWORD Bootstrap::RunImpl() {
     RuntimeObservationSnapshot lastRuntime{};
     while (WaitForSingleObject(stopEvent, 250) == WAIT_TIMEOUT) {
         player_lifecycle::DrainDiagnostics(diagnostics);
+        if (ai_sync::Installed()) ai_sync::DrainLocomotionFlight(diagnostics);
         world_interactions::DrainObservationDiagnostics(diagnostics);
         world_actions::DrainDiagnosticFiles(diagnostics);
         semantic_reconciliation::DrainDiagnosticFiles();

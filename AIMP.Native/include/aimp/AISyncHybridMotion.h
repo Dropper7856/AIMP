@@ -44,6 +44,9 @@ public:
     // A Discontinuity pose holds until an ordinary successor starts its segment.
     // The follower must honor stale/nativeAction rather than chase those poses.
     [[nodiscard]] bool SampleAt(std::uint64_t now, Target& out) const noexcept;
+    // Newest accepted Host pose (no interpolation delay), with the velocity of
+    // the last segment. Stale/boundary flags as in SampleAt. Empty: false.
+    [[nodiscard]] bool Latest(std::uint64_t now, Target& out) const noexcept;
     void Reset() noexcept;
     [[nodiscard]] std::size_t Count() const noexcept { return count_; }
 

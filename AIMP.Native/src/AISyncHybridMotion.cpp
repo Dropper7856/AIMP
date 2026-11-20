@@ -171,6 +171,23 @@ bool Timeline::SampleAt(std::uint64_t now, Target& out) const noexcept {
     return true;
 }
 
+bool Timeline::Latest(std::uint64_t now, Target& out) const noexcept {
+    if (count_ == 0) return false;
+    const auto& latest = history_[(first_ + count_ - 1) % kHistoryCapacity];
+    out = Pose(latest);
+    if ((latest.flags & kBoundary) == 0U && count_ >= 2)
+        out.velocity = SegmentVelocity(history_[(first_ + count_ - 2) % kHistoryCapacity], latest);
+    const auto hostNow = offsetNegative_ ? AddSaturated(now, offsetMagnitude_) :
+        (now >= offsetMagnitude_ ? now - offsetMagnitude_ : 0);
+    const auto arrivalAge = now >= latestArrivalMs_ ? now - latestArrivalMs_ : 0;
+    const auto hostAge = hostNow >= latest.tick ? hostNow - latest.tick : 0;
+    if (arrivalAge >= kStaleAfterMs || hostAge >= kStaleAfterMs) {
+        out.velocity = {};
+        out.stale = true;
+    }
+    return true;
+}
+
 void Timeline::Reset() noexcept {
     first_ = count_ = 0;
     latestArrivalMs_ = offsetMagnitude_ = 0;
