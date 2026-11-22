@@ -10565,7 +10565,11 @@ void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uin
     auto& k=f.keep;
     const bool hostMoving=speed>0.25F||latestSpeed>0.25F;
     if(hostMoving)f.stillSince=0U;else if(!f.stillSince)f.stillSince=now;
-    const bool hostStopped=!hostMoving&&now-f.stillSince>=150U;
+    // 562: the Host's own stop cycle (0x3B) is known before its speed drops
+    // to zero. Aim at its newest pose and stop pushing: 561 kept a trail
+    // lookahead during the Host's braking and the Client ran 4 m past it.
+    const bool hostBraking=actor.streamCycleState==0x3BU;
+    const bool hostStopped=(!hostMoving&&now-f.stillSince>=150U)||hostBraking;
     // Gait: the Host's effective gait M+198 alternates every few frames even
     // while its requested gait is constant (559: 2/3/2/3 at 10 Hz). Writing
     // each value to M+194 reset M+190 every change. Hold the highest Host gait
@@ -10589,7 +10593,9 @@ void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uin
         // up to 4 m straight ahead of the newest pose: at the AISYNC stairs the
         // Host turned right and climbed while the Client goal stayed straight
         // on the floor, so the Client turned late and ran under the stairs.
-        const float lookahead=std::clamp(latestSpeed*0.4F,1.5F,3.0F);
+        // 562: >= 2.5 m. Goals closer than ~1 m complete the Move (status 6)
+        // and 561 recreated it 42 times in one test.
+        const float lookahead=std::clamp(latestSpeed*0.5F,2.5F,4.0F);
         std::array<float,3> trail{};
         const std::array<float,3> body{local[0],local[1],local[2]};
         if(actor.directPoseTimeline.TrailPoint(body,lookahead,1.0F,trail)&&
