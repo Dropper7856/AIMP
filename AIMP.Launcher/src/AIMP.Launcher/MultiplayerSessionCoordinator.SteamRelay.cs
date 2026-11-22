@@ -97,6 +97,8 @@ internal sealed partial class MultiplayerSessionCoordinator
         await _commandGate.WaitAsync(_lifetime.Token).ConfigureAwait(false);
         try
         {
+            if (SteamRelay.HasAddress(friendName))
+                throw new InvalidOperationException("The invite was blocked: the sender's Steam name contains a web or IP address.");
             _pendingSteamInvite = (friendName, ValidateSteamInvitation(address));
             if (!_steamFrontendReady || !_controller.Snapshot.IpcConnected)
             {
