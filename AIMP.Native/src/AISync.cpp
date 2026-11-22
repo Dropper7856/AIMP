@@ -10216,7 +10216,10 @@ bool ApplyExecutionCarrier(const State& state,std::uint64_t through,std::uint64_
                 sample.position[axis]=state.position[axis];
                 sample.velocity[axis]=state.motionVelocity[axis];
             }
-            sample.yaw=state.yaw;sample.flags=state.motionFlags;
+            // 565 carries the Host start heading in motionFlags bits 3/16-27;
+            // the timeline accepts only Valid/NativeAction/Discontinuity and
+            // rejected every pose of a Host start cycle (Client froze ~1-2 s).
+            sample.yaw=state.yaw;sample.flags=state.motionFlags&7U;
             static_cast<void>(actor->directPoseTimeline.Push(sample,arrivalTick));
         } else {
             actor->directPoseTimeline.Reset();
