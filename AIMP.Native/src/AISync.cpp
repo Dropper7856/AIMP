@@ -97,6 +97,9 @@ constexpr std::uint32_t kLifecycleFlags = LifecycleSpatialDiscontinuity | Lifecy
 constexpr float kLifecycleDiscontinuityDistance = 3.5F;
 constexpr float kLifecycleVerticalDiscontinuity = 2.5F;
 constexpr std::uintptr_t kPositionOffset = 0x70U, kYawOffset = 0x174U;
+// State.motionFlags (565): bit 3 = Host start-cycle steering heading valid,
+// bits 16-27 = that heading quantized over [0, 2*pi) in 4096 steps.
+constexpr std::uint32_t kMotionStartHeading = 8U, kMotionHeadingMask = 0x0FFF0000U;
 constexpr std::uintptr_t kInteractionManagerGlobalRva = 0x012F0C88U;
 constexpr std::uintptr_t kRoleTaskCleanupRva = 0x00361A90U;
 constexpr auto kCharacterRegistry = character_direct_step_runtime::NativeCharacterRegistry();
@@ -1112,7 +1115,8 @@ bool Valid(const State& s) noexcept {
     if (s.interactionParticipantIncarnation!=0U&&((s.stateFlags&InteractionValid)==0U||
         (s.interactionFlags&InteractionTargetIsParticipant)==0U||s.interactionTargetPeer==0U))return false;
     if (!ValidCycleCall(s.transition)) return false;
-    if((s.motionFlags&~7U)!=0U)return false;
+    if((s.motionFlags&~(7U|kMotionStartHeading|kMotionHeadingMask))!=0U)return false;
+    if((s.motionFlags&kMotionStartHeading)!=0U&&(s.motionFlags&1U)==0U)return false;
     for(const auto velocity:s.motionVelocity)if(!std::isfinite(velocity)||std::abs(velocity)>128.0F)return false;
     if((s.motionFlags&1U)!=0U) {
         if(!s.motionTick||(s.stateFlags&PoseValid)==0U)return false;
@@ -3164,6 +3168,20 @@ void CapturePose(Actor& actor, ULONGLONG now) noexcept {
     // 511 Client run gait 3 while the Host played 2 (diag 174301, t=4-6 s).
     if(Read(actor.character+0x42A8U,movement)&&movement&&Read(movement+0x198U,gait)&&gait<=3U)
         actor.desired.moveType=gait;
+    // 565: while the Host stands in its start cycle (0x37, vtable EABE00),
+    // 00660DC0 keeps the steering heading it is about to leave along at
+    // cycle+50 (world yaw, the Character+174 convention; +58 = not yet
+    // initialised). Half of the Alien's starts are 150-180 degree turn starts,
+    // so the Client cannot guess the direction from the facing.
+    if(cycle&&cycleState==0x37U&&cycleType==gBase+0xEABE00U&&(actor.desired.motionFlags&1U)!=0U) {
+        float heading{};std::uint8_t pending{1U};
+        if(Read(cycle+0x58U,pending)&&!pending&&Read(cycle+0x50U,heading)&&std::isfinite(heading)&&std::abs(heading)<100.0F) {
+            constexpr float kTwoPi=6.2831853F;
+            heading=std::fmod(heading,kTwoPi);if(heading<0.0F)heading+=kTwoPi;
+            const auto quantized=static_cast<std::uint32_t>(std::lround(heading/kTwoPi*4095.0F))&0xFFFU;
+            actor.desired.motionFlags|=kMotionStartHeading|(quantized<<16U);
+        }
+    }
     const float speed=std::hypot(actor.desired.motionVelocity[0],actor.desired.motionVelocity[2]);
     actor.desired.velocityX=actor.desired.motionVelocity[0];actor.desired.velocityZ=actor.desired.motionVelocity[2];
     actor.desired.locomotionIntensity=speed>0.02F?1.0F:0.0F;
@@ -10571,7 +10589,24 @@ void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uin
     // Start the local Move when the Host ENTERS its start cycle.
     // Bounded: a Host standing in 0x37 for long is not about to leave.
     if(actor.streamCycleState==0x37U){if(!k.startSeenAt)k.startSeenAt=now;}else k.startSeenAt=0U;
-    const bool hostStarting=k.startSeenAt&&now-k.startSeenAt<1500U;
+    // 565: only with the Host's real steering heading (cycle+50 carried in
+    // motionFlags). 564 aimed along the facing: wrong for every turn start
+    // (8 of 23 measured starts were 150-180 degrees). A straight start waits
+    // ~0.87 s on the Host but only ~0.3 s locally, so it is delayed 350 ms;
+    // a turn start (Host waits ~0.62 s) begins at once.
+    float startHeading{};bool startHeadingValid{};
+    if((actor.recoveryPose.motionFlags&kMotionStartHeading)!=0U) {
+        startHeading=static_cast<float>((actor.recoveryPose.motionFlags&kMotionHeadingMask)>>16U)/4095.0F*6.2831853F;
+        startHeadingValid=true;
+    }
+    ULONGLONG startDelay=0U;
+    if(startHeadingValid) {
+        float turn=startHeading-yaw;
+        while(turn>3.14159265F)turn-=6.2831853F;
+        while(turn<-3.14159265F)turn+=6.2831853F;
+        if(std::abs(turn)<1.05F)startDelay=350U;
+    }
+    const bool hostStarting=startHeadingValid&&k.startSeenAt&&now-k.startSeenAt>=startDelay&&now-k.startSeenAt<1500U;
     const bool hostMoving=speed>0.25F||latestSpeed>0.25F||hostStarting;
     if(hostMoving)f.stillSince=0U;else if(!f.stillSince)f.stillSince=now;
     // 562: the Host's own stop cycle (0x3B) is known before its speed drops
@@ -10595,9 +10630,9 @@ void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uin
     }
     if(k.boosted&&gait<3U){++gait;k.actions|=kFlightBoost;gFollowBoostFrames.fetch_add(1U,std::memory_order_relaxed);}
     float goal[3]{latest.position[0],latest.position[1],latest.position[2]};
-    if(!hostStopped&&latestSpeed<=0.5F&&hostStarting&&std::isfinite(latest.yaw)) {
-        // Host still winding up in place: aim along its facing (564).
-        const float fx=std::sin(latest.yaw),fz=std::cos(latest.yaw);
+    if(!hostStopped&&latestSpeed<=0.5F&&hostStarting) {
+        // Host still winding up in place: aim along its steering heading.
+        const float fx=std::sin(startHeading),fz=std::cos(startHeading);
         goal[0]=latest.position[0]+fx*2.5F;goal[2]=latest.position[2]+fz*2.5F;
         k.actions|=kFlightStartGoal;
     } else if(!hostStopped&&latestSpeed>0.05F) {
@@ -10765,6 +10800,10 @@ void RecordHostFlight(Actor& actor,const float* position,float yaw,float speed) 
     std::uintptr_t movement{};std::uint32_t requested{};
     if(Read(actor.character+0x42A8U,movement)&&movement&&Read(movement+0x194U,requested))
         sample.gait=static_cast<std::uint8_t>((std::min)(requested,255U));
+    if((actor.desired.motionFlags&kMotionStartHeading)!=0U) {
+        sample.gx=static_cast<float>((actor.desired.motionFlags&kMotionHeadingMask)>>16U)/4095.0F*6.2831853F;
+        sample.flags|=128U;
+    }
     RecordFlight(sample);
 }
 } // namespace
@@ -12273,7 +12312,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
         if(!legendLogged) {
             legendLogged=true;
             diagnostics.Log("info","aisync_locomotion_legend",
-                "aisync_locomotion: 10 Hz per AI. role1 Host (x,y,z = Host pose, hostSpeed = its speed), role2 Client (x,y,z = local body; tx,tz = Host pose rendered 100 ms late; hx,hz/hostSpeed = newest Host pose; err = |target-body| XZ; along = lag behind newest Host pose along its velocity; gx,gz = goal on the live follow Move; speed = measured body speed). cycle = locomotion cycle state (1 idle, 55 start, 56 move, 59 stop), mode = MovementAction+8, gait = requested M+194, effGait = M+198, hostGait = Host effective gait, status/phase = follow request +C/+68. flags: 1 navmesh polygon, 2 goal edit pending, 4 seen by local viewer, 8 follow Move live, 16 stale Host pose, 32 gait boosted, 64 no Host pose. warp = root motion pacing factor applied to the Client body (1 = retail speed). actions (since previous record): 1 create, 2 create failed, 4 goal edit, 8 edit refused, 16 release, 32 stuck replan, 64 hidden correction, 128 hard correction, 256 idle turn, 512 boosted gait, 1024 Move completed, 2048 Move failed, 4096 relinquished (action/pair/passage/stale), 8192 action pose follow, 16384 goal taken on the Host trail, 32768 goal kept ahead of a body past the newest Host pose, 65536 goal along the Host facing while it enters its start cycle. edits..corrections are cumulative per AI.",
+                "aisync_locomotion: 10 Hz per AI. role1 Host (x,y,z = Host pose, hostSpeed = its speed), role2 Client (x,y,z = local body; tx,tz = Host pose rendered 100 ms late; hx,hz/hostSpeed = newest Host pose; err = |target-body| XZ; along = lag behind newest Host pose along its velocity; gx,gz = goal on the live follow Move; speed = measured body speed). cycle = locomotion cycle state (1 idle, 55 start, 56 move, 59 stop), mode = MovementAction+8, gait = requested M+194, effGait = M+198, hostGait = Host effective gait, status/phase = follow request +C/+68. flags: 1 navmesh polygon, 2 goal edit pending, 4 seen by local viewer, 8 follow Move live, 16 stale Host pose, 32 gait boosted, 64 no Host pose, 128 (Host) gx = start-cycle steering heading sent to Clients. warp = root motion pacing factor applied to the Client body (1 = retail speed). actions (since previous record): 1 create, 2 create failed, 4 goal edit, 8 edit refused, 16 release, 32 stuck replan, 64 hidden correction, 128 hard correction, 256 idle turn, 512 boosted gait, 1024 Move completed, 2048 Move failed, 4096 relinquished (action/pair/passage/stale), 8192 action pose follow, 16384 goal taken on the Host trail, 32768 goal kept ahead of a body past the newest Host pose, 65536 goal along the Host facing while it enters its start cycle. edits..corrections are cumulative per AI.",
                 {});
         }
     }

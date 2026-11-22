@@ -78,7 +78,12 @@ internal static class AISyncCodecTests
             AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.ValidateNative(invalid));
             AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.EncodeNetwork(session, invalid));
         }
-        foreach (var flags in new uint[] { 8, 9, 0x80000001U, uint.MaxValue })
+        // 565: a Host start-cycle heading (bit 3, bits 16-27) rides on a valid sample.
+        {
+            var heading = sample.ToArray(); U32(heading, 836, 9U | (2048U << 16));
+            AIMP.Protocol.AISyncCodec.ValidateNative(heading);
+        }
+        foreach (var flags in new uint[] { 8, 17, 8U | (2048U << 16), 0x80000001U, uint.MaxValue })
         {
             var invalid = sample.ToArray(); U32(invalid, 836, flags);
             AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.ValidateNative(invalid));
@@ -124,7 +129,7 @@ internal static class AISyncCodecTests
             var truncated = validNetwork.AsSpan(0, length).ToArray();
             AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.DecodeNetwork(truncated, session));
         }
-        var badNetwork = validNetwork.ToArray(); U32(badNetwork, 16 + 836, 9U);
+        var badNetwork = validNetwork.ToArray(); U32(badNetwork, 16 + 836, 17U);
         AssertEx.Throws<AIMP.Protocol.ProtocolException>(() => AIMP.Protocol.AISyncCodec.DecodeNetwork(badNetwork, session));
         return Task.CompletedTask;
     }

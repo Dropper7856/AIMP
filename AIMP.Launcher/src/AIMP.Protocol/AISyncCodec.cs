@@ -39,7 +39,11 @@ public static class AISyncCodec
     public const uint MotionValidSample = 1U << 0;
     public const uint MotionNativeActionOwnsMotion = 1U << 1;
     public const uint MotionDiscontinuity = 1U << 2;
-    private const uint KnownMotionFlags = MotionValidSample | MotionNativeActionOwnsMotion | MotionDiscontinuity;
+    // 565: bit 3 = Host start-cycle steering heading valid, bits 16-27 = heading quantized over [0, 2*pi).
+    public const uint MotionStartHeading = 1U << 3;
+    public const uint MotionStartHeadingMask = 0x0FFF0000U;
+    private const uint KnownMotionFlags = MotionValidSample | MotionNativeActionOwnsMotion | MotionDiscontinuity
+        | MotionStartHeading | MotionStartHeadingMask;
 
     public static ulong SessionCookie(Guid session)
     {
@@ -67,7 +71,7 @@ public static class AISyncCodec
     private static void ValidateMotion(ReadOnlySpan<byte> bytes)
     {
         var flags = U32(bytes, 836);
-        if ((flags & ~KnownMotionFlags) != 0)
+        if ((flags & ~KnownMotionFlags) != 0 || ((flags & MotionStartHeading) != 0 && (flags & MotionValidSample) == 0))
             throw new ProtocolException("Invalid AISync motion flags.");
         for (var offset = 824; offset <= 832; offset += 4)
             if (!BoundedFloat(bytes, offset, -128F, 128F))
