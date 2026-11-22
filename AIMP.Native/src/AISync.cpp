@@ -274,6 +274,10 @@ struct Actor {
             ULONGLONG lastFlightAt{},speedAt{};
             float speedX{},speedZ{},measuredSpeed{};
             std::uint32_t actions{},edits{},editRefusals{},creates{},releases{},corrections{};
+            // 560: root motion pacing factor (smoothed) and the held Host gait.
+            float warp{1.0F};
+            ULONGLONG warpAt{},gaitHoldAt{};
+            std::uint32_t gaitHold{};
         } keep{};
     } follow{};
     // Latest Host state in causal stream order (never an older queued carrier).
@@ -8242,6 +8246,85 @@ bool MatchRetailBytes(const std::uintptr_t rva, std::initializer_list<std::uint8
             reinterpret_cast<const void*>(gBase + rva), expected.size())) return false;
     return std::memcmp(actual.data(), expected.begin(), expected.size()) == 0;
 }
+// ---- Root motion pacing (560) ---------------------------------------------
+// 007C67B0 (thiscall, frame dt) applies the animation's root displacement:
+// local delta Character+730 (x) / +738 (z), rotated by yaw, added to the
+// body, then clamped onto the navmesh by 0044B420. Gait is the only native
+// speed control, and the Host already runs at its top gait, so a Client that
+// started 200-300 ms late never closes the gap (559 test: 1.5-3 m steady lag).
+// The Client follow driver therefore scales ONLY the planar root displacement
+// of its own followed AI by a bounded factor for that one call. Animation,
+// cycles, steering, the route and the navmesh clamp stay entirely retail; the
+// Host is never touched. A factor expires by itself after kRootWarpLeaseMs and
+// is ignored outside ordinary locomotion cycles (start/move/turn/stop).
+constexpr float kRootWarpMin=0.80F,kRootWarpMax=1.30F;
+constexpr ULONGLONG kRootWarpLeaseMs=200U;
+struct RootWarpSlot {
+    std::atomic<std::uintptr_t> character{};
+    std::atomic<std::uint32_t> factorBits{};
+    std::atomic<ULONGLONG> until{};
+};
+std::array<RootWarpSlot,16> gRootWarp{};
+std::atomic<std::uint32_t> gRootWarpLive{};
+std::atomic<std::uint64_t> gRootWarpFrames{},gRootWarpFaster{},gRootWarpSlower{},gRootWarpSlotsFull{};
+void* gRootMotionTrampoline{};
+std::atomic<void*> gRootMotionOriginal{};
+bool gRootWarpHookInstalled{};
+std::string gRootWarpHookError;
+void SetRootWarp(const std::uintptr_t character,const float factor,const ULONGLONG now) noexcept {
+    if(!character)return;
+    const bool neutral=!std::isfinite(factor)||std::abs(factor-1.0F)<0.01F;
+    RootWarpSlot* free{};
+    for(auto& slot:gRootWarp) {
+        const auto owner=slot.character.load(std::memory_order_acquire);
+        if(owner==character) {
+            if(neutral){slot.until.store(0U,std::memory_order_release);return;}
+            slot.factorBits.store(std::bit_cast<std::uint32_t>(std::clamp(factor,kRootWarpMin,kRootWarpMax)),std::memory_order_release);
+            slot.until.store(now+kRootWarpLeaseMs,std::memory_order_release);
+            return;
+        }
+        if(!free&&(owner==0U||slot.until.load(std::memory_order_acquire)<now))free=&slot;
+    }
+    if(neutral)return;
+    if(!free){gRootWarpSlotsFull.fetch_add(1U,std::memory_order_relaxed);return;}
+    free->until.store(0U,std::memory_order_release);
+    free->character.store(character,std::memory_order_release);
+    free->factorBits.store(std::bit_cast<std::uint32_t>(std::clamp(factor,kRootWarpMin,kRootWarpMax)),std::memory_order_release);
+    free->until.store(now+kRootWarpLeaseMs,std::memory_order_release);
+    gRootWarpLive.store(1U,std::memory_order_release);
+}
+float RootWarpFor(const std::uintptr_t character) noexcept {
+    if(!gRootWarpLive.load(std::memory_order_acquire))return 1.0F;
+    const auto now=GetTickCount64();
+    for(const auto& slot:gRootWarp) {
+        if(slot.character.load(std::memory_order_acquire)!=character)continue;
+        if(slot.until.load(std::memory_order_acquire)<now)return 1.0F;
+        const float factor=std::bit_cast<float>(slot.factorBits.load(std::memory_order_acquire));
+        return std::isfinite(factor)?std::clamp(factor,kRootWarpMin,kRootWarpMax):1.0F;
+    }
+    return 1.0F;
+}
+void __fastcall RootMotionDetour(void* object,void*,float dt) noexcept {
+    const auto original=reinterpret_cast<void(__thiscall*)(void*,float)>(
+        gRootMotionOriginal.load(std::memory_order_acquire));
+    if(original==nullptr)return;
+    const auto character=reinterpret_cast<std::uintptr_t>(object);
+    const float factor=RootWarpFor(character);
+    if(factor==1.0F){original(object,dt);return;}
+    std::uintptr_t cycle{};std::uint8_t state{};
+    const bool ordinary=Read(character+0x36CU,cycle)&&cycle&&Read(cycle+0x1AU,state)&&
+        (state==0x37U||state==0x38U||state==0x39U||state==0x3BU);
+    float x{},z{};
+    if(!ordinary||!Read(character+0x730U,x)||!Read(character+0x738U,z)||!std::isfinite(x)||!std::isfinite(z)){
+        original(object,dt);return;
+    }
+    auto* delta=reinterpret_cast<float*>(character+0x730U);
+    delta[0]=x*factor;delta[2]=z*factor;
+    original(object,dt);
+    delta[0]=x;delta[2]=z;
+    gRootWarpFrames.fetch_add(1U,std::memory_order_relaxed);
+    (factor>1.0F?gRootWarpFaster:gRootWarpSlower).fetch_add(1U,std::memory_order_relaxed);
+}
 __declspec(naked) void BackstageEligibilityShim() noexcept {
     __asm {
         pushfd
@@ -9825,6 +9908,14 @@ bool Install(const std::uintptr_t base, HookManager& hooks, LevelGenerationTrack
         if (!rollback.empty()) error += "; rollback: " + rollback;
         return false;
     }
+    {
+        // Optional (560): without it native follow keeps gait-only pacing.
+        std::string warpError;
+        gRootWarpHookInstalled=Hook(hooks,"aisync_root_motion_pacing",0x003C67B0U,
+            reinterpret_cast<void*>(&RootMotionDetour),{0x55,0x8B,0xEC,0x83,0xE4,0xF0},
+            &gRootMotionTrampoline,&gRootMotionOriginal,warpError);
+        gRootWarpHookError=warpError;
+    }
     character_direct_step_runtime::SetNativeAITransitionGuard(&RetainAuthoritativeSourceGraph);
     character_direct_step_runtime::SetPairedVictimHeldQuery(&PairedVictimHeld);
     // The complete native transaction pipeline is mandatory.
@@ -10262,7 +10353,7 @@ struct LocomotionFlight {
     std::uint64_t utc{};
     std::uint32_t entityA{},actions{},edits{},refusals{},creates{},releases{},corrections{};
     std::uint8_t role{},cycleState{},mode{},hostGait{},gait{},effGait{},status{},phase{},flags{};
-    float lx{},ly{},lz{},lyaw{},tx{},tz{},hx{},hz{},hs{},gx{},gz{},err{},along{},ms{};
+    float lx{},ly{},lz{},lyaw{},tx{},tz{},hx{},hz{},hs{},gx{},gz{},err{},along{},ms{},warp{1.0F};
 };
 std::mutex gFlightGate;
 std::array<LocomotionFlight,4096> gFlight{};
@@ -10385,8 +10476,15 @@ constexpr float kFollowBoostAlong=2.5F,kFollowUnboostAlong=1.2F;
 // Divergence recovery: the body is re-placed on the Host pose only while the
 // local viewer cannot see it; the hard bound is a last resort (lost route,
 // wrong floor) and is counted separately.
-constexpr float kHiddenCorrectionDistance=2.5F,kHardCorrectionDistance=12.0F;
-constexpr ULONGLONG kHiddenCorrectionDwellMs=1200U,kHardCorrectionDwellMs=3000U,kCorrectionCooldownMs=2000U;
+// 559 test: at 2.5 m / 1.2 s the hidden correction fired on the ordinary
+// start-up lag, and the recreated Move then played a full stop + start (2 s
+// standing still while the Host ran on: 13-15 m behind). Root motion pacing
+// now closes ordinary lag; corrections are kept for a genuinely lost route.
+constexpr float kHiddenCorrectionDistance=6.0F,kHardCorrectionDistance=15.0F;
+constexpr ULONGLONG kHiddenCorrectionDwellMs=1500U,kHardCorrectionDwellMs=3000U,kCorrectionCooldownMs=3000U;
+// Root motion pacing: along-track lag is closed over ~0.8 s, the factor moves
+// at most 1.5 per second so the stride never visibly changes rate abruptly.
+constexpr float kRootWarpHorizonS=0.8F,kRootWarpSlewPerS=1.5F;
 bool FollowGoalDeposited(std::uintptr_t request,const float* goal) noexcept {
     std::uint8_t flags{};float deposited[3]{};
     return Read(request+0xB8U,flags)&&(flags&0x40U)!=0U&&
@@ -10463,9 +10561,13 @@ void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uin
     const bool hostMoving=speed>0.25F||latestSpeed>0.25F;
     if(hostMoving)f.stillSince=0U;else if(!f.stillSince)f.stillSince=now;
     const bool hostStopped=!hostMoving&&now-f.stillSince>=150U;
-    // Gait: the Host's effective gait; one step faster while clearly behind
-    // the newest Host pose, with hysteresis so the cycle does not flicker.
+    // Gait: the Host's effective gait M+198 alternates every few frames even
+    // while its requested gait is constant (559: 2/3/2/3 at 10 Hz). Writing
+    // each value to M+194 reset M+190 every change. Hold the highest Host gait
+    // for 600 ms while it moves; one step faster while clearly behind.
     std::uint32_t gait=hostGait<=3U?hostGait:1U;
+    if(gait>=k.gaitHold||!hostMoving||!k.gaitHoldAt||now-k.gaitHoldAt>=600U){k.gaitHold=gait;k.gaitHoldAt=now;}
+    else gait=k.gaitHold;
     if(hostMoving&&along>kFollowBoostAlong) {
         k.unboostSince=0U;if(!k.boostSince)k.boostSince=now;
         if(now-k.boostSince>=150U)k.boosted=true;
@@ -10503,6 +10605,19 @@ void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uin
     }
     f.failures=0U;
     static_cast<void>(FollowGait(actor.character,gait));
+    // Root motion pacing toward the newest Host pose (see RootMotionDetour).
+    {
+        float desired=1.0F;
+        if(hostMoving&&!hostStopped&&gRootWarpHookInstalled) {
+            const float reference=(std::max)(latestSpeed,2.0F);
+            desired=1.0F+std::clamp(along/(reference*kRootWarpHorizonS),kRootWarpMin-1.0F,kRootWarpMax-1.0F);
+        }
+        const float dt=k.warpAt&&now>k.warpAt?(std::min)(0.1F,static_cast<float>(now-k.warpAt)*0.001F):0.016F;
+        k.warpAt=now;
+        const float step=kRootWarpSlewPerS*dt;
+        k.warp+=std::clamp(desired-k.warp,-step,step);
+        SetRootWarp(actor.character,k.warp,now);
+    }
     const float gdx=goal[0]-f.goal[0],gdz=goal[2]-f.goal[2];
     const float moved2=gdx*gdx+gdz*gdz;
     const bool due=!f.goalValid||hostStopped!=f.stopping||moved2>=kFollowEditDistance2||
@@ -10563,6 +10678,7 @@ void RecordClientFlight(Actor& actor,const ULONGLONG now) noexcept {
     }
     if(LocalViewerSees(local))sample.flags|=kFlightSeen;
     if(k.boosted)sample.flags|=kFlightBoosted;
+    sample.warp=RootWarpFor(actor.character);
     sample.actions=k.actions;k.actions=0U;
     sample.edits=k.edits;sample.refusals=k.editRefusals;sample.creates=k.creates;
     sample.releases=k.releases;sample.corrections=k.corrections;
@@ -12075,7 +12191,7 @@ void DrainLocomotionFlight(Diagnostics& diagnostics) noexcept {
                  {"x",number(s.lx),true},{"y",number(s.ly),true},{"z",number(s.lz),true},{"yaw",number(s.lyaw),true},
                  {"tx",number(s.tx),true},{"tz",number(s.tz),true},{"hx",number(s.hx),true},{"hz",number(s.hz),true},
                  {"hostSpeed",number(s.hs),true},{"speed",number(s.ms),true},{"err",number(s.err),true},{"along",number(s.along),true},
-                 {"gx",number(s.gx),true},{"gz",number(s.gz),true},
+                 {"gx",number(s.gx),true},{"gz",number(s.gz),true},{"warp",number(s.warp),true},
                  {"cycle",Diagnostics::Unsigned(s.cycleState),true},{"mode",Diagnostics::Unsigned(s.mode),true},
                  {"hostGait",Diagnostics::Unsigned(s.hostGait),true},{"gait",Diagnostics::Unsigned(s.gait),true},
                  {"effGait",Diagnostics::Unsigned(s.effGait),true},{"status",Diagnostics::Unsigned(s.status),true},
@@ -12093,7 +12209,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
         if(!legendLogged) {
             legendLogged=true;
             diagnostics.Log("info","aisync_locomotion_legend",
-                "aisync_locomotion: 10 Hz per AI. role1 Host (x,y,z = Host pose, hostSpeed = its speed), role2 Client (x,y,z = local body; tx,tz = Host pose rendered 100 ms late; hx,hz/hostSpeed = newest Host pose; err = |target-body| XZ; along = lag behind newest Host pose along its velocity; gx,gz = goal on the live follow Move; speed = measured body speed). cycle = locomotion cycle state (1 idle, 55 start, 56 move, 59 stop), mode = MovementAction+8, gait = requested M+194, effGait = M+198, hostGait = Host effective gait, status/phase = follow request +C/+68. flags: 1 navmesh polygon, 2 goal edit pending, 4 seen by local viewer, 8 follow Move live, 16 stale Host pose, 32 gait boosted, 64 no Host pose. actions (since previous record): 1 create, 2 create failed, 4 goal edit, 8 edit refused, 16 release, 32 stuck replan, 64 hidden correction, 128 hard correction, 256 idle turn, 512 boosted gait, 1024 Move completed, 2048 Move failed, 4096 relinquished (action/pair/passage/stale), 8192 action pose follow. edits..corrections are cumulative per AI.",
+                "aisync_locomotion: 10 Hz per AI. role1 Host (x,y,z = Host pose, hostSpeed = its speed), role2 Client (x,y,z = local body; tx,tz = Host pose rendered 100 ms late; hx,hz/hostSpeed = newest Host pose; err = |target-body| XZ; along = lag behind newest Host pose along its velocity; gx,gz = goal on the live follow Move; speed = measured body speed). cycle = locomotion cycle state (1 idle, 55 start, 56 move, 59 stop), mode = MovementAction+8, gait = requested M+194, effGait = M+198, hostGait = Host effective gait, status/phase = follow request +C/+68. flags: 1 navmesh polygon, 2 goal edit pending, 4 seen by local viewer, 8 follow Move live, 16 stale Host pose, 32 gait boosted, 64 no Host pose. warp = root motion pacing factor applied to the Client body (1 = retail speed). actions (since previous record): 1 create, 2 create failed, 4 goal edit, 8 edit refused, 16 release, 32 stuck replan, 64 hidden correction, 128 hard correction, 256 idle turn, 512 boosted gait, 1024 Move completed, 2048 Move failed, 4096 relinquished (action/pair/passage/stale), 8192 action pose follow. edits..corrections are cumulative per AI.",
                 {});
         }
     }
@@ -12429,6 +12545,11 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"nativeFollowHiddenCorrections", Diagnostics::Unsigned(gFollowHiddenCorrections.load()), true},
          {"nativeFollowHardCorrections", Diagnostics::Unsigned(gFollowHardCorrections.load()), true},
          {"nativeFollowBoostFrames", Diagnostics::Unsigned(gFollowBoostFrames.load()), true},
+         {"rootWarpHookInstalled", Diagnostics::Boolean(gRootWarpHookInstalled), true},
+         {"rootWarpFrames", Diagnostics::Unsigned(gRootWarpFrames.load()), true},
+         {"rootWarpFaster", Diagnostics::Unsigned(gRootWarpFaster.load()), true},
+         {"rootWarpSlower", Diagnostics::Unsigned(gRootWarpSlower.load()), true},
+         {"rootWarpSlotsFull", Diagnostics::Unsigned(gRootWarpSlotsFull.load()), true},
          {"locomotionFlightDropped", Diagnostics::Unsigned(gFlightDropped), true},
          {"directPoseEmergencyCorrections", Diagnostics::Unsigned(gDirectPoseEmergencyCorrections.load()), true},
          {"clientCycleCallsReplayFailed", Diagnostics::Unsigned(gCycleCallsReplayFailed.load()), true},
