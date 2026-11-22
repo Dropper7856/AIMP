@@ -188,6 +188,54 @@ bool Timeline::Latest(std::uint64_t now, Target& out) const noexcept {
     return true;
 }
 
+bool Timeline::TrailPoint(const std::array<float, 3>& from, const float lookahead, const float maxLead,
+    std::array<float, 3>& out) const noexcept {
+    if (count_ == 0 || !std::isfinite(lookahead) || !std::isfinite(maxLead)) return false;
+    const auto at = [this](const std::size_t i) -> const Sample& { return history_[(first_ + i) % kHistoryCapacity]; };
+    const std::size_t last = count_ - 1;
+    if ((at(last).flags & kBoundary) != 0U) return false;
+    std::size_t begin = last;
+    while (begin > 0 && (at(begin - 1).flags & kBoundary) == 0U) --begin;
+    // Closest trail point; height counts double so a body on the floor below
+    // a staircase maps to the stair entrance, not to the step above it.
+    std::size_t segment = last;
+    std::array<float, 3> point = at(last).position;
+    float best = std::numeric_limits<float>::infinity();
+    for (std::size_t i = begin; i < last; ++i) {
+        const auto& a = at(i).position; const auto& b = at(i + 1).position;
+        const float dx = b[0] - a[0], dy = b[1] - a[1], dz = b[2] - a[2];
+        const float length2 = dx * dx + dz * dz;
+        float t = length2 > 1e-6F ? ((from[0] - a[0]) * dx + (from[2] - a[2]) * dz) / length2 : 0.0F;
+        t = std::clamp(t, 0.0F, 1.0F);
+        const std::array<float, 3> p{a[0] + dx * t, a[1] + dy * t, a[2] + dz * t};
+        const float ex = from[0] - p[0], ey = (from[1] - p[1]) * 2.0F, ez = from[2] - p[2];
+        const float distance = ex * ex + ey * ey + ez * ez;
+        if (distance < best) { best = distance; segment = i; point = p; }
+    }
+    float remaining = (std::max)(0.0F, lookahead);
+    while (segment < last && remaining > 0.0F) {
+        const auto& b = at(segment + 1).position;
+        const float dx = b[0] - point[0], dy = b[1] - point[1], dz = b[2] - point[2];
+        const float length = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (length >= remaining && length > 1e-6F) {
+            const float k = remaining / length;
+            out = {point[0] + dx * k, point[1] + dy * k, point[2] + dz * k};
+            return true;
+        }
+        remaining -= length; point = b; ++segment;
+    }
+    if (remaining > 0.0F && maxLead > 0.0F && last > begin) {
+        const auto velocity = SegmentVelocity(at(last - 1), at(last));
+        const float speed = std::sqrt(velocity[0] * velocity[0] + velocity[2] * velocity[2]);
+        if (speed > 0.25F) {
+            const float lead = (std::min)(remaining, maxLead);
+            point[0] += velocity[0] / speed * lead; point[2] += velocity[2] / speed * lead;
+        }
+    }
+    out = point;
+    return true;
+}
+
 void Timeline::Reset() noexcept {
     first_ = count_ = 0;
     latestArrivalMs_ = offsetMagnitude_ = 0;

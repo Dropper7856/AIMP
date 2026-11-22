@@ -47,6 +47,13 @@ public:
     // Newest accepted Host pose (no interpolation delay), with the velocity of
     // the last segment. Stale/boundary flags as in SampleAt. Empty: false.
     [[nodiscard]] bool Latest(std::uint64_t now, Target& out) const noexcept;
+    // Point on the Host's recorded trail (561): project `from` onto the
+    // newest boundary-free run of poses, then walk `lookahead` metres forward
+    // along it. Past the newest pose, extend along its last segment by at most
+    // `maxLead` metres. A goal on the trail turns where the Host turned and
+    // climbs where it climbed; a straight extrapolation overshot corners.
+    [[nodiscard]] bool TrailPoint(const std::array<float, 3>& from, float lookahead, float maxLead,
+        std::array<float, 3>& out) const noexcept;
     void Reset() noexcept;
     [[nodiscard]] std::size_t Count() const noexcept { return count_; }
 

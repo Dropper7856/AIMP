@@ -10346,7 +10346,7 @@ std::atomic<std::uint64_t> gFollowEdits{},gFollowEditRefusals{},gFollowHiddenCor
 constexpr std::uint32_t kFlightCreate=1U,kFlightCreateFail=2U,kFlightEdit=4U,kFlightEditRefused=8U,
     kFlightRelease=16U,kFlightStuckReplan=32U,kFlightHiddenCorrection=64U,kFlightHardCorrection=128U,
     kFlightIdleTurn=256U,kFlightBoost=512U,kFlightCompleted=1024U,kFlightFailed=2048U,
-    kFlightRelinquish=4096U,kFlightActionFollow=8192U;
+    kFlightRelinquish=4096U,kFlightActionFollow=8192U,kFlightTrailGoal=16384U;
 constexpr std::uint8_t kFlightNavPoly=1U,kFlightPendingEdit=2U,kFlightSeen=4U,kFlightLive=8U,
     kFlightStale=16U,kFlightBoosted=32U,kFlightNoTarget=64U;
 struct LocomotionFlight {
@@ -10482,6 +10482,7 @@ constexpr float kFollowBoostAlong=2.5F,kFollowUnboostAlong=1.2F;
 // now closes ordinary lag; corrections are kept for a genuinely lost route.
 constexpr float kHiddenCorrectionDistance=6.0F,kHardCorrectionDistance=15.0F;
 constexpr ULONGLONG kHiddenCorrectionDwellMs=1500U,kHardCorrectionDwellMs=3000U,kCorrectionCooldownMs=3000U;
+constexpr float kWrongFloorHeight=1.5F;
 // Root motion pacing: along-track lag is closed over ~0.8 s, the factor moves
 // at most 1.5 per second so the stride never visibly changes rate abruptly.
 constexpr float kRootWarpHorizonS=0.8F,kRootWarpSlewPerS=1.5F;
@@ -10510,8 +10511,12 @@ void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uin
     // Divergence recovery, never in view (see constants above).
     {
         auto& k=f.keep;
-        if(planar>kHiddenCorrectionDistance){if(!k.farSince)k.farSince=now;}else k.farSince=0U;
-        if(planar>kHardCorrectionDistance){if(!k.hardSince)k.hardSince=now;}else k.hardSince=0U;
+        // A body on another floor (under the stairs the Host climbed) is lost
+        // even when its XZ distance is small: the route goal resolves to the
+        // floor it is on. Climbing stairs normally differs by < 0.5 m.
+        const bool wrongFloor=std::abs(target.position[1]-local[1])>kWrongFloorHeight;
+        if(planar>kHiddenCorrectionDistance||wrongFloor){if(!k.farSince)k.farSince=now;}else k.farSince=0U;
+        if(planar>kHardCorrectionDistance||wrongFloor){if(!k.hardSince)k.hardSince=now;}else k.hardSince=0U;
         const bool cooled=!k.lastCorrection||now-k.lastCorrection>=kCorrectionCooldownMs;
         const bool hidden=k.farSince&&now-k.farSince>=kHiddenCorrectionDwellMs&&
             !LocalViewerSees(local)&&!LocalViewerSees(target.position.data());
@@ -10578,10 +10583,23 @@ void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uin
     if(k.boosted&&gait<3U){++gait;k.actions|=kFlightBoost;gFollowBoostFrames.fetch_add(1U,std::memory_order_relaxed);}
     float goal[3]{latest.position[0],latest.position[1],latest.position[2]};
     if(!hostStopped&&latestSpeed>0.05F) {
-        // Through-goal ahead of the Host so retail never reaches its braking
-        // distance while the Host keeps moving.
-        const float lead=std::clamp(latestSpeed*0.5F,1.5F,4.0F);
-        goal[0]+=latest.velocity[0]/latestSpeed*lead;goal[2]+=latest.velocity[2]/latestSpeed*lead;
+        // Through-goal ahead of the body so retail never reaches its braking
+        // distance while the Host keeps moving. 561: the goal lies ON the
+        // Host's recorded trail, at most 1 m past its newest pose. 560 put it
+        // up to 4 m straight ahead of the newest pose: at the AISYNC stairs the
+        // Host turned right and climbed while the Client goal stayed straight
+        // on the floor, so the Client turned late and ran under the stairs.
+        const float lookahead=std::clamp(latestSpeed*0.4F,1.5F,3.0F);
+        std::array<float,3> trail{};
+        const std::array<float,3> body{local[0],local[1],local[2]};
+        if(actor.directPoseTimeline.TrailPoint(body,lookahead,1.0F,trail)&&
+            std::isfinite(trail[0])&&std::isfinite(trail[1])&&std::isfinite(trail[2])) {
+            goal[0]=trail[0];goal[1]=trail[1];goal[2]=trail[2];
+            k.actions|=kFlightTrailGoal;
+        } else {
+            const float lead=1.0F;
+            goal[0]+=latest.velocity[0]/latestSpeed*lead;goal[2]+=latest.velocity[2]/latestSpeed*lead;
+        }
     }
     const bool needsMove=hostMoving||planar>0.6F;
     if(!f.object) {
@@ -12209,7 +12227,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
         if(!legendLogged) {
             legendLogged=true;
             diagnostics.Log("info","aisync_locomotion_legend",
-                "aisync_locomotion: 10 Hz per AI. role1 Host (x,y,z = Host pose, hostSpeed = its speed), role2 Client (x,y,z = local body; tx,tz = Host pose rendered 100 ms late; hx,hz/hostSpeed = newest Host pose; err = |target-body| XZ; along = lag behind newest Host pose along its velocity; gx,gz = goal on the live follow Move; speed = measured body speed). cycle = locomotion cycle state (1 idle, 55 start, 56 move, 59 stop), mode = MovementAction+8, gait = requested M+194, effGait = M+198, hostGait = Host effective gait, status/phase = follow request +C/+68. flags: 1 navmesh polygon, 2 goal edit pending, 4 seen by local viewer, 8 follow Move live, 16 stale Host pose, 32 gait boosted, 64 no Host pose. warp = root motion pacing factor applied to the Client body (1 = retail speed). actions (since previous record): 1 create, 2 create failed, 4 goal edit, 8 edit refused, 16 release, 32 stuck replan, 64 hidden correction, 128 hard correction, 256 idle turn, 512 boosted gait, 1024 Move completed, 2048 Move failed, 4096 relinquished (action/pair/passage/stale), 8192 action pose follow. edits..corrections are cumulative per AI.",
+                "aisync_locomotion: 10 Hz per AI. role1 Host (x,y,z = Host pose, hostSpeed = its speed), role2 Client (x,y,z = local body; tx,tz = Host pose rendered 100 ms late; hx,hz/hostSpeed = newest Host pose; err = |target-body| XZ; along = lag behind newest Host pose along its velocity; gx,gz = goal on the live follow Move; speed = measured body speed). cycle = locomotion cycle state (1 idle, 55 start, 56 move, 59 stop), mode = MovementAction+8, gait = requested M+194, effGait = M+198, hostGait = Host effective gait, status/phase = follow request +C/+68. flags: 1 navmesh polygon, 2 goal edit pending, 4 seen by local viewer, 8 follow Move live, 16 stale Host pose, 32 gait boosted, 64 no Host pose. warp = root motion pacing factor applied to the Client body (1 = retail speed). actions (since previous record): 1 create, 2 create failed, 4 goal edit, 8 edit refused, 16 release, 32 stuck replan, 64 hidden correction, 128 hard correction, 256 idle turn, 512 boosted gait, 1024 Move completed, 2048 Move failed, 4096 relinquished (action/pair/passage/stale), 8192 action pose follow, 16384 goal taken on the Host trail. edits..corrections are cumulative per AI.",
                 {});
         }
     }
