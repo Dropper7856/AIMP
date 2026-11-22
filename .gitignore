@@ -6,6 +6,7 @@ AIMP.Electron/*
 !AIMP.Electron/preload.js
 !AIMP.Electron/api-security.js
 !AIMP.Electron/startup-updater.js
+!AIMP.Electron/log-rotation.js
 !AIMP.Electron/update.html
 !AIMP.Electron/package.json
 !AIMP.Electron/package-lock.json
