@@ -180,6 +180,8 @@ internal static class Program
         new("Developer mode session gate", DeveloperModeTests.SessionGateAsync),
         new("Steam persona selection", SteamPersonaTests.SelectionAsync),
         new("Steam persona imposed name", SteamPersonaTests.ImposedNameAsync),
+        new("Link/IP names are detected", LinkTextTests.DetectsAddressesAsync),
+        new("Link/IP names are refused", LinkTextTests.NamesRefuseAddressesAsync),
         new("UI bridge rejects browser traffic", BridgeSecurityTests.RejectsBrowserTrafficAsync),
         new("UI bridge accepts game traffic", BridgeSecurityTests.AcceptsGameTrafficAsync),
         new("Solo lobby starts alone", SoloLobbyTests.StartsAloneAsync),
