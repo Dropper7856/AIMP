@@ -279,6 +279,7 @@ struct Actor {
             ULONGLONG warpAt{},gaitHoldAt{};
             std::uint32_t gaitHold{};
             float headX{},headZ{};bool headValid{};
+            ULONGLONG startSeenAt{};
         } keep{};
     } follow{};
     // Latest Host state in causal stream order (never an older queued carrier).
@@ -10347,7 +10348,7 @@ std::atomic<std::uint64_t> gFollowEdits{},gFollowEditRefusals{},gFollowHiddenCor
 constexpr std::uint32_t kFlightCreate=1U,kFlightCreateFail=2U,kFlightEdit=4U,kFlightEditRefused=8U,
     kFlightRelease=16U,kFlightStuckReplan=32U,kFlightHiddenCorrection=64U,kFlightHardCorrection=128U,
     kFlightIdleTurn=256U,kFlightBoost=512U,kFlightCompleted=1024U,kFlightFailed=2048U,
-    kFlightRelinquish=4096U,kFlightActionFollow=8192U,kFlightTrailGoal=16384U,kFlightAheadGoal=32768U;
+    kFlightRelinquish=4096U,kFlightActionFollow=8192U,kFlightTrailGoal=16384U,kFlightAheadGoal=32768U,kFlightStartGoal=65536U;
 constexpr std::uint8_t kFlightNavPoly=1U,kFlightPendingEdit=2U,kFlightSeen=4U,kFlightLive=8U,
     kFlightStale=16U,kFlightBoosted=32U,kFlightNoTarget=64U;
 struct LocomotionFlight {
@@ -10564,7 +10565,14 @@ void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uin
         }
     }
     auto& k=f.keep;
-    const bool hostMoving=speed>0.25F||latestSpeed>0.25F;
+    // 564: the Host's start cycle (0x37) begins up to ~0.8 s before its body
+    // moves, and the Client's own start cycle then needs ~0.9 s more. Waiting
+    // for Host speed left the Client 4-5 m behind at the kill after a stop.
+    // Start the local Move when the Host ENTERS its start cycle.
+    // Bounded: a Host standing in 0x37 for long is not about to leave.
+    if(actor.streamCycleState==0x37U){if(!k.startSeenAt)k.startSeenAt=now;}else k.startSeenAt=0U;
+    const bool hostStarting=k.startSeenAt&&now-k.startSeenAt<1500U;
+    const bool hostMoving=speed>0.25F||latestSpeed>0.25F||hostStarting;
     if(hostMoving)f.stillSince=0U;else if(!f.stillSince)f.stillSince=now;
     // 562: the Host's own stop cycle (0x3B) is known before its speed drops
     // to zero. Aim at its newest pose and stop pushing: 561 kept a trail
@@ -10587,7 +10595,12 @@ void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uin
     }
     if(k.boosted&&gait<3U){++gait;k.actions|=kFlightBoost;gFollowBoostFrames.fetch_add(1U,std::memory_order_relaxed);}
     float goal[3]{latest.position[0],latest.position[1],latest.position[2]};
-    if(!hostStopped&&latestSpeed>0.05F) {
+    if(!hostStopped&&latestSpeed<=0.5F&&hostStarting&&std::isfinite(latest.yaw)) {
+        // Host still winding up in place: aim along its facing (564).
+        const float fx=std::sin(latest.yaw),fz=std::cos(latest.yaw);
+        goal[0]=latest.position[0]+fx*2.5F;goal[2]=latest.position[2]+fz*2.5F;
+        k.actions|=kFlightStartGoal;
+    } else if(!hostStopped&&latestSpeed>0.05F) {
         // Through-goal ahead of the body so retail never reaches its braking
         // distance while the Host keeps moving. 561: the goal lies ON the
         // Host's recorded trail, at most 1 m past its newest pose. 560 put it
@@ -12260,7 +12273,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
         if(!legendLogged) {
             legendLogged=true;
             diagnostics.Log("info","aisync_locomotion_legend",
-                "aisync_locomotion: 10 Hz per AI. role1 Host (x,y,z = Host pose, hostSpeed = its speed), role2 Client (x,y,z = local body; tx,tz = Host pose rendered 100 ms late; hx,hz/hostSpeed = newest Host pose; err = |target-body| XZ; along = lag behind newest Host pose along its velocity; gx,gz = goal on the live follow Move; speed = measured body speed). cycle = locomotion cycle state (1 idle, 55 start, 56 move, 59 stop), mode = MovementAction+8, gait = requested M+194, effGait = M+198, hostGait = Host effective gait, status/phase = follow request +C/+68. flags: 1 navmesh polygon, 2 goal edit pending, 4 seen by local viewer, 8 follow Move live, 16 stale Host pose, 32 gait boosted, 64 no Host pose. warp = root motion pacing factor applied to the Client body (1 = retail speed). actions (since previous record): 1 create, 2 create failed, 4 goal edit, 8 edit refused, 16 release, 32 stuck replan, 64 hidden correction, 128 hard correction, 256 idle turn, 512 boosted gait, 1024 Move completed, 2048 Move failed, 4096 relinquished (action/pair/passage/stale), 8192 action pose follow, 16384 goal taken on the Host trail, 32768 goal kept ahead of a body past the newest Host pose. edits..corrections are cumulative per AI.",
+                "aisync_locomotion: 10 Hz per AI. role1 Host (x,y,z = Host pose, hostSpeed = its speed), role2 Client (x,y,z = local body; tx,tz = Host pose rendered 100 ms late; hx,hz/hostSpeed = newest Host pose; err = |target-body| XZ; along = lag behind newest Host pose along its velocity; gx,gz = goal on the live follow Move; speed = measured body speed). cycle = locomotion cycle state (1 idle, 55 start, 56 move, 59 stop), mode = MovementAction+8, gait = requested M+194, effGait = M+198, hostGait = Host effective gait, status/phase = follow request +C/+68. flags: 1 navmesh polygon, 2 goal edit pending, 4 seen by local viewer, 8 follow Move live, 16 stale Host pose, 32 gait boosted, 64 no Host pose. warp = root motion pacing factor applied to the Client body (1 = retail speed). actions (since previous record): 1 create, 2 create failed, 4 goal edit, 8 edit refused, 16 release, 32 stuck replan, 64 hidden correction, 128 hard correction, 256 idle turn, 512 boosted gait, 1024 Move completed, 2048 Move failed, 4096 relinquished (action/pair/passage/stale), 8192 action pose follow, 16384 goal taken on the Host trail, 32768 goal kept ahead of a body past the newest Host pose, 65536 goal along the Host facing while it enters its start cycle. edits..corrections are cumulative per AI.",
                 {});
         }
     }

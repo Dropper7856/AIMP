@@ -3,6 +3,6 @@
 namespace aimp {
 
 inline constexpr char kNativeVersion[] =
-    "0.11.4.563-alien-vs-survivors";
+    "0.11.4.564-alien-vs-survivors";
 
 } // namespace aimp
