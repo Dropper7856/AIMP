@@ -4,12 +4,18 @@
 #include "aimp/CrashGuard.h"
 #include "aimp/Diagnostics.h"
 #include "aimp/HookManager.h"
+#include "aimp/PlayerSpectatePolicy.h"
 #include "aimp/SignatureResolver.h"
 #include "aimp/WorldPublicActions.h"
+#include "aimp/AlienPvPLocalController.h"
 
+#include <Windows.h>
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <cstdio>
+#include <string>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -38,6 +44,44 @@ std::atomic<std::uint64_t> gLevelExitObserved{0}, gLevelExitAllowed{0}, gLevelEx
 std::atomic<std::uint32_t> gLevelExitLastPrimitive{0};
 std::atomic<std::int32_t> gLevelExitLastMode{-1};
 std::atomic<std::uint64_t> gMissionCompleteObserved{0}, gMissionCompleteDrained{0};
+// Spectate: the suppressed local death (death boundary) and the published view.
+std::atomic<std::uintptr_t> gSpectateVictim{0};
+std::atomic<std::uint64_t> gSpectateDiedAt{0};
+std::atomic<std::uint64_t> gSpectateTarget{0};
+std::atomic<std::uint32_t> gSpectateCandidates{0};
+std::atomic<std::uint64_t> gSpectateChanges{0}, gSpectateChangesDrained{0};
+std::atomic<std::uint64_t> gSpectateBindFailures{0}, gSpectateBindFailuresDrained{0};
+std::atomic<std::uint64_t> gSpectateNoCandidates{0}, gSpectateNoCandidatesDrained{0};
+std::atomic<std::uint64_t> gSpectateCameraAttempts{0}, gSpectateCameraAttemptsDrained{0};
+// Reasserts that found another camera active (a script/death camera took over).
+std::atomic<std::uint64_t> gSpectateCameraStolen{0};
+std::atomic<std::uintptr_t> gSpectateLastActiveCamera{0}, gSpectateLastFollowCamera{0}, gSpectateLastTargetCharacter{0};
+// Engine fade manager held black by the player kill/death states (see RestoreSceneFade).
+std::atomic<std::uint64_t> gFadeRestores{0}, gFadeRestoresDrained{0}, gFadeRestoreFailures{0};
+std::atomic<std::int32_t> gFadeLastMode{-1};
+std::atomic<bool> gFadeCodeRejected{false};
+// Living participants that can be watched, refreshed every engine pump, dead or alive.
+std::atomic<std::uint32_t> gSpectateLivingTeammates{0};
+std::atomic<std::uint64_t> gDeathFadeSuppressed{0}, gDeathFadeSuppressedDrained{0};
+std::atomic<bool> gLocalPlayerDown{false};
+std::atomic<std::uint64_t> gDownEpisodes{0};
+// Diagnostics: distinct script effects executed while the local player is down.
+struct DownEffect {
+    std::uint32_t method{}, entity{}, type{}, primitive{};
+    std::uint32_t ms{};          // first seen, ms after the episode started
+    bool afterDeath{};           // first seen after the death boundary
+    bool suppressed{};
+    [[nodiscard]] bool Same(const DownEffect& o) const noexcept {
+        return method == o.method && entity == o.entity && type == o.type && primitive == o.primitive;
+    }
+};
+constexpr std::size_t kDownEffectCapacity = 384U;
+std::mutex gDownEffectMutex;
+std::array<DownEffect, kDownEffectCapacity> gDownEffects{};
+std::uint64_t gDownEffectEpisodeStart{};
+std::uint64_t gDownEffectsDropped{};
+std::size_t gDownEffectCount{};
+std::uint64_t gDownEffectEpisode{};
 const void* gGlobalRootAddress{};
 // Published before HookManager resumes patched threads. Neither destination
 // is cleared at logical shutdown: an in-flight naked detour still needs it.
@@ -134,8 +178,241 @@ int __stdcall DecideLocalDeath(const std::uintptr_t victim) noexcept {
     }
     RecordEvent(event);
     if (event.decision != Decision::Suppress) return 0;
+    gSpectateDiedAt.store(GetTickCount64(), std::memory_order_relaxed);
+    gSpectateVictim.store(victim, std::memory_order_release);
     gLocalDeathSequence.fetch_add(1U, std::memory_order_acq_rel);
     return 1;
+}
+
+// ---------- spectate ----------
+// alien-isolation-coop writes the partner's pose into the KillCamera records
+// it finds by scanning memory. Here the remote participant is a real
+// Character, so the retail follow camera is retargeted to it instead, with the
+// same certified camera calls as AlienPvPLocalController (no process scan).
+constexpr std::uintptr_t kCameraGlobalsRva = 0x012F0C88U;
+constexpr std::uintptr_t kCameraSetEntityRva = 0x00029220U;
+constexpr std::uintptr_t kCameraActivateRva = 0x00032E10U;
+constexpr std::uintptr_t kPauseManagerRva = 0x012F194CU;
+constexpr std::uintptr_t kCharacterSkeletonOffset = 0x718U;
+// Over-the-shoulder on a standing human: position (side, up, back), then aim
+// (side, up, ahead). Same FollowBehavior layout as the Alien PvP camera.
+constexpr std::array<float, 6> kSpectateFollow{0.4F, 1.55F, -2.2F, 0.0F, 1.35F, 2.0F};
+
+struct SpectateCamera {
+    std::uintptr_t manager{}, follow{}, behavior{};
+    std::array<float, 6> originalFollow{};
+    std::uint8_t originalFirstPerson{};
+    bool saved{};
+};
+struct SpectateRuntime {
+    std::uintptr_t victim{};
+    std::uint32_t generation{};
+    std::uint64_t diedAt{};
+    std::uint64_t target{};
+    std::uintptr_t targetCharacter{};
+    std::uint64_t nextAssertMs{};
+    SpectateCamera camera{};
+    bool leftDown{}, rightDown{};
+};
+SpectateRuntime gSpectate{}; // certified engine thread only
+
+template <typename T>
+bool ReadAt(const std::uintptr_t at, T& out) noexcept {
+    return at != 0U && crash_guard::TryCopy(&out, reinterpret_cast<const void*>(at), sizeof(T));
+}
+template <typename T>
+bool WriteAt(const std::uintptr_t at, const T& value) noexcept {
+    return at != 0U && crash_guard::TryCopy(reinterpret_cast<void*>(at), &value, sizeof(T));
+}
+
+constexpr std::uint32_t BehaviorNameHash(const char* name, const std::size_t size) noexcept {
+    std::uint32_t h{};
+    for (std::size_t i = 0U, j = 0U; i < 256U; ++i, j = (j + 1U) % size)
+        h += static_cast<std::uint32_t>(static_cast<std::uint8_t>(name[j])) << (i & 31U);
+    return h;
+}
+
+std::uintptr_t FindFollowBehavior(const std::uintptr_t camera) noexcept {
+    std::uintptr_t array{};
+    std::uint32_t count{};
+    if (!ReadAt(camera + 0xBCU, array) || !array || !ReadAt(camera + 0xC0U, count) || count > 256U) return 0U;
+    for (std::uint32_t i = 0U; i < count; ++i) {
+        std::uintptr_t behavior{};
+        std::uint32_t type{};
+        if (ReadAt(array + i * sizeof(std::uintptr_t), behavior) && behavior &&
+            ReadAt(behavior + 8U, type) && type == BehaviorNameHash("FollowBehavior", 14U)) return behavior;
+    }
+    return 0U;
+}
+
+bool CurrentFollowCamera(const std::uintptr_t base, std::uintptr_t& manager, std::uintptr_t& follow) noexcept {
+    std::uintptr_t root{};
+    return base != 0U && ReadAt(base + kCameraGlobalsRva, root) && root &&
+        ReadAt(root + 0x58U, manager) && manager && ReadAt(manager + 0x1DCU, follow) && follow;
+}
+
+bool ActivateFollowOn(const std::uintptr_t base, const SpectateCamera& camera,
+    const std::uintptr_t character, const bool activate) noexcept {
+    std::uintptr_t skeleton{};
+    if (!base || !camera.manager || !camera.follow || !character ||
+        !ReadAt(character + kCharacterSkeletonOffset, skeleton) || !skeleton) return false;
+#if defined(_MSC_VER)
+    __try {
+        reinterpret_cast<void(__thiscall*)(void*, void*)>(base + kCameraSetEntityRva)(
+            reinterpret_cast<void*>(camera.follow), reinterpret_cast<void*>(character));
+        if (activate)
+            static_cast<void>(reinterpret_cast<unsigned(__thiscall*)(void*, void*)>(base + kCameraActivateRva)(
+                reinterpret_cast<void*>(camera.manager), reinterpret_cast<void*>(camera.follow)));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+#else
+    return false;
+#endif
+}
+
+bool BindSpectateCamera(const std::uintptr_t base, SpectateCamera& camera) noexcept {
+    std::uintptr_t manager{}, follow{};
+    if (!CurrentFollowCamera(base, manager, follow)) return false;
+    if (camera.saved && (camera.manager != manager || camera.follow != follow)) camera = {};
+    camera.manager = manager;
+    camera.follow = follow;
+    const auto behavior = FindFollowBehavior(follow);
+    if (!behavior) return false;
+    if (!camera.saved) {
+        if (!ReadAt(behavior + 0x9CU, camera.originalFollow) ||
+            !ReadAt(behavior + 0xF6U, camera.originalFirstPerson)) return false;
+        camera.behavior = behavior;
+        camera.saved = true;
+    }
+    return camera.behavior == behavior && WriteAt(behavior + 0x9CU, kSpectateFollow) &&
+        WriteAt(behavior + 0xF6U, std::uint8_t{0});
+}
+
+// Same world only: put the follow camera back as retail left it. The dead
+// local player keeps whatever script camera the game activates next.
+void ReleaseSpectateCamera(const std::uintptr_t base, const bool sameWorld) noexcept {
+    alien_pvp_local::SetSpectateOrbit(0U, 0U, 0U);
+    auto& camera = gSpectate.camera;
+    std::uintptr_t manager{}, follow{};
+    if (sameWorld && camera.saved && CurrentFollowCamera(base, manager, follow) &&
+        manager == camera.manager && follow == camera.follow && FindFollowBehavior(follow) == camera.behavior) {
+        static_cast<void>(WriteAt(camera.behavior + 0x9CU, camera.originalFollow));
+        static_cast<void>(WriteAt(camera.behavior + 0xF6U, camera.originalFirstPerson));
+        if (gSpectate.victim) static_cast<void>(ActivateFollowOn(base, camera, gSpectate.victim, false));
+    }
+    camera = {};
+    gSpectate.target = 0U;
+    gSpectate.targetCharacter = 0U;
+}
+
+bool SpectateInputAllowed(const std::uintptr_t base) noexcept {
+    DWORD process{};
+    const auto foreground = GetForegroundWindow();
+    if (!foreground || !GetWindowThreadProcessId(foreground, &process) || process != GetCurrentProcessId())
+        return false;
+    std::uintptr_t pauseManager{};
+    std::uint32_t pauseReasons{};
+    return !(ReadAt(base + kPauseManagerRva, pauseManager) && pauseManager &&
+        ReadAt(pauseManager + 4U, pauseReasons) && (pauseReasons & 0x00012000U) != 0U);
+}
+
+// The player kill/death states (00649FA0, 0064B630, 0064B270) fade the
+// engine fade manager (static object RVA 15D0970) out to black and finish it
+// as mode 1 = held black. Only a fade-in clears it; in solo play the GameOver
+// checkpoint reload does that, which AIMP suppresses. Do what CATHODE
+// ScreenFadeIn (00611E00) does, then finish it: a fresh fade-in token also
+// invalidates the death states, so they can no longer darken the view.
+// Fields: +1B44 mode (0 off, 1 held, 2 in, 3 out), +1B48 value, +1B5C token.
+constexpr std::uintptr_t kFadeManagerRva = 0x015D0970U;
+constexpr std::uintptr_t kFadeBeginInRva = 0x005F2330U;   // int  ()          new fade-in token
+constexpr std::uintptr_t kFadeSetModeRva = 0x005F2360U;   // bool (token, mode)
+constexpr std::uintptr_t kFadeSetValueRva = 0x001A2460U;  // void (token, float)
+constexpr std::uintptr_t kFadeFinishRva = 0x005F2390U;    // void (token)
+constexpr std::uintptr_t kFadeEndInRva = 0x005F2350U;     // void ()          fade-in counter--
+
+bool FadeCodeMatches(const std::uintptr_t base) noexcept {
+    struct Expected { std::uintptr_t rva; std::array<std::uint8_t, 10> bytes; };
+    static constexpr std::array<Expected, 5> kExpected{{
+        {kFadeBeginInRva, {0x8B,0x81,0x5C,0x1B,0x00,0x00,0xFF,0x81,0x58,0x1B}},
+        {kFadeSetModeRva, {0x8B,0x44,0x24,0x04,0x3B,0x81,0x5C,0x1B,0x00,0x00}},
+        {kFadeSetValueRva, {0x8B,0x44,0x24,0x04,0x3B,0x81,0x5C,0x1B,0x00,0x00}},
+        {kFadeFinishRva, {0x8B,0x44,0x24,0x04,0x3B,0x81,0x5C,0x1B,0x00,0x00}},
+        {kFadeEndInRva, {0xFF,0x89,0x58,0x1B,0x00,0x00,0xC3,0xCC,0xCC,0xCC}}}};
+    for (const auto& expected : kExpected) {
+        std::array<std::uint8_t, 10> actual{};
+        if (!ReadAt(base + expected.rva, actual) || actual != expected.bytes) return false;
+    }
+    return true;
+}
+
+// Engine thread. True when the fade manager is (now) off.
+bool RestoreSceneFade(const std::uintptr_t base) noexcept {
+    if (base == 0U || gFadeCodeRejected.load(std::memory_order_relaxed)) return false;
+    static bool verified{};
+    if (!verified) {
+        if (!FadeCodeMatches(base)) { gFadeCodeRejected.store(true, std::memory_order_relaxed); return false; }
+        verified = true;
+    }
+    const auto manager = base + kFadeManagerRva;
+    std::int32_t mode{};
+    if (!ReadAt(manager + 0x1B44U, mode) || mode < 0 || mode > 3) {
+        gFadeRestoreFailures.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+    if (mode == 0) return true;
+    gFadeLastMode.store(mode, std::memory_order_relaxed);
+#if defined(_MSC_VER)
+    __try {
+        auto* self = reinterpret_cast<void*>(manager);
+        const int token = reinterpret_cast<int(__thiscall*)(void*)>(base + kFadeBeginInRva)(self);
+        static_cast<void>(reinterpret_cast<bool(__thiscall*)(void*, int, int)>(base + kFadeSetModeRva)(self, token, 2));
+        reinterpret_cast<void(__thiscall*)(void*, int, float)>(base + kFadeSetValueRva)(self, token, 1.0F);
+        reinterpret_cast<void(__thiscall*)(void*, int)>(base + kFadeFinishRva)(self, token);
+        reinterpret_cast<void(__thiscall*)(void*)>(base + kFadeEndInRva)(self);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        gFadeRestoreFailures.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
+    gFadeRestores.fetch_add(1U, std::memory_order_relaxed);
+    return ReadAt(manager + 0x1B44U, mode) && mode == 0;
+#else
+    return false;
+#endif
+}
+
+int SpectateStep(const std::uintptr_t base) noexcept {
+    const bool allowed = SpectateInputAllowed(base);
+    const bool left = allowed && (GetAsyncKeyState(VK_LEFT) & 0x8000) != 0;
+    const bool right = allowed && (GetAsyncKeyState(VK_RIGHT) & 0x8000) != 0;
+    const int step = (left && !gSpectate.leftDown ? -1 : 0) + (right && !gSpectate.rightDown ? 1 : 0);
+    gSpectate.leftDown = left;
+    gSpectate.rightDown = right;
+    return step;
+}
+
+void RecordDownEffect(const std::uint32_t method, const std::uint32_t entity,
+    const std::uint32_t type, const std::uint32_t primitive, const bool suppressed) noexcept {
+    const auto now = GetTickCount64();
+    std::lock_guard lock(gDownEffectMutex);
+    const auto episode = gDownEpisodes.load(std::memory_order_relaxed);
+    if (episode != gDownEffectEpisode) {
+        gDownEffectEpisode = episode; gDownEffectCount = 0U; gDownEffectEpisodeStart = now; gDownEffectsDropped = 0U;
+    }
+    DownEffect effect{method, entity, type, primitive,
+        static_cast<std::uint32_t>(std::min<std::uint64_t>(now - gDownEffectEpisodeStart, UINT32_MAX)),
+        gSpectateVictim.load(std::memory_order_relaxed) != 0U, suppressed};
+    for (std::size_t i = 0U; i < gDownEffectCount; ++i) if (gDownEffects[i].Same(effect)) {
+        gDownEffects[i].suppressed = gDownEffects[i].suppressed || suppressed;
+        return;
+    }
+    if (gDownEffectCount < gDownEffects.size()) gDownEffects[gDownEffectCount++] = effect;
+    else ++gDownEffectsDropped;
+}
+
+void PublishSpectate(const std::uint64_t target, const std::uint32_t candidates) noexcept {
+    gSpectateCandidates.store(candidates, std::memory_order_relaxed);
+    if (gSpectateTarget.exchange(target, std::memory_order_acq_rel) != target)
+        gSpectateChanges.fetch_add(1U, std::memory_order_relaxed);
 }
 
 std::optional<std::int32_t> ReadGameplayMode() noexcept {
@@ -262,6 +539,161 @@ std::uint64_t LocalLevelExitSequence() noexcept {
     return gLocalLevelExitSequence.load(std::memory_order_acquire);
 }
 
+void PumpSpectateOnEngineThread(const SpectateContext& context) noexcept {
+    const auto teammates = context.cameraReserved ? 0U
+        : static_cast<std::uint32_t>(std::min(context.candidateCount, spectate::kMaxCandidates));
+    gSpectateLivingTeammates.store(teammates, std::memory_order_relaxed);
+    {
+        // Down = dying in a kill (health state >= 3 before the death boundary)
+        // or already dead; the same fields DecideLocalDeath records.
+        std::uint16_t hp{};
+        std::uint32_t health{};
+        const bool dying = context.localPlayer != 0U && ReadAt(context.localPlayer + 0x33CU, hp) &&
+            ReadAt(context.localPlayer + 0x32CU, health) && (hp == 0U || health >= 3U);
+        const bool down = teammates != 0U &&
+            (dying || gSpectateVictim.load(std::memory_order_acquire) != 0U);
+        if (gLocalPlayerDown.exchange(down, std::memory_order_relaxed) != down && down)
+            gDownEpisodes.fetch_add(1U, std::memory_order_relaxed);
+    }
+    auto& s = gSpectate;
+    const auto victim = gSpectateVictim.load(std::memory_order_acquire);
+    if (victim != 0U && victim != s.victim) {
+        // A new suppressed death. Any previous view belonged to another world.
+        s = {};
+        s.victim = victim;
+        s.generation = context.nativeGeneration;
+        s.diedAt = gSpectateDiedAt.load(std::memory_order_relaxed);
+    }
+    if (s.victim == 0U) return;
+    const bool sameWorld = context.nativeGeneration == s.generation;
+    if (!gEnabled.load(std::memory_order_acquire) || !sameWorld ||
+        (context.localPlayer != 0U && context.localPlayer != s.victim)) {
+        // Level change, reload or shutdown: the dead body is gone, stop for good.
+        ReleaseSpectateCamera(context.moduleBase, sameWorld && gEnabled.load(std::memory_order_acquire));
+        auto expected = s.victim;
+        gSpectateVictim.compare_exchange_strong(expected, 0U, std::memory_order_acq_rel);
+        s = {};
+        PublishSpectate(0U, 0U);
+        return;
+    }
+
+    std::array<std::uint64_t, spectate::kMaxCandidates> peers{};
+    const auto count = std::min(context.candidateCount, spectate::kMaxCandidates);
+    for (std::size_t i = 0U; i < count; ++i) peers[i] = context.candidates[i].peer;
+    const auto candidates = static_cast<std::uint32_t>(count);
+    if (context.cameraReserved) {
+        if (s.target != 0U) ReleaseSpectateCamera(context.moduleBase, true);
+        PublishSpectate(0U, candidates);
+        return;
+    }
+    const auto now = GetTickCount64();
+    const int step = SpectateStep(context.moduleBase);
+    if (now - s.diedAt < spectate::kStartDelayMs) {
+        PublishSpectate(0U, candidates);
+        return;
+    }
+    const auto next = step != 0 ? spectate::Cycle(s.target, peers.data(), count, step)
+                                : spectate::KeepOrNext(s.target, peers.data(), count);
+    if (next == 0U) {
+        // A dead player without a certified camera target previously failed
+        // silently, leaving the game on its retail black death screen.
+        gSpectateNoCandidates.fetch_add(1U, std::memory_order_relaxed);
+        // The watched teammate is being killed (no longer a living candidate):
+        // keep orbiting its body instead of falling back to its head camera.
+        if (s.target != 0U && s.targetCharacter != 0U && s.camera.behavior != 0U)
+            alien_pvp_local::SetSpectateOrbit(context.moduleBase, s.camera.behavior, s.targetCharacter);
+        else
+            alien_pvp_local::SetSpectateOrbit(0U, 0U, 0U);
+        PublishSpectate(s.target, 0U);
+        return;
+    }
+    std::uintptr_t character{};
+    for (std::size_t i = 0U; i < count; ++i)
+        if (context.candidates[i].peer == next) character = context.candidates[i].character;
+    const bool changed = next != s.target || character != s.targetCharacter;
+    if (changed || now >= s.nextAssertMs) {
+        std::uintptr_t active{};
+        const bool owned = !changed && s.camera.saved &&
+            ReadAt(s.camera.manager + 0x1D8U, active) && active == s.camera.follow;
+        if (!changed && s.camera.saved && !owned) gSpectateCameraStolen.fetch_add(1U, std::memory_order_relaxed);
+        gSpectateLastActiveCamera.store(active, std::memory_order_relaxed);
+        gSpectateLastFollowCamera.store(s.camera.follow, std::memory_order_relaxed);
+        gSpectateLastTargetCharacter.store(character, std::memory_order_relaxed);
+        if (!owned) {
+            gSpectateCameraAttempts.fetch_add(1U, std::memory_order_relaxed);
+            if (BindSpectateCamera(context.moduleBase, s.camera) &&
+                ActivateFollowOn(context.moduleBase, s.camera, character, true)) {
+                s.target = next;
+                s.targetCharacter = character;
+            } else {
+                gSpectateBindFailures.fetch_add(1U, std::memory_order_relaxed);
+            }
+        }
+        s.nextAssertMs = now + spectate::kReassertMs;
+    }
+    // Only once a teammate is really watched: otherwise the retail black stays.
+    if (s.target != 0U && !RestoreSceneFade(context.moduleBase))
+        gFadeRestoreFailures.fetch_add(1U, std::memory_order_relaxed);
+    // Third-person mouse orbit instead of the FollowBehavior head view.
+    alien_pvp_local::SetSpectateOrbit(s.target != 0U ? context.moduleBase : 0U,
+        s.target != 0U ? s.camera.behavior : 0U, s.target != 0U ? s.targetCharacter : 0U);
+    PublishSpectate(s.target, candidates);
+}
+
+SpectateState SpectateSnapshot() noexcept {
+    return {gSpectateTarget.load(std::memory_order_acquire), gSpectateCandidates.load(std::memory_order_relaxed)};
+}
+
+bool LocalPlayerDown() noexcept {
+    return gLocalPlayerDown.load(std::memory_order_relaxed);
+}
+
+namespace {
+bool DecideDeathPresentation(bool down, std::uint32_t method, std::uint32_t entity,
+    std::uint32_t type, std::uint32_t primitive) noexcept;
+}
+bool SuppressDeathPresentation(const std::uint32_t method, const std::uint32_t entity,
+    const std::uint32_t type, const std::uint32_t primitive) noexcept {
+    const bool down = gLocalPlayerDown.load(std::memory_order_relaxed);
+    const bool suppress = DecideDeathPresentation(down, method, entity, type, primitive);
+    if (down) RecordDownEffect(method, entity, type, primitive, suppress);
+    if (suppress) gDeathFadeSuppressed.fetch_add(1U, std::memory_order_relaxed);
+    return suppress;
+}
+
+namespace {
+bool DecideDeathPresentation(const bool down, const std::uint32_t method, const std::uint32_t entity,
+    const std::uint32_t type, const std::uint32_t primitive) noexcept {
+    constexpr std::array<std::uint32_t, 8> kScreenFadeOut{
+        0x9BD3BC8EU, 0x3558D11EU, 0xE6BB387AU, 0x5513C887U,
+        0x9EB7BC86U, 0xF3C51273U, 0x03D53481U, 0x421953F3U};
+    // ShortGuids of the CATHODE ScreenFadeOutTo{Black,White}[Timed] function
+    // types and their AV variants (CathodeLib algorithm).
+    const auto isFade = [&](const std::uint32_t value) noexcept {
+        return value != 0U && std::find(kScreenFadeOut.begin(), kScreenFadeOut.end(), value) != kScreenFadeOut.end();
+    };
+    if (down && (isFade(primitive) || isFade(type)) && gEnabled.load(std::memory_order_acquire) &&
+        world_actions::SessionAuthorityBound()) {
+        const auto mode = ReadGameplayMode();
+        if (mode && *mode != 0 && *mode != 3) return true;
+    }
+    // IDs from alien-isolation-coop (coopnet.c swallow_cb), same retail build:
+    // TriggerDeath on the Health_Damage_Death composite (fade to black,
+    // vignette, colour), and "Death DOF".."Death DOF_3"/"Time to Death" in
+    // Global\systemic_post_processing. The DOF starts ~0.3 s before the death,
+    // so the rule depends on a watchable teammate, not on our death state.
+    constexpr std::uint32_t kTriggerDeath = 0xAE498037U, kHealthDamageDeath = 0x3F4DEFE1U;
+    constexpr std::uint32_t kDeathDofMethod = 0x830C2104U;
+    constexpr std::array<std::uint32_t, 5> kDeathDof{0xBCF22095U, 0xAF7FD498U, 0x97E51B56U, 0xBCD40132U, 0x006BBDB7U};
+    const bool effect = (method == kTriggerDeath && type == kHealthDamageDeath) ||
+        (method == kDeathDofMethod && std::find(kDeathDof.begin(), kDeathDof.end(), entity) != kDeathDof.end());
+    if (!effect || !gEnabled.load(std::memory_order_acquire) || !world_actions::SessionAuthorityBound() ||
+        gSpectateLivingTeammates.load(std::memory_order_relaxed) == 0U) return false;
+    const auto mode = ReadGameplayMode();
+    return mode && *mode != 0 && *mode != 3;
+}
+} // namespace
+
 void ObserveMissionComplete() noexcept {
     if (!gEnabled.load(std::memory_order_acquire) || !world_actions::SessionAuthorityBound()) return;
     const auto mode = ReadGameplayMode();
@@ -327,6 +759,114 @@ void DrainDiagnostics(Diagnostics& diagnostics) {
             "[PlayerLifecycle] local terminal HUD trigger executed; completion reported before Flash dispatch.",
             {{"observed", Diagnostics::Unsigned(completed), true},
              {"levelExitSequence", Diagnostics::Unsigned(LocalLevelExitSequence()), true}});
+    }
+    const auto spectateChanges = gSpectateChanges.load(std::memory_order_relaxed);
+    if (spectateChanges != gSpectateChangesDrained.exchange(spectateChanges, std::memory_order_relaxed)) {
+        const auto state = SpectateSnapshot();
+        diagnostics.Log("info", "playerlifecycle_spectate",
+            state.targetPeer != 0U ? "[PlayerLifecycle] spectating a living participant"
+                                   : "[PlayerLifecycle] spectate stopped",
+            {{"targetPeer", Diagnostics::Unsigned(state.targetPeer), true},
+             {"candidates", Diagnostics::Unsigned(state.candidates), true},
+             {"changes", Diagnostics::Unsigned(spectateChanges), true}});
+    }
+    {
+        static std::array<DownEffect, kDownEffectCapacity> effects{};
+        std::uint64_t droppedEffects{};
+        std::size_t effectCount{};
+        std::uint64_t episode{};
+        {
+            std::lock_guard lock(gDownEffectMutex);
+            effects = gDownEffects;
+            effectCount = gDownEffectCount;
+            episode = gDownEffectEpisode;
+            droppedEffects = gDownEffectsDropped;
+        }
+        static std::uint64_t drainedEpisode{};
+        static std::size_t drainedCount{};
+        if (episode != drainedEpisode) { drainedEpisode = episode; drainedCount = 0U; }
+        const auto hex = [](const std::uint32_t value) {
+            char text[11]{};
+            std::snprintf(text, sizeof(text), "0x%08X", value);
+            return std::string(text);
+        };
+        for (; drainedCount < effectCount; ++drainedCount) {
+            const auto& effect = effects[drainedCount];
+            diagnostics.Log("info", "playerlifecycle_down_effect",
+                "[PlayerLifecycle] script effect executed while the local player is down",
+                {{"episode", Diagnostics::Unsigned(episode), true},
+                 {"method", hex(effect.method)},
+                 {"entity", hex(effect.entity)},
+                 {"type", hex(effect.type)},
+                 {"primitive", hex(effect.primitive)},
+                 {"ms", Diagnostics::Unsigned(effect.ms), true},
+                 {"afterDeath", Diagnostics::Boolean(effect.afterDeath), true},
+                 {"suppressed", Diagnostics::Boolean(effect.suppressed), true},
+                 {"dropped", Diagnostics::Unsigned(droppedEffects), true}});
+        }
+    }
+    {
+        const auto orbit = alien_pvp_local::SpectateOrbitSnapshot();
+        static std::uint64_t loggedFrames{};
+        if (orbit.frames >= loggedFrames + 600U || (orbit.frames != 0U && loggedFrames == 0U)) {
+            loggedFrames = orbit.frames;
+            diagnostics.Log("info", "playerlifecycle_spectate_orbit",
+                "[PlayerLifecycle] third-person spectate orbit applied after the follow camera update",
+                {{"frames", Diagnostics::Unsigned(orbit.frames), true},
+                 {"collisions", Diagnostics::Unsigned(orbit.collisions), true},
+                 {"noWorld", Diagnostics::Unsigned(orbit.noWorld), true}});
+        }
+    }
+    const auto restores = gFadeRestores.load(std::memory_order_relaxed);
+    if (restores != gFadeRestoresDrained.exchange(restores, std::memory_order_relaxed)) {
+        diagnostics.Log("info", "playerlifecycle_spectate_fade_restored",
+            "[PlayerLifecycle] engine fade manager cleared (death black) while spectating",
+            {{"restores", Diagnostics::Unsigned(restores), true},
+             {"lastMode", std::to_string(gFadeLastMode.load(std::memory_order_relaxed)), true},
+             {"failures", Diagnostics::Unsigned(gFadeRestoreFailures.load(std::memory_order_relaxed)), true},
+             {"codeRejected", Diagnostics::Boolean(gFadeCodeRejected.load(std::memory_order_relaxed)), true}});
+    } else if (gFadeCodeRejected.load(std::memory_order_relaxed) || gFadeRestoreFailures.load(std::memory_order_relaxed) != 0U) {
+        static std::uint64_t reportedFailures{~0ULL};
+        const auto failures = gFadeRestoreFailures.load(std::memory_order_relaxed);
+        if (failures != reportedFailures) {
+            reportedFailures = failures;
+            diagnostics.Log("warning", "playerlifecycle_spectate_fade_unavailable",
+                "[PlayerLifecycle] engine fade manager could not be cleared; the spectate view may stay black",
+                {{"failures", Diagnostics::Unsigned(failures), true},
+                 {"codeRejected", Diagnostics::Boolean(gFadeCodeRejected.load(std::memory_order_relaxed)), true}});
+        }
+    }
+    const auto fades = gDeathFadeSuppressed.load(std::memory_order_relaxed);
+    if (fades != gDeathFadeSuppressedDrained.exchange(fades, std::memory_order_relaxed)) {
+        diagnostics.Log("info", "playerlifecycle_death_presentation_suppressed",
+            "[PlayerLifecycle] death fade/DOF suppressed so the spectate view stays visible",
+            {{"suppressed", Diagnostics::Unsigned(fades), true}});
+    }
+    const auto noCandidates = gSpectateNoCandidates.load(std::memory_order_relaxed);
+    if (noCandidates != gSpectateNoCandidatesDrained.exchange(noCandidates, std::memory_order_relaxed)) {
+        diagnostics.Log("warning", "playerlifecycle_spectate_no_candidate",
+            "[PlayerLifecycle] dead player has no qualified living spectator target; camera remains unbound.",
+            {{"frames", Diagnostics::Unsigned(noCandidates), true},
+             {"cameraAttempts", Diagnostics::Unsigned(gSpectateCameraAttempts.load(std::memory_order_relaxed)), true}});
+    }
+    const auto attempts = gSpectateCameraAttempts.load(std::memory_order_relaxed);
+    if (attempts != gSpectateCameraAttemptsDrained.exchange(attempts, std::memory_order_relaxed)) {
+        const auto state = SpectateSnapshot();
+        diagnostics.Log("info", "playerlifecycle_spectate_camera_attempts",
+            "[PlayerLifecycle] spectate camera binding attempts and current state.",
+            {{"attempts", Diagnostics::Unsigned(attempts), true},
+             {"stolen", Diagnostics::Unsigned(gSpectateCameraStolen.load(std::memory_order_relaxed)), true},
+             {"activeCamera", Diagnostics::Pointer(reinterpret_cast<const void*>(gSpectateLastActiveCamera.load(std::memory_order_relaxed)))},
+             {"followCamera", Diagnostics::Pointer(reinterpret_cast<const void*>(gSpectateLastFollowCamera.load(std::memory_order_relaxed)))},
+             {"targetCharacter", Diagnostics::Pointer(reinterpret_cast<const void*>(gSpectateLastTargetCharacter.load(std::memory_order_relaxed)))},
+             {"targetPeer", Diagnostics::Unsigned(state.targetPeer), true},
+             {"candidates", Diagnostics::Unsigned(state.candidates), true}});
+    }
+    const auto bindFailures = gSpectateBindFailures.load(std::memory_order_relaxed);
+    if (bindFailures != gSpectateBindFailuresDrained.exchange(bindFailures, std::memory_order_relaxed)) {
+        diagnostics.Log("warning", "playerlifecycle_spectate_camera_unavailable",
+            "[PlayerLifecycle] spectate follow camera could not be bound; retrying.",
+            {{"failures", Diagnostics::Unsigned(bindFailures), true}});
     }
     if (dropped != 0U) {
         diagnostics.Log("warning", "playerlifecycle_diagnostics_overflow",

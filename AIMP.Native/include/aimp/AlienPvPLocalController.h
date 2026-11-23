@@ -6,6 +6,13 @@ namespace aimp { class HookManager; }
 
 namespace aimp::alien_pvp_local {
 bool InstallCameraHooks(std::uintptr_t base,HookManager& hooks,std::string& error);
+// PlayerLifecycle spectate: third-person orbit around a living Character,
+// driven by the mouse (wheel = distance), applied after the retail
+// FollowBehavior update of exactly this behavior. target 0 turns it off.
+// Engine thread.
+void SetSpectateOrbit(std::uintptr_t base,std::uintptr_t followBehavior,std::uintptr_t target) noexcept;
+struct SpectateOrbitStats {std::uint64_t frames{},collisions{},noWorld{};};
+[[nodiscard]] SpectateOrbitStats SpectateOrbitSnapshot() noexcept;
 
 // All entry points run on the certified engine thread. The local controller
 // never accepts a network pointer, never changes the AI lease owner and never

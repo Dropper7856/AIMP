@@ -19,4 +19,9 @@ int TakeCameraWheel() noexcept;
 void SetMapMode(bool enabled) noexcept;
 struct MapPointer {float x{480},y{270};int wheel{};bool down{},clicked{};};
 MapPointer TakeMapPointer() noexcept;
+// Spectate orbit camera: while enabled (and the PvP firewall is inactive),
+// raw mouse motion and wheel are captured for the orbit, not the dead player.
+void SetSpectateMouse(bool enabled) noexcept;
+struct SpectateMouse {int dx{},dy{},wheel{};};
+SpectateMouse TakeSpectateMouse() noexcept;
 } // namespace aimp::alien_pvp_input

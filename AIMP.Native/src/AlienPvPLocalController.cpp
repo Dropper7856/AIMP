@@ -68,6 +68,12 @@ void* gPostBlendTrampoline{};
 std::atomic<std::uint32_t> gCameraGeneration{};
 struct WorldSample {std::atomic<std::uintptr_t> world{};std::atomic<std::uint64_t> at{};std::atomic<std::uint32_t> generation{};};
 std::array<WorldSample,4> gWorlds{};
+// Spectate orbit (PlayerLifecycle). Worlds sampled for it use this generation tag.
+constexpr std::uint32_t kOrbitWorldGeneration=0xFFFFFFFFU;
+std::atomic<std::uintptr_t> gOrbitBase{},gOrbitBehavior{},gOrbitTarget{};
+std::atomic<std::uint64_t> gOrbitFrames{},gOrbitCollisions{},gOrbitNoWorld{};
+struct OrbitState {std::uintptr_t target{};float yaw{},pitch{0.25F},distance{3.0F},shown{3.0F};};
+OrbitState gOrbit{}; // engine thread only
 
 template<typename T>
 bool Read(const std::uintptr_t at, T& out) noexcept {
@@ -541,10 +547,82 @@ void FollowAfter(std::uintptr_t behavior) noexcept {
         static_cast<void>(Write(behavior+0x1CU,out));
     }
 }
+bool OrbitRay(std::uintptr_t base,std::uintptr_t world,const std::array<float,3>& from,const std::array<float,3>& to,
+    std::array<float,3>& hit) noexcept {
+    alignas(16) float a[4]{from[0],from[1],from[2],0},b[4]{to[0],to[1],to[2],0},p[4]{},n[4]{};
+    alignas(16) std::uint8_t result[16]{};
+#if defined(_MSC_VER)
+    __try {
+        using Fn=void(__thiscall*)(std::uintptr_t,void*,std::uintptr_t,const void*,const void*,void*,void*);
+        reinterpret_cast<Fn>(base+0x0028DAB0U)(0U,result,world,a,b,p,n);
+        if(!result[0])return false;
+        hit={p[0],p[1],p[2]};return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+#else
+    return false;
+#endif
+}
+// Third-person orbit for a dead player watching a teammate. Same output
+// fields as the PvP free camera (FollowAfter): behavior eye/look and the
+// child camera transform, written after the retail update of this frame.
+void SpectateOrbitAfter(std::uintptr_t behavior) noexcept {
+    const auto base=gOrbitBase.load(std::memory_order_acquire);
+    const auto target=gOrbitTarget.load(std::memory_order_acquire);
+    if(!base || !target || behavior!=gOrbitBehavior.load(std::memory_order_acquire))return;
+    std::array<float,3> body{};float facing{};
+    if(!Read(target+0x70U,body) || !std::isfinite(body[0]) || !std::isfinite(body[1]) || !std::isfinite(body[2]))return;
+    if(gOrbit.target!=target) {
+        // Start behind the watched player, looking the way they face.
+        gOrbit=OrbitState{};gOrbit.target=target;
+        if(Read(target+0x174U,facing) && std::isfinite(facing))gOrbit.yaw=facing;
+        static_cast<void>(alien_pvp_input::TakeSpectateMouse());
+    }
+    const auto mouse=alien_pvp_input::TakeSpectateMouse();
+    constexpr float kSensitivity=0.0022F;
+    gOrbit.yaw+=static_cast<float>(mouse.dx)*kSensitivity;
+    gOrbit.pitch=std::clamp(gOrbit.pitch+static_cast<float>(mouse.dy)*kSensitivity,-0.55F,1.25F);
+    gOrbit.distance=std::clamp(gOrbit.distance-static_cast<float>(mouse.wheel)/120.0F*0.35F,1.2F,6.0F);
+    const std::array<float,3> pivot{body[0],body[1]+1.55F,body[2]};
+    const float flat=std::cos(gOrbit.pitch);
+    const std::array<float,3> dir{-std::sin(gOrbit.yaw)*flat,std::sin(gOrbit.pitch),-std::cos(gOrbit.yaw)*flat};
+    // Collision: nearest hit over the physics worlds sampled this second.
+    float allowed=gOrbit.distance;bool anyWorld{};
+    const auto now=GetTickCount64();
+    const std::array<float,3> reach{pivot[0]+dir[0]*(gOrbit.distance+0.3F),pivot[1]+dir[1]*(gOrbit.distance+0.3F),
+        pivot[2]+dir[2]*(gOrbit.distance+0.3F)};
+    for(auto& sample:gWorlds) {
+        if(sample.generation.load(std::memory_order_acquire)!=kOrbitWorldGeneration || now-sample.at.load()>1000U)continue;
+        const auto world=sample.world.load();if(!world)continue;
+        anyWorld=true;std::array<float,3> hit{};
+        if(OrbitRay(base,world,pivot,reach,hit)) {
+            const float x=hit[0]-pivot[0],y=hit[1]-pivot[1],z=hit[2]-pivot[2];
+            allowed=std::min(allowed,std::max(0.35F,std::sqrt(x*x+y*y+z*z)-0.3F));
+        }
+    }
+    if(!anyWorld)gOrbitNoWorld.fetch_add(1U,std::memory_order_relaxed);
+    if(allowed<gOrbit.distance)gOrbitCollisions.fetch_add(1U,std::memory_order_relaxed);
+    // Pull in at once on a hit; ease back out so a doorway does not pop.
+    gOrbit.shown=allowed<gOrbit.shown?allowed:gOrbit.shown+(allowed-gOrbit.shown)*0.12F;
+    const std::array<float,3> eye{pivot[0]+dir[0]*gOrbit.shown,pivot[1]+dir[1]*gOrbit.shown,pivot[2]+dir[2]*gOrbit.shown};
+    // The behavior transform block (+0C quaternion x,y,z,w, +1C position) is
+    // copied into the rendered camera block by 0042ADA0 right after this
+    // update. Basis +X right, +Y up, +Z forward; yaw as Character+0x174,
+    // positive pitch looks down. Look from the eye at the pivot, no roll.
+    const float lx=pivot[0]-eye[0],ly=pivot[1]-eye[1],lz=pivot[2]-eye[2];
+    const float length=std::sqrt(lx*lx+ly*ly+lz*lz);
+    if(!(length>0.05F))return;
+    const float psi=std::atan2(lx,lz),theta=std::asin(std::clamp(-ly/length,-1.0F,1.0F));
+    const float cy=std::cos(psi*0.5F),sy=std::sin(psi*0.5F),cp=std::cos(theta*0.5F),sp=std::sin(theta*0.5F);
+    const std::array<float,4> rotation{cy*sp,sy*cp,-sy*sp,cy*cp};
+    static_cast<void>(Write(behavior+0x0CU,rotation));
+    static_cast<void>(Write(behavior+0x1CU,eye));
+    gOrbitFrames.fetch_add(1U,std::memory_order_relaxed);
+}
 void __fastcall FollowDetour(void* self,void*,std::uint32_t a,std::uint32_t b) noexcept {
     FollowBefore(reinterpret_cast<std::uintptr_t>(self));
     reinterpret_cast<void(__thiscall*)(void*,std::uint32_t,std::uint32_t)>(gFollowTrampoline)(self,a,b);
     FollowAfter(reinterpret_cast<std::uintptr_t>(self));
+    SpectateOrbitAfter(reinterpret_cast<std::uintptr_t>(self));
 }
 bool NoclipViewCurrent() noexcept {
     return GetCurrentThreadId()==gPilotThread.load(std::memory_order_acquire) &&
@@ -581,7 +659,8 @@ void __fastcall PostBlendDetour(void* self,void*) noexcept {
         static_cast<void>(Write(manager+offset,0.0F));
 }
 void __fastcall WorldDetour(void* self,void*,std::uint32_t a,std::uint32_t b) noexcept {
-    const auto generation=gCameraGeneration.load(std::memory_order_acquire);
+    auto generation=gCameraGeneration.load(std::memory_order_acquire);
+    if(!generation && gOrbitTarget.load(std::memory_order_relaxed))generation=kOrbitWorldGeneration;
     if(generation) {
         const auto world=reinterpret_cast<std::uintptr_t>(self);const auto now=GetTickCount64();
         for(auto& sample:gWorlds) {
@@ -594,6 +673,19 @@ void __fastcall WorldDetour(void* self,void*,std::uint32_t a,std::uint32_t b) no
 }
 } // namespace
 
+void SetSpectateOrbit(const std::uintptr_t base,const std::uintptr_t followBehavior,const std::uintptr_t target) noexcept {
+    const bool on=base && followBehavior && target;
+    if(on && !alien_pvp_input::Installed())static_cast<void>(alien_pvp_input::EnsureInstalled(base));
+    alien_pvp_input::SetSpectateMouse(on);
+    gOrbitBase.store(on?base:0U,std::memory_order_release);
+    gOrbitBehavior.store(on?followBehavior:0U,std::memory_order_release);
+    gOrbitTarget.store(on?target:0U,std::memory_order_release);
+    if(!on)gOrbit=OrbitState{};
+}
+SpectateOrbitStats SpectateOrbitSnapshot() noexcept {
+    return {gOrbitFrames.load(std::memory_order_relaxed),gOrbitCollisions.load(std::memory_order_relaxed),
+        gOrbitNoWorld.load(std::memory_order_relaxed)};
+}
 bool InstallCameraHooks(std::uintptr_t base,HookManager& hooks,std::string& error) {
     // Both supplied x86 entries start with push ebp; mov ebp,esp;
     // and esp,-16. Six complete relocation-free instructions bytes.

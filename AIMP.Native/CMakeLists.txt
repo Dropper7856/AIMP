@@ -412,6 +412,12 @@ if(BUILD_TESTING)
     set_target_properties(AIMP.PlayerTorchRuntimeTests PROPERTIES
         VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
     add_test(NAME PlayerTorchRuntime COMMAND AIMP.PlayerTorchRuntimeTests)
+    add_executable(AIMP.PlayerSpectatePolicyTests tests/PlayerSpectatePolicyTests.cpp)
+    target_include_directories(AIMP.PlayerSpectatePolicyTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_options(AIMP.PlayerSpectatePolicyTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.PlayerSpectatePolicyTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME PlayerSpectatePolicy COMMAND AIMP.PlayerSpectatePolicyTests)
     add_executable(AIMP.PlayerHidingRuntimeTests tests/PlayerHidingRuntimeTests.cpp)
     target_link_libraries(AIMP.PlayerHidingRuntimeTests PRIVATE AIMP.Core)
     target_include_directories(AIMP.PlayerHidingRuntimeTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")

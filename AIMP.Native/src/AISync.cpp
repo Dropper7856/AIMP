@@ -15,6 +15,8 @@
 #include <limits>
 #include "aimp/AISyncProfiling.h"
 #include "aimp/AISyncExecutionPolicy.h"
+#include "aimp/PlayerLifecycle.h"
+#include "aimp/PlayerSpectatePolicy.h"
 #include "aimp/AISyncNavigation.h"
 #include "aimp/AISyncExecutionRuntime.h"
 #include "aimp/AISyncNativeOwnership.h"
@@ -262,8 +264,9 @@ struct Actor {
     // whose goal tracks the Host pose. Retail navigation/locomotion executes it.
     struct NativeFollow {
         std::uintptr_t object{},control{};
-        ULONGLONG createdAt{},stillSince{},retryAt{},divergedSince{},idleYawSince{};
+        ULONGLONG createdAt{},stillSince{},retryAt{},divergedSince{},idleYawSince{},brakeStuckSince{},strandedSince{};
         float divergedAnchorX{},divergedAnchorZ{};
+        bool strandedMove{};
         std::uint32_t failures{};
         bool stopping{};
         // Last goal deposited on THIS request (558): edits are rate limited.
@@ -10358,7 +10361,7 @@ void PumpHostImpacts() noexcept {
 // moves its goal every frame; retail replans or edits the terminal in place.
 // A Host stop becomes a final goal: retail brakes and plays its own stop.
 std::atomic<std::uint64_t> gFollowCreated{},gFollowCreateFailures{},gFollowCompleted{},gFollowCancelled{},
-    gFollowEmergencies{},gFollowIdleTurns{},gFollowDivergenceReplans{};
+    gFollowEmergencies{},gFollowIdleTurns{},gFollowDivergenceReplans{},gSpectateFallbackCandidates{};
 std::atomic<std::uint64_t> gFollowEdits{},gFollowEditRefusals{},gFollowHiddenCorrections{},gFollowHardCorrections{},
     gFollowBoostFrames{};
 // ---- Locomotion flight recorder (558) -------------------------------------
@@ -10617,6 +10620,23 @@ void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uin
     // lookahead during the Host's braking and the Client ran 4 m past it.
     const bool hostBraking=actor.streamCycleState==0x3BU;
     const bool hostStopped=(!hostMoving&&now-f.stillSince>=150U)||hostBraking;
+    // 571: a live Move whose body stays in the local stop cycle (0x3B) while
+    // the Host runs ahead never leaves it on its own (570: 2.5 s at session
+    // start, 1 s before a kill, sliding at 0.3 m/s so the 0.15 m stuck test
+    // never fired). A fresh Move starts from 0x37 at once; retire this one.
+    if(f.object&&!hostStopped&&std::max(speed,latestSpeed)>2.0F&&planar>2.0F) {
+        std::uintptr_t ownCycle{};std::uint8_t ownState{};
+        if(Read(actor.character+0x36CU,ownCycle)&&ownCycle&&Read(ownCycle+0x1AU,ownState)&&ownState==0x3BU) {
+            if(!f.brakeStuckSince)f.brakeStuckSince=now;
+            else if(now-f.brakeStuckSince>=400U) {
+                f.brakeStuckSince=0U;
+                ReleaseNativeFollow(actor);
+                actor.follow.retryAt=now+100U;actor.follow.keep.actions|=kFlightStuckReplan;
+                gFollowDivergenceReplans.fetch_add(1U,std::memory_order_relaxed);
+                return;
+            }
+        } else f.brakeStuckSince=0U;
+    } else f.brakeStuckSince=0U;
     // Gait: the Host's effective gait M+198 alternates every few frames even
     // while its requested gait is constant (559: 2/3/2/3 at 10 Hz). Writing
     // each value to M+194 reset M+190 every change. Hold the highest Host gait
@@ -10682,9 +10702,27 @@ void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uin
     // means two visible U-turns, and the next Host start goes the same way.
     const bool overranStop=hostStopped&&pastStop>0.0F&&pastStop<1.5F&&stopLateral<0.75F;
     if(overranStop){goal[0]=local[0];goal[1]=local[1];goal[2]=local[2];}
-    const bool needsMove=!overranStop&&(hostMoving||planar>0.6F);
+    // 572: a Move created < ~1 m from its goal completes at once (status 6)
+    // while the body has just entered its start cycle; the body then stays
+    // in start/move (0x37/0x38) with no request and runs in place (571: 14 s).
+    // A stopped Host needs > 1 m of error before a Move is worth starting.
+    const bool needsMove=!overranStop&&(hostMoving||planar>(hostStopped?1.0F:0.6F));
     if(!f.object) {
-        if(!needsMove||now<f.retryAt){FollowIdleFacing(actor,target,local,yaw,now);return;}
+        std::uintptr_t ownCycle{};std::uint8_t ownState{};
+        const bool running=Read(actor.character+0x36CU,ownCycle)&&ownCycle&&Read(ownCycle+0x1AU,ownState)&&
+            (ownState==0x37U||ownState==0x38U);
+        if(running){if(!f.strandedSince)f.strandedSince=now;}else f.strandedSince=0U;
+        // Stranded in locomotion without a request: give retail a real Move
+        // to finish (it brakes through its own stop cycle at the goal).
+        const bool stranded=running&&now-f.strandedSince>=400U;
+        if(stranded&&!needsMove) {
+            goal[0]=local[0]+std::sin(yaw)*1.5F;goal[1]=local[1];goal[2]=local[2]+std::cos(yaw)*1.5F;
+            k.actions|=kFlightStuckReplan;
+        }
+        if(!(needsMove||stranded)||now<f.retryAt) {
+            if(!running)FollowIdleFacing(actor,target,local,yaw,now);
+            return;
+        }
         const character_direct_step_runtime::MovementResourceLease resources(actor.character);
         if(!resources)return;
         static_cast<void>(FollowGait(actor.character,gait));
@@ -10698,6 +10736,7 @@ void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uin
             gFollowCreateFailures.fetch_add(1U,std::memory_order_relaxed);return;
         }
         f.object=ref.object;f.control=ref.control;f.createdAt=now;f.stopping=hostStopped;f.idleYawSince=0U;
+        f.strandedMove=!needsMove;
         std::copy_n(initial,3U,f.goal);f.goalValid=true;f.lastEditAt=now;
         k.actions|=kFlightCreate;++k.creates;
         gFollowCreated.fetch_add(1U,std::memory_order_relaxed);return;
@@ -10720,6 +10759,8 @@ void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uin
         k.warp+=std::clamp(desired-k.warp,-step,step);
         SetRootWarp(actor.character,k.warp,now);
     }
+    // The stranded recovery Move keeps its own goal until it brakes there.
+    if(f.strandedMove&&!hostMoving)return;
     const float gdx=goal[0]-f.goal[0],gdz=goal[2]-f.goal[2];
     const float moved2=gdx*gdx+gdz*gdz;
     const bool due=!f.goalValid||hostStopped!=f.stopping||moved2>=kFollowEditDistance2||
@@ -10825,6 +10866,35 @@ void PublishLocalIncarnation() noexcept {
     }
     static_cast<void>(registry.PublishLocal(ticket));
 }
+// PlayerLifecycle spectate: living remote participants of this exact world,
+// ascending peer order. The Alien PvP owner's parked human is never watchable.
+static void PumpPlayerSpectate(const std::uint32_t generation, const bool cameraReserved,
+    const std::uint64_t alienOwner) noexcept {
+    std::array<player_lifecycle::SpectateCandidate, player_lifecycle::spectate::kMaxCandidates> candidates{};
+    std::size_t count{};
+    if (Stable() && gCurrent.nativeGeneration == generation) {
+        for (std::uint32_t i = 0U; i < gCurrent.participantCount && count < candidates.size(); ++i) {
+            const auto peer = gCurrent.participants[i].peer;
+            if (peer == 0U || peer == gCurrent.localPeer || peer == alienOwner) continue;
+            const auto character = ParticipantForPeer(peer);
+            if (LivingCharacter(character)) {
+                candidates[count++] = {peer, character};
+            } else if (character != 0U && RegisteredPlayerRepresentation(character)) {
+                // A replicated player may temporarily have its activation
+                // flag cleared while its HP and native lifetime remain valid.
+                std::uint16_t hp{};std::uint32_t health{};
+                if(Read(character+0x33CU,hp)&&hp!=0U&&Read(character+0x32CU,health)&&health<3U) {
+                    candidates[count++] = {peer, character};
+                    gSpectateFallbackCandidates.fetch_add(1U,std::memory_order_relaxed);
+                }
+            }
+        }
+        std::sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(count),
+            [](const auto& a, const auto& b) { return a.peer < b.peer; });
+    }
+    player_lifecycle::PumpSpectateOnEngineThread({gBase, LocalPlayer(), generation,
+        candidates.data(), count, cameraReserved});
+}
 void PumpOnEngineThread() noexcept {
     const profiling::Timer timing(profiling::Section::AiPump);
     if (!Installed() || !EngineThread()) return;
@@ -10923,6 +10993,8 @@ void PumpOnEngineThread() noexcept {
         localRequested?LocalPlayer():0U,
         static_cast<std::uint32_t>(pvpPhysicalGeneration),
         gPvPLease.ownerPeer,gCurrent.localPeer,localLease,localRequested});
+    PumpPlayerSpectate(static_cast<std::uint32_t>(pvpPhysicalGeneration),localRequested,
+        (gCurrent.flags & kAlienPvP)!=0U?gPvPLease.ownerPeer:0U);
     const auto pilot=alien_pvp_local::Snapshot();
     alien_pvp::Context pvp{};
     if(activeLease) {
@@ -12646,6 +12718,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"nativeFollowEmergencies", Diagnostics::Unsigned(gFollowEmergencies.load()), true},
          {"nativeFollowDivergenceReplans", Diagnostics::Unsigned(gFollowDivergenceReplans.load()), true},
          {"nativeFollowIdleTurns", Diagnostics::Unsigned(gFollowIdleTurns.load()), true},
+         {"spectateFallbackCandidates", Diagnostics::Unsigned(gSpectateFallbackCandidates.load()), true},
          {"nativeFollowGoalEdits", Diagnostics::Unsigned(gFollowEdits.load()), true},
          {"nativeFollowGoalEditRefusals", Diagnostics::Unsigned(gFollowEditRefusals.load()), true},
          {"nativeFollowHiddenCorrections", Diagnostics::Unsigned(gFollowHiddenCorrections.load()), true},

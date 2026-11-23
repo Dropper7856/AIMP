@@ -36,6 +36,8 @@ std::atomic<int> gCameraWheel{};
 std::atomic<bool> gMapMode{};
 std::atomic<bool> gMapClicked{};
 std::atomic<int> gMapX{},gMapY{},gMapWheel{};
+std::atomic<bool> gSpectateMouse{};
+std::atomic<int> gSpectateX{},gSpectateY{},gSpectateWheel{};
 std::uintptr_t gExecutableBase{};
 AsyncKeyFn gOriginalAsync{};
 RawInputFn gOriginalRaw{};
@@ -130,8 +132,18 @@ UINT WINAPI HookRaw(const HRAWINPUT input,const UINT command,
     const auto result=original(input,command,data,size,headerSize);
     if (command!=RID_INPUT || !data ||
         result==static_cast<UINT>(-1) || result<sizeof(RAWINPUTHEADER)) return result;
-    if (!Active() && !CinematicBlocked()) return result;
     auto* raw=static_cast<RAWINPUT*>(data);
+    if (!Active() && gSpectateMouse.load(std::memory_order_acquire) &&
+        raw->header.dwType==RIM_TYPEMOUSE && result>=sizeof(RAWINPUTHEADER)+sizeof(RAWMOUSE) &&
+        (raw->data.mouse.usFlags&MOUSE_MOVE_ABSOLUTE)==0U) {
+        gSpectateX.fetch_add(raw->data.mouse.lLastX,std::memory_order_relaxed);
+        gSpectateY.fetch_add(raw->data.mouse.lLastY,std::memory_order_relaxed);
+        if((raw->data.mouse.usButtonFlags&RI_MOUSE_WHEEL)!=0U)
+            gSpectateWheel.fetch_add(static_cast<SHORT>(raw->data.mouse.usButtonData),std::memory_order_relaxed);
+        raw->data.mouse.lLastX=raw->data.mouse.lLastY=0;
+        return result;
+    }
+    if (!Active() && !CinematicBlocked()) return result;
     if (CinematicBlocked() && raw->header.dwType==RIM_TYPEKEYBOARD &&
         result>=sizeof(RAWINPUTHEADER)+sizeof(RAWKEYBOARD) &&
         raw->data.keyboard.VKey==VK_RETURN) {
@@ -300,6 +312,14 @@ MapPointer TakeMapPointer() noexcept {
 }
 
 bool Installed() noexcept { return gInstalled.load(std::memory_order_acquire); }
+void SetSpectateMouse(const bool enabled) noexcept {
+    if (gSpectateMouse.exchange(enabled,std::memory_order_acq_rel)!=enabled) {
+        gSpectateX.store(0);gSpectateY.store(0);gSpectateWheel.store(0);
+    }
+}
+SpectateMouse TakeSpectateMouse() noexcept {
+    return {gSpectateX.exchange(0),gSpectateY.exchange(0),gSpectateWheel.exchange(0)};
+}
 bool ConfigureCinematic(bool enabled,bool host) noexcept {
     if (!enabled) {
         gCinematicRole.store(0,std::memory_order_release);
