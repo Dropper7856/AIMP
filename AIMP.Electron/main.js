@@ -5,6 +5,7 @@ const http = require('node:http');
 const path = require('node:path');
 const { createApiSecurity } = require('./api-security');
 const { runStartupUpdate } = require('./startup-updater');
+const { rotateLogs } = require('./log-rotation');
 
 // Split-screen: several launchers may run at once, each controlling its own
 // game. Slot 1 is the usual launcher; slots 2+ get their own user data
@@ -469,6 +470,9 @@ app.whenReady().then(async () => {
       app.quit();
       return;
     }
+    // Roll oversized logs before this session writes to them; compression
+    // and pruning of the rolled copies continue in the background.
+    rotateLogs([electronLogPath(), apiLogPath()], { log: logElectron });
     logElectron(`Desktop launcher starting: version=${app.getVersion()}; instance=${instanceSlot}; `
       + `api=${API_URL}; executable=${process.execPath}`);
     // Updating replaces files the other running launchers use.

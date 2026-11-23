@@ -346,7 +346,15 @@ internal sealed partial class SteamRelay : ISteamRelay, ISteamLobbies
         _diagnostics.Log("Steam", $"Steam relay ready as {FormatAddress(LocalSteamId)} ({SteamClient.Name}).");
     }
 
-    private void OnRichPresenceJoinRequested(Friend friend, string connect) => RaiseJoin(friend.Name, connect);
+    private void OnRichPresenceJoinRequested(Friend friend, string connect)
+    {
+        if (HasAddress(friend.Name))
+        {
+            LogBlocked("Steam join request", friend.Id.Value);
+            return;
+        }
+        RaiseJoin(friend.Name, connect);
+    }
 
     private void RaiseJoin(string friendName, string connect)
     {

@@ -112,8 +112,21 @@ internal sealed partial class MultiplayerSessionCoordinator
         finally { _commandGate.Release(); }
     }
 
+    // Second line of defence at the menu boundary (the Steam helper process already
+    // filters): text with a web or IP address never reaches the in-game menu.
+    private static bool IsBlockedListing(SteamLobbyListing lobby) =>
+        SteamRelay.HasAddress(lobby.Name, lobby.Map, lobby.Mode);
+
+    private static string SafeName(string name, ulong steamId) =>
+        SteamRelay.HasAddress(name) ? SteamRelay.HiddenName(steamId) : name;
+
     private async Task ShowLobbyInviteAsync(SteamLobbyInvite invite)
     {
+        if (SteamRelay.HasAddress(invite.FromName))
+        {
+            _diagnostics.Log("Steam", $"Blocked invite from {invite.FromSteamId}: Steam name contains a web or IP address.");
+            return;
+        }
         await _bridge.SendAsync("INVITE_RECEIVED", new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["from"] = invite.FromSteamId.ToString(CultureInfo.InvariantCulture),
@@ -158,7 +171,7 @@ internal sealed partial class MultiplayerSessionCoordinator
         var filter = NormalizeFilter(requestedFilter);
         var lobbies = await TryFindSteamLobbiesAsync().ConfigureAwait(false);
         var shown = (lobbies ?? Array.Empty<SteamLobbyListing>())
-            .Where(lobby => MatchesFilter(lobby, filter)).Take(MaxServerRows).ToArray();
+            .Where(lobby => !IsBlockedListing(lobby) && MatchesFilter(lobby, filter)).Take(MaxServerRows).ToArray();
         await _bridge.SendAsync("SERVER_LIST", BuildServerListValues(shown)).ConfigureAwait(false);
         if (lobbies is null) return;
         _diagnostics.Log("Steam", $"Server browser: {lobbies.Count} AIMP lobb{(lobbies.Count == 1 ? "y" : "ies")} found, {shown.Length} shown (filter {filter}).");
@@ -247,10 +260,12 @@ internal sealed partial class MultiplayerSessionCoordinator
             ["icount"] = invites.Count.ToString(CultureInfo.InvariantCulture)
         };
         for (var index = 0; index < friends.Count; index++) AddFriendValues(values, $"f{index}_", friends[index]);
-        for (var index = 0; index < invites.Count; index++)
+        var shownInvites = invites.Where(invite => !SteamRelay.HasAddress(invite.FromName)).ToArray();
+        values["icount"] = shownInvites.Length.ToString(CultureInfo.InvariantCulture);
+        for (var index = 0; index < shownInvites.Length; index++)
         {
-            values[$"i{index}_from"] = invites[index].FromSteamId.ToString(CultureInfo.InvariantCulture);
-            values[$"i{index}_name"] = invites[index].FromName;
+            values[$"i{index}_from"] = shownInvites[index].FromSteamId.ToString(CultureInfo.InvariantCulture);
+            values[$"i{index}_name"] = shownInvites[index].FromName;
         }
         return values;
     }
@@ -258,7 +273,7 @@ internal sealed partial class MultiplayerSessionCoordinator
     private static void AddFriendValues(Dictionary<string, string> values, string prefix, SteamFriendEntry friend)
     {
         values[prefix + "id"] = friend.SteamId.ToString(CultureInfo.InvariantCulture);
-        values[prefix + "name"] = friend.Name;
+        values[prefix + "name"] = SafeName(friend.Name, friend.SteamId);
         values[prefix + "status"] = friend.Status;
         values[prefix + "aimp"] = friend.RunningAimp ? "1" : "0";
         values[prefix + "join"] = friend.CanJoin ? "1" : "0";
@@ -289,6 +304,8 @@ internal sealed partial class MultiplayerSessionCoordinator
         if (!TryParseSteamId(from, out var id)) throw new InvalidOperationException("Select an invite first.");
         var invite = RequireSteam().TakeInvite(id)
             ?? throw new InvalidOperationException("That invite has expired. Ask your friend to invite you again.");
+        if (SteamRelay.HasAddress(invite.FromName))
+            throw new InvalidOperationException("That invite was blocked: the sender's Steam name contains a web or IP address.");
         await JoinSteamLobbyAsync(invite.LobbyId, $"{invite.FromName}'s lobby").ConfigureAwait(false);
     }
 

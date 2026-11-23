@@ -32,6 +32,7 @@ public static class ModelValidation
             || value.PlayerCount is < 0
             || value.PlayerCount > value.Capacity
             || !Bounded(value.ServerName, 1, ProtocolConstants.MaximumServerNameLength)
+            || LinkText.ContainsAddress(value.ServerName)
             || !PlayerName.TryNormalize(value.HostName, out _, out _)
             || !Bounded(value.Level, 1, 128)
             || !Bounded(value.State, 1, 32)
@@ -432,6 +433,7 @@ public static class ModelValidation
         if (value is null
             || value.SessionId == Guid.Empty
             || !Bounded(value.ServerName, 1, ProtocolConstants.MaximumServerNameLength)
+            || LinkText.ContainsAddress(value.ServerName)
             || !Bounded(value.Level, 1, 128)
             || !Bounded(value.State, 1, 32)
             || value.Capacity is < 1 or > 32

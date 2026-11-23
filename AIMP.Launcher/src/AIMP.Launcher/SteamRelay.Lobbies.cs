@@ -51,6 +51,22 @@ internal sealed partial class SteamRelay
         SteamFriends.OnGameLobbyJoinRequested -= OnGameLobbyJoinRequested;
     }
 
+    // ---- link / IP names ---------------------------------------------------
+    // Malware (e.g. Vidar) renames Steam accounts to C2 addresses such as
+    // "https://65.109.243.177|", and anyone can type a URL into a lobby name.
+    // Such names are never shown, joined or let through the relay.
+
+    internal static bool HasAddress(string? text) => LinkText.ContainsAddress(text);
+
+    internal static bool HasAddress(params string?[] texts) => texts.Any(LinkText.ContainsAddress);
+
+    // Shown instead of a Steam name that contains a link or IP address.
+    internal static string HiddenName(ulong steamId) =>
+        $"[hidden name] #{steamId % 10000:D4}";
+
+    private void LogBlocked(string what, ulong steamId) =>
+        _diagnostics.Log("Steam", $"Blocked {what} from {steamId}: Steam name or lobby text contains a web or IP address.");
+
     private void OnLobbyInvite(Friend friend, Lobby lobby) =>
         AddInvite(friend.Id, friend.Name, lobby.Id, accepted: false);
 
@@ -94,13 +110,7 @@ internal sealed partial class SteamRelay
     {
         if (_hostSocket is null) { lobby.Leave(); return; } // hosting stopped while Steam created it
         _lobby = lobby;
-        // A private Steam lobby is never listed; only invited players can join it.
-        _ = visibility switch
-        {
-            SteamLobbyVisibility.Public => lobby.SetPublic(),
-            SteamLobbyVisibility.Private => lobby.SetPrivate(),
-            _ => lobby.SetFriendsOnly()
-        };
+        _ = visibility == SteamLobbyVisibility.Public ? lobby.SetPublic() : lobby.SetFriendsOnly();
         lobby.SetJoinable(true);
         WriteAdvert(lobby, advert);
         _diagnostics.Log("Steam", $"Steam lobby {lobby.Id.Value} created ({visibility}).");
@@ -124,9 +134,11 @@ internal sealed partial class SteamRelay
         int hosted;
         lock (_gate) hosted = _tunnels.Count(tunnel => tunnel.ClientManager is null);
         if (hosted >= MaxHostTunnels) return "too many relay connections";
+        var friend = new Friend(peer);
+        if (HasAddress(friend.Name)) return "Steam name contains a web or IP address";
         if (_lobbyVisibility == SteamLobbyVisibility.Public) return null;
         if (peer.Value == 0) return $"Steam did not report the player's SteamID and the lobby is {_lobbyVisibility}";
-        return new Friend(peer).IsFriend ? null : $"not a Steam friend and the lobby is {_lobbyVisibility}";
+        return friend.IsFriend ? null : $"not a Steam friend and the lobby is {_lobbyVisibility}";
     }
 
     private void WriteAdvert(Lobby lobby, SteamLobbyAdvert advert)
@@ -182,7 +194,15 @@ internal sealed partial class SteamRelay
             throw new InvalidOperationException("That lobby's listing does not match its owner. It was not joined.");
         if (host == LocalSteamId)
             throw new InvalidOperationException("That is your own lobby.");
+        RejectBlockedLobby(lobby, host);
         return host;
+    }
+
+    private void RejectBlockedLobby(Lobby lobby, ulong host)
+    {
+        if (!IsBlockedLobby(lobby)) return;
+        LogBlocked("lobby join", host);
+        throw new InvalidOperationException("That lobby was blocked: its host name or listing contains a web or IP address.");
     }
 
     private void LeaveLobbyOnPump()
@@ -215,24 +235,31 @@ internal sealed partial class SteamRelay
             .WithMaxResults(MaxSearchResults)
             .RequestAsync();
         var raw = found ?? Array.Empty<Lobby>();
-        var listings = ReadSearchListings(raw, out var unreadable);
+        var listings = ReadSearchListings(raw, out var unreadable, out var blocked);
         var fromSearch = listings.Count;
         AddFriendListings(listings);
         _diagnostics.Log("Steam", $"Lobby search: Steam returned {raw.Length} lobb{(raw.Length == 1 ? "y" : "ies")} " +
-            $"({unreadable} unreadable, {fromSearch} listed), {listings.Count - fromSearch} more from friends' presence.");
+            $"({unreadable} unreadable, {blocked} blocked for web/IP addresses, {fromSearch} listed), " +
+            $"{listings.Count - fromSearch} more from friends' presence.");
         return SortListings(listings.Values);
     }
 
     // Own lobby is skipped; lobbies without a readable AIMP listing are counted for the log.
-    private Dictionary<ulong, SteamLobbyListing> ReadSearchListings(IEnumerable<Lobby> found, out int unreadable)
+    // Lobbies whose listing or owner name carries a link/IP are dropped (counted as blocked).
+    private Dictionary<ulong, SteamLobbyListing> ReadSearchListings(IEnumerable<Lobby> found, out int unreadable, out int blocked)
     {
         var listings = new Dictionary<ulong, SteamLobbyListing>();
         unreadable = 0;
+        blocked = 0;
         foreach (var lobby in found)
-            if (ReadListing(lobby) is not { } listing) unreadable++;
+            if (IsBlockedLobby(lobby)) blocked++;
+            else if (ReadListing(lobby) is not { } listing) unreadable++;
             else if (listing.HostSteamId != LocalSteamId) listings[listing.LobbyId] = listing;
         return listings;
     }
+
+    private static bool IsBlockedLobby(Lobby lobby) =>
+        HasAddress(lobby.Owner.Name, lobby.GetData("name"), lobby.GetData("map"), lobby.GetData("mode"));
 
     // Friends-only lobbies never show up in a search; friends advertise them in rich presence.
     private static void AddFriendListings(IDictionary<ulong, SteamLobbyListing> listings)
@@ -262,6 +289,8 @@ internal sealed partial class SteamRelay
     private static SteamLobbyListing? ReadFriendListing(Friend friend)
     {
         if (!friend.IsPlayingThisGame || friend.GetRichPresence(MarkerKey) != "hosting") return null;
+        if (HasAddress(friend.Name, friend.GetRichPresence("aimp_name"), friend.GetRichPresence("aimp_map"),
+                friend.GetRichPresence("aimp_mode"))) return null;
         if (!ulong.TryParse(friend.GetRichPresence("aimp_lobby"), NumberStyles.None, CultureInfo.InvariantCulture, out var lobbyId)
             || lobbyId == 0) return null;
         return new SteamLobbyListing(lobbyId, friend.Id.Value,
@@ -293,6 +322,10 @@ internal sealed partial class SteamRelay
     private static SteamFriendEntry DescribeFriend(Friend friend)
     {
         var aimp = friend.IsPlayingThisGame ? friend.GetRichPresence(MarkerKey) : null;
+        // A friend renamed to a link/IP may be infected; keep the row but hide the name.
+        if (HasAddress(friend.Name))
+            return new SteamFriendEntry(friend.Id.Value, HiddenName(friend.Id.Value),
+                "Name contains a web/IP address - blocked", !string.IsNullOrEmpty(aimp), 0, false);
         var listing = ReadFriendListing(friend);
         var canJoin = listing is { Joinable: true, Compatible: true };
         return new SteamFriendEntry(friend.Id.Value, Clip(friend.Name, 32), FriendStatus(friend, aimp, listing),
@@ -327,7 +360,7 @@ internal sealed partial class SteamRelay
         if (!EnsureInitialized(force: true))
             throw new InvalidOperationException("Steam is not running. Start Steam to invite friends.");
         var friend = new Friend(friendId);
-        var name = Clip(friend.Name, 32);
+        var name = HasAddress(friend.Name) ? HiddenName(friendId) : Clip(friend.Name, 32);
         if (!friend.IsFriend) throw new InvalidOperationException("You can only invite your Steam friends.");
         var sent = _lobby is { } lobby ? lobby.InviteFriend(friendId) : InviteToHostGame(friend);
         if (!sent) throw new InvalidOperationException($"Steam could not send the invite to {name}.");
@@ -366,6 +399,12 @@ internal sealed partial class SteamRelay
 
     private void AddInvite(SteamId from, string fromName, SteamId lobbyId, bool accepted)
     {
+        if (HasAddress(fromName)) LogBlocked(accepted ? "accepted Steam invite" : "lobby invite", from.Value);
+        else StoreInvite(from, fromName, lobbyId, accepted);
+    }
+
+    private void StoreInvite(SteamId from, string fromName, SteamId lobbyId, bool accepted)
+    {
         var invite = new SteamLobbyInvite(from.Value, Clip(fromName, 32), lobbyId.Value, DateTime.UtcNow, accepted);
         lock (_gate)
         {
@@ -385,7 +424,7 @@ internal sealed partial class SteamRelay
 
     // Friends see "aimp" = menu / hosting / joined. While hosting a Friends Only or
     // Public lobby, the Steam "Join Game" connect string and listing details are
-    // published (Private lobbies are never listed; friends join them by invite).
+    // published (Private lobbies are solo and never host over Steam).
     private void ApplyPresence()
     {
         var role = _hostSocket is not null ? "hosting" : _lobby is not null || _clientHostSteamId != 0 ? "joined" : "menu";

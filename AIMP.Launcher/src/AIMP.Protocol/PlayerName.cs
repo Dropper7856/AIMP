@@ -36,6 +36,14 @@ public static class PlayerName
             }
         }
 
+        // Steam names carrying C2/malware addresses ("https://1.2.3.4|") must not
+        // reach other players through the lobby, so links and IPs are refused.
+        if (LinkText.ContainsAddress(normalized))
+        {
+            error = "The name cannot contain a web address or an IP address.";
+            return false;
+        }
+
         error = string.Empty;
         return true;
     }

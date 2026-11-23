@@ -227,9 +227,9 @@ Browser requests must also use the exact HTTP/HTTPS origin supplied in `AIMP_FRO
 Logs are bounded automatically at launcher startup:
 
 - **Per-run logs** (`%LOCALAPPDATA%\AIMP\logs`): every finished log is gzipped to `<name>.gz`, and only the newest 10 files of each kind are kept. Logs still open by a running game or launcher are never touched, so the current session's logs stay as plain text for **Export Diagnostics**.
-- **Electron logs** (`aimp-electron.log`, `aimp-launcher-api.log`) are not rotated yet.
+- **Electron logs**: once a log reaches 1 MiB it is renamed to `<name>.<UTC time>.log`, a fresh file is started, and the rolled copy is gzipped. The newest 10 archives of each log are kept.
 
-Compression is lossless: the original is deleted only after its `.gz` decompresses back to identical bytes (SHA-256 and length); otherwise the original is kept. `.gz` files open in 7-Zip, WinRAR, or `tar -xzf`.
+Compression is lossless: the original is deleted only after its `.gz` decompresses back to identical bytes (SHA-256 and length for per-run logs, byte comparison for Electron logs); otherwise the original is kept. `.gz` files open in 7-Zip, WinRAR, or `tar -xzf`.
 
 ## Developer Mode
 

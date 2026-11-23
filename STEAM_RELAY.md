@@ -161,7 +161,25 @@ Account details shows "Steam ID".
 | `Could not reach steam:... through Steam relay` | Host has no lobby open, host is not running this build, or wrong ID. |
 | `That Steam ID is your own account` | Both PCs use the same Steam account; use two accounts. |
 | Join Game in friends list launches Spacewar | The joiner's launcher was not open. Open the launcher first, then click Join Game. |
+| Log: `Blocked ... Steam name or lobby text contains a web or IP address` / friend shown as `[hidden name] #1234` | That Steam account's name (or the lobby's name/map) contains a URL or IP address, the pattern malware uses for C2 "dead drops" in Steam profile names. Its lobbies, invites, Join Game requests and relay connections are refused. |
 | Works by IP but not by Steam | Check both installs have `steam_api64.dll` and `Facepunch.Steamworks.Win64.dll` in `resources\api`. |
+
+## Link / IP names (malware C2 in Steam names)
+
+Infostealers such as Vidar store their C2 address in Steam profile names, for
+example `https://65.109.243.177|`. Steam never chooses where AIMP connects: joins
+only use Steam-verified SteamIDs, `connect` strings must be `steam:<SteamID64>`, and
+Direct Connection uses only the saved IP. But those names and lobby texts used to be
+shown in the server browser, Friends page, invites and lobby, where they could send
+players to a malware site. `AIMP.Protocol/LinkText.cs` now detects URLs, domains, IPv4/IPv6,
+and defanged or full-width spellings of them, such as `1.2.3[.]4`, `hxxps` or `６５．１０９…`:
+
+- Server browser: lobbies whose owner name, lobby name, map or mode contains one are hidden.
+- Joining such a lobby, invites from such a sender and Join Game from such a friend are refused.
+- Friends page: the friend stays listed as `[hidden name] #<last 4 digits>` and cannot be joined.
+- Hosting: relay peers with such a Steam name are rejected.
+- Lobby protocol: player, host and server names with a link or IP are refused (`PlayerName`,
+  `LobbyHost`, `ModelValidation`). A Steam persona like that is not used as the player name.
 
 ## Rebuilding the menu
 

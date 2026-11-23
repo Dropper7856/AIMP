@@ -99,6 +99,11 @@ public sealed partial class LobbyHost : IAsyncDisposable
             throw new ArgumentException("The server name is out of bounds.", nameof(options));
         }
 
+        if (LinkText.ContainsAddress(options.ServerName))
+        {
+            throw new ArgumentException("The server name cannot contain a web address or an IP address.", nameof(options));
+        }
+
         if (options.Port is < 0 or > 65535)
         {
             throw new ArgumentOutOfRangeException(nameof(options));
