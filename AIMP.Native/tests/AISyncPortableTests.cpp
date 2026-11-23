@@ -46,6 +46,10 @@ int main(int argc,char** argv) {
     assert(!HybridMayConsumeConstructor(1U,0xEACE68U,0x38U));
     assert(!MovementDrainCycleAllowed(0xEABE00U,0x37U));
     assert(!MovementDrainCycleAllowed(0xEABA40U,3U));
+    // Humanoid neutral idle (Android/human spawn cycle) may host a follow Move.
+    assert(HybridLocomotionCycleAllowed(0xDBB428U,1U));
+    assert(!HybridLocomotionCycleAllowed(0xDBB428U,2U));
+    assert(!MovementDrainCycleAllowed(0xDBB428U,1U));
     // Deferred End_Action cannot finish early, from stale evidence, or via a
     // lethal native branch. All five independent obligations are mandatory.
     for(unsigned mask=0;mask<32U;++mask)

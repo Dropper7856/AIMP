@@ -236,9 +236,13 @@ constexpr bool AlienPossessionDrainCycleAllowed(const std::uint32_t typeRva,cons
 // acquiring a path/scheduler drain. Host constructors006577F0/00657980 can
 // legitimately leave it in locomotion-start37 or neutral3 after an action.
 // These extra entries do NOT relax the separate movement-drain proof above.
+// 0065BDD0/0065FC80 install the humanoid (Android, human) neutral cycle
+// (00402D50, RVA DBB428, "Idle"/"Aimed_Idle", state 1) where the Alien gets
+// EAD858. Without it a Client Android never left its spawn idle.
 constexpr bool HybridLocomotionCycleAllowed(const std::uint32_t typeRva,const std::uint8_t state) noexcept {
     return MovementDrainCycleAllowed(typeRva,state)||
-        (typeRva==0xEABE00U&&state==0x37U)||(typeRva==0xEABA40U&&state==3U);
+        (typeRva==0xEABE00U&&state==0x37U)||(typeRva==0xEABA40U&&state==3U)||
+        (typeRva==0xDBB428U&&state==0x01U);
 }
 constexpr bool HybridMayConsumeConstructor(const std::uint32_t contract,const std::uint32_t typeRva,
     const std::uint8_t state) noexcept {
