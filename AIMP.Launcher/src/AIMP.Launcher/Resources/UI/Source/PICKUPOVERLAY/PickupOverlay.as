@@ -59,6 +59,63 @@ package
          addChild(this.aimp_vent_layer);
       }
 
+      // Spectate bar (bottom of the screen): the watched player's name and the
+      // Left/Right switch buttons, dimmed when nobody else can be watched.
+      // Refreshed by the Launcher while the local player is dead; a stale bar
+      // hides itself like the vent bar.
+      private var aimp_spectate_layer:Sprite;
+      private var aimp_spectate_at:int = 0;
+
+      private function aimp_hide_spectate() : void
+      {
+         if(this.aimp_spectate_layer != null && this.aimp_spectate_layer.parent != null)
+            this.aimp_spectate_layer.parent.removeChild(this.aimp_spectate_layer);
+         this.aimp_spectate_layer = null;
+      }
+
+      private function aimp_spectate_key(label:String, x:Number, y:Number, size:Number, enabled:Boolean) : Sprite
+      {
+         var key:Sprite = new Sprite();key.mouseEnabled = false;key.mouseChildren = false;
+         key.graphics.lineStyle(2,16777215,1);
+         key.graphics.beginFill(16777215,0.12);
+         key.graphics.drawRoundRect(0,0,size,size,8,8);
+         key.graphics.endFill();
+         var text:TextField = this.aimp_create_round_end_text(label,22,size,size * 0.5 - 15);
+         key.addChild(text);
+         key.x = x;key.y = y;key.alpha = enabled ? 1 : 0.3;
+         return key;
+      }
+
+      private function aimp_update_spectate(line:String) : void
+      {
+         this.aimp_hide_spectate();this.aimp_spectate_at = getTimer();
+         if(this.aimp_get_bridge_value(line,"active") != "1" || this.aimp_loading_layer != null || this.aimp_round_end_layer != null || this.aimp_mission_wait_layer != null) return;
+         var name:String = this.aimp_get_bridge_value(line,"name");
+         var others:int = int(this.aimp_get_bridge_value(line,"others"));
+         var canSwitch:Boolean = others > 1;
+         var width:Number = stage != null ? stage.stageWidth : 1280;
+         var height:Number = stage != null ? stage.stageHeight : 720;
+         var panelWidth:Number = width * 0.44;
+         var panelHeight:Number = 96;
+         var left:Number = (width - panelWidth) * 0.5;
+         var top:Number = height * 0.86 - panelHeight;
+         var keySize:Number = 44;
+         this.aimp_spectate_layer = new Sprite();this.aimp_spectate_layer.mouseEnabled = false;this.aimp_spectate_layer.mouseChildren = false;
+         this.aimp_spectate_layer.graphics.beginFill(0,0.6);
+         this.aimp_spectate_layer.graphics.drawRect(left,top,panelWidth,panelHeight);
+         this.aimp_spectate_layer.graphics.endFill();
+         var title:TextField = this.aimp_create_round_end_text("SPECTATING",14,panelWidth,top + 6);title.x = left;
+         this.aimp_spectate_layer.addChild(title);
+         var label:TextField = this.aimp_create_round_end_text(name,28,panelWidth - 2 * (keySize + 32),top + 30);label.x = left + keySize + 32;
+         this.aimp_spectate_layer.addChild(label);
+         this.aimp_spectate_layer.addChild(this.aimp_spectate_key("<",left + 16,top + 30,keySize,canSwitch));
+         this.aimp_spectate_layer.addChild(this.aimp_spectate_key(">",left + panelWidth - 16 - keySize,top + 30,keySize,canSwitch));
+         var hint:TextField = this.aimp_create_round_end_text(canSwitch ? "Left / Right arrow: switch player" : "No other player to watch",12,panelWidth,top + panelHeight - 20);hint.x = left;
+         hint.alpha = canSwitch ? 0.85 : 0.5;
+         this.aimp_spectate_layer.addChild(hint);
+         addChild(this.aimp_spectate_layer);
+      }
+
       public var pickup_cursor_mc:MovieClip;
       
       public var scriptedMessage_mc:MovieClip;
@@ -717,6 +774,7 @@ package
       private function aimp_on_bridge_frame(param1:Event) : void
       {
          if(this.aimp_vent_layer != null && getTimer() - this.aimp_vent_at > 2000) this.aimp_hide_vents();
+         if(this.aimp_spectate_layer != null && (getTimer() - this.aimp_spectate_at > 2000 || this.aimp_round_end_layer != null || this.aimp_mission_wait_layer != null)) this.aimp_hide_spectate();
          var lineEnd:int = 0;
          var line:String = null;
          var count:int = 0;
@@ -829,6 +887,11 @@ package
          if(param1.indexOf("ALIEN_VENTS|") == 0)
          {
             this.aimp_update_vents(param1);
+            return;
+         }
+         if(param1.indexOf("SPECTATE|") == 0)
+         {
+            this.aimp_update_spectate(param1);
             return;
          }
          if(param1.indexOf("SESSION_LOADING|") == 0)

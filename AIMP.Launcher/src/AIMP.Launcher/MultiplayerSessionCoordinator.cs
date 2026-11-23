@@ -647,6 +647,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _ = TryAdvanceRemoteMovementAsync(runtime, now);
         TryScheduleAlienPvPBinding(runtime, now);
         TryScheduleAlienVentMap(runtime,now);
+        TryScheduleSpectateBanner(now);
         UpdateVoiceSession(runtime);
     }
 
