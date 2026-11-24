@@ -16,6 +16,10 @@ namespace multiplayer_pause {
 bool Install(std::uintptr_t moduleBase, HookManager& hooks,
     LevelGenerationTracker& generations, std::string& error);
 [[nodiscard]] bool Installed() noexcept;
+// Nonzero while a retail pause/overlay menu should own the player's input:
+// 1 = 0x2000/0x10000 menu reason, 2 = full 0x401 Pause_Game pair, 3 = partial
+// 0x401 bits; 2/3 only with an active pause_menu/HUB owner. Pure reads.
+[[nodiscard]] std::uint32_t MenuOpen(std::uintptr_t moduleBase) noexcept;
 // Logical shutdown restores retail query results immediately. HookManager owns
 // physical restoration; shim destinations and their immutable data stay alive.
 void Shutdown() noexcept;

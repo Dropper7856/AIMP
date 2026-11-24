@@ -8,8 +8,12 @@
 
 namespace aimp::alien_pvp::actions {
 // These are gameplay admission limits, not undocumented CATHODE constants.
-inline constexpr float kAttackReach=2.6F, kAttackHeight=1.5F;
-inline constexpr float kAttackCosine=0.5F; // 60 degrees either side of the look direction
+// AvS 2026-11-24: 2.6 m / 60 degrees rejected every third-person click as
+// NoTarget (the camera sits behind the Alien, aim is approximate). This is only
+// the shortlist; the retail attack-availability query still proves the hit.
+inline constexpr float kAttackReach=3.2F, kAttackHeight=1.5F;
+inline constexpr float kAttackCosine=0.34F; // ~70 degrees either side of the look direction
+inline constexpr float kVentExitCosine=0.5F; // 60 degrees, vent exit selection (unchanged)
 inline constexpr float kVentMatchTolerance=0.02F, kVentEnterReach=8.0F;
 // Deliberate PvP selection radius. Actual connectivity remains a native query;
 // a portal in front is not evidence that an arbitrary floor is traversable.
@@ -70,7 +74,7 @@ inline float DirectedExitScore(Point source,float yaw,const Vent& vent) noexcept
     if(d2<kVentExitMinimumDistance*kVentExitMinimumDistance || d2>kVentExitReach*kVentExitReach ||
         std::abs(p.y-source.y)>3.5F)return std::numeric_limits<float>::infinity();
     const float facing=(dx*std::sin(yaw)+dz*std::cos(yaw))/std::sqrt(d2);
-    if(facing<kAttackCosine)return std::numeric_limits<float>::infinity();
+    if(facing<kVentExitCosine)return std::numeric_limits<float>::infinity();
     // Prefer the nearest eligible exit in the look cone; never synthesize a
     // coordinate on the far side of a wall or silently choose another floor.
     return DistanceSquared(source,p);

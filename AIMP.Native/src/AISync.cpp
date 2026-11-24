@@ -11840,23 +11840,43 @@ bool PvPShowReplica(std::uintptr_t character) noexcept {
     __try {reinterpret_cast<void(__thiscall*)(void*,bool)>(gBase+0x0038B100U)(reinterpret_cast<void*>(character),false);return true;}
     __except(EXCEPTION_EXECUTE_HANDLER){return false;}
 }
+// Debug point for "Alien in vent state but still visible to the survivor"
+// (AvS 2026-11-24): why an observer refused to mirror the owner's stage.
+struct PvPReplicaTelemetry final {
+    std::atomic<std::uint64_t> backstageWanted{},rejectedState{},rejectedResources{},backstageWriteFailed{},applied{};
+    std::atomic<unsigned> lastRejectedState{};
+} gPvPReplicaTelemetry;
 bool ReplicatePvPPose(const alien_pvp::Context& context,const alien_pvp::Frame& pose) noexcept {
     if(context.localOwner || !context.owned || !PvPLeaseScopeCurrent() || !PvPLeaseLiveIdentity() ||
         context.character!=gPvPLease.ticket.character || PairSourceBusy(context.character) ||
         PairReservedCharacter(context.character) || (pose.flags&alien_pvp::OwnerMeasured)==0U)return false;
+    const bool backstage=(pose.flags&alien_pvp::Backstage)!=0U;
     std::uintptr_t cycle{};std::uint8_t state{},a{},b{};
     if(!Read(context.character+0x36CU,cycle)||!cycle||!Read(cycle+0x1AU,state)||
         !Read(context.character+0x2DAU,a)||!Read(context.character+0x2DBU,b)||
-        (state!=1U&&state!=55U&&state!=56U&&state!=57U&&state!=59U&&state!=75U&&state!=77U))return false;
-    const bool backstage=(pose.flags&alien_pvp::Backstage)!=0U;
+        (state!=1U&&state!=55U&&state!=56U&&state!=57U&&state!=59U&&state!=75U&&state!=77U)) {
+        if(backstage && !(a||b)) {
+            gPvPReplicaTelemetry.rejectedState.fetch_add(1U,std::memory_order_relaxed);
+            gPvPReplicaTelemetry.lastRejectedState.store(state,std::memory_order_relaxed);
+        }
+        return false;
+    }
+    if(backstage && !(a||b))gPvPReplicaTelemetry.backstageWanted.fetch_add(1U,std::memory_order_relaxed);
     const character_direct_step_runtime::MovementResourceLease resources(context.character);
-    if(!resources)return false;
+    if(!resources) {
+        if(backstage && !(a||b))gPvPReplicaTelemetry.rejectedResources.fetch_add(1U,std::memory_order_relaxed);
+        return false;
+    }
     if(!backstage) {
         std::uintptr_t withdrawal{};std::uint32_t withdrawState{};
         if(ResolveAlienWithdrawContext(context.character,withdrawal,withdrawState) && withdrawState &&
             !ApplyAlienWithdrawEntry(withdrawal,0U))return false;
     }
-    if((a||b)!=backstage && !SetCharacterBackstage(context.character,backstage))return false;
+    if((a||b)!=backstage && !SetCharacterBackstage(context.character,backstage)) {
+        gPvPReplicaTelemetry.backstageWriteFailed.fetch_add(1U,std::memory_order_relaxed);
+        return false;
+    }
+    if(backstage && !(a||b))gPvPReplicaTelemetry.applied.fetch_add(1U,std::memory_order_relaxed);
     if(!backstage) {
         std::uint8_t invisible{};
         if(!Read(context.character+0x2D9U,invisible))return false;
@@ -12392,6 +12412,36 @@ void LogDiagnostics(Diagnostics& diagnostics) {
         }
     }
     pvp_actions::LogAttack(diagnostics);
+    pvp_actions::LogMiss(diagnostics);
+    {
+        static std::uint64_t lastWanted{},lastRejected{};
+        const auto wanted=gPvPReplicaTelemetry.backstageWanted.load(),rejected=gPvPReplicaTelemetry.rejectedState.load();
+        if(wanted!=lastWanted || rejected!=lastRejected) {
+            lastWanted=wanted;lastRejected=rejected;
+            diagnostics.Log("info","alien_pvp_replica_stage",
+                "Observer mirroring of the Alien owner's vent (backstage) stage. rejectedState = replica cycle not mirrorable (lastRejectedCycle), rejectedResources = movement lease busy, backstageWriteFailed = native write refused, applied = hidden successfully.",
+                {{"backstageWanted",Diagnostics::Unsigned(wanted),true},
+                 {"applied",Diagnostics::Unsigned(gPvPReplicaTelemetry.applied.load()),true},
+                 {"rejectedState",Diagnostics::Unsigned(rejected),true},
+                 {"lastRejectedCycle",Diagnostics::Unsigned(gPvPReplicaTelemetry.lastRejectedState.load()),true},
+                 {"rejectedResources",Diagnostics::Unsigned(gPvPReplicaTelemetry.rejectedResources.load()),true},
+                 {"backstageWriteFailed",Diagnostics::Unsigned(gPvPReplicaTelemetry.backstageWriteFailed.load()),true}});
+        }
+    }
+    {
+        // Debug point for "Alien cannot use the pause menu" (AvS 2026-11-24).
+        static std::uint64_t lastEdges{},lastBypassed{};
+        const auto menu=alien_pvp_input::MenuSnapshot();
+        if(menu.menuOpenEdges!=lastEdges || (menu.menuState && menu.bypassedCalls!=lastBypassed)) {
+            lastEdges=menu.menuOpenEdges;lastBypassed=menu.bypassedCalls;
+            diagnostics.Log("info","alien_pvp_menu_input",
+                "Alien pilot input firewall vs retail pause menu; menuState 0 none, 1 menu reason 0x12000, 2 Pause_Game 0x401 + pause_menu owner, 3 partial 0x401 + owner. bypassedCalls are input reads handed to the menu.",
+                {{"firewallRequested",Diagnostics::Boolean(menu.firewallRequested),true},
+                 {"menuState",Diagnostics::Unsigned(menu.menuState),true},
+                 {"menuOpenEdges",Diagnostics::Unsigned(menu.menuOpenEdges),true},
+                 {"bypassedCalls",Diagnostics::Unsigned(menu.bypassedCalls),true}});
+        }
+    }
     {
         static std::uint64_t lastGateCount{};
         const auto count=gPairGateCount.load(std::memory_order_relaxed);

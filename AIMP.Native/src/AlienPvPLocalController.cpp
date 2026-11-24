@@ -12,6 +12,7 @@
 #include "aimp/CharacterDirectStepRuntime.h"
 #include "aimp/CrashGuard.h"
 #include "aimp/HookManager.h"
+#include "aimp/MultiplayerPause.h"
 
 #include <Windows.h>
 #include <algorithm>
@@ -50,6 +51,12 @@ struct LocalState final {
     bool attackDown{}, enterDown{}, exitDown{}, roarDown{};
     bool ventMapOpen{},wasBackstage{},ventLeft{},ventRight{},ventConfirm{};
     bool ventWasPending{},ventCancelSent{};std::uint64_t ventPendingAt{};
+    // WASD keys held when a vent action became pending. Only a NEW press
+    // cancels: holding W while pressing E used to cancel every entry 400 ms
+    // later (AvS 2026-11-24: "runs around and doesn't enter the vent").
+    unsigned ventMoveMask{};
+    // Free camera chases the Alien along its real exit passage.
+    bool exitTracking{};
     int nearbyVent{-1},selectedVent{-1};
     float cameraDistance{3.0F},cameraHeight{2.0F},cameraSide{0.5F};
     bool duct{};unsigned ductRun{};std::uint64_t ductAt{};
@@ -325,12 +332,9 @@ bool GameFocused() noexcept {
 }
 bool InputAllowed(const std::uintptr_t base) noexcept {
     if (!GameFocused()) return false;
-    std::uintptr_t pauseManager{};
-    std::uint32_t pauseReasons{};
-    if (Read(base+0x012F194CU,pauseManager) && pauseManager &&
-        Read(pauseManager+4U,pauseReasons) &&
-        (pauseReasons&0x00012000U)!=0U) return false;
-    return true;
+    // Includes the 0x401 Pause_Game + pause_menu case the old 0x12000-only
+    // test missed (AvS 2026-11-24: Alien could not quit/disconnect).
+    return multiplayer_pause::MenuOpen(base)==0U;
 }
 bool CameraStillOwned(const Context& context) noexcept {
     CameraBinding current{};
@@ -382,8 +386,15 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
     const auto authority=alien_pvp::VentAuthority();
     const bool pendingVent=(authority.action==alien_pvp::Action::EnterVent || authority.action==alien_pvp::Action::ExitVent) &&
         (authority.phase==alien_pvp::ActionPhase::Preparing || authority.phase==alien_pvp::ActionPhase::Started);
-    if(pendingVent && !gLocal.ventWasPending){gLocal.ventPendingAt=now;gLocal.ventCancelSent=false;}
+    const unsigned moveMask=focused?
+        (Down('W')?1U:0U)|(Down('A')?2U:0U)|(Down('S')?4U:0U)|(Down('D')?8U:0U):0U;
+    if(pendingVent && !gLocal.ventWasPending) {
+        gLocal.ventPendingAt=now;gLocal.ventCancelSent=false;gLocal.ventMoveMask=moveMask;
+    }
     if(!pendingVent)gLocal.ventCancelSent=false;
+    // A key released during the pending action may cancel when pressed again.
+    const unsigned freshMove=moveMask&~gLocal.ventMoveMask;
+    gLocal.ventMoveMask=moveMask;
     gLocal.ventWasPending=pendingVent;
     alien_pvp::vents::Table vents{};
     const bool haveVents=UpdateVentInterface(context,vents);
@@ -415,7 +426,26 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
     alien_pvp::LocalInput input{};
     input.forward=static_cast<float>(forward);input.strafe=static_cast<float>(side);
     input.yaw=alien_pvp::WrapYaw(yaw);input.gait=gait;input.focused=focused;
-    if(gLocal.freeCamera && focused && alien_pvp::ControlActive()) {
+    // AvS 2026-11-24: during an exit the screen sat on "Exiting ventilation..."
+    // at the spot where E was pressed while the Alien crawled the duct for up to
+    // 25 s. Chase the real (backstage) Alien body instead; FollowAfter keeps this
+    // look direction rather than the mouse orbit while tracking.
+    gLocal.exitTracking=gLocal.freeCamera && authority.action==alien_pvp::Action::ExitVent &&
+        authority.phase==alien_pvp::ActionPhase::Started;
+    if(gLocal.exitTracking) {
+        std::array<float,3> body{};float facing{};
+        if(Read(context.alien+0x70U,body) && std::isfinite(body[0]) && std::isfinite(body[1]) && std::isfinite(body[2])) {
+            if(!Read(context.alien+0x174U,facing) || !std::isfinite(facing))facing=yaw;
+            const std::array<float,3> desired{body[0]-std::sin(facing)*2.8F,body[1]+1.6F,body[2]-std::cos(facing)*2.8F};
+            const float blend=std::min(1.0F,dt*6.0F);
+            const float jump=std::hypot(std::hypot(desired[0]-gLocal.freeEye[0],desired[2]-gLocal.freeEye[2]),desired[1]-gLocal.freeEye[1]);
+            for(unsigned i=0;i<3;++i)gLocal.freeEye[i]=jump>20.0F?desired[i]:gLocal.freeEye[i]+(desired[i]-gLocal.freeEye[i])*blend;
+            const std::array<float,3> look{body[0]-gLocal.freeEye[0],body[1]+0.6F-gLocal.freeEye[1],body[2]-gLocal.freeEye[2]};
+            const float length=std::sqrt(look[0]*look[0]+look[1]*look[1]+look[2]*look[2]);
+            if(length>0.05F)for(unsigned i=0;i<3;++i)gLocal.freeForward[i]=look[i]/length;
+        }
+        input.forward=input.strafe=0.0F;
+    } else if(gLocal.freeCamera && focused && alien_pvp::ControlActive()) {
         const float f=static_cast<float>(Down('W'))-static_cast<float>(Down('S'));
         const float s=static_cast<float>(Down('D'))-static_cast<float>(Down('A'));
         const float up=static_cast<float>(Down(VK_SPACE))-static_cast<float>(Down(VK_CONTROL));
@@ -437,7 +467,7 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
     const bool interact=focused && Down('E'),exit=focused && Down('Q');
     const bool cancelKey=(interact && !gLocal.enterDown) || (exit && !gLocal.exitDown);
     const bool cancelMove=focused && !gLocal.freeCamera && pendingVent && now-gLocal.ventPendingAt>=400U &&
-        (Down('W')||Down('A')||Down('S')||Down('D'));
+        freshMove!=0U;
     if(pendingVent && !gLocal.ventCancelSent && (cancelKey||cancelMove)) {
         input.action=alien_pvp::Action::CancelVent;alien_pvp::CaptureLocal(input);gLocal.ventCancelSent=true;
     }
@@ -456,10 +486,15 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
     }
     gLocal.enterDown=interact;gLocal.exitDown=exit;
     alien_pvp_input::SetMapMode(false);
+    // Left OR right click attacks (AvS 2026-11-24: players tried right click;
+    // it was never bound). One edge for either button.
+    const auto attackHeld=[&]() noexcept {return Down(VK_LBUTTON) || Down(VK_RBUTTON);};
     if(!gLocal.freeCamera && !pendingVent) {
-        edge(VK_LBUTTON,gLocal.attackDown,alien_pvp::Action::Attack);
+        const bool pressed=focused && attackHeld();
+        if(pressed && !gLocal.attackDown){input.action=alien_pvp::Action::Attack;alien_pvp::CaptureLocal(input);}
+        gLocal.attackDown=pressed;
         edge('G',gLocal.roarDown,alien_pvp::Action::Roar);
-    } else {gLocal.attackDown=Down(VK_LBUTTON);gLocal.roarDown=Down('G');}
+    } else {gLocal.attackDown=attackHeld();gLocal.roarDown=Down('G');}
     input.action=alien_pvp::Action::None;
     alien_pvp::CaptureLocal(input);
     gLocal.moving=alien_pvp::MovingNow();
@@ -493,7 +528,7 @@ void FollowAfter(std::uintptr_t behavior) noexcept {
     if(!Read(gLocal.character+0x70U,body) || !Read(behavior+0x1C0U,base) || !Read(behavior+0x1CU,position))return;
     if(gLocal.freeCamera) {
         const float length=std::hypot(std::hypot(base[0]-position[0],base[2]-position[2]),base[1]-position[1]);
-        if(length>0.01F)for(unsigned i=0;i<3;++i)gLocal.freeForward[i]=(base[i]-position[i])/length;
+        if(length>0.01F && !gLocal.exitTracking)for(unsigned i=0;i<3;++i)gLocal.freeForward[i]=(base[i]-position[i])/length;
         const auto out=gLocal.freeEye;
         std::array<float,3> target{};
         for(unsigned i=0;i<3;++i)target[i]=out[i]+gLocal.freeForward[i]*5.0F;

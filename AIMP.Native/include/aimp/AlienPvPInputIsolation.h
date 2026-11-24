@@ -8,6 +8,11 @@ namespace aimp::alien_pvp_input {
 // All observers transparently call the original functions outside local PvP.
 bool EnsureInstalled(std::uintptr_t gameModule) noexcept;
 bool Installed() noexcept;
+// Debug point for the "Alien cannot use the pause menu" report: firewall
+// requested state, last multiplayer_pause::MenuOpen code, how many times a menu
+// opened while installed and how many filtered calls were passed to the menu.
+struct MenuStats {bool firewallRequested{};std::uint32_t menuState{};std::uint64_t menuOpenEdges{},bypassedCalls{};};
+MenuStats MenuSnapshot() noexcept;
 void SetActive(bool enabled) noexcept;
 // Campaign-only host authority; independent of the Alien PvP input firewall.
 bool ConfigureCinematic(bool enabled,bool host) noexcept;

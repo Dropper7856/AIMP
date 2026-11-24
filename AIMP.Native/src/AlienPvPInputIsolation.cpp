@@ -1,6 +1,7 @@
 #include "aimp/AlienPvPInputIsolation.h"
 
 #include "aimp/CrashGuard.h"
+#include "aimp/MultiplayerPause.h"
 
 #include <Windows.h>
 #include <array>
@@ -54,7 +55,26 @@ bool PassKey(const std::uint32_t key) noexcept {
     return key==VK_ESCAPE || key==VK_MENU || key==VK_F12 ||
         key==VK_SNAPSHOT || key==VK_LWIN || key==VK_RWIN;
 }
-bool Active() noexcept { return gActive.load(std::memory_order_acquire); }
+// AvS 2026-11-24 (menu bug): the firewall must never stand between the player
+// and a retail pause/overlay menu. The pilot's engine-thread Pump also turns it
+// off, but it can lag (or not run at all while backstage/vent states hold the
+// camera), so every filtered call re-checks the menu itself, cached for 50 ms.
+std::atomic<std::uint64_t> gMenuCheckedAt{},gMenuBypassed{},gMenuOpenEdges{};
+std::atomic<std::uint32_t> gMenuState{};
+std::uint32_t MenuState() noexcept {
+    const auto now=GetTickCount64();
+    if(now-gMenuCheckedAt.load(std::memory_order_relaxed)<50U)return gMenuState.load(std::memory_order_relaxed);
+    const auto state=multiplayer_pause::MenuOpen(gExecutableBase);
+    const auto previous=gMenuState.exchange(state,std::memory_order_relaxed);
+    if(state && !previous)gMenuOpenEdges.fetch_add(1U,std::memory_order_relaxed);
+    gMenuCheckedAt.store(now,std::memory_order_relaxed);
+    return state;
+}
+bool Active() noexcept {
+    if(!gActive.load(std::memory_order_acquire))return false;
+    if(MenuState()!=0U){gMenuBypassed.fetch_add(1U,std::memory_order_relaxed);return false;}
+    return true;
+}
 // The playable-Alien camera resolver already certifies these exact retail
 // camera manager fields. Unknown cameras are a candidate for a cutscene,
 // never authority to mutate game state.
@@ -312,6 +332,10 @@ MapPointer TakeMapPointer() noexcept {
 }
 
 bool Installed() noexcept { return gInstalled.load(std::memory_order_acquire); }
+MenuStats MenuSnapshot() noexcept {
+    return {gActive.load(std::memory_order_acquire),gMenuState.load(std::memory_order_relaxed),
+        gMenuOpenEdges.load(std::memory_order_relaxed),gMenuBypassed.load(std::memory_order_relaxed)};
+}
 void SetSpectateMouse(const bool enabled) noexcept {
     if (gSpectateMouse.exchange(enabled,std::memory_order_acq_rel)!=enabled) {
         gSpectateX.store(0);gSpectateY.store(0);gSpectateWheel.store(0);

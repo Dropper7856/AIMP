@@ -41,6 +41,7 @@ struct Active final {
     VentSlot* vent{};
     bool used{},entered{},cancelled{},terminalSent{},hostEnded{},moveArrived{},entrySubmitted{},remoteVent{};
     bool presentationStarted{},ownerFinished{};
+    std::uint64_t arrivedAt{};std::uint32_t cancelRefusals{};
     std::uint64_t ventProgressAt{};float ventBestDistance{std::numeric_limits<float>::infinity()};
     bool attackLatched{},retailArmed{},presented{};std::uint64_t latchedAt{},lastPairTrace{},armedAt{},presentedAt{};
     std::uint32_t retargets{},flagConsumed{};
@@ -75,9 +76,12 @@ struct VentTelemetry final {
     std::atomic<unsigned> action{},phase{},cycle{},frameStatus{};
     std::atomic<bool> host{},backstage{},cancelling{};
     std::atomic<float> x{},y{},z{};
+    std::atomic<unsigned> arrivedNoPassage{},refusedCancels{}; // session counters
 } ventTelemetry;
 void TraceVent(unsigned frameStatus=0U) noexcept {
     if(!active.used || (active.receipt.action!=Action::EnterVent && active.receipt.action!=Action::ExitVent))return;
+    if(frameStatus==3U)ventTelemetry.arrivedNoPassage.fetch_add(1U,std::memory_order_relaxed);
+    if(frameStatus==4U)ventTelemetry.refusedCancels.fetch_add(1U,std::memory_order_relaxed);
     policy::Point body{};std::uint8_t state{};bool backstage{};
     if(!Body(active.context.character,body)||!Cycle(active.context.character,state,backstage))return;
     ventTelemetry.sequence=active.receipt.hostSequence;ventTelemetry.elapsed=GetTickCount64()-active.began;
@@ -92,7 +96,7 @@ void LogVent(Diagnostics& diagnostics) {
     const auto revision=ventTelemetry.revision.load(std::memory_order_acquire),now=GetTickCount64();
     if(!revision || revision==lastRevision || now-lastAt<1000U)return;
     lastRevision=revision;lastAt=now;
-    diagnostics.Log("info","alien_vent_progress","Engine-thread vent observations; frameResult 0 pending, 1 arrived, 2 refused.",
+    diagnostics.Log("info","alien_vent_progress","Engine-thread vent observations; frameResult 0 pending, 1 arrived, 2 refused, 3 arrivedButNoPassage2.5s, 4 cancelRefusedDuringPassage.",
         {{"host",Diagnostics::Boolean(ventTelemetry.host.load()),true},
          {"hostSequence",Diagnostics::Unsigned(ventTelemetry.sequence.load()),true},
          {"elapsedMs",Diagnostics::Unsigned(ventTelemetry.elapsed.load()),true},
@@ -102,6 +106,8 @@ void LogVent(Diagnostics& diagnostics) {
          {"frameResult",Diagnostics::Unsigned(ventTelemetry.frameStatus.load()),true},
          {"backstage",Diagnostics::Boolean(ventTelemetry.backstage.load()),true},
          {"cancelling",Diagnostics::Boolean(ventTelemetry.cancelling.load()),true},
+         {"arrivedNoPassageTotal",Diagnostics::Unsigned(ventTelemetry.arrivedNoPassage.load()),true},
+         {"refusedCancelsTotal",Diagnostics::Unsigned(ventTelemetry.refusedCancels.load()),true},
          {"x",std::to_string(ventTelemetry.x.load()),true},
          {"y",std::to_string(ventTelemetry.y.load()),true},
          {"z",std::to_string(ventTelemetry.z.load()),true}});
@@ -120,7 +126,41 @@ struct AttackTelemetry final {
     // 00717D90), last node type, OR of attack-manager availability bytes
     // +8..+E (bit n = +8+n; +8 ANY, +D any proven) and source/victim +2B4.
     std::atomic<unsigned> meleeStarts{},meleeRefused{},meleeType{},availability{},sourceFlag2B4{},victimFlag2B4{},brainFaults{};
+    // Session counters (never reset per attack).
+    std::atomic<unsigned> ventHijacks{};
+    // Last NoTarget rejection: nearest certified survivor relative to the
+    // Alien and the pilot's aim (debug point for "clicking does nothing").
+    std::atomic<std::uint64_t> missRevision{},missSequence{};
+    std::atomic<unsigned> missCandidates{},missLiving{},missPublished{};
+    std::atomic<float> missDistance{-1.0F},missHeight{},missCosine{},missYaw{};
 } attackTelemetry;
+void TraceMiss(std::uint64_t sequence,unsigned candidates,unsigned living,unsigned published,
+    float distance,float height,float cosine,float yaw) noexcept {
+    attackTelemetry.missSequence=sequence;attackTelemetry.missCandidates=candidates;
+    attackTelemetry.missLiving=living;attackTelemetry.missPublished=published;
+    attackTelemetry.missDistance=distance;attackTelemetry.missHeight=height;
+    attackTelemetry.missCosine=cosine;attackTelemetry.missYaw=yaw;
+    attackTelemetry.missRevision.fetch_add(1U,std::memory_order_release);
+}
+void LogMiss(Diagnostics& diagnostics) {
+    static std::uint64_t lastRevision{};
+    const auto revision=attackTelemetry.missRevision.load(std::memory_order_acquire);
+    if(!revision || revision==lastRevision)return;
+    lastRevision=revision;
+    diagnostics.Log("info","alien_attack_no_target",
+        "Host rejected an Alien attack with NoTarget. Nearest participant: distanceM (flat), heightM, cosine of the angle to the pilot's aim (needs >= admission cosine), candidates/living/published counts.",
+        {{"hostSequence",Diagnostics::Unsigned(attackTelemetry.missSequence.load()),true},
+         {"participants",Diagnostics::Unsigned(attackTelemetry.missCandidates.load()),true},
+         {"living",Diagnostics::Unsigned(attackTelemetry.missLiving.load()),true},
+         {"pairPublished",Diagnostics::Unsigned(attackTelemetry.missPublished.load()),true},
+         {"distanceM",std::to_string(attackTelemetry.missDistance.load()),true},
+         {"heightM",std::to_string(attackTelemetry.missHeight.load()),true},
+         {"aimCosine",std::to_string(attackTelemetry.missCosine.load()),true},
+         {"aimYaw",std::to_string(attackTelemetry.missYaw.load()),true},
+         {"reachM",std::to_string(policy::kAttackReach),true},
+         {"admissionCosine",std::to_string(policy::kAttackCosine),true},
+         {"ventHijacks",Diagnostics::Unsigned(attackTelemetry.ventHijacks.load()),true}});
+}
 void TraceAttack(unsigned stage,unsigned selector=0U) noexcept {
     std::uint8_t state{};bool backstage{};
     if(!Cycle(active.context.character,state,backstage))state=0xFFU;
@@ -150,7 +190,7 @@ void LogAttack(Diagnostics& diagnostics) {
     const auto sequence=attackTelemetry.sequence.load();
     if(!revision || revision==lastRevision || (sequence==lastSequence && now-lastAt<250U))return;
     lastRevision=revision;lastSequence=sequence;lastAt=now;
-    diagnostics.Log("info","alien_attack_progress","Host attack preparation; stage 1 noSelection 2 noRecord 3 targetFault 4 queryRefused 5 selectorUnproven 6 rayPending 7 submitted 8 pairRefused 9 entered 10 enteredWithRayPending 11 pairRunning 12 victimNotAcquired4s 13 retailArmed 14 retailWindowExpired 15 retailOtherVictim 16 retailRetargeted(selector=count) 17 armedQueryRefused 18 brainTargetUnavailable 19 attackBranchConsumedFlag(selector=count) 24 retailNeverStartedMelee3s 20 clientPresented 21 clientPresentRefused 22 clientNotEntered 23 clientEntered.",
+    diagnostics.Log("info","alien_attack_progress","Host attack preparation; stage 1 noSelection 2 noRecord 3 targetFault 4 queryRefused 5 selectorUnproven 6 rayPending 7 submitted 8 pairRefused 9 entered 10 enteredWithRayPending 11 pairRunning 12 victimNotAcquired4s 13 retailArmed 14 retailWindowExpired 15 retailOtherVictim 16 retailRetargeted(selector=count) 17 armedQueryRefused 18 brainTargetUnavailable 19 attackBranchConsumedFlag(selector=count) 24 retailNeverStartedMelee3s 25 retailChoseVentAborted(selector=cycle) 20 clientPresented 21 clientPresentRefused 22 clientNotEntered 23 clientEntered.",
         {{"hostSequence",Diagnostics::Unsigned(sequence),true},
          {"elapsedMs",Diagnostics::Unsigned(attackTelemetry.elapsed.load()),true},
          {"stage",Diagnostics::Unsigned(attackTelemetry.stage.load()),true},
@@ -177,6 +217,7 @@ void LogAttack(Diagnostics& diagnostics) {
 void TraceVent(unsigned=0U) noexcept {}
 void TraceAttack(unsigned,unsigned=0U) noexcept {}
 void TracePair(unsigned) noexcept {}
+void TraceMiss(std::uint64_t,unsigned,unsigned,unsigned,float,float,float,float) noexcept {}
 #endif
 bool Ordinary(const std::uint8_t state) noexcept {return state==1U || state==55U || state==56U || state==59U;}
 bool Protected(const std::uint8_t state) noexcept {return state==18U || state==75U || state==77U || state==78U || state==79U;}
@@ -647,11 +688,24 @@ bool AttackQueryRetired(const std::uintptr_t chooser) noexcept {
 bool SelectVictim(const ap::Context& c,const ap::Frame& command,PairIdentity& victim) noexcept {
     std::array<policy::Candidate,33> candidates{};std::size_t count{};
     policy::Point source{};if(!Body(c.character,source))return false;
+    unsigned seen{},living{},published{};
+    float nearest=-1.0F,nearestHeight{},nearestCosine{};
     const auto append=[&](std::uint64_t peer) noexcept {
         if(!peer || peer==c.scope.ownerPeer || count==candidates.size())return;
         for(std::size_t i=0;i<count;++i)if(candidates[i].peer==peer)return;
         const auto character=ParticipantForPeer(peer);PairIdentity p{};policy::Point point{};
-        if(!LivingCharacter(character) || !PublishedPairVictim(character,p) || !PairIdentityLive(p) || !Body(character,point))return;
+        ++seen;
+        if(!LivingCharacter(character))return;
+        ++living;
+        if(Body(character,point)) {
+            const float dx=point.x-source.x,dz=point.z-source.z,d=std::sqrt(dx*dx+dz*dz);
+            if(nearest<0.0F || d<nearest) {
+                nearest=d;nearestHeight=point.y-source.y;
+                nearestCosine=d>0.05F?(dx*std::sin(command.yaw)+dz*std::cos(command.yaw))/d:1.0F;
+            }
+        }
+        if(!PublishedPairVictim(character,p) || !PairIdentityLive(p) || !Body(character,point))return;
+        ++published;
         // This is only the candidate shortlist. Actual reachability is proved
         // by the explicit-target retail availability query before entry.
         candidates[count++]={peer,point,true,true,player_hiding::Hidden(character),true};
@@ -659,7 +713,9 @@ bool SelectVictim(const ap::Context& c,const ap::Frame& command,PairIdentity& vi
     append(gCurrent.localPeer);
     for(std::uint32_t i=0;i<gCurrent.participantCount;++i)append(gCurrent.participants[i].peer);
     const auto peer=policy::SelectVictim(source,command.yaw,c.scope.ownerPeer,{candidates.data(),count});
-    return peer && PublishedPairVictim(ParticipantForPeer(peer),victim) && PairIdentityLive(victim) && victim.peer==peer;
+    const bool selected=peer && PublishedPairVictim(ParticipantForPeer(peer),victim) && PairIdentityLive(victim) && victim.peer==peer;
+    if(!selected)TraceMiss(command.hostSequence,seen,living,published,nearest,nearestHeight,nearestCosine,command.yaw);
+    return selected;
 }
 bool VictimStillInReach(const ap::Context& c,const PairIdentity& victim,const ap::Frame& command) noexcept {
     if(!PairIdentityLive(victim) || !LivingCharacter(victim.character) || ParticipantForPeer(victim.peer)!=victim.character)return false;
@@ -733,6 +789,15 @@ void Cancel(const ap::Context& c,bool living) noexcept {
 bool InterruptVent(const ap::Context& c,ap::Frame& result) noexcept {
     if(!Same(c) || active.terminalSent ||
         (active.receipt.action!=Action::EnterVent && active.receipt.action!=Action::ExitVent))return false;
+    // AvS 2026-11-24 (entry 8111): a cancel accepted after the passage began
+    // left the Host Alien backstage while every replica rolled its own
+    // traversal back and kept showing it. Once the opening animation (18) or,
+    // for an entry, backstage has started, the passage must complete.
+    std::uint8_t state{};bool backstage{};
+    if(Cycle(c.character,state,backstage) &&
+        (state==18U || (active.receipt.action==Action::EnterVent && (backstage || Protected(state))))) {
+        ++active.cancelRefusals;TraceVent(4U);return false;
+    }
     Terminal(result,Phase::Cancelled,Reason::NativeBusy);
     Cancel(c,true);return true;
 }
@@ -902,6 +967,17 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
                     active.entered=true;result=active.receipt;result.phase=Phase::Started;result.reason=Reason::None;
                     ++result.resolutionRevision;active.receipt=result;return true;
                 }
+                // AvS 2026-11-24 (both armed attacks, stage 24 cycle 18): with
+                // its decision slice unfenced the retail brain never ran
+                // ATTACK_CORE (flagConsumed 0, meleeStarts 0) and took the Alien
+                // into a vent instead; the pilot then saw an "automatic" vent
+                // entry while the survivor still saw the Alien standing there.
+                // Hand the brain back the moment it picks any vent/withdraw cycle.
+                if(state!=78U && (backstage || Protected(state))) {
+                    attackTelemetry.ventHijacks.fetch_add(1U,std::memory_order_relaxed);
+                    ReleaseAttackTarget();TraceAttack(25U,state);
+                    Terminal(result,Phase::Rejected,Reason::NativeRefused);active.cancelled=true;return true;
+                }
 #ifndef AIMP_ALIEN_ACTION_TEST
                 const auto starts=gPvPMeleeStarts.load(std::memory_order_relaxed);
                 attackTelemetry.meleeStarts=starts;attackTelemetry.meleeRefused=gPvPMeleeRefused.load(std::memory_order_relaxed);
@@ -1027,6 +1103,7 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
     if(!active.moveArrived && !StepVent(c,*active.vent,active.receipt,nativeResult)) {
         active.vent->quarantined=true;Terminal(result,Phase::Failed,Reason::Fault);Clear();return true;
     }
+    if(nativeResult==1 && !active.moveArrived)active.arrivedAt=now;
     if(nativeResult==1)active.moveArrived=true;
     TraceVent(static_cast<unsigned>(nativeResult));
     // Retail shuts down a finished node immediately, releasing its request
@@ -1055,6 +1132,16 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
             policy::Point{active.receipt.resolvedX,active.receipt.resolvedY,active.receipt.resolvedZ};
         const float distance=std::sqrt(policy::DistanceSquared(body,goal));
         if(distance+0.25F<active.ventBestDistance) {active.ventBestDistance=distance;active.ventProgressAt=now;}
+    }
+    // AvS 2026-11-24 (entry 7394): the node reported arrival at 5.7 s but no
+    // passage (cycle 56, frontstage) followed; the Alien idled in place until
+    // the player gave up at 9 s. Fail an arrived entry that has not started
+    // its passage within 2.5 s so the pilot gets control back and can retry.
+    if(active.moveArrived && active.arrivedAt && !expected && !Protected(state) && !backstage &&
+        active.receipt.action==Action::EnterVent && now-active.arrivedAt>2500U) {
+        TraceVent(3U);
+        Terminal(result,Phase::Failed,Reason::Timeout);
+        Cancel(c,true);return true;
     }
     const auto traversalLimit=active.receipt.action==Action::EnterVent?10000U:25000U;
     const bool stalled=active.receipt.action==Action::EnterVent && !Protected(state) &&
