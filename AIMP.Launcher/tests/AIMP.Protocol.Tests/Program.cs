@@ -38,6 +38,7 @@ internal static class Program
         new("PlayerSync posture coherent memory capture", PlayerPostureTests.CaptureAsync),
         new("PlayerSync retail crouch animation coverage", RemoteCrouchAnimationTests.RetailAsync),
         new("PlayerSync crouch animation independent preparation", RemoteCrouchAnimationTests.PreparationReceiptAsync),
+        new("Preparation receipt with manifests wiped by a launcher update", RemoteCrouchAnimationTests.StaleManifestReceiptAsync),
         new("PlayerSync torch wire", PlayerTorchTests.WireAsync),
         new("PlayerSync hiding wire and validation", PlayerHidingTests.WireAsync),
         new("PlayerSync hiding coherent capture and lifecycle", PlayerHidingTests.CaptureAsync),
