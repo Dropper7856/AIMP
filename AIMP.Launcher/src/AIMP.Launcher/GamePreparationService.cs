@@ -260,7 +260,7 @@ public sealed class GamePreparationService
                 {
                     Update("Checking", 1, 0, levels.Length, string.Empty, "Checking multiplayer assets");
                     var shared = TryReadReceipt(ReceiptPath(game));
-                    if (shared != null && RemoteCrouchAnimationInstaller.IsInstalled(game) && ReceiptCovers(game, shared, levels))
+                    if (shared != null && RemoteCrouchAnimationInstaller.IsInstalled(game) && ReceiptProblem(game, shared, levels) is null)
                     {
                         _diagnostics.Log("Preparation", "Another Alien: Isolation is running; using the existing preparation without changes.");
                         Complete(shared);
@@ -277,10 +277,20 @@ public sealed class GamePreparationService
                 token.ThrowIfCancellationRequested();
                 var receiptPath = ReceiptPath(game);
                 var existing = TryReadReceipt(receiptPath);
-                if (existing != null && ReceiptCovers(game, existing, levels))
+                if (existing != null)
                 {
-                    Complete(existing);
-                    return;
+                    var problem = ReceiptProblem(game, existing, levels);
+                    if (problem is null)
+                    {
+                        Complete(existing);
+                        return;
+                    }
+                    // A launcher update/reinstall wipes <install>\WorldManifestCache
+                    // while this receipt survives in %LOCALAPPDATA%. Rebuild; the
+                    // receipt below is overwritten in place (no stale files kept).
+                    // The reason may quote receipt paths: keep forged newlines out of the log.
+                    var reason = string.Concat(problem.Select(c => char.IsControl(c) ? '?' : c));
+                    _diagnostics.Log("Preparation", $"Previous preparation is stale ({reason}); rebuilding.");
                 }
                 var legacyManifests = WorldManifestCompiler.DeleteLegacyCache();
                 _diagnostics.Log("Preparation", $"World manifest cache: {WorldManifestCompiler.CacheDirectory.Value}" +
@@ -335,6 +345,9 @@ public sealed class GamePreparationService
                         pakHash, binHash));
                 }
                 var array = manifests.ToArray();
+                // Would make every later launch treat this receipt as stale.
+                foreach (var outside in array.Where(m => !IsTrustedManifestPath(m.ManifestPath, WorldManifestCompiler.CacheDirectory.Value)))
+                    _diagnostics.Log("Preparation", $"Warning: compiled manifest '{outside.ManifestPath}' is outside the cache '{WorldManifestCompiler.CacheDirectory.Value}'.");
                 var receipt = new PreparationReceipt(RecipeVersion, WorldManifestConstants.CompilerVersion,
                     game, CaptureStamps(game, levels, array), array);
                 Directory.CreateDirectory(Path.GetDirectoryName(receiptPath)!);
@@ -359,19 +372,70 @@ public sealed class GamePreparationService
     // A receipt may cover more levels than requested: one prepared in Developer
     // mode (with the campaign) stays valid for Survival only. Its stamps are
     // checked over its own levels.
-    private static bool ReceiptCovers(string game, PreparationReceipt receipt,
+    // Returns null when the receipt is valid, otherwise a short reason for the log.
+    // Never throws for missing files: a stale receipt only means "prepare again".
+    private static string? ReceiptProblem(string game, PreparationReceipt receipt,
         IReadOnlyList<WorldManifestLevelSource> levels)
     {
-        if (receipt.RecipeVersion != RecipeVersion || receipt.CompilerVersion != WorldManifestConstants.CompilerVersion
-            || !SameDirectory(receipt.GameDirectory, game)
-            || !levels.All(l => receipt.Manifests.Any(m => SameDirectory(l.LevelDirectory, m.LevelDirectory))))
-            return false;
+        if (ReceiptHeaderProblem(game, receipt, levels) is { } header) return header;
+        // The receipt is user-writable JSON: only trust manifests inside the
+        // current cache. An old install's folder (or any other path) is stale.
+        var cache = WorldManifestCompiler.CacheDirectory.Value;
+        var untrusted = receipt.Manifests.FirstOrDefault(m => !IsTrustedManifestPath(m.ManifestPath, cache));
+        if (untrusted != null)
+            return $"manifest outside the current cache or missing: {untrusted.ManifestPath}";
         var prepared = levels.Count == receipt.Manifests.Length ? levels
             : WorldManifestLevelDiscovery.Discover(game, includeCampaign: true).Where(l => l.CanCompile)
                 .Where(l => receipt.Manifests.Any(m => SameDirectory(l.LevelDirectory, m.LevelDirectory))).ToArray();
-        return prepared.Count == receipt.Manifests.Length
-            && StampsEqual(receipt.Files, CaptureStamps(game, prepared, receipt.Manifests),
-                Path.Combine(game, "DATA", "GLOBAL", "ANIMATION.PAK"));
+        return prepared.Count != receipt.Manifests.Length ? "prepared level set changed"
+            : ReceiptStampsProblem(game, receipt, prepared);
+    }
+
+    private static string? ReceiptHeaderProblem(string game, PreparationReceipt receipt,
+        IReadOnlyList<WorldManifestLevelSource> levels)
+    {
+        if (receipt.RecipeVersion != RecipeVersion || receipt.CompilerVersion != WorldManifestConstants.CompilerVersion)
+            return "recipe or compiler version changed";
+        if (!SameDirectory(receipt.GameDirectory, game))
+            return "different game directory";
+        return levels.All(l => receipt.Manifests.Any(m => SameDirectory(l.LevelDirectory, m.LevelDirectory)))
+            ? null : "levels not covered";
+    }
+
+    private static string? ReceiptStampsProblem(string game, PreparationReceipt receipt,
+        IReadOnlyList<WorldManifestLevelSource> prepared)
+    {
+        Dictionary<string, FileStamp> current;
+        try { current = CaptureStamps(game, prepared, receipt.Manifests); }
+        catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return $"prepared file missing: {(e as FileNotFoundException)?.FileName ?? e.Message}";
+        }
+        return StampsEqual(receipt.Files, current, Path.Combine(game, "DATA", "GLOBAL", "ANIMATION.PAK"))
+            ? null : "game or prepared files changed";
+    }
+
+    // A trusted manifest is an existing regular *.aimpwm file directly inside the
+    // cache directory, and not itself a reparse point. The directory may be a
+    // junction (players move the cache to another drive); the compiler writes
+    // through it anyway, so rejecting it would only force a rebuild every launch.
+    internal static bool IsTrustedManifestPath(string manifestPath, string cacheDirectory)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(manifestPath) || !Path.IsPathFullyQualified(manifestPath)) return false;
+            var full = Path.GetFullPath(manifestPath);
+            var cache = Path.GetFullPath(cacheDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var file = new FileInfo(full);
+            return string.Equals(Path.GetDirectoryName(full), cache, StringComparison.OrdinalIgnoreCase)
+                && full.EndsWith(".aimpwm", StringComparison.OrdinalIgnoreCase)
+                && file.Exists && (file.Attributes & (FileAttributes.ReparsePoint | FileAttributes.Directory)) == 0;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException
+            or NotSupportedException or System.Security.SecurityException)
+        {
+            return false;
+        }
     }
 
     private void Complete(PreparationReceipt receipt)
