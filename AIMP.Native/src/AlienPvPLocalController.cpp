@@ -8,6 +8,7 @@
 #include "aimp/AlienPvPTechnicalPolicy.h"
 #include "aimp/AlienPvPVents.h"
 #include "aimp/AlienPvPFreeCamera.h"
+#include "aimp/AlienPvPActionPolicy.h"
 
 #include "aimp/CharacterDirectStepRuntime.h"
 #include "aimp/CrashGuard.h"
@@ -69,6 +70,9 @@ struct LocalState final {
     std::array<float,3> pickerExit{},pickerEye{},pickerToward{};bool pickerHasToward{};
     float pickerYaw{},pickerPitch{},orbitYaw0{},orbitPitch0{};
     bool hudHidden{};std::uint64_t hudAt{};
+    // AvS 2026-11-25 round 4: "Left click to kill" hint. Same shortlist rule
+    // the Host applies (reach, height, aim cone or body contact).
+    bool attackReady{};
     int nearbyVent{-1},selectedVent{-1};
     float cameraDistance{3.0F},cameraHeight{2.0F},cameraSide{0.5F};
     bool duct{};unsigned ductRun{};std::uint64_t ductAt{};
@@ -94,7 +98,7 @@ std::atomic<std::uint64_t> gOrbitFrames{},gOrbitCollisions{},gOrbitNoWorld{};
 struct OrbitState {std::uintptr_t target{};float yaw{},pitch{0.25F},distance{3.0F},shown{3.0F};};
 OrbitState gOrbit{}; // engine thread only
 struct AimStats final {
-    std::atomic<std::uint32_t> aims{},mode{},worlds{};std::atomic<float> open{};std::atomic<int> vent{-1};
+    std::atomic<std::uint32_t> aims{},mode{},worlds{};std::atomic<float> open{},out{},lift{};std::atomic<int> vent{-1};
 } gAimStats; // written by the camera hook, read by diagnostics
 
 template<typename T>
@@ -594,6 +598,17 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
     // Left OR right click attacks (AvS 2026-11-24: players tried right click;
     // it was never bound). One edge for either button.
     const auto attackHeld=[&]() noexcept {return Down(VK_LBUTTON) || Down(VK_RBUTTON);};
+    gLocal.attackReady=false;
+    if(!gLocal.freeCamera && !pendingVent && !IsBackstage(context.alien) && context.survivorCount) {
+        alien_pvp::actions::Point source{};
+        if(Read(context.alien+0x70U,source.x) && Read(context.alien+0x74U,source.y) && Read(context.alien+0x78U,source.z)) {
+            std::array<alien_pvp::actions::Candidate,4> candidates{};std::size_t count{};
+            for(std::uint32_t s=0;s<context.survivorCount && s<4U;++s)
+                candidates[count++]={s+1U,{context.survivors[s][0],context.survivors[s][1],context.survivors[s][2]},true,true,false,true};
+            // Peer ids here are placeholders (index+1); the Alien "peer" is 0x7FFF.
+            gLocal.attackReady=alien_pvp::actions::SelectVictim(source,input.yaw,0x7FFFU,{candidates.data(),count})!=0U;
+        }
+    }
     if(!gLocal.freeCamera && !pendingVent) {
         const bool pressed=focused && attackHeld();
         if(pressed && !gLocal.attackDown){input.action=alien_pvp::Action::Attack;alien_pvp::CaptureLocal(input);}
@@ -649,36 +664,57 @@ void AimPickerCamera(const std::array<float,3>& orbitForward) noexcept {
         }
         return best;
     };
-    float yaw{},open{-1.0F};int mode{};
+    // AvS 2026-11-25 round 4: 0.7 m out still framed the duct ("seeing the
+    // inside of the vent"; vent 17 open 0.54 m from exit+1 m). Probe from three
+    // heights, then put the eye up to 2.5 m out into the open side, at up to
+    // 1.8 m (ceiling-limited), so the view shows the room the Alien drops into.
+    // If every probe is boxed in (exit inside the duct above a ceiling opening)
+    // and a floor lies clearly below, probe again 1.2 m above that floor.
+    float yaw{},open{-1.0F},floorY{e[1]};int mode{};
+    std::array<float,3> origin{e[0],e[1]+1.0F,e[2]};
     if(worldCount) {
-        constexpr int kDirections=16;constexpr float kReach=6.0F;float bestScore=-1.0e9F;
-        const std::array<float,3> from{e[0],e[1]+1.0F,e[2]};
-        for(int i=0;i<kDirections;++i) {
-            const float a=static_cast<float>(i)*6.28318530718F/static_cast<float>(kDirections);
-            const float dx=std::sin(a),dz=std::cos(a);
-            const float d=cast(from,{from[0]+dx*kReach,from[1],from[2]+dz*kReach});
-            const float toward=gLocal.pickerHasToward?
-                std::max(0.0F,dx*gLocal.pickerToward[0]+dz*gLocal.pickerToward[2]):0.0F;
-            const float score=d+1.5F*toward;
-            if(score>bestScore){bestScore=score;yaw=a;open=d;}
-        }
+        constexpr int kDirections=16;constexpr float kReach=8.0F;
+        const auto probe=[&](const std::array<float,3>& from,float& bestScore) noexcept {
+            for(int i=0;i<kDirections;++i) {
+                const float a=static_cast<float>(i)*6.28318530718F/static_cast<float>(kDirections);
+                const float dx=std::sin(a),dz=std::cos(a);
+                const float d=cast(from,{from[0]+dx*kReach,from[1],from[2]+dz*kReach});
+                const float toward=gLocal.pickerHasToward?
+                    std::max(0.0F,dx*gLocal.pickerToward[0]+dz*gLocal.pickerToward[2]):0.0F;
+                const float score=d+1.5F*toward;
+                if(score>bestScore){bestScore=score;yaw=a;open=d;origin=from;}
+            }
+        };
+        float bestScore=-1.0e9F;
+        for(const float h:{1.0F,1.6F,0.4F})probe({e[0],e[1]+h,e[2]},bestScore);
         mode=1;
+        if(open<1.0F) {
+            const float down=cast({e[0],e[1]+0.2F,e[2]},{e[0],e[1]-8.0F,e[2]});
+            if(down>1.4F && down<8.0F) {
+                floorY=e[1]+0.2F-down;bestScore=-1.0e9F;
+                probe({e[0],floorY+1.2F,e[2]},bestScore);mode=4;
+            }
+        }
     } else if(gLocal.pickerHasToward) {
         yaw=std::atan2(gLocal.pickerToward[0],gLocal.pickerToward[2]);mode=2;
     } else {
         yaw=std::atan2(orbitForward[0],orbitForward[2]);mode=3;
     }
     const float dx=std::sin(yaw),dz=std::cos(yaw);
-    const float out=mode==1?std::clamp(open-0.3F,0.0F,0.7F):0.7F;
-    float height=1.0F;
+    const float out=(mode==1 || mode==4)?std::clamp(open-0.5F,0.0F,2.5F):1.5F;
+    float y=origin[1];
     if(worldCount) {
-        const float up=cast({e[0]+dx*out,e[1]+0.3F,e[2]+dz*out},{e[0]+dx*out,e[1]+1.6F,e[2]+dz*out});
-        height=std::clamp(0.3F+up-0.25F,0.4F,1.2F);
+        // Raise toward 1.8 m above the probe's floor level, under the ceiling.
+        const std::array<float,3> at{origin[0]+dx*out,origin[1],origin[2]+dz*out};
+        const float up=cast(at,{at[0],at[1]+1.5F,at[2]});
+        y=std::clamp(at[1]+up-0.3F,floorY+0.4F,floorY+1.8F);
     }
-    gLocal.pickerEye={e[0]+dx*out,e[1]+height,e[2]+dz*out};
+    gLocal.pickerEye={origin[0]+dx*out,y,origin[2]+dz*out};
+    gAimStats.out.store(out,std::memory_order_relaxed);
+    gAimStats.lift.store(y-e[1],std::memory_order_relaxed);
     gLocal.orbitYaw0=std::atan2(orbitForward[0],orbitForward[2]);
     gLocal.orbitPitch0=std::asin(std::clamp(orbitForward[1],-1.0F,1.0F));
-    gLocal.pickerYaw=yaw;gLocal.pickerPitch=mode==3?gLocal.orbitPitch0:-0.12F;
+    gLocal.pickerYaw=yaw;gLocal.pickerPitch=mode==3?gLocal.orbitPitch0:-0.2F;
     gLocal.pickerAimed=true;gLocal.pickerAimPending=false;
     gLocal.freeEye=gLocal.pickerEye;
     gAimStats.mode.store(static_cast<std::uint32_t>(mode),std::memory_order_relaxed);
@@ -938,12 +974,13 @@ Readiness Snapshot() noexcept {
 }
 VentInterface VentSnapshot() noexcept {
     return {false,gLocal.wasBackstage,gLocal.nearbyVent,gLocal.selectedVent,gLocal.freeCamera,
-        gLocal.pickerSlot,gLocal.pickerCount};
+        gLocal.pickerSlot,gLocal.pickerCount,gLocal.attackReady};
 }
 VentCameraStats VentCameraSnapshot() noexcept {
     return {gAimStats.aims.load(std::memory_order_acquire),gAimStats.mode.load(std::memory_order_relaxed),
         gAimStats.worlds.load(std::memory_order_relaxed),gAimStats.open.load(std::memory_order_relaxed),
-        gAimStats.vent.load(std::memory_order_relaxed)};
+        gAimStats.vent.load(std::memory_order_relaxed),gAimStats.out.load(std::memory_order_relaxed),
+        gAimStats.lift.load(std::memory_order_relaxed)};
 }
 bool GoToVent(std::uint32_t index) noexcept {
     if(!gLocal.freeCamera || !gLocal.wasBackstage || alien_pvp::VentPending() || !alien_pvp::ControlActive() ||

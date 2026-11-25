@@ -14,7 +14,9 @@ namespace aimp::alien_pvp::actions {
 inline constexpr float kAttackReach=3.2F, kAttackHeight=1.5F;
 inline constexpr float kAttackCosine=0.34F; // ~70 degrees either side of the look direction
 inline constexpr float kVentExitCosine=0.5F; // 60 degrees, vent exit selection (unchanged)
-inline constexpr float kAttackContact=1.2F; // closer than this, any direction is admitted
+// Closer than this, any direction is admitted. AvS 2026-11-25 round 4: 1.3 m
+// with the survivor behind the third-person aim was rejected (NoTarget).
+inline constexpr float kAttackContact=1.6F;
 inline constexpr float kVentMatchTolerance=0.02F, kVentEnterReach=8.0F;
 // Deliberate PvP selection radius. Actual connectivity remains a native query;
 // a portal in front is not evidence that an arbitrary floor is traversable.

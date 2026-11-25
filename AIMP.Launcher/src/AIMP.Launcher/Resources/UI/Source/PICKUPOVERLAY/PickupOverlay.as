@@ -34,12 +34,26 @@ package
          var action:int = int(this.aimp_get_bridge_value(line,"action"));
          var pickerCount:int = int(this.aimp_get_bridge_value(line,"pickerCount"));
          var pickerSlot:int = int(this.aimp_get_bridge_value(line,"pickerSlot"));
-         if(ready && !free && !pending && nearby < 0) return;
+         // Kill prompts (AvS 2026-11-25 round 4). A pending attack used to show
+         // the last vent text ("Exiting ventilation... E / Q: cancel").
+         var attackReady:Boolean = this.aimp_get_bridge_value(line,"attackReady") == "1";
+         var attackPending:Boolean = this.aimp_get_bridge_value(line,"attackPending") == "1";
+         if(ready && !free && !pending && nearby < 0 && !attackReady && !attackPending) return;
          var width:Number = stage != null ? stage.stageWidth : 1280;
          var height:Number = stage != null ? stage.stageHeight : 720;
          var text:String = "Waiting for Alien control authorization from Host...";
          var help:String = "";
-         if(ready)
+         var red:Boolean = false;
+         if(ready && attackPending && !free)
+         {
+            text = "Waiting for survivor to die";red = true;
+         }
+         else if(ready && attackReady && !free && !pending)
+         {
+            text = "Left click to kill";
+            if(nearby >= 0) help = 'Press "E" to enter ventilation';
+         }
+         else if(ready)
          {
             if(pending) text = action == 3 ? "Exiting ventilation... E / Q: cancel" : "Entering ventilation... E / Q: cancel";
             else if(free && pickerCount > 0) text = "Exit " + (pickerSlot + 1) + " / " + pickerCount + (nearby >= 0 ? ': press "E" to crawl out here' : ": looking for the opening...");
@@ -53,6 +67,7 @@ package
          this.aimp_vent_layer.graphics.drawRect(width * 0.12,height * 0.80,width * 0.76,help == "" ? 52 : 84);
          this.aimp_vent_layer.graphics.endFill();
          var prompt:TextField = this.aimp_create_round_end_text(text,22,width * 0.76,height * 0.80 + 10);prompt.x = width * 0.12;
+         if(red) prompt.textColor = 16724787;
          this.aimp_vent_layer.addChild(prompt);
          if(help != "")
          {

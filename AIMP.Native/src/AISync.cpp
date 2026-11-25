@@ -12253,6 +12253,12 @@ bool SnapshotAlienVents(std::uint32_t page,std::string& json,int goTo,std::uint6
     if(goTo>=0 && (incarnation!=gPvPLease.ticket.serial || !alien_pvp_local::GoToVent(static_cast<std::uint32_t>(goTo))))return false;
     const auto ui=alien_pvp_local::VentSnapshot();
     const auto authority=alien_pvp::VentAuthority();
+    // AvS 2026-11-25 round 4: a pending attack was reported as a pending vent
+    // and the HUD showed the last vent text ("Exiting ventilation... E / Q").
+    const bool attackPending=pvp_actions::active.used && !pvp_actions::active.cancelled &&
+        pvp_actions::active.receipt.action==alien_pvp::Action::Attack;
+    const bool attackStarted=attackPending && (pvp_actions::active.entered || pvp_actions::active.presented ||
+        pvp_actions::active.receipt.phase==alien_pvp::ActionPhase::Started);
     json="AVSVENTS:{\"scope\":\""+std::to_string(gPvPLease.sessionCookie)+":"+
         std::to_string(gPvPLease.ownerPeer)+":"+std::to_string(gPvPLease.nativeGeneration)+":"+
         std::to_string(gPvPLease.worldGeneration)+":"+std::to_string(gPvPLease.ticket.serial)+"\",\"page\":"+
@@ -12263,7 +12269,10 @@ bool SnapshotAlienVents(std::uint32_t page,std::string& json,int goTo,std::uint6
         ",\"y\":"+std::to_string(body[1])+",\"z\":"+std::to_string(body[2])+
         ",\"action\":"+std::to_string(static_cast<unsigned>(authority.action))+
         ",\"phase\":"+std::to_string(static_cast<unsigned>(authority.phase))+
-        ",\"pending\":"+(alien_pvp::VentPending()?"true":"false")+
+        ",\"pending\":"+(alien_pvp::VentPending() && !attackPending?"true":"false")+
+        ",\"attackReady\":"+(ui.attackReady && !attackPending?"true":"false")+
+        ",\"attackPending\":"+(attackPending?"true":"false")+
+        ",\"attackStarted\":"+(attackStarted?"true":"false")+
         ",\"controlReady\":"+(alien_pvp::ControlActive()?"true":"false")+",\"vents\":[";
     bool comma{};
     for(auto i=page*64U;i<std::min(table.count,(page+1U)*64U);++i) {
@@ -12596,10 +12605,12 @@ void LogDiagnostics(Diagnostics& diagnostics) {
         if(aim.aims!=lastAims) {
             lastAims=aim.aims;
             diagnostics.Log("info","alien_pvp_vent_camera",
-                "Vent-exit picker camera aimed at a new exit (debug point for the grey view into the duct). mode 1 physics rays found the open side of the room, 2 no physics world sampled (faced the nearest survivor), 3 neither (kept the mouse view). openM = free distance seen from the exit on the chosen side (-1 unknown); worlds = physics worlds probed.",
+                "Vent-exit picker camera aimed at a new exit (debug point for the grey view into the duct). mode 1 physics rays found the open side of the room, 2 no physics world sampled (faced the nearest survivor), 3 neither (kept the mouse view), 4 boxed in at the exit so probed 1.2 m above the floor found below. openM = free distance seen on the chosen side (-1 unknown); outM = metres the eye sits out from the exit into the room; liftM = eye height over the exit point; worlds = physics worlds probed.",
                 {{"vent",std::to_string(aim.vent),true},
                  {"mode",Diagnostics::Unsigned(aim.mode),true},
                  {"openM",std::to_string(aim.open),true},
+                 {"outM",std::to_string(aim.out),true},
+                 {"liftM",std::to_string(aim.lift),true},
                  {"worlds",Diagnostics::Unsigned(aim.worlds),true},
                  {"aims",Diagnostics::Unsigned(aim.aims),true}});
         }
