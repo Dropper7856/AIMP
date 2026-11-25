@@ -3,6 +3,7 @@
 
 #include <array>
 #include <atomic>
+#include <vector>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -51,6 +52,7 @@ bool Installed() noexcept { return gInstalled.load(std::memory_order_acquire); }
 namespace {
 constexpr std::uintptr_t kGunLayerUpdateRva = 0x002742B0U;
 constexpr std::uintptr_t kGunLayerCallRva = 0x00274A16U;
+constexpr std::uintptr_t kGunLayerJmpRva = 0x00274A04U;  // E9 tail jump
 constexpr std::uintptr_t kGunLayerFaultRva = 0x00274921U; // mov ecx,[eax+50]
 std::atomic<bool> gGunLayerInstalled{};
 std::atomic<std::uintptr_t> gGunLayerBase{};
@@ -87,6 +89,24 @@ bool InstallGunLayerGuard(const std::uintptr_t base, HookManager& hooks, std::st
     call.expectedTarget = reinterpret_cast<void*>(base + kGunLayerUpdateRva);
     call.detour = reinterpret_cast<void*>(&GunLayerUpdateGuarded);
     if (!hooks.InstallCallRedirect(call, error)) return false;
+    // Round 6: the crash came back through the second entry. Vtable slot
+    // 012AF200 -> 00674A00 (AND byte [ecx+8],F9 / JMP 006742B0) tail-jumps in,
+    // so the E8 redirect never saw it. Retarget that JMP rel32 too; ecx and
+    // the caller's return address are unchanged, and the wrapper pops nothing.
+    const auto jmpSite = base + kGunLayerJmpRva;
+    const auto rel = [](const std::uintptr_t from, const std::uintptr_t to) {
+        return static_cast<std::uint32_t>(to - (from + 5U));
+    };
+    const auto bytes = [](const std::uint32_t value) {
+        return std::vector<std::byte>{std::byte{0xE9},
+            static_cast<std::byte>(value & 0xFFU), static_cast<std::byte>((value >> 8U) & 0xFFU),
+            static_cast<std::byte>((value >> 16U) & 0xFFU), static_cast<std::byte>(value >> 24U)};
+    };
+    std::array<BytePatchRequest, 1U> jump{};
+    jump[0].target = reinterpret_cast<void*>(jmpSite);
+    jump[0].expected = bytes(rel(jmpSite, base + kGunLayerUpdateRva));
+    jump[0].replacement = bytes(rel(jmpSite, reinterpret_cast<std::uintptr_t>(&GunLayerUpdateGuarded)));
+    if (!hooks.InstallPatchBatch("GunLayerGuard.VtableTailJump", jump, error)) return false;
     gGunLayerInstalled.store(true, std::memory_order_release);
     return true;
 }

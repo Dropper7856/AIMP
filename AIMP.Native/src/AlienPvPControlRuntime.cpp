@@ -583,6 +583,15 @@ bool VentPending() noexcept {
     return ActionBusy() || g.hasDeferredAction || g.ventAuthority.phase==ActionPhase::Preparing ||
         g.ventAuthority.phase==ActionPhase::Started;
 }
+// AvS round 6: VentPending() is "any action in flight" for movement/input
+// gating. The HUD showed "Entering ventilation... E / Q" for a busy KILL on
+// the Client pilot (its local attack record closed while the Host retried).
+bool VentRequestPending() noexcept {
+    return (g.hasDeferredAction && VentAction(g.deferredAction)) ||
+        (VentAction(g.ventAuthority) && (g.ventAuthority.phase==ActionPhase::Preparing ||
+            g.ventAuthority.phase==ActionPhase::Started));
+}
+bool NonVentActionBusy() noexcept {return ActionBusy() && !VentRequestPending();}
 void Reset(bool certifiedLivingCharacter) noexcept {
     if(g.context.actions && g.context.actions->cancel)g.context.actions->cancel(g.context,certifiedLivingCharacter);
     if(certifiedLivingCharacter && g.context.character && g.ownsSlot)

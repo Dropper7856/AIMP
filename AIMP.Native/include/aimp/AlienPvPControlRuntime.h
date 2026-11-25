@@ -28,6 +28,9 @@ bool Owns(std::uintptr_t character,std::uint32_t generation) noexcept;
 bool MovingNow() noexcept;
 Frame VentAuthority() noexcept;
 bool VentPending() noexcept;
+// HUD only: a vent request really in flight / a non-vent (attack) action busy.
+bool VentRequestPending() noexcept;
+bool NonVentActionBusy() noexcept;
 bool ControlActive() noexcept;
 // Worker-thread calls. Queues hold copied frames, never native resources.
 bool QueueCommand(std::span<const std::byte> bytes) noexcept;

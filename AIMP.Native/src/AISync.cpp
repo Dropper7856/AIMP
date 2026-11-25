@@ -12288,8 +12288,10 @@ bool SnapshotAlienVents(std::uint32_t page,std::string& json,int goTo,std::uint6
     const auto authority=alien_pvp::VentAuthority();
     // AvS 2026-11-25 round 4: a pending attack was reported as a pending vent
     // and the HUD showed the last vent text ("Exiting ventilation... E / Q").
-    const bool attackPending=pvp_actions::active.used && !pvp_actions::active.cancelled &&
-        pvp_actions::active.receipt.action==alien_pvp::Action::Attack;
+    // Round 6: also while the control runtime still has a non-vent action in
+    // flight (Client pilot: Host retrying the kill after the local record closed).
+    const bool attackPending=(pvp_actions::active.used && !pvp_actions::active.cancelled &&
+        pvp_actions::active.receipt.action==alien_pvp::Action::Attack) || alien_pvp::NonVentActionBusy();
     const bool attackStarted=attackPending && (pvp_actions::active.entered || pvp_actions::active.presented ||
         pvp_actions::active.receipt.phase==alien_pvp::ActionPhase::Started);
     json="AVSVENTS:{\"scope\":\""+std::to_string(gPvPLease.sessionCookie)+":"+
@@ -12302,7 +12304,7 @@ bool SnapshotAlienVents(std::uint32_t page,std::string& json,int goTo,std::uint6
         ",\"y\":"+std::to_string(body[1])+",\"z\":"+std::to_string(body[2])+
         ",\"action\":"+std::to_string(static_cast<unsigned>(authority.action))+
         ",\"phase\":"+std::to_string(static_cast<unsigned>(authority.phase))+
-        ",\"pending\":"+(alien_pvp::VentPending() && !attackPending?"true":"false")+
+        ",\"pending\":"+(alien_pvp::VentRequestPending() && !attackPending?"true":"false")+
         ",\"attackReady\":"+(ui.attackReady && !attackPending?"true":"false")+
         ",\"attackPending\":"+(attackPending?"true":"false")+
         ",\"attackStarted\":"+(attackStarted?"true":"false")+
