@@ -44,6 +44,7 @@ bool LastCorrection(Frame& frame,std::uint64_t& ageMs) noexcept;
 // the others did not (session totals, any thread).
 struct MovementStats final {
     std::uint64_t heldFrames{},drivenFrames{},blockedAction{},blockedVent{},blockedStale{},blockedStage{},driveRefused{};
+    std::uint64_t chaseDriven{}; // AvS round 5: frames the auto-chase drove the Alien
 };
 MovementStats MovementSnapshot() noexcept;
 } // namespace aimp::alien_pvp

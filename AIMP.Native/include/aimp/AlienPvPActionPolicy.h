@@ -11,7 +11,13 @@ namespace aimp::alien_pvp::actions {
 // AvS 2026-11-24: 2.6 m / 60 degrees rejected every third-person click as
 // NoTarget (the camera sits behind the Alien, aim is approximate). This is only
 // the shortlist; the retail attack-availability query still proves the hit.
-inline constexpr float kAttackReach=3.2F, kAttackHeight=1.5F;
+// AvS 2026-11-25 round 5 (user decision): a click is valid within 3 m; the
+// Alien then chases the chosen survivor until the kill grabs them (guaranteed
+// kill), giving up only past the leash, after the chase window or retries.
+inline constexpr float kAttackReach=3.0F, kAttackHeight=1.5F;
+inline constexpr float kAttackLeash=6.0F, kAttackChaseStop=0.9F;
+inline constexpr std::uint64_t kAttackChaseMs=8000U;
+inline constexpr unsigned kAttackRetries=4U;
 inline constexpr float kAttackCosine=0.34F; // ~70 degrees either side of the look direction
 inline constexpr float kVentExitCosine=0.5F; // 60 degrees, vent exit selection (unchanged)
 // Closer than this, any direction is admitted. AvS 2026-11-25 round 4: 1.3 m

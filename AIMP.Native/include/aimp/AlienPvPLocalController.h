@@ -49,7 +49,11 @@ struct VentInterface {bool open{},backstage{};int nearby{-1},selected{-1};bool f
 // (m, -1 unknown); aims = exits aimed so far; vent = last aimed exit index.
 // Round 4: mode 4 = boxed in at the exit, probed 1.2 m above the floor below;
 // out = metres the eye sits out from the exit, lift = eye height over the exit.
-struct VentCameraStats {std::uint32_t aims{},mode{},worlds{};float open{};int vent{-1};float out{},lift{};};
+// Round 5: floorDrop = room floor found below the exit (m, 0 = floor-level
+// exit), ventHidden = frames a vent in reach was hidden behind geometry (E not
+// offered). mode 5 = eye pulled back to the verified-open probe point.
+struct VentCameraStats {std::uint32_t aims{},mode{},worlds{};float open{};int vent{-1};float out{},lift{},floorDrop{};
+    std::uint64_t ventHidden{};};
 [[nodiscard]] VentCameraStats VentCameraSnapshot() noexcept;
 bool GoToVent(std::uint32_t index) noexcept;
 void Pump(const Context& context) noexcept;

@@ -651,6 +651,14 @@ DWORD Bootstrap::RunImpl() {
                 : (heapError.empty() ? "UI heap synchronization requires the exact executable hash." : heapError));
         if (installed && !heapError.empty()) diagnostics.Log("warning", "ui_heap_guard_protection", heapError);
     }
+    {
+        std::string gunError;
+        const bool installed = validation.hashMatch &&
+            ui_heap_guard::InstallGunLayerGuard(moduleBase, *hooks, gunError);
+        diagnostics.Log(installed ? "info" : "error", "gun_layer_guard",
+            installed ? "Retail gun-layer update skips a frame instead of crashing when a character's held item is missing (AvS new-match crash 00674921)."
+                : (gunError.empty() ? "Gun layer guard requires the exact executable hash." : gunError));
+    }
 
     {
         std::string integrityError;
@@ -1669,7 +1677,8 @@ DWORD Bootstrap::RunImpl() {
     }
     const bool retainAISyncHooks = ai_sync::Installed();
     // The ItemSync detour runs on the engine thread like the pause shims: keep it for the process lifetime.
-    const bool retainUiRuntime = ui_heap_guard::Installed() || multiplayer_pause::Installed() ||
+    const bool retainUiRuntime = ui_heap_guard::Installed() || ui_heap_guard::GunLayerGuardInstalled() ||
+        multiplayer_pause::Installed() ||
         item_sync::Installed() || throwable_sync::Installed() || voice_sync::Installed() || loading_context_guard::Installed();
     ai_sync::BeginLogicalShutdown();
     animation_sync::props::BeginLogicalShutdown();

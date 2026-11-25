@@ -4,6 +4,11 @@
 #include <array>
 #include <atomic>
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <Windows.h>
+
 namespace aimp::ui_heap_guard {
 namespace {
 std::atomic<bool> gInstalled{};
@@ -42,4 +47,49 @@ bool Install(const std::uintptr_t base, HookManager& hooks, std::string& error) 
 }
 
 bool Installed() noexcept { return gInstalled.load(std::memory_order_acquire); }
+
+namespace {
+constexpr std::uintptr_t kGunLayerUpdateRva = 0x002742B0U;
+constexpr std::uintptr_t kGunLayerCallRva = 0x00274A16U;
+constexpr std::uintptr_t kGunLayerFaultRva = 0x00274921U; // mov ecx,[eax+50]
+std::atomic<bool> gGunLayerInstalled{};
+std::atomic<std::uintptr_t> gGunLayerBase{};
+std::atomic<std::uint64_t> gGunLayerSkipped{};
+int GunLayerFilter(const EXCEPTION_POINTERS* info) noexcept {
+    const auto base = gGunLayerBase.load(std::memory_order_relaxed);
+    const auto* record = info ? info->ExceptionRecord : nullptr;
+    // Only the known null held-item read; any other fault stays a crash.
+    return record && base && record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+        reinterpret_cast<std::uintptr_t>(record->ExceptionAddress) == base + kGunLayerFaultRva &&
+        record->NumberParameters >= 2U && record->ExceptionInformation[0] == 0U &&
+        record->ExceptionInformation[1] < 0x1000U ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
+}
+void __fastcall GunLayerUpdateGuarded(void* layer, void*) noexcept {
+    const auto base = gGunLayerBase.load(std::memory_order_relaxed);
+    __try {
+        reinterpret_cast<void(__thiscall*)(void*)>(base + kGunLayerUpdateRva)(layer);
+    } __except (GunLayerFilter(GetExceptionInformation())) {
+        gGunLayerSkipped.fetch_add(1U, std::memory_order_relaxed);
+    }
+}
+}
+
+bool InstallGunLayerGuard(const std::uintptr_t base, HookManager& hooks, std::string& error) {
+    if (GunLayerGuardInstalled()) return true;
+    if (base == 0U || !hooks.MutationAllowed()) {
+        error = "gun layer guard requires the certified executable";
+        return false;
+    }
+    gGunLayerBase.store(base, std::memory_order_relaxed);
+    CallRedirectRequest call;
+    call.name = "GunLayerGuard.HeldItemNull";
+    call.callSite = reinterpret_cast<void*>(base + kGunLayerCallRva);
+    call.expectedTarget = reinterpret_cast<void*>(base + kGunLayerUpdateRva);
+    call.detour = reinterpret_cast<void*>(&GunLayerUpdateGuarded);
+    if (!hooks.InstallCallRedirect(call, error)) return false;
+    gGunLayerInstalled.store(true, std::memory_order_release);
+    return true;
+}
+bool GunLayerGuardInstalled() noexcept { return gGunLayerInstalled.load(std::memory_order_acquire); }
+std::uint64_t GunLayerFaultsSkipped() noexcept { return gGunLayerSkipped.load(std::memory_order_relaxed); }
 }

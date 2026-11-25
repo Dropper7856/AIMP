@@ -20,5 +20,8 @@ struct ActionHooks final {
     bool (*drive)(const Context&,const Frame* intent) noexcept{};
     bool (*replicatePose)(const Context&,const Frame&) noexcept{};
     bool (*interruptVent)(const Context&,Frame&) noexcept{};
+    // AvS round 5 auto-chase. While a pending attack has not been submitted:
+    // 0 not chasing, 1 run toward the victim along yaw, 2 close enough, hold.
+    int (*chase)(const Context&,float& yaw) noexcept{};
 };
 } // namespace aimp::alien_pvp

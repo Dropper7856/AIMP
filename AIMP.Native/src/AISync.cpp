@@ -1,6 +1,7 @@
 #include <intrin.h>
 #include "aimp/AISync.h"
 #include "aimp/AlienPvPLocalController.h"
+#include "aimp/UIHeapGuard.h"
 #include "aimp/AlienPvPSpatialPolicy.h"
 #include "aimp/AlienPvPResponsiveStop.h"
 #include "aimp/AlienPvPControlRuntime.h"
@@ -970,6 +971,9 @@ std::atomic<std::uint64_t> gPairedVictimInitializeAborted{};
 std::atomic<std::uint64_t> gPairedVictimEventsRejected{}, gPairedVictimDuplicates{}, gPairedVictimBusy{};
 std::atomic<std::uint64_t> gPairedVictimNativeDispatches{}, gPairedVictimNativeStarted{};
 std::atomic<std::uint64_t> gPairedVictimAvailabilityOverrides{};
+// AvS round 5: OR of paired-victim availability outcomes since the last
+// alien_attack_progress line (bits documented there).
+std::atomic<std::uint32_t> gPairedVictimGateSeen{};
 std::atomic<std::uint64_t> gPairedPlayerPreparationRemaps{}, gPairedPlayerCategoryRemaps{};
 std::atomic<std::uint64_t> gPairedVictimLocalDispatches{}, gPairedVictimLocalStarted{};
 std::atomic<std::uint64_t> gPairedVictimConvergenceDetached{}, gPairedVictimSnapshotsDeferred{};
@@ -4466,14 +4470,43 @@ bool LocalVictimInitializationReady(const std::uintptr_t victim, const std::uint
         Read(nativeCycle + 0x68U, source) && Read(nativeCycle + 0xB0U, sourceCycle) &&
         VictimAdmissionMatches(victim, source, sourceCycle);
 }
+// Diagnostics only: why LocalVictimInitializationReady refused (0 = ready).
+std::uint32_t LocalVictimGateBits(const std::uintptr_t victim, const std::uintptr_t nativeCycle) noexcept {
+    PairIdentity binding{};
+    std::uintptr_t source{}, sourceCycle{}, graph{}, controller{};
+    std::uint8_t enabled{}, player{}, state{};
+    if (!LocalClientVictim(victim)) return 128U;
+    if (!PublishedPairParticipant(victim, binding) || binding.animated == 0U) return 256U;
+    if (!Read(binding.animated + 0x2CF4U, enabled) || enabled == 0U ||
+        !Read(binding.animated + 0x34BCU, graph) || graph == 0U) return 512U;
+    if (!Read(victim + 0x31CU, controller) || controller == 0U ||
+        !Read(controller + 0x48U, player) || player == 0U) return 1024U;
+    if (!Read(nativeCycle + 0x1AU, state) || state != 0x4FU) return 2048U;
+    if (!Read(nativeCycle + 0x68U, source) || !Read(nativeCycle + 0xB0U, sourceCycle) ||
+        !VictimAdmissionMatches(victim, source, sourceCycle)) return 4096U;
+    return 0U;
+}
 std::uint32_t __fastcall PairedVictimAvailabilityDetour(void* logical, void*, const std::uintptr_t nativeCycle) noexcept {
     const auto retail = reinterpret_cast<TargetEligibility>(gBase + 0x0038B330U)(logical);
-    if (retail == 0U) return retail;
+    if (retail == 0U) { gPairedVictimGateSeen.fetch_or(1U, std::memory_order_relaxed); return retail; }
     std::uintptr_t victim{};
     if (!Read(reinterpret_cast<std::uintptr_t>(logical), victim) ||
-        reinterpret_cast<std::uintptr_t>(logical) != victim + 0x280U ||
-        (!RemoteVictimPresentationReady(victim) && !LocalVictimInitializationReady(victim, nativeCycle)) ||
-        !RemoteVictimPairPresent(victim, nativeCycle)) return retail;
+        reinterpret_cast<std::uintptr_t>(logical) != victim + 0x280U) {
+        gPairedVictimGateSeen.fetch_or(2U, std::memory_order_relaxed); return retail;
+    }
+    const bool local = LocalClientVictim(victim);
+    const bool remoteReady = RemoteVictimPresentationReady(victim);
+    const bool localReady = !remoteReady && LocalVictimInitializationReady(victim, nativeCycle);
+    const bool present = (remoteReady || localReady) && RemoteVictimPairPresent(victim, nativeCycle);
+    {
+        std::uint32_t bits = local ? 64U : 0U;
+        if (!remoteReady && !local) bits |= 4U;
+        if (!remoteReady && !localReady && local) bits |= 8U | LocalVictimGateBits(victim, nativeCycle);
+        if ((remoteReady || localReady) && !present) bits |= 16U;
+        if (present) bits |= 32U;
+        gPairedVictimGateSeen.fetch_or(bits, std::memory_order_relaxed);
+    }
+    if (!present) return retail;
     // Only the victim initializer and the two paired destructors call here.
     // A loaded remote presentation actor may have proxy execution phase 1/2/3;
     // permit its native victim/death graph, never its autonomous brain.
@@ -12589,6 +12622,7 @@ void LogDiagnostics(Diagnostics& diagnostics) {
                  {"blockedStale",Diagnostics::Unsigned(m.blockedStale),true},
                  {"blockedStage",Diagnostics::Unsigned(m.blockedStage),true},
                  {"driveRefused",Diagnostics::Unsigned(m.driveRefused),true},
+                 {"chaseDriven",Diagnostics::Unsigned(m.chaseDriven),true},
                  {"stalls",Diagnostics::Unsigned(stalls),true},
                  {"restarts",Diagnostics::Unsigned(s.restarts.load()),true},
                  {"requestsLost",Diagnostics::Unsigned(lost),true},
@@ -12600,17 +12634,26 @@ void LogDiagnostics(Diagnostics& diagnostics) {
         }
     }
     {
+        static std::uint64_t lastGunSkips{};
+        if(const auto skips=ui_heap_guard::GunLayerFaultsSkipped();skips!=lastGunSkips) {
+            lastGunSkips=skips;
+            diagnostics.Log("warning","gun_layer_guard_skip",
+                "Retail gun-layer update hit a missing held item (the new-match crash) and skipped that frame; total this session.",
+                {{"skips",Diagnostics::Unsigned(skips),true}});
+        }
         static std::uint32_t lastAims{};
         const auto aim=alien_pvp_local::VentCameraSnapshot();
         if(aim.aims!=lastAims) {
             lastAims=aim.aims;
             diagnostics.Log("info","alien_pvp_vent_camera",
-                "Vent-exit picker camera aimed at a new exit (debug point for the grey view into the duct). mode 1 physics rays found the open side of the room, 2 no physics world sampled (faced the nearest survivor), 3 neither (kept the mouse view), 4 boxed in at the exit so probed 1.2 m above the floor found below. openM = free distance seen on the chosen side (-1 unknown); outM = metres the eye sits out from the exit into the room; liftM = eye height over the exit point; worlds = physics worlds probed.",
+                "Vent-exit picker camera aimed at a new exit (debug point for the grey view into the duct). mode 1 physics rays found the open side of the room, 2 no physics world sampled (faced the nearest survivor), 3 neither (kept the mouse view), 4 elevated (ceiling) exit, probed 0.8-1.6 m above the room floor found below it, 5 no verified eye position (stayed on the probe point). Round 5: an eye must be reachable from its probe point, stand over a floor and see the exit. openM = free distance seen on the chosen side (-1 unknown); outM = metres the eye sits out from the exit (flat); liftM = eye height over the exit point (negative below a ceiling exit); floorDropM = room floor below the exit (0 = floor-level exit); ventHiddenFrames = frames a vent in reach was hidden behind geometry so E was not offered (session total); worlds = physics worlds probed.",
                 {{"vent",std::to_string(aim.vent),true},
                  {"mode",Diagnostics::Unsigned(aim.mode),true},
                  {"openM",std::to_string(aim.open),true},
                  {"outM",std::to_string(aim.out),true},
                  {"liftM",std::to_string(aim.lift),true},
+                 {"floorDropM",std::to_string(aim.floorDrop),true},
+                 {"ventHiddenFrames",Diagnostics::Unsigned(aim.ventHidden),true},
                  {"worlds",Diagnostics::Unsigned(aim.worlds),true},
                  {"aims",Diagnostics::Unsigned(aim.aims),true}});
         }
