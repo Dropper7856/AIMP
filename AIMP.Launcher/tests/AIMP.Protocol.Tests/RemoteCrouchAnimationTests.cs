@@ -28,6 +28,45 @@ internal static class RemoteCrouchAnimationTests
         return Task.CompletedTask;
     }
 
+    // A launcher update wipes <install>\WorldManifestCache while the receipt in
+    // %LOCALAPPDATA% survives: its manifests must be judged stale, never trusted
+    // outside the current cache, and never throw.
+    internal static Task StaleManifestReceiptAsync()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "aimp-stale-receipt-" + Guid.NewGuid().ToString("N"));
+        var cache = Path.Combine(root, "WorldManifestCache");
+        var oldInstall = Path.Combine(root, "old-install", "WorldManifestCache");
+        Directory.CreateDirectory(cache);
+        Directory.CreateDirectory(oldInstall);
+        try
+        {
+            var current = Path.Combine(cache, "MAP.aimpwm");
+            File.WriteAllBytes(current, [1]);
+            AssertEx.True(GamePreparationService.IsTrustedManifestPath(current, cache), "A manifest in the current cache is trusted.");
+            AssertEx.True(GamePreparationService.IsTrustedManifestPath(current, cache + Path.DirectorySeparatorChar),
+                "A trailing separator on the cache directory is ignored.");
+            AssertEx.False(GamePreparationService.IsTrustedManifestPath(Path.Combine(cache, "GONE.aimpwm"), cache),
+                "A manifest wiped by a launcher update is stale.");
+            var elsewhere = Path.Combine(oldInstall, "MAP.aimpwm");
+            File.WriteAllBytes(elsewhere, [1]);
+            AssertEx.False(GamePreparationService.IsTrustedManifestPath(elsewhere, cache),
+                "A manifest left in another install's cache is not trusted.");
+            AssertEx.False(GamePreparationService.IsTrustedManifestPath(Path.Combine(cache, "..", "old-install", "WorldManifestCache", "MAP.aimpwm"), cache),
+                "Relative segments cannot escape the cache.");
+            var other = Path.Combine(cache, "notes.txt");
+            File.WriteAllBytes(other, [1]);
+            AssertEx.False(GamePreparationService.IsTrustedManifestPath(other, cache), "Only *.aimpwm files are manifests.");
+            AssertEx.False(GamePreparationService.IsTrustedManifestPath("MAP.aimpwm", cache), "Relative receipt paths are rejected.");
+            AssertEx.False(GamePreparationService.IsTrustedManifestPath(string.Empty, cache), "Empty receipt paths are rejected.");
+            AssertEx.False(GamePreparationService.IsTrustedManifestPath("C:\\bad\0name.aimpwm", cache), "Invalid paths are rejected, not thrown.");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+        return Task.CompletedTask;
+    }
+
     internal static Task RetailAsync()
     {
         var path = Environment.GetEnvironmentVariable("AIMP_TEST_ANIMATION_PAK");
