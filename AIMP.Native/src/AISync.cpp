@@ -12659,6 +12659,24 @@ void LogDiagnostics(Diagnostics& diagnostics) {
                  {"worlds",Diagnostics::Unsigned(aim.worlds),true},
                  {"aims",Diagnostics::Unsigned(aim.aims),true}});
         }
+        // Round 7: "no vent prompt in front of a vent". Every 2 s while the
+        // reach counters move: was a vent in reach at all, and did the
+        // line-of-sight ray hide it (hit far from the vent) or accept it.
+        static std::uint64_t lastReach{},lastHidden{},lastFace{};static ULONGLONG lastReachLog{};
+        const auto nowTick=GetTickCount64();
+        if((aim.inReachFrames!=lastReach || aim.ventHidden!=lastHidden || aim.ventFaceHits!=lastFace) &&
+            nowTick-lastReachLog>=2000U) {
+            lastReach=aim.inReachFrames;lastHidden=aim.ventHidden;lastFace=aim.ventFaceHits;lastReachLog=nowTick;
+            diagnostics.Log("info","alien_pvp_vent_reach",
+                "Alien pilot vent prompt check (session totals). inReachFrames = frames a vent was within reach (2.75 m flat, -1.5..+4.5 m height); hiddenFrames = frames the chest->vent ray hit geometry more than 1 m from the vent (E not offered), hiddenGapM = that last distance; faceFrames = frames the ray hit within 1 m of the vent (its own grille; E still offered), faceGapM = that last distance; tableCount = native vent table size (0 = unreadable); worlds = physics worlds ray-tested.",
+                {{"inReachFrames",Diagnostics::Unsigned(aim.inReachFrames),true},
+                 {"hiddenFrames",Diagnostics::Unsigned(aim.ventHidden),true},
+                 {"hiddenGapM",std::to_string(aim.hiddenGap),true},
+                 {"faceFrames",Diagnostics::Unsigned(aim.ventFaceHits),true},
+                 {"faceGapM",std::to_string(aim.faceGap),true},
+                 {"tableCount",Diagnostics::Unsigned(aim.tableCount),true},
+                 {"worlds",Diagnostics::Unsigned(aim.reachWorlds),true}});
+        }
     }
     {
         static std::uint64_t lastWanted{},lastRejected{};

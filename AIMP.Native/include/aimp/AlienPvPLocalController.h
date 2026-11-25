@@ -53,7 +53,13 @@ struct VentInterface {bool open{},backstage{};int nearby{-1},selected{-1};bool f
 // exit), ventHidden = frames a vent in reach was hidden behind geometry (E not
 // offered). mode 5 = eye pulled back to the verified-open probe point.
 struct VentCameraStats {std::uint32_t aims{},mode{},worlds{};float open{};int vent{-1};float out{},lift{},floorDrop{};
-    std::uint64_t ventHidden{};};
+    std::uint64_t ventHidden{};
+    // Round 7: ventFaceHits = frames the ray hit within 1 m of the vent point
+    // (its own grille, still offered); hiddenGap/faceGap = last such distance.
+    std::uint64_t ventFaceHits{};float hiddenGap{-1.0F},faceGap{-1.0F};
+    // inReachFrames = frames any vent was inside reach; tableCount = native
+    // vent table size; reachWorlds = physics worlds the reach ray used.
+    std::uint64_t inReachFrames{};std::uint32_t tableCount{},reachWorlds{};};
 [[nodiscard]] VentCameraStats VentCameraSnapshot() noexcept;
 bool GoToVent(std::uint32_t index) noexcept;
 void Pump(const Context& context) noexcept;
