@@ -72,10 +72,11 @@ internal static class RemoteCrouchAnimationTests
         var path = Environment.GetEnvironmentVariable("AIMP_TEST_ANIMATION_PAK");
         if (string.IsNullOrWhiteSpace(path))
         {
-            Console.WriteLine("SKIP retail crouch/hiding animation patch: AIMP_TEST_ANIMATION_PAK is not set.");
+            Console.WriteLine("SKIP retail crouch animation patch: AIMP_TEST_ANIMATION_PAK is not set.");
             return Task.CompletedTask;
         }
         var pak = new PAK2(path);
+        var retailPak = new PAK2(path);
         const string dbPath = @"DATA\ANIM_SYS\569978346_ANIM_CLIP_DB.BIN";
         var changed = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -86,6 +87,14 @@ internal static class RemoteCrouchAnimationTests
             changed.Add(profile.ClipDbEntry);
             changed.Add(profile.SkeletonDefEntry);
         }
+        var thirdPerson = RemoteCrouchAnimationInstaller.ThirdPersonClips;
+        var thirdPersonAliases = thirdPerson.Select(c => c.AliasHash).ToHashSet();
+        var thirdPersonPaths = thirdPerson.Select(c => c.PathHash).ToHashSet();
+        var added = thirdPerson.SelectMany(c => new[] { "STREAMED", "STREAMED64" }
+            .Select(d => RemoteCrouchAnimationInstaller.StreamedSectionEntry(d, c.PathHash))).ToArray();
+        foreach (var name in added) AssertEx.False(pak.Entries.Any(e => e.Filename == name), "Retail must not contain " + name);
+        changed.UnionWith(added);
+        changed.Add(RemoteCrouchAnimationInstaller.DebugStringsEntry);
         var before = pak.Entries.ToDictionary(e => e.Filename, e => SHA256.HashData(e.Content));
         var original = AnimClipDatabase.Parse(pak.Entries.Single(e => e.Filename == dbPath).Content);
         var originalGlobalBytes = pak.Entries.Single(e => e.Filename == @"DATA\ANIM_SYS\ANIM_CLIP_DB.BIN").Content;
@@ -110,17 +119,37 @@ internal static class RemoteCrouchAnimationTests
         var global = GlobalClipDatabase.Parse(pak.Entries.Single(e => e.Filename == @"DATA\ANIM_SYS\ANIM_CLIP_DB.BIN").Content);
         using var patchedReader = new BinaryReader(new MemoryStream(pak.Entries.Single(e => e.Filename == @"DATA\ANIM_SYS\ANIM_CLIP_DB.BIN").Content));
         var patchedSections = AnimClipDatabase.ReadTable(patchedReader, r => (r.ReadUInt32(), r.ReadUInt32()));
-        AssertEx.True(originalSections.Keys.SequenceEqual(patchedSections.Keys));
-        AssertEx.True(originalSections.Values.SequenceEqual(patchedSections.Values), "Preserve all resident/streamed clip mappings.");
+        AssertEx.True(originalSections.Keys.SequenceEqual(patchedSections.Keys.Where(k => !thirdPersonPaths.Contains(k.Hash))
+                .Select(k => (k.Hash, k.Slot))) &&
+            originalSections.Values.SequenceEqual(patchedSections.Values.Take(originalSections.Values.Count)),
+            "Preserve all resident/streamed clip mappings; only the third-person clip sections are appended.");
+        foreach (var clip in thirdPerson)
+        {
+            AssertEx.Equal(clip.PathHash, global.SectionGroup(clip.PathHash)!.Value, clip.Alias + " is its own streamed group");
+            AssertEx.Equal(uint.MaxValue, global.SectionClipIndex(clip.PathHash), clip.Alias + " is streamed (index -1)");
+            foreach (var directory in new[] { "STREAMED", "STREAMED64" })
+                AssertEx.True(pak.Entries.Single(e => e.Filename == RemoteCrouchAnimationInstaller.StreamedSectionEntry(directory, clip.PathHash))
+                    .Content.AsSpan().SequenceEqual(RemoteCrouchAnimationInstaller.ThirdPersonSection(clip, directory)),
+                    clip.Alias + " " + directory + " section is the launcher resource");
+        }
+        // OpenCAGE resolves every clip's names on load; check them with CathodeLib's own reader.
+        var debugNames = new AnimationStrings(pak.Entries.Single(e => e.Filename == RemoteCrouchAnimationInstaller.DebugStringsEntry).Content, "debug");
+        foreach (var name in thirdPerson.SelectMany(RemoteCrouchAnimationInstaller.DebugNames))
+            AssertEx.Equal(name, debugNames.GetString(AnimClipDatabase.HashName(name)), "Debug name for OpenCAGE: " + name);
+        var retailNames = new AnimationStrings(retailPak.Entries.Single(e => e.Filename == RemoteCrouchAnimationInstaller.DebugStringsEntry).Content, "retail");
+        AssertEx.True(retailNames.Entries.All(kv => debugNames.GetString(kv.Key) == kv.Value), "Every retail debug name is kept.");
         AssertEx.True(original.BlendSets.Keys.SequenceEqual(patched.BlendSets.Keys));
         AssertEx.True(original.BlendSets.Values.SequenceEqual(patched.BlendSets.Values));
-        VerifyHiding(pak, original, originalGlobal, patched, global, characters);
+        VerifyBaseTables(pak, original, originalGlobal, patched, global, characters, thirdPersonAliases);
         foreach (var profile in RemoteCrouchAnimationInstaller.Profiles)
         {
             var crew = AnimClipDatabase.Parse(pak.Entries.Single(e => e.Filename == profile.ClipDbEntry).Content);
-            foreach (var (name, pathHash) in HidingClips)
-                AssertEx.Equal(pathHash, crew.Animations.Get(AnimClipDatabase.HashName(name))!.Value.Path,
-                    profile.Character + " hiding alias: " + name);
+            var retailCrew = AnimClipDatabase.Parse(retailPak.Entries.Single(e => e.Filename == profile.ClipDbEntry).Content);
+            AssertEx.True(RetailPlusThirdPerson(retailCrew, crew, thirdPersonAliases),
+                profile.Character + " base table must stay retail plus the AIMP third-person clips.");
+            foreach (var clip in thirdPerson)
+                AssertEx.Equal(new AnimClipDatabase.Clip(clip.PathHash, 0), crew.Animations.Get(clip.AliasHash)!.Value,
+                    profile.Character + " plays " + clip.Alias);
             AssertEx.True(crew.Context("CROUCHED") is not null, profile.Character + " crouched context");
             var skeleton = pak.Entries.Single(e => e.Filename == profile.SkeletonDefEntry).Content;
             AssertEx.Equal(AnimClipDatabase.HashName(profile.LowRes), BitConverter.ToUInt32(skeleton, 4));
@@ -173,37 +202,19 @@ internal static class RemoteCrouchAnimationTests
         foreach (var entry in pak.Entries.Where(e => changed.Contains(e.Filename)))
             AssertEx.True(first[entry.Filename].AsSpan().SequenceEqual(SHA256.HashData(entry.Content)),
                 "Patch must be idempotent: " + entry.Filename);
-        VerifyRejectedHidingSource(pak);
-        Console.WriteLine("Retail NPC crouch/hiding aliases, dependencies, metadata, contexts, unrelated resources and idempotence verified.");
+        Console.WriteLine("Retail NPC crouch aliases, retail base tables, dependencies, metadata, contexts, unrelated resources and idempotence verified.");
         return Task.CompletedTask;
     }
 
-    private static readonly (string Name, uint Path)[] HidingClips =
-    [
-        ("player_hiding_high_enter", 2721887201U), ("player_hiding_high_idle", 579261719U),
-        ("player_hiding_high_exit", 921403137U), ("player_hiding_low_enter", 2481641574U),
-        ("player_hiding_low_idle", 3973604370U), ("player_hiding_low_exit", 2574502800U),
-    ];
-
-    private static void VerifyHiding(PAK2 pak, AnimClipDatabase original, GlobalClipDatabase originalGlobal,
-        AnimClipDatabase patched, GlobalClipDatabase global, uint[] characters)
+    // AnimationSync plays third-person clips only: no first-person (FEMALEFP)
+    // clip may enter a representation's base table. The crouch walks stay in
+    // the CROUCHED context only.
+    private static void VerifyBaseTables(PAK2 pak, AnimClipDatabase original, GlobalClipDatabase originalGlobal,
+        AnimClipDatabase patched, GlobalClipDatabase global, uint[] characters, HashSet<uint> thirdPersonAliases)
     {
         var player = AnimClipDatabase.Parse(pak.Entries.Single(e => e.Filename == @"DATA\ANIM_SYS\2554777613_ANIM_CLIP_DB.BIN").Content);
         var character = AnimClipDatabase.HashName("E_RIPLEY");
         var expectedGroups = originalGlobal.Dependencies(character).ToHashSet();
-        foreach (var (name, path) in HidingClips)
-        {
-            var key = AnimClipDatabase.HashName(name);
-            var source = player.Animations.Get(key)!.Value;
-            AssertEx.Equal(new AnimClipDatabase.Clip(path, 0), source, "Retail hiding source identity: " + name);
-            AssertEx.Equal(source, patched.Animations.Get(key)!.Value, "Remote hiding alias: " + name);
-            var group = global.SectionGroup(source.Path)!.Value;
-            AssertEx.Equal(uint.MaxValue, global.SectionClipIndex(source.Path), "Retail hiding clips are streamed.");
-            AssertEx.Equal(source.Path, group, "Streamed section is keyed by the clip path.");
-            AssertEx.True(pak.Entries.Any(e => e.Filename == $@"DATA\ANIM_SYS\STREAMED\ANIM_CLIP_DB_SEC_{group}.BIN"));
-            AssertEx.False(global.Dependencies(character).Contains(group), "Do not request a streamed clip from RESIDENT.");
-            Console.WriteLine($"Hiding alias {name}: path={source.Path}, metadata={source.MetadataInstance}, section={group}, index={global.SectionClipIndex(source.Path)}");
-        }
         foreach (var name in new[] { "fp_walk_f_crouch", "fp_walk_b_crouch", "fp_walk_l_crouch" })
             expectedGroups.Add(global.SectionGroup(player.Animations.Get(AnimClipDatabase.HashName(name))!.Value.Path)!.Value);
         expectedGroups.Add(global.SectionGroup(original.Context("WEAPON_SHOTGUN")!.Animations
@@ -215,49 +226,23 @@ internal static class RemoteCrouchAnimationTests
         foreach (var other in characters.Where(c => !PlayerCharacterCatalog.All.Any(p => p.NameHash == c)))
             AssertEx.True(originalGlobal.Dependencies(other).SequenceEqual(global.Dependencies(other)),
                 "Another character's dependencies changed: " + other);
-        foreach (var (hash, slot) in original.Animations.Keys)
-            AssertEx.Equal(original.Animations.Values[slot], patched.Animations.Get(hash)!.Value,
-                "Preserve existing base alias: " + hash);
-        AssertEx.Equal(original.Animations.Keys.Count + HidingClips.Count(c =>
-            !original.Animations.Contains(AnimClipDatabase.HashName(c.Name))), patched.Animations.Keys.Count);
+        AssertEx.True(RetailPlusThirdPerson(original, patched, thirdPersonAliases),
+            "The representation base table must stay retail plus third-person clips: no first-person alias is added.");
         var def = pak.Entries.Single(e => e.Filename == @"DATA\ANIM_SYS\SKELE\DEFS\569978346.BIN").Content;
         AssertEx.Equal(AnimClipDatabase.HashName("FEMALENPC"), BitConverter.ToUInt32(def, 4));
         AssertEx.True(Enumerable.Range(0, BitConverter.ToInt32(def, 12))
-            .Any(i => BitConverter.ToUInt32(def, 16 + i * 4) == AnimClipDatabase.HashName("FEMALEFP")));
+            .Any(i => BitConverter.ToUInt32(def, 16 + i * 4) == AnimClipDatabase.HashName("FEMALEFP")),
+            "The crouch walks still retarget FEMALEFP through the low-res skeleton.");
     }
 
-    private static void VerifyRejectedHidingSource(PAK2 pak)
+    // Retail rows unchanged (same values, same relative key order); the only
+    // additions are the AIMP third-person aliases.
+    private static bool RetailPlusThirdPerson(AnimClipDatabase retail, AnimClipDatabase patched, HashSet<uint> thirdPerson)
     {
-        var entry = pak.Entries.Single(e => e.Filename == @"DATA\ANIM_SYS\2554777613_ANIM_CLIP_DB.BIN");
-        var original = entry.Content;
-        try
-        {
-            foreach (var failure in new[] { "metadata", "missing", "section" })
-            {
-                var player = AnimClipDatabase.Parse(original);
-                var key = AnimClipDatabase.HashName("player_hiding_low_exit");
-                if (failure == "missing")
-                {
-                    var table = new AnimClipDatabase.Table<AnimClipDatabase.Clip>();
-                    foreach (var (hash, slot) in player.Animations.Keys.Where(k => k.Hash != key))
-                        table.Set(hash, player.Animations.Values[slot]);
-                    player.Animations = table;
-                }
-                else player.Animations.Set(key, failure == "metadata"
-                    ? player.Animations.Get(key)!.Value with { MetadataInstance = 1 }
-                    : new AnimClipDatabase.Clip(0, 0));
-                entry.Content = player.Serialize();
-                var before = pak.Entries.ToDictionary(e => e.Filename, e => SHA256.HashData(e.Content));
-                var rejected = false;
-                try { RemoteCrouchAnimationInstaller.Patch(pak); }
-                catch (InvalidDataException ex) when (ex.Message.Contains("player_hiding_low_exit")) { rejected = true; }
-                AssertEx.True(rejected, "Reject invalid hiding source before publishing package entries: " + failure);
-                foreach (var resource in pak.Entries)
-                    AssertEx.True(before[resource.Filename].AsSpan().SequenceEqual(SHA256.HashData(resource.Content)),
-                        "Rejected hiding patch modified resource: " + resource.Filename);
-            }
-        }
-        finally { entry.Content = original; }
+        var kept = patched.Animations.Keys.Where(k => !thirdPerson.Contains(k.Hash)).ToList();
+        return patched.Animations.Keys.Count == retail.Animations.Keys.Count + thirdPerson.Count &&
+            retail.Animations.Keys.Select(k => k.Hash).SequenceEqual(kept.Select(k => k.Hash)) &&
+            retail.Animations.Keys.All(k => retail.Animations.Values[k.Slot] == patched.Animations.Get(k.Hash));
     }
 
     private static void VerifyLocomotion(PAK2 pak, GlobalClipDatabase global, AnimClipDatabase db, byte[] retail, byte[] blend)

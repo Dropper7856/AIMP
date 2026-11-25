@@ -17,6 +17,8 @@
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="Resources\AlienPvP\alien_behavior.apb" LogicalName="AIMP.Launcher.AlienPvP.alien_behavior.apb" />
+    <!-- AnimationSync third-person clips: the two streamed sections OpenCAGE builds per clip. -->
+    <EmbeddedResource Include="Resources\AnimationSync\*.bin" LogicalName="AIMP.Launcher.AnimationSync.%(Filename)%(Extension)" />
     <!-- Facepunch.Steamworks ships steam_api64.dll as legacy package content,
          which PackageReference does not copy. -->
     <None Include="$(PkgFacepunch_Steamworks)\content\steam_api64.dll"

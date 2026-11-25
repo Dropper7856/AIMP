@@ -469,6 +469,12 @@ if(BUILD_TESTING)
     set_target_properties(AIMP.AnimationSyncPropsHookTests PROPERTIES
         VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
     add_test(NAME AnimationSyncPropsHookInstallation COMMAND AIMP.AnimationSyncPropsHookTests)
+    add_executable(AIMP.AnimationSyncThirdPersonTests tests/AnimationSyncThirdPersonTests.cpp)
+    target_include_directories(AIMP.AnimationSyncThirdPersonTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_options(AIMP.AnimationSyncThirdPersonTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.AnimationSyncThirdPersonTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME AnimationSyncThirdPersonTable COMMAND AIMP.AnimationSyncThirdPersonTests)
     add_executable(AIMP.AISyncHookTests tests/AISyncHookInstallationTests.cpp)
     target_link_libraries(AIMP.AISyncHookTests PRIVATE AIMP.Core)
     target_compile_definitions(AIMP.AISyncHookTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

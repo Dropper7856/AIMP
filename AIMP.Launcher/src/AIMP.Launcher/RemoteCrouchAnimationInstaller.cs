@@ -17,19 +17,18 @@ namespace AIMP.Launcher;
 ///     walks (FEMALEFP), which E_RIPLEY may retarget through the existing
 ///     FEMALEFP-&gt;FEMALENPC mapping once FEMALEFP is one of its low-res sources
 ///     and the player's clip group is one of its dependencies.
-/// Hiding entry/idle/exit aliases also use the player's FEMALEFP clips in the
-/// base table for isolated remote animation commands. Upper-body weapon layers
-/// still come from the weapon contexts.
-/// AnimationSync: every other first-person alias the representation lacks
-/// (interactions: buttons, generators, terminals, vents, levers, hacking...) is
-/// added to its base table too, so any scripted clip the owner plays can be
-/// replayed by alias on the remote body. Retail aliases are never replaced.
+/// AnimationSync no longer gives representations any first-person clip: they
+/// play third-person clips only (AIMP.Native AnimationSyncThirdPerson.h), all
+/// of which the retail representation sets already hold. Version 10 drops the
+/// FEMALEFP interaction and hiding aliases versions 8/9 added. Version 11
+/// adds the AIMP-made third-person clips (ThirdPersonAnimationClips); 12 also
+/// registers their debug names, without which OpenCAGE cannot load the PAK.
 /// ANIMATION.PAK is global: the retail file is backed up once and every
 /// installation rebuilds the patched file from that backup.
 /// </summary>
-internal static class RemoteCrouchAnimationInstaller
+internal static partial class RemoteCrouchAnimationInstaller
 {
-    private const int PatchVersion = 8;
+    private const int PatchVersion = 12;
     private const string PlayerClipDbEntry = @"DATA\ANIM_SYS\2554777613_ANIM_CLIP_DB.BIN"; // 1ST_PERSON_RIPLEY
     private const string GlobalClipDbEntry = @"DATA\ANIM_SYS\ANIM_CLIP_DB.BIN";
     private const string CrouchedContext = "CROUCHED";
@@ -54,14 +53,8 @@ internal static class RemoteCrouchAnimationInstaller
     private const string CrouchBackward = "fp_walk_b_crouch";
     private const string CrouchLeft = "fp_walk_l_crouch";
 
-    private static readonly string[] HidingClips =
-    [
-        "player_hiding_high_enter", "player_hiding_high_idle", "player_hiding_high_exit",
-        "player_hiding_low_enter", "player_hiding_low_idle", "player_hiding_low_exit",
-    ];
-
     private static IEnumerable<string> PlayerSources => Replacements.Where(r => r.PlayerClip)
-        .Select(r => r.Source).Concat(HidingClips).Distinct();
+        .Select(r => r.Source).Distinct();
 
     private static readonly string[] Idles =
     [
@@ -128,7 +121,9 @@ internal static class RemoteCrouchAnimationInstaller
             .Concat(Backward.Select(n => (n, CrouchBackward, true)))
             .Concat(Left.Concat(Right).Select(n => (n, CrouchLeft, true)));
 
-    private sealed record State(int PatchVersion, string OriginalSha256, string PatchedSha256);
+    // ClipsSha256: the shipped third-person clips; a rebuilt clip re-patches
+    // without a PatchVersion bump (null in states written before 578).
+    private sealed record State(int PatchVersion, string OriginalSha256, string PatchedSha256, string? ClipsSha256 = null);
 
     // Read-only: true when Install would find nothing to patch.
     internal static bool IsInstalled(string game)
@@ -140,7 +135,7 @@ internal static class RemoteCrouchAnimationInstaller
         try
         {
             var state = File.Exists(statePath) ? JsonSerializer.Deserialize<State>(File.ReadAllText(statePath)) : null;
-            return state != null && state.PatchVersion == PatchVersion && File.Exists(target) && File.Exists(backup)
+            return state != null && state.PatchVersion == PatchVersion && state.ClipsSha256 == ThirdPersonClipsSha256() && File.Exists(target) && File.Exists(backup)
                 && Hash(target) == state.PatchedSha256 && Hash(backup) == state.OriginalSha256;
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
@@ -160,12 +155,9 @@ internal static class RemoteCrouchAnimationInstaller
         var state = File.Exists(statePath) ? JsonSerializer.Deserialize<State>(File.ReadAllText(statePath)) : null;
 
         var current = Hash(target);
-        if (state != null && state.PatchVersion == PatchVersion && current == state.PatchedSha256 &&
+        if (state != null && state.PatchVersion == PatchVersion && state.ClipsSha256 == ThirdPersonClipsSha256() && current == state.PatchedSha256 &&
             File.Exists(backup) && Hash(backup) == state.OriginalSha256)
-        {
-            AnimationSyncBoneMasks.Ensure(game, backup, state.OriginalSha256, token);
             return;
-        }
 
         // The current file is retail unless it is our own earlier output. A
         // repaired or updated game replaces the retained original.
@@ -193,11 +185,10 @@ internal static class RemoteCrouchAnimationInstaller
             if (Hash(target) != current) throw new IOException("ANIMATION.PAK changed during preparation.");
             File.Replace(staged, target, null);
             if (Hash(target) != patched) throw new IOException("The published ANIMATION.PAK differs from its staged copy.");
-            File.WriteAllText(statePath + ".tmp", JsonSerializer.Serialize(new State(PatchVersion, original, patched)));
+            File.WriteAllText(statePath + ".tmp", JsonSerializer.Serialize(new State(PatchVersion, original, patched, ThirdPersonClipsSha256())));
             File.Move(statePath + ".tmp", statePath, true);
         }
         finally { if (File.Exists(staged)) File.Delete(staged); }
-        AnimationSyncBoneMasks.Ensure(game, backup, original, token);
     }
 
     private static PAK2.File Entry(PAK2 pak, string name) =>
@@ -207,6 +198,7 @@ internal static class RemoteCrouchAnimationInstaller
     internal static void Patch(PAK2 pak)
     {
         foreach (var profile in Profiles) Patch(pak, profile);
+        PatchThirdPersonClips(pak);
     }
 
     private static void Patch(PAK2 pak, Profile profile)
@@ -231,8 +223,6 @@ internal static class RemoteCrouchAnimationInstaller
             if (!db.Animations.Contains(key)) throw new InvalidDataException($"{character} has no '{name}' clip.");
             context.Animations.Set(key, crouchAim);
         }
-        foreach (var name in HidingClips)
-            db.Animations.Set(AnimClipDatabase.HashName(name), PlayerClip(player, name));
 
         // Resident sources need character dependencies. Streamed hiding clips
         // keep their native on-demand path; adding those hashes as resident
@@ -241,7 +231,6 @@ internal static class RemoteCrouchAnimationInstaller
         var global = GlobalClipDatabase.Parse(globalEntry.Content);
         if (!global.Serialize().AsSpan().SequenceEqual(globalEntry.Content))
             throw new InvalidDataException("The global animation database is not in the supported format.");
-        AddSharedPlayerClips(pak, global, player, db, profile);
         foreach (var source in PlayerSources)
         {
             var clip = PlayerClip(player, source);
@@ -292,48 +281,6 @@ internal static class RemoteCrouchAnimationInstaller
         ("locomotion_cycle_blend", @"HUMAN\LOCOMOTIONCYCLE"),
         ("aimed_locomotion_cycle_blend", @"HUMAN\AIMED_LOCOMOTION_CYCLE_BLEND"),
     ];
-
-    // AnimationSync: player base-table aliases this representation lacks. Only
-    // clips without a per-database metadata instance, in a section layout the
-    // engine can load for another character. A resident clip group that cannot
-    // be added as a dependency (shared range) leaves that group's aliases out
-    // rather than failing the whole preparation.
-    private static void AddSharedPlayerClips(PAK2 pak, GlobalClipDatabase global, AnimClipDatabase player,
-        AnimClipDatabase db, Profile profile)
-    {
-        var entries = EntryNames(pak);
-        var candidates = new List<(uint Hash, AnimClipDatabase.Clip Clip, uint? Group)>();
-        foreach (var (hash, slot) in player.Animations.Keys)
-        {
-            if (db.Animations.Contains(hash)) continue;
-            var clip = player.Animations.Values[slot];
-            if (SharedSection(entries, global, clip, out var group)) candidates.Add((hash, clip, group));
-        }
-        var refused = new HashSet<uint>();
-        foreach (var group in candidates.Select(c => c.Group).OfType<uint>().Distinct())
-        {
-            try { global.AddDependency(profile.Hash, group); }
-            catch (InvalidDataException) { refused.Add(group); }
-        }
-        foreach (var (hash, clip, group) in candidates)
-            if (group is not uint resident || !refused.Contains(resident)) db.Animations.Set(hash, clip);
-    }
-
-    // true = shareable; group = the resident clip group to depend on (null when streamed).
-    private static HashSet<string> EntryNames(PAK2 pak) =>
-        pak.Entries.Select(e => e.Filename).ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-    private static bool SharedSection(HashSet<string> entries, GlobalClipDatabase global, AnimClipDatabase.Clip clip, out uint? group)
-    {
-        group = null;
-        if (clip.MetadataInstance != 0 || global.SectionGroup(clip.Path) is not uint section) return false;
-        var streamed = global.SectionClipIndex(clip.Path) == uint.MaxValue;
-        if (streamed && section != clip.Path) return false;
-        var name = $@"DATA\ANIM_SYS\{(streamed ? "STREAMED" : "RESIDENT")}\ANIM_CLIP_DB_SEC_{section}.BIN";
-        if (!entries.Contains(name)) return false;
-        group = streamed ? null : section;
-        return true;
-    }
 
     private static AnimClipDatabase.Clip CrouchAim(AnimClipDatabase db) =>
         db.Context("WEAPON_SHOTGUN")?.Animations.Get(AnimClipDatabase.HashName("cover_low_aim"))
@@ -392,6 +339,7 @@ internal static class RemoteCrouchAnimationInstaller
     internal static void Validate(PAK2 pak)
     {
         foreach (var profile in Profiles) Validate(pak, profile);
+        ValidateThirdPersonClips(pak);
     }
 
     private static void Validate(PAK2 pak, Profile profile)
@@ -407,9 +355,6 @@ internal static class RemoteCrouchAnimationInstaller
         foreach (var name in AimedIdles)
             if (context.Animations.Get(AnimClipDatabase.HashName(name)) != CrouchAim(db))
                 throw new InvalidDataException($"Patched {character} crouched aim lacks '{name}'.");
-        foreach (var name in HidingClips)
-            if (db.Animations.Get(AnimClipDatabase.HashName(name)) != PlayerClip(player, name))
-                throw new InvalidDataException($"Patched {character} lacks hiding clip '{name}'.");
         var global = GlobalClipDatabase.Parse(Entry(pak, GlobalClipDbEntry).Content);
         foreach (var (alias, _) in LocomotionBlends)
         {
@@ -428,19 +373,6 @@ internal static class RemoteCrouchAnimationInstaller
                 !global.Dependencies(profile.Hash).Contains(group))
                 throw new InvalidDataException($"Patched {character} does not load player clip '{source}'.");
         }
-        // AnimationSync: a shared player alias must be loadable where present.
-        var dependencies = global.Dependencies(profile.Hash);
-        var entries = EntryNames(pak);
-        var shared = 0;
-        foreach (var (hash, slot) in player.Animations.Keys)
-        {
-            var clip = player.Animations.Values[slot];
-            if (db.Animations.Get(hash) != clip || !SharedSection(entries, global, clip, out var group)) continue;
-            if (group is uint resident && !dependencies.Contains(resident))
-                throw new InvalidDataException($"Patched {character} does not load shared player clip {hash}.");
-            shared++;
-        }
-        if (shared == 0) throw new InvalidDataException($"Patched {character} lacks the shared player clips.");
         var def = Entry(pak, profile.SkeletonDefEntry).Content;
         var sources = Enumerable.Range(0, BitConverter.ToInt32(def, LowResCountOffset))
             .Select(i => BitConverter.ToUInt32(def, LowResSourcesOffset + i * 4)).ToHashSet();
@@ -520,6 +452,14 @@ internal sealed class GlobalClipDatabase
     }
 
     public uint? SectionGroup(uint clipPath) => _sections.Get(clipPath)?.A;
+
+    // A streamed clip is its own group, index -1 (retail layout; OpenCAGE adds
+    // imported clips the same way): the engine loads its section on demand.
+    public void AddStreamedSection(uint clipPath)
+    {
+        if (_sections.Contains(clipPath)) throw new InvalidDataException("The animation already has a clip section.");
+        _sections.Set(clipPath, new Pair(clipPath, uint.MaxValue));
+    }
     public uint SectionClipIndex(uint clipPath) => (_sections.Get(clipPath)
         ?? throw new InvalidDataException("The animation has no clip section.")).B;
 
