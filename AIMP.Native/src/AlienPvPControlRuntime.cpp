@@ -18,6 +18,7 @@ namespace {
 std::mutex gQueueMutex;
 Mailbox<64> gIncoming,gOutgoing;
 std::atomic<std::uint64_t> gReceived{},gRejected{},gExpired{},gDropped{},gInputs{},gCommits{},gPoses{},gCorrections{},gUnsupported{};
+std::atomic<std::uint64_t> gHeld{},gDriven{},gBlockedAction{},gBlockedVent{},gBlockedStale{},gBlockedStage{},gDriveRefused{};
 struct State final {
     Context context{};InputWindow window{};PredictionHistory history{};
     DeliveryInbox inbox{};DeliveryOutbox<> outbox{};bool deliveryFault{};std::uint64_t deliveryGeneration{};
@@ -324,9 +325,15 @@ void ApplyMovement(std::uint64_t now,float dt) noexcept {
     const bool fresh=g.context.localOwner ?
         active && g.context.pilotReady && Fresh(now,g.capturedAt,150U) &&
             Fresh(now,g.lastAckAt,kAuthorityTimeoutMs) : g.window.InputFresh(now);
-    if(ActionBusy() || g.hasDeferredAction) {static_cast<void>(StopDonorMovement());static_cast<void>(CancelRecovery());ReleaseCarrier();return;}
+    const bool held=g.context.localOwner && g.local.focused && (g.local.forward!=0.0F || g.local.strafe!=0.0F);
+    if(held)gHeld.fetch_add(1U,std::memory_order_relaxed);
+    if(ActionBusy() || g.hasDeferredAction) {
+        if(held)gBlockedAction.fetch_add(1U,std::memory_order_relaxed);
+        static_cast<void>(StopDonorMovement());static_cast<void>(CancelRecovery());ReleaseCarrier();return;
+    }
     if(g.context.localOwner && VentAction(g.ventAuthority) &&
         (g.ventAuthority.phase==ActionPhase::Preparing || g.ventAuthority.phase==ActionPhase::Started)) {
+        if(held)gBlockedVent.fetch_add(1U,std::memory_order_relaxed);
         static_cast<void>(StopDonorMovement());static_cast<void>(CancelRecovery());ReleaseCarrier();return;
     }
     const bool remoteVent=!g.context.localOwner && VentAction(g.ventAuthority) &&
@@ -386,6 +393,7 @@ void ApplyMovement(std::uint64_t now,float dt) noexcept {
         g.expired=false;return;
     }
     if(!fresh || !stageKnown || backstage || !OrdinaryCycle(g.context.character)) {
+        if(held)(fresh?gBlockedStage:gBlockedStale).fetch_add(1U,std::memory_order_relaxed);
         static_cast<void>(StopDonorMovement());
         const bool expired=g.window.Granted() && !fresh;
         if(expired&&!g.expired)gExpired.fetch_add(1U,std::memory_order_relaxed);
@@ -441,6 +449,7 @@ void ApplyMovement(std::uint64_t now,float dt) noexcept {
         }
         g.moving=g.context.actions->drive(g.context,input.focused?&intent:nullptr) &&
             (intent.forward!=0.0F || intent.strafe!=0.0F) && input.focused;
+        if(held)(g.moving?gDriven:gDriveRefused).fetch_add(1U,std::memory_order_relaxed);
         if(g.moving){g.appliedInput=g.window.LastInput();g.appliedHost=g.window.LastHost();}
         return;
     }
@@ -628,6 +637,14 @@ bool TryPopObservation(std::array<std::uint8_t,kWireBytes>& bytes) noexcept {
     std::lock_guard lock(gQueueMutex);TimedFrame value{};
     while(gOutgoing.Pop(value))if(Encode(value.frame,bytes))return true;
     return false;
+}
+bool LastCorrection(Frame& frame,std::uint64_t& ageMs) noexcept {
+    if(!g.context.owned || g.context.localOwner || !g.correctionAt)return false;
+    frame=g.correction;ageMs=GetTickCount64()-g.correctionAt;return true;
+}
+MovementStats MovementSnapshot() noexcept {
+    return {gHeld.load(),gDriven.load(),gBlockedAction.load(),gBlockedVent.load(),gBlockedStale.load(),
+        gBlockedStage.load(),gDriveRefused.load()};
 }
 Counters Snapshot() noexcept {
     return {gReceived.load(),gRejected.load(),gExpired.load(),gDropped.load(),gInputs.load(),gCommits.load(),

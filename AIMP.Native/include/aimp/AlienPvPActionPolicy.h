@@ -14,6 +14,7 @@ namespace aimp::alien_pvp::actions {
 inline constexpr float kAttackReach=3.2F, kAttackHeight=1.5F;
 inline constexpr float kAttackCosine=0.34F; // ~70 degrees either side of the look direction
 inline constexpr float kVentExitCosine=0.5F; // 60 degrees, vent exit selection (unchanged)
+inline constexpr float kAttackContact=1.2F; // closer than this, any direction is admitted
 inline constexpr float kVentMatchTolerance=0.02F, kVentEnterReach=8.0F;
 // Deliberate PvP selection radius. Actual connectivity remains a native query;
 // a portal in front is not evidence that an arbitrary floor is traversable.
@@ -46,7 +47,9 @@ inline std::uint64_t SelectVictim(Point source,float yaw,std::uint64_t alienPeer
         const float d2=dx*dx+dz*dz,dy=std::abs(c.position.y-source.y);
         if(dy>kAttackHeight||d2>kAttackReach*kAttackReach)continue;
         const float d=std::sqrt(d2);
-        if(d>0.05F&&(dx*fx+dz*fz)/d<kAttackCosine)continue;
+        // Body contact needs no aim (AvS 2026-11-25: 0.25 m away, rejected for
+        // standing slightly behind the look direction).
+        if(d>kAttackContact&&(dx*fx+dz*fz)/d<kAttackCosine)continue;
         // Stable tie-breaks prevent registry iteration order from picking a victim.
         const float score=d2+dy*dy;
         if(score<best||(score==best&&(!peer||c.peer<peer))){best=score;peer=c.peer;}

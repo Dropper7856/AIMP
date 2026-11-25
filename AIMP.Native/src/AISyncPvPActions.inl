@@ -44,6 +44,7 @@ struct Active final {
     std::uint64_t arrivedAt{};std::uint32_t cancelRefusals{};
     std::uint64_t ventProgressAt{};float ventBestDistance{std::numeric_limits<float>::infinity()};
     bool attackLatched{},retailArmed{},presented{};std::uint64_t latchedAt{},lastPairTrace{},armedAt{},presentedAt{};
+    bool directSubmitted{};
     std::uint32_t retargets{},flagConsumed{};
     std::uintptr_t attackAnimated{};bool shouldAttackSet{};
     ap::attack::HeldTarget brainTarget{};
@@ -190,7 +191,7 @@ void LogAttack(Diagnostics& diagnostics) {
     const auto sequence=attackTelemetry.sequence.load();
     if(!revision || revision==lastRevision || (sequence==lastSequence && now-lastAt<250U))return;
     lastRevision=revision;lastSequence=sequence;lastAt=now;
-    diagnostics.Log("info","alien_attack_progress","Host attack preparation; stage 1 noSelection 2 noRecord 3 targetFault 4 queryRefused 5 selectorUnproven 6 rayPending 7 submitted 8 pairRefused 9 entered 10 enteredWithRayPending 11 pairRunning 12 victimNotAcquired4s 13 retailArmed 14 retailWindowExpired 15 retailOtherVictim 16 retailRetargeted(selector=count) 17 armedQueryRefused 18 brainTargetUnavailable 19 attackBranchConsumedFlag(selector=count) 24 retailNeverStartedMelee3s 25 retailChoseVentAborted(selector=cycle) 20 clientPresented 21 clientPresentRefused 22 clientNotEntered 23 clientEntered.",
+    diagnostics.Log("info","alien_attack_progress","Host attack preparation; stage 1 noSelection 2 noRecord 3 targetFault 4 queryRefused 5 selectorUnproven 6 rayPending 7 submitted 8 pairRefused 9 entered 10 enteredWithRayPending 11 pairRunning 12 victimNotAcquired4s 13 retailArmed 14 retailWindowExpired 15 retailOtherVictim 16 retailRetargeted(selector=count) 17 armedQueryRefused 18 brainTargetUnavailable 19 attackBranchConsumedFlag(selector=count) 24 retailNeverStartedMelee3s 25 retailChoseVentAborted(selector=cycle) 26 directPairNoDefinition 27 directPairInteractionRefused 28 directPairNativeFault 29 directPairDonorBusy 30 directPairNotEntered1.5s (7 = direct pair submitted) 20 clientPresented 21 clientPresentRefused 22 clientNotEntered 23 clientEntered.",
         {{"hostSequence",Diagnostics::Unsigned(sequence),true},
          {"elapsedMs",Diagnostics::Unsigned(attackTelemetry.elapsed.load()),true},
          {"stage",Diagnostics::Unsigned(attackTelemetry.stage.load()),true},
@@ -749,6 +750,36 @@ bool PresentPair(const ap::Context& c,const PairIdentity& victim,const std::uint
         return true;
     } AIMP_ACTION_CATCH {return false;}
 }
+// AvS 2026-11-25 (user decision: direct kill only, no fallback). Every armed
+// retail-brain attempt since 453 ended stage 24: ATTACK_CORE never ran
+// (flagConsumed 0, meleeStarts 0), the Alien idled 3 s and the pilot's input
+// was frozen. The Host now starts the same native paired kill the observer
+// side already presents (PresentPair): interaction registration + the paired
+// transition with the selector proven by the explicit availability query.
+// Return codes (attack stage): 0 submitted, 26 definition not resolved,
+// 27 interaction refused, 28 native fault, 29 donor still retiring.
+unsigned HostDirectPair(const ap::Context& c,const PairIdentity& victim,const std::uint32_t selector) noexcept {
+    if(!Live(c) || !PvPLeaseScopeCurrent() || !c.host || !c.localOwner || gPvPLease.releasing ||
+        !PairIdentityLive(victim) || PairReservedCharacter(c.character) || PairReservedCharacter(victim.character))return 27U;
+#ifndef AIMP_ALIEN_ACTION_TEST
+    if(!StopDonor(c))return 29U;
+    static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(c.character));
+#endif
+    interactions::Definition definition{};
+    if(!animation::ResolvePairDefinition(c.character,gPvPLease.runtimeId,victim.character,victim.runtimeId,selector,definition))return 26U;
+    std::uintptr_t root{},manager{},cycle{};
+    if(!Read(gBase+kInteractionManagerGlobalRva,root) || !root || !Read(root,manager) || !manager ||
+        !Read(c.character+0x36CU,cycle) || !cycle)return 28U;
+    AIMP_ACTION_TRY {
+        const auto accepted=Native<CharacterInteraction>(0x00254820U)(
+            reinterpret_cast<void*>(manager+0x90U),c.scope.entityA,c.scope.entityB,victim.entityA,victim.entityB,
+            definition.victimAttachment>0?std::uint64_t{1U}:std::uint64_t{0U},definition.victimAttachment);
+        if((accepted&0xFFU)==0U)return 27U;
+        Native<PairedTransitionA>(0x0025C4E0U)(reinterpret_cast<void*>(cycle),victim.character,
+            static_cast<std::int32_t>(selector),0U);
+        return 0U;
+    } AIMP_ACTION_CATCH {return 28U;}
+}
 void Clear() noexcept {
     if(active.victim.character)player_hiding::FinishPvPSearch(active.victim.character);
     ReleaseAttackTarget();
@@ -949,6 +980,23 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
             return false;
         }
         if(active.receipt.phase==Phase::Preparing) {
+            if(active.directSubmitted) {
+                // The paired cycle (78) proves the native kill really started.
+                if(state==78U) {
+                    std::uintptr_t cycle{},definition{},pairVictim{};std::uint32_t index{};
+                    if(Read(c.character+0x36CU,cycle) && cycle && Read(cycle+0x4CU,definition) && definition &&
+                        Read(definition+4U,index) && index<25U)active.receipt.selector=index;
+                    TracePair(Read(cycle+0x44U,pairVictim) && pairVictim==active.victim.character?9U:15U);
+                    active.entered=true;result=active.receipt;result.phase=Phase::Started;result.reason=Reason::None;
+                    ++result.resolutionRevision;active.receipt=result;return true;
+                }
+                // Fail fast: never hold the pilot for seconds on a refused pair.
+                if(now-active.submittedAt>1500U) {
+                    TracePair(30U);
+                    Terminal(result,Phase::Rejected,Reason::NativeRefused);active.cancelled=true;return true;
+                }
+                return false;
+            }
             if(active.retailArmed) {
                 // The retail brain (worker thread) runs ActionMeleeAttack on
                 // the held target, the only path that completed a kill (453).
@@ -1050,35 +1098,18 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
                 if(ready){active.attackLatched=true;active.latchedAt=now;active.receipt.selector=selector;}
             }
             if(active.attackLatched) {
-                // Arm the retail melee: the victim becomes the AI target until
-                // the action clears. Without a held target 004128E0 refuses
-                // every melee start, so the brain never attacks unprompted.
-                if(!HoldAttackTarget(active.victim.character)) {
-                    Terminal(result,Phase::Failed,Reason::NativeUnavailable);active.cancelled=true;return true;
+                const auto submitted=HostDirectPair(c,active.victim,active.receipt.selector);
+                TraceAttack(submitted==0U?7U:submitted,active.receipt.selector);
+                if(submitted!=0U) {
+                    Terminal(result,Phase::Rejected,submitted==29U?Reason::NativeBusy:Reason::NativeRefused);
+                    active.cancelled=true;return true;
                 }
-#ifndef AIMP_ALIEN_ACTION_TEST
-                // The retail brain must own the Alien for the armed window: no
-                // donor kind9 request left in its tree (461 crashed with one
-                // still retiring), and no direct-step idle hold, which blocks
-                // the BT's own run to the victim (459/460 stayed in place).
-                if(!StopDonor(c)) {
-                    ReleaseAttackTarget();Terminal(result,Phase::Failed,Reason::NativeBusy);active.cancelled=true;return true;
-                }
-                static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(c.character));
-#endif
-                active.retailArmed=true;active.armedAt=now;
-                attackTelemetry.armedPolls=0U;attackTelemetry.flagConsumed=0U;attackTelemetry.retargets=0U;
-                attackTelemetry.brainMissing=0U;
-                attackTelemetry.meleeStarts=0U;attackTelemetry.meleeRefused=0U;attackTelemetry.meleeType=0xFFU;
-                attackTelemetry.availability=0U;attackTelemetry.sourceFlag2B4=0U;attackTelemetry.victimFlag2B4=0U;
-#ifndef AIMP_ALIEN_ACTION_TEST
-                gPvPMeleeStarts.store(0U,std::memory_order_relaxed);gPvPMeleeRefused.store(0U,std::memory_order_relaxed);
-                gPvPMeleeWatch.store(active.attackAnimated,std::memory_order_relaxed);
-                ArmPvPBrain(c.character,now+kRetailAttackWindowMs+500U);
-#endif
-                TraceAttack(13U,active.receipt.selector);
+                active.directSubmitted=true;active.entrySubmitted=true;active.submittedAt=now;
                 return false;
             }
+            // The retail-brain arming of 453-575 (HoldAttackTarget + SHOULD_ATTACK
+            // + ArmPvPBrain) is retired: see HostDirectPair. Its armed-branch
+            // handling above stays for a receipt armed by an older peer only.
             if(now-active.began>1500U){Terminal(result,Phase::Rejected,Reason::NativeRefused);active.cancelled=true;return true;}
             return false;
         }

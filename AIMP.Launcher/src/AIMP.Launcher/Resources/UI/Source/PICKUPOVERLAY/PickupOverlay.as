@@ -32,6 +32,8 @@ package
          var nearby:int = int(this.aimp_get_bridge_value(line,"nearby"));
          var phase:int = int(this.aimp_get_bridge_value(line,"phase"));
          var action:int = int(this.aimp_get_bridge_value(line,"action"));
+         var pickerCount:int = int(this.aimp_get_bridge_value(line,"pickerCount"));
+         var pickerSlot:int = int(this.aimp_get_bridge_value(line,"pickerSlot"));
          if(ready && !free && !pending && nearby < 0) return;
          var width:Number = stage != null ? stage.stageWidth : 1280;
          var height:Number = stage != null ? stage.stageHeight : 720;
@@ -40,9 +42,10 @@ package
          if(ready)
          {
             if(pending) text = action == 3 ? "Exiting ventilation... E / Q: cancel" : "Entering ventilation... E / Q: cancel";
-            else if(free) text = nearby >= 0 ? 'Press "E" to exit ventilation here' : "Move close to a ventilation opening to exit";
+            else if(free && pickerCount > 0) text = "Exit " + (pickerSlot + 1) + " / " + pickerCount + (nearby >= 0 ? ': press "E" to crawl out here' : ": looking for the opening...");
+            else if(free) text = "No ventilation exit found nearby";
             else text = 'Press "E" to enter ventilation';
-            if(free) help = "Mouse: look | WASD: fly | Space / Ctrl: up / down | Shift: faster";
+            if(free && !pending) help = "A / D (or Left / Right): next exit near a survivor | Mouse: look";
             else if(phase == 3 || phase == 4) help = "Ventilation unavailable. Move closer and try again.";
          }
          this.aimp_vent_layer = new Sprite();this.aimp_vent_layer.mouseEnabled = false;this.aimp_vent_layer.mouseChildren = false;

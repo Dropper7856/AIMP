@@ -10895,6 +10895,51 @@ static void PumpPlayerSpectate(const std::uint32_t generation, const bool camera
     player_lifecycle::PumpSpectateOnEngineThread({gBase, LocalPlayer(), generation,
         candidates.data(), count, cameraReserved});
 }
+// Debug point for "the Alien sees me where I'm not / I see the Alien elsewhere"
+// (AvS 2026-11-25). Once a second while an Alien lease is active, each PC
+// records where IT draws the Alien and every participant, plus (observer) the
+// last owner pose it received. Comparing both PCs' entries at the same
+// timestamp measures the drift of each replica independently.
+struct PvPSyncSample final {
+    std::atomic<std::uint64_t> revision{},at{};
+    std::atomic<bool> host{},localOwner{};
+    std::atomic<float> alien[3]{},correction[3]{},local[3]{};
+    std::atomic<std::uint64_t> correctionAgeMs{},correctionSequence{};
+    std::atomic<std::uint32_t> correctionFlags{},alienCycle{},peers{};
+    std::atomic<std::uint64_t> peer[4]{};
+    std::atomic<float> peerPos[4][3]{};
+} gPvPSync;
+void SamplePvPSync(const bool localOwner,const bool active) noexcept {
+    static std::uint64_t lastAt{};
+    const auto now=GetTickCount64();
+    if(!active || now-lastAt<1000U)return;
+    lastAt=now;
+    const auto alien=gPvPLease.ticket.character;
+    const auto store3=[](std::atomic<float>* out,std::uintptr_t character) noexcept {
+        float p[3]{};
+        if(character && Read(character+0x70U,p[0]) && Read(character+0x74U,p[1]) && Read(character+0x78U,p[2]))
+            for(int i=0;i<3;++i)out[i].store(p[i],std::memory_order_relaxed);
+    };
+    store3(gPvPSync.alien,alien);
+    store3(gPvPSync.local,LocalPlayer());
+    std::uintptr_t cycle{};std::uint8_t state{0xFFU};
+    if(Read(alien+0x36CU,cycle) && cycle)static_cast<void>(Read(cycle+0x1AU,state));
+    gPvPSync.alienCycle=state;
+    alien_pvp::Frame correction{};std::uint64_t age{};
+    if(alien_pvp::LastCorrection(correction,age)) {
+        gPvPSync.correction[0]=correction.x;gPvPSync.correction[1]=correction.y;gPvPSync.correction[2]=correction.z;
+        gPvPSync.correctionAgeMs=age;gPvPSync.correctionSequence=correction.sequence;gPvPSync.correctionFlags=correction.flags;
+    } else gPvPSync.correctionAgeMs=UINT64_MAX;
+    std::uint32_t n{};
+    for(std::uint32_t i=0;i<gCurrent.participantCount && n<4U;++i) {
+        const auto peer=gCurrent.participants[i].peer;
+        if(!peer || peer==gCurrent.localPeer)continue;
+        gPvPSync.peer[n]=peer;store3(gPvPSync.peerPos[n],ParticipantForPeer(peer));++n;
+    }
+    gPvPSync.peers=n;gPvPSync.host=gRole.load(std::memory_order_acquire)==Role::Host;
+    gPvPSync.localOwner=localOwner;gPvPSync.at=now;
+    gPvPSync.revision.fetch_add(1U,std::memory_order_release);
+}
 void PumpOnEngineThread() noexcept {
     const profiling::Timer timing(profiling::Section::AiPump);
     if (!Installed() || !EngineThread()) return;
@@ -10988,11 +11033,28 @@ void PumpOnEngineThread() noexcept {
         gPvPTechnicalEpoch.store(gPairBindingEpoch.load(std::memory_order_acquire),std::memory_order_release);
         gPvPTechnicalPeer.store(gPvPLease.ownerPeer,std::memory_order_release);
     }
-    alien_pvp_local::Pump({gBase,
+    alien_pvp_local::Context pilotContext{gBase,
         localLease?gPvPLease.ticket.character:0U,
         localRequested?LocalPlayer():0U,
         static_cast<std::uint32_t>(pvpPhysicalGeneration),
-        gPvPLease.ownerPeer,gCurrent.localPeer,localLease,localRequested});
+        gPvPLease.ownerPeer,gCurrent.localPeer,localLease,localRequested};
+    if(localLease) {
+        // Survivors on this PC (proxies of remote players; the local player is
+        // the parked technical body of the pilot and is never a survivor).
+        const auto addSurvivor=[&](std::uint64_t peer) noexcept {
+            if(!peer || peer==gPvPLease.ownerPeer || pilotContext.survivorCount>=4U)return;
+            const auto character=ParticipantForPeer(peer);
+            float p[3]{};
+            if(!LivingCharacter(character) || !Read(character+0x70U,p[0]) || !Read(character+0x74U,p[1]) ||
+                !Read(character+0x78U,p[2]) || !std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]))return;
+            for(std::uint32_t i=0;i<pilotContext.survivorCount;++i)
+                if(pilotContext.survivors[i][0]==p[0] && pilotContext.survivors[i][2]==p[2])return;
+            auto& out=pilotContext.survivors[pilotContext.survivorCount++];out[0]=p[0];out[1]=p[1];out[2]=p[2];
+        };
+        for(std::uint32_t i=0;i<gCurrent.participantCount;++i)addSurvivor(gCurrent.participants[i].peer);
+    }
+    alien_pvp_local::Pump(pilotContext);
+    SamplePvPSync(localLease,activeLease);
     PumpPlayerSpectate(static_cast<std::uint32_t>(pvpPhysicalGeneration),localRequested,
         (gCurrent.flags & kAlienPvP)!=0U?gPvPLease.ownerPeer:0U);
     const auto pilot=alien_pvp_local::Snapshot();
@@ -12147,7 +12209,8 @@ bool SnapshotAlienVents(std::uint32_t page,std::string& json,int goTo,std::uint6
         std::to_string(gPvPLease.worldGeneration)+":"+std::to_string(gPvPLease.ticket.serial)+"\",\"page\":"+
         std::to_string(page)+",\"count\":"+std::to_string(table.count)+",\"nearby\":"+std::to_string(ui.nearby)+
         ",\"selected\":"+std::to_string(ui.selected)+",\"open\":"+(ui.open?"true":"false")+
-        ",\"backstage\":"+(ui.backstage?"true":"false")+",\"freeCamera\":"+(ui.freeCamera?"true":"false")+",\"x\":"+std::to_string(body[0])+
+        ",\"backstage\":"+(ui.backstage?"true":"false")+",\"freeCamera\":"+(ui.freeCamera?"true":"false")+
+        ",\"pickerSlot\":"+std::to_string(ui.pickerSlot)+",\"pickerCount\":"+std::to_string(ui.pickerCount)+",\"x\":"+std::to_string(body[0])+
         ",\"y\":"+std::to_string(body[1])+",\"z\":"+std::to_string(body[2])+
         ",\"action\":"+std::to_string(static_cast<unsigned>(authority.action))+
         ",\"phase\":"+std::to_string(static_cast<unsigned>(authority.phase))+
@@ -12413,6 +12476,50 @@ void LogDiagnostics(Diagnostics& diagnostics) {
     }
     pvp_actions::LogAttack(diagnostics);
     pvp_actions::LogMiss(diagnostics);
+    {
+        static std::uint64_t lastRevision{};
+        const auto revision=gPvPSync.revision.load(std::memory_order_acquire);
+        if(revision && revision!=lastRevision) {
+            lastRevision=revision;
+            const auto f=[](const std::atomic<float>* p) {
+                return std::to_string(p[0].load())+","+std::to_string(p[1].load())+","+std::to_string(p[2].load());
+            };
+            std::string peers;
+            for(std::uint32_t i=0;i<gPvPSync.peers.load() && i<4U;++i) {
+                if(!peers.empty())peers+=";";
+                peers+=std::to_string(gPvPSync.peer[i].load())+"@"+f(gPvPSync.peerPos[i]);
+            }
+            const auto age=gPvPSync.correctionAgeMs.load();
+            diagnostics.Log("info","alien_pvp_sync_probe",
+                "Where THIS PC draws the Alien and each other participant (x,y,z), once a second. Compare with the other PC's entry at the same time: the difference is that replica's drift. correction = last owner pose received (observers only).",
+                {{"host",Diagnostics::Boolean(gPvPSync.host.load()),true},
+                 {"localOwner",Diagnostics::Boolean(gPvPSync.localOwner.load()),true},
+                 {"alien",f(gPvPSync.alien),true},
+                 {"alienCycle",Diagnostics::Unsigned(gPvPSync.alienCycle.load()),true},
+                 {"localPlayer",f(gPvPSync.local),true},
+                 {"correction",age==UINT64_MAX?std::string("none"):f(gPvPSync.correction),true},
+                 {"correctionAgeMs",age==UINT64_MAX?std::string("-1"):std::to_string(age),true},
+                 {"correctionFlags",Diagnostics::Unsigned(gPvPSync.correctionFlags.load()),true},
+                 {"participants",peers,true}});
+        }
+    }
+    {
+        static std::uint64_t lastBlocked{};
+        const auto m=alien_pvp::MovementSnapshot();
+        const auto blocked=m.blockedAction+m.blockedVent+m.blockedStale+m.blockedStage;
+        if(blocked!=lastBlocked) {
+            lastBlocked=blocked;
+            diagnostics.Log("info","alien_pvp_movement_blocks",
+                "Frames in which the Alien pilot held a movement key but the Alien was not driven, by cause (session totals). action = attack/vent receipt busy or deferred, vent = vent authority pending, stale = input/authority not fresh, stage = not in an ordinary locomotion cycle.",
+                {{"heldFrames",Diagnostics::Unsigned(m.heldFrames),true},
+                 {"drivenFrames",Diagnostics::Unsigned(m.drivenFrames),true},
+                 {"blockedAction",Diagnostics::Unsigned(m.blockedAction),true},
+                 {"blockedVent",Diagnostics::Unsigned(m.blockedVent),true},
+                 {"blockedStale",Diagnostics::Unsigned(m.blockedStale),true},
+                 {"blockedStage",Diagnostics::Unsigned(m.blockedStage),true},
+                 {"driveRefused",Diagnostics::Unsigned(m.driveRefused),true}});
+        }
+    }
     {
         static std::uint64_t lastWanted{},lastRejected{};
         const auto wanted=gPvPReplicaTelemetry.backstageWanted.load(),rejected=gPvPReplicaTelemetry.rejectedState.load();

@@ -51,7 +51,10 @@ internal sealed partial class MultiplayerSessionCoordinator
                 ["action"]=root.GetProperty("action").GetInt32().ToString(CultureInfo.InvariantCulture),
                 ["phase"]=root.GetProperty("phase").GetInt32().ToString(CultureInfo.InvariantCulture),
                 ["pending"]=root.GetProperty("pending").GetBoolean()?"1":"0",
-                ["freeCamera"]=root.GetProperty("freeCamera").GetBoolean()?"1":"0"
+                ["freeCamera"]=root.GetProperty("freeCamera").GetBoolean()?"1":"0",
+                // Vent-exit picker (native 2026-11-25); absent from an older DLL.
+                ["pickerSlot"]=root.TryGetProperty("pickerSlot",out var slot)?slot.GetInt32().ToString(CultureInfo.InvariantCulture):"-1",
+                ["pickerCount"]=root.TryGetProperty("pickerCount",out var total)?total.GetInt32().ToString(CultureInfo.InvariantCulture):"0"
             },_lifetime.Token).ConfigureAwait(false);
             _alienVentHudVisible=true;
         }

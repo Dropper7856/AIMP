@@ -36,4 +36,14 @@ struct Counters final {
     std::uint64_t received{},rejected{},expired{},dropped{},inputs{},commits{},poses{},corrections{},unsupportedActions{};
 };
 Counters Snapshot() noexcept;
+// Engine thread: the last owner pose (Correction) this observer received and
+// its age. False on the owner or before any correction. Debug only.
+bool LastCorrection(Frame& frame,std::uint64_t& ageMs) noexcept;
+// Debug point for "the Alien is hard to control / stops in place": frames in
+// which the local pilot held a movement key, how many drove the Alien and why
+// the others did not (session totals, any thread).
+struct MovementStats final {
+    std::uint64_t heldFrames{},drivenFrames{},blockedAction{},blockedVent{},blockedStale{},blockedStage{},driveRefused{};
+};
+MovementStats MovementSnapshot() noexcept;
 } // namespace aimp::alien_pvp

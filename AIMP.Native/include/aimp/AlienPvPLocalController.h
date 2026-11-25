@@ -25,13 +25,20 @@ struct Context {
     std::uint64_t ownerPeer{}, localPeer{};
     bool exclusiveLease{};
     bool possessionRequested{};
+    // Living survivors' current positions on this PC (Host-certified
+    // participants other than the Alien owner). Used only to rank vent exits.
+    std::uint32_t survivorCount{};
+    float survivors[4][3]{};
 };
 
 struct Readiness final {
     bool inputIsolated{}, cameraBound{}, technicalHidden{}, moving{};
 };
 [[nodiscard]] Readiness Snapshot() noexcept;
-struct VentInterface {bool open{},backstage{};int nearby{-1},selected{-1};bool freeCamera{};};
+struct VentInterface {bool open{},backstage{};int nearby{-1},selected{-1};bool freeCamera{};
+    // Vent-exit picker (replaces free flight while backstage): candidate exits
+    // near survivors, the selected position in that list and the list size.
+    int pickerSlot{-1},pickerCount{};};
 [[nodiscard]] VentInterface VentSnapshot() noexcept;
 bool GoToVent(std::uint32_t index) noexcept;
 void Pump(const Context& context) noexcept;

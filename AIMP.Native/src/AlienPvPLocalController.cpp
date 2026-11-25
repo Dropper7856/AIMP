@@ -57,6 +57,12 @@ struct LocalState final {
     unsigned ventMoveMask{};
     // Free camera chases the Alien along its real exit passage.
     bool exitTracking{};
+    // AvS 2026-11-25: free flight inside the vents drifted out of the level
+    // (alt-tab) and gave no sense of where to go. Backstage the camera now
+    // jumps between real exits ranked by distance to the survivors.
+    std::array<int,8> pickerVents{};int pickerCount{},pickerSlot{-1};
+    std::uint64_t pickerBuiltAt{};bool pickPrev{},pickNext{};
+    bool hudHidden{};std::uint64_t hudAt{};
     int nearbyVent{-1},selectedVent{-1};
     float cameraDistance{3.0F},cameraHeight{2.0F},cameraSide{0.5F};
     bool duct{};unsigned ductRun{};std::uint64_t ductAt{};
@@ -377,6 +383,71 @@ bool UpdateVentInterface(const Context& context,alien_pvp::vents::Table& table) 
         gLocal.selectedVent=closest;
     return true;
 }
+// Rank exits: the two nearest each survivor (closest survivor first), then the
+// exit nearest the Alien itself as a "leave here" fallback. Vent indices only;
+// positions are re-read from the native table on every use.
+void BuildVentPicker(const Context& context,const alien_pvp::vents::Table& table,std::uint64_t now) noexcept {
+    const int previous=gLocal.pickerSlot>=0 && gLocal.pickerSlot<gLocal.pickerCount?gLocal.pickerVents[gLocal.pickerSlot]:-1;
+    struct Entry {int vent;float score;};
+    std::array<Entry,8> list{};int count{};
+    const auto add=[&](int vent,float score) noexcept {
+        if(vent<0)return;
+        for(int i=0;i<count;++i)if(list[i].vent==vent){list[i].score=std::min(list[i].score,score);return;}
+        if(count<static_cast<int>(list.size()))list[count++]={vent,score};
+    };
+    const auto nearest=[&](const float* from,int skip,float& best) noexcept {
+        int found=-1;best=1.0e9F;
+        for(std::uint32_t i=0;i<table.count;++i) {
+            if(static_cast<int>(i)==skip)continue;
+            alien_pvp::vents::Point p{};
+            if(!alien_pvp::vents::ReadPoint(table,i,&VentRead,p))continue;
+            const float d=std::hypot(p[0]-from[0],p[2]-from[2])+std::abs(p[1]-from[1])*1.5F;
+            if(d<best){best=d;found=static_cast<int>(i);}
+        }
+        return found;
+    };
+    for(std::uint32_t s=0;s<context.survivorCount && s<4U;++s) {
+        float d1{},d2{};
+        const int first=nearest(context.survivors[s],-1,d1);
+        add(first,d1);
+        add(nearest(context.survivors[s],first,d2),d2);
+    }
+    float own{};alien_pvp::vents::Point body{};
+    if(Read(context.alien+0x70U,body))add(nearest(body.data(),-1,own),1.0e6F+own);
+    std::sort(list.begin(),list.begin()+count,[](const Entry& a,const Entry& b){return a.score<b.score;});
+    gLocal.pickerCount=count;gLocal.pickerSlot=count?0:-1;
+    for(int i=0;i<count;++i) {
+        gLocal.pickerVents[i]=list[i].vent;
+        if(list[i].vent==previous)gLocal.pickerSlot=i;
+    }
+    gLocal.pickerBuiltAt=now;
+}
+// Weapon/health HUD of the parked technical survivor ("the Alien has a pistol
+// in its UI", AvS 2026-11-25). Donor alien_extra.cpp: the game's own
+// force_hud_hidden/visible on the "weaponstuff" overlay, +40 = forced flag.
+// "pickupOverlay" is NOT touched: it hosts AIMP's vent bar and prompts.
+void SetGameHudHidden(const std::uintptr_t base,const bool hidden) noexcept {
+    std::uintptr_t manager{},movies{};std::uint32_t count{};
+    if(!base || !Read(base+0x0134A78CU,manager) || !manager || !Read(manager+0x38U,movies) || !movies ||
+        !Read(manager+0x3CU,count) || count>256U)return;
+    constexpr char kName[]="weaponstuff";
+    for(std::uint32_t i=0;i<count;++i) {
+        std::uintptr_t movie{},name{},view{},root{};
+        if(!Read(movies+i*4U,movie) || !movie || !Read(movie+0x34U,name) || !name)continue;
+        bool same=true;
+        for(std::size_t k=0;k<sizeof(kName) && same;++k){char ch{};same=Read(name+k,ch) && ch==kName[k];}
+        if(!same || !Read(movie+8U,view) || !view || !Read(movie+0x68U,root) || !root)continue;
+        std::uint8_t forced{};
+        if(hidden && Read(movie+0x40U,forced) && forced)continue; // still hidden
+#if defined(_MSC_VER)
+        __try {
+            reinterpret_cast<void(__thiscall*)(void*,const char*)>(base+0x004081E0U)(
+                reinterpret_cast<void*>(movie),hidden?"force_hud_hidden":"force_hud_visible");
+        } __except(EXCEPTION_EXECUTE_HANDLER) {continue;}
+#endif
+        static_cast<void>(Write(movie+0x40U,std::uint8_t{hidden?1U:0U}));
+    }
+}
 void TickInput(const Context& context,const std::uint64_t now) noexcept {
     if (now==gLocal.lastFrameMs) return;
     const float dt=gLocal.lastFrameMs && now>=gLocal.lastFrameMs?
@@ -445,17 +516,28 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
             if(length>0.05F)for(unsigned i=0;i<3;++i)gLocal.freeForward[i]=look[i]/length;
         }
         input.forward=input.strafe=0.0F;
-    } else if(gLocal.freeCamera && focused && alien_pvp::ControlActive()) {
-        const float f=static_cast<float>(Down('W'))-static_cast<float>(Down('S'));
-        const float s=static_cast<float>(Down('D'))-static_cast<float>(Down('A'));
-        const float up=static_cast<float>(Down(VK_SPACE))-static_cast<float>(Down(VK_CONTROL));
-        const auto direction=FlightDirection(gLocal.freeForward,yaw,f,s,up);
-        for(unsigned i=0;i<3;++i)
-            gLocal.freeEye[i]=std::clamp(gLocal.freeEye[i]+direction[i]*(Down(VK_SHIFT)?12.0F:5.0F)*dt,-99900.0F,99900.0F);
+    } else if(gLocal.freeCamera && alien_pvp::ControlActive()) {
+        // Vent-exit picker. Never flies: the eye only ever sits on a real exit.
+        if(haveVents && (!gLocal.pickerCount || now-gLocal.pickerBuiltAt>=1000U))
+            BuildVentPicker(context,vents,now);
+        const bool prev=focused && (Down('A') || Down(VK_LEFT));
+        const bool next=focused && (Down('D') || Down(VK_RIGHT));
+        if(gLocal.pickerCount>0) {
+            if(prev && !gLocal.pickPrev)gLocal.pickerSlot=(gLocal.pickerSlot+gLocal.pickerCount-1)%gLocal.pickerCount;
+            if(next && !gLocal.pickNext)gLocal.pickerSlot=(gLocal.pickerSlot+1)%gLocal.pickerCount;
+            if(gLocal.pickerSlot<0)gLocal.pickerSlot=0;
+            alien_pvp::vents::Point exit{};
+            if(alien_pvp::vents::ReadPoint(vents,static_cast<std::uint32_t>(gLocal.pickerVents[gLocal.pickerSlot]),&VentRead,exit)) {
+                gLocal.freeEye={exit[0],exit[1]+0.6F,exit[2]};
+                gLocal.selectedVent=gLocal.pickerVents[gLocal.pickerSlot];
+            }
+        }
+        gLocal.pickPrev=prev;gLocal.pickNext=next;
         // This is a local camera, never an Alien movement/teleport command.
         input.forward=input.strafe=0.0F;
         static_cast<void>(UpdateVentInterface(context,vents));
     }
+    if(!gLocal.freeCamera){gLocal.pickerCount=0;gLocal.pickerSlot=-1;}
     // Edges are queued independently of movement; holding a button does not
     // repeat a vent/attack command every frame. Native adapters explicitly
     // execute host-authorized native actions. No fabricated health effect.
@@ -761,7 +843,8 @@ Readiness Snapshot() noexcept {
         gLocal.visualReady,gLocal.moving};
 }
 VentInterface VentSnapshot() noexcept {
-    return {false,gLocal.wasBackstage,gLocal.nearbyVent,gLocal.selectedVent,gLocal.freeCamera};
+    return {false,gLocal.wasBackstage,gLocal.nearbyVent,gLocal.selectedVent,gLocal.freeCamera,
+        gLocal.pickerSlot,gLocal.pickerCount};
 }
 bool GoToVent(std::uint32_t index) noexcept {
     if(!gLocal.freeCamera || !gLocal.wasBackstage || alien_pvp::VentPending() || !alien_pvp::ControlActive() ||
@@ -789,6 +872,8 @@ void Reset(const bool sameCameraWorld,const bool certifiedLivingCharacter) noexc
     // The controller does not release AISync's exclusive lease: only the lease
     // owner does that after the certified request boundary is idle.
     alien_pvp_input::SetActive(false);
+    // Overlays are recreated with a new level; only restore in the same world.
+    if (gLocal.hudHidden && sameCameraWorld) SetGameHudHidden(gCameraBase,false);
     const auto camera=gLocal.camera;
     alien_pvp_visual::RestoreAlienHead(gLocal.character,gLocal.generation,
         certifiedLivingCharacter && sameCameraWorld);
@@ -887,6 +972,12 @@ void Pump(const Context& context) noexcept {
         alien_pvp_visual::RestoreTechnical(context.technicalPlayer,context.nativeGeneration,
             TechnicalIdentityCurrent(gLocal.camera));
     alien_pvp_input::SetActive(gLocal.visualReady && InputAllowed(context.moduleBase));
+    // Re-assert every 250 ms: the game re-shows the overlay on its own events.
+    if (gLocal.visualReady && now-gLocal.hudAt>=250U) {
+        gLocal.hudAt=now;SetGameHudHidden(context.moduleBase,true);gLocal.hudHidden=true;
+    } else if (!gLocal.visualReady && gLocal.hudHidden) {
+        SetGameHudHidden(context.moduleBase,false);gLocal.hudHidden=false;
+    }
     if (gLocal.visualReady) TickInput(context,now);
     else alien_pvp::CaptureLocal({});
 }
