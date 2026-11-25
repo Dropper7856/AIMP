@@ -39,14 +39,17 @@ struct ClipSelection final { std::uint32_t phase{}, kind{}; };
     bool exitPlaying, std::uint64_t elapsedMs) noexcept {
     return phase == 3U && concealedByUs && !exitPlaying && elapsedMs < 1500U;
 }
+// The owner reports the first-person aliases; a representation plays their
+// third-person versions (player_hiding_*_3p, AnimationSyncThirdPerson.h).
+// Both name the same locker phase, so receiver-side checks keep working.
 [[nodiscard]] constexpr ClipSelection ClassifyClip(std::uint32_t token) noexcept {
     switch (token) {
-    case 0xCF2A9F36U: return {1U, 1U};
-    case 0x1C440762U: return {2U, 1U};
-    case 0x5E642560U: return {3U, 1U};
-    case 0x80645982U: return {1U, 2U};
-    case 0x15691ACEU: return {2U, 2U};
-    case 0x3FDD3AF4U: return {3U, 2U};
+    case 0xCF2A9F36U: case 0x83B82548U: return {1U, 1U};
+    case 0x1C440762U: case 0x9E3AFEC4U: return {2U, 1U};
+    case 0x5E642560U: case 0x3BD6E37EU: return {3U, 1U};
+    case 0x80645982U: case 0x489ADE24U: return {1U, 2U};
+    case 0x15691ACEU: case 0x3E136460U: return {2U, 2U};
+    case 0x3FDD3AF4U: case 0xBB039362U: return {3U, 2U};
     default: return {};
     }
 }

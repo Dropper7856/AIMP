@@ -1,5 +1,6 @@
 #include "aimp/AnimationSyncRuntime.h"
 #include "aimp/AnimationSyncTimeline.h"
+#include "aimp/AnimationSyncThirdPerson.h"
 #include "aimp/AnimationSyncPropsRuntime.h"
 #include "aimp/AISyncNativeIntent.h"
 #include "aimp/CharacterDirectStepRuntime.h"
@@ -46,6 +47,10 @@ constexpr std::uint64_t kMaximumStartAgeMs = 1500U;
 // After the owner's clip ends, a one-shot keeps playing for the network delay.
 constexpr std::uint64_t kClearGraceMs = 750U;
 constexpr std::size_t kSlots = 40U;
+// Representations play third-person clips only (AnimationSyncThirdPerson.h).
+// The first-person posture rebuild (bone masks, owner body effectors, IK,
+// grounding) stays compiled for reference but never runs.
+constexpr bool kFirstPersonPosture = false;
 
 struct Cycle final {
     std::uintptr_t address{}, type{}, owner{}, graph{};
@@ -69,6 +74,16 @@ struct RemoteDiagnostics final {
     std::uint32_t maskTarget{}, maskCrewBones{}, maskCrewDriven{};
     std::uint64_t maskNoBase{};
     std::uint64_t applied{}, failed{}, stale{}, unavailable{}, interrupted{}, completed{}, cancelled{}, deferred{};
+    // Owner first-person clips with no third-person version: not played.
+    std::uint64_t unmapped{};
+    // lastUnmapped / source: owner first-person alias tokens (dropped / last played).
+    std::uint32_t lastUnmapped{}, source{};
+    // The owner's first-person take as last published (frames, seconds).
+    std::int32_t sourceStart{-1}, sourceEnd{-1};
+    float sourceDuration{};
+    // Current clip, horizontal millimetres: how far the owner's published
+    // Character moved, how far the representation moved, their largest gap.
+    std::uint32_t ownerTravelMm{}, repTravelMm{}, repGapMaxMm{};
     std::uint64_t transition{};
     std::uint32_t animation{}, resource{}, clipPath{};
     const char* stage{"pending"};
@@ -110,6 +125,13 @@ struct Slot final {
     float ownerRate{-1.0F}, rateSamplePhase{};
     std::uint64_t rateSampleAt{}, resyncAt{};
     std::uint32_t readmits{};
+    // The third-person clip is the owner's own take (same alias): its clock
+    // may follow the owner's. A stand-in clip plays on its own clock and to
+    // its end: the owner's clear of its first-person take does not stop it
+    // (the first-person take is shorter or ends earlier); only a newer owner
+    // action without a third-person clip (superseded) or a newer clip does.
+    bool ownerClock{}, superseded{};
+    std::array<float, 3> admittedAt{}, ownerFirst{};
     Cycle owned{};
     RemoteDiagnostics diagnostics{};
 };
@@ -802,7 +824,10 @@ void Segment(const State& s, float& start, float& end) noexcept {
 bool OwnerPhase(const Slot& slot, const std::uint64_t now, float& phase, float& remaining) noexcept {
     if (!Active(slot.desired)) return false;
     auto age = static_cast<std::uint64_t>(slot.desired.elapsedMilliseconds) + now - slot.receivedAt;
-    if (slot.ownerRate >= 0.0F && slot.ownerRate < 0.05F * slot.desired.speed) age = 0U;
+    // Holding, or rate not measured yet (needs 200 ms of samples): a staged
+    // clip may wait on its first frame (Lever_2 until right click), so do not
+    // project the owner ahead before its clock is seen moving.
+    if (slot.ownerRate < 0.05F * slot.desired.speed) age = 0U;
     std::int32_t loops{};
     if (!timeline::Project(slot.desired, age, phase, loops)) return false;
     float start{}, end{};
@@ -824,7 +849,7 @@ void NoteEnding(Slot& slot, const char* result, const Cycle& cycle, const std::u
 // Our replay of the owner's current clip: same transition, not a locker clip
 // (those follow their recorded path instead).
 bool Following(const Slot& slot) noexcept {
-    return Active(slot.desired) && slot.handled == slot.desired.transition &&
+    return slot.ownerClock && Active(slot.desired) && slot.handled == slot.desired.transition &&
         slot.desired.animation == slot.owned.animation &&
         player_hiding_presentation::ClassifyClip(slot.owned.animation).phase == 0U;
 }
@@ -836,8 +861,14 @@ void Readmit(Slot& slot, const bool following, const std::uint64_t now) noexcept
     ++slot.readmits; ++slot.diagnostics.readmitted; slot.handled = 0U;
 }
 // Keep our clip on the owner's clock: holds, slow stages and drift.
+// While the owner holds (a staged interaction waiting for input, e.g. the
+// hand on the Lever_2 handle until click + S), pin ours to its frame every
+// pump so it stays still instead of drifting 0.3 s ahead and snapping back.
 void FollowOwnerClock(Slot& slot, const Cycle& current, const std::uint64_t now) noexcept {
-    if (current.graph == 0U || now - slot.startedAt < 400U || now - slot.resyncAt < 250U) return;
+    // Unknown rate (-1) counts as holding: from admission until the owner's
+    // clock is seen moving, ours stays on the owner's last published frame.
+    const bool holding = slot.ownerRate < 0.05F * slot.desired.speed;
+    if (current.graph == 0U || (!holding && (now - slot.startedAt < 400U || now - slot.resyncAt < 250U))) return;
     float ours{}, duration{}, target{}, remaining{};
     if (!timeline::Read(current.graph, ours, duration) || !OwnerPhase(slot, now, target, remaining)) return;
     float difference = std::abs(ours - target);
@@ -846,9 +877,25 @@ void FollowOwnerClock(Slot& slot, const Cycle& current, const std::uint64_t now)
         Segment(slot.desired, start, end);
         if (end > start) difference = (std::min)(difference, std::abs((end - start) - difference));
     }
-    if (difference <= 0.3F) return;
+    if (difference <= (holding ? 0.02F : 0.3F)) return;
     slot.resyncAt = now;
     if (timeline::Seek(current.graph, target)) ++slot.diagnostics.resynced;
+}
+
+// Horizontal distances (x/z) of the clip in progress, for the snapshot.
+std::uint32_t HorizontalMm(const std::array<float, 3>& a, const std::array<float, 3>& b) noexcept {
+    const auto dx = a[0] - b[0], dz = a[2] - b[2];
+    const auto mm = std::sqrt(dx * dx + dz * dz) * 1000.0F;
+    return std::isfinite(mm) ? static_cast<std::uint32_t>((std::min)(mm, 1.0e9F)) : 0U;
+}
+void MeasureTravel(Slot& slot) noexcept {
+    auto& d = slot.diagnostics;
+    std::array<float, 3> at{};
+    if (!Read(slot.character + 0x70U, at)) return;
+    d.repTravelMm = (std::max)(d.repTravelMm, HorizontalMm(at, slot.admittedAt));
+    if (!Active(slot.desired)) return;
+    d.ownerTravelMm = (std::max)(d.ownerTravelMm, HorizontalMm(slot.desired.position, slot.ownerFirst));
+    d.repGapMaxMm = (std::max)(d.repGapMaxMm, HorizontalMm(at, slot.desired.position));
 }
 
 void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept {
@@ -868,7 +915,7 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
         // it later than the owner and needs its whole path into/out of the prop.
         const auto ownedHiding = player_hiding_presentation::ClassifyClip(slot.owned.animation).phase;
         const bool cleared = !Active(slot.desired) && slot.clearedAt != 0U &&
-            ownedHiding != 1U && ownedHiding != 3U &&
+            ownedHiding != 1U && ownedHiding != 3U && (slot.ownerClock || slot.superseded) &&
             (slot.ownedLoops != 1 || now - slot.clearedAt > kClearGraceMs + slot.holsterWait);
         const bool following = Following(slot);
         if (!Owned(current, slot.owned)) {
@@ -889,6 +936,7 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
             }
             else { ++d.deferred; d.stage = "cancel-deferred"; }
         } else {
+            MeasureTravel(slot);
             if (slot.owned.graph == 0U && current.graph != 0U) {
                 slot.owned.graph = current.graph; d.stage = "playing";
             }
@@ -950,7 +998,7 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
     slot.maskActive = false;
     slot.crewPose.fill(-1);
     d.maskTarget = d.maskCrewBones = d.maskCrewDriven = 0U;
-    if (const auto* mask = FindMask(d.clipPath)) {
+    if (const auto* mask = kFirstPersonPosture ? FindMask(d.clipPath) : nullptr) {
         d.maskStatus = mask->status; d.maskSkeleton = mask->skeleton; d.maskTracks = mask->tracks;
         d.maskMoving = mask->moving; d.maskHeld = mask->held;
         std::uint32_t lowBones{}, highBones{};
@@ -1035,6 +1083,8 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
         slot.owned = current; slot.startedAt = now; slot.ownedLoops = playback.loops;
         slot.ownerStartY = slot.desired.position[1];
         slot.ownedYaw = heading;
+        slot.admittedAt = placement; slot.ownerFirst = slot.desired.position;
+        d.ownerTravelMm = d.repTravelMm = d.repGapMaxMm = 0U;
     }
     if (!invoked || !constructed || (current.flags & 4U) != 0U || current.graph == 0U) {
         ++d.failed; d.stage = "native-admission"; return;
@@ -1339,10 +1389,15 @@ void RecordPose(const std::size_t index, const State& state) noexcept {
     else track.samples[track.count++] = sample;
 }
 
-bool Publish(const std::uintptr_t character, const State& state, std::string& error) noexcept {
-    if (character < 0x10000U || !Valid(state)) {
+bool Publish(const std::uintptr_t character, const State& owner, std::string& error) noexcept {
+    if (character < 0x10000U || !Valid(owner)) {
         error = "Animation sync requires a Character binding and a valid clip state"; return false;
     }
+    // The owner reports its first-person alias; the representation plays the
+    // third-person clip that stands for it, or nothing.
+    State state = owner;
+    bool ownerClock{};
+    const bool mapped = third_person::Translate(state, ownerClock);
     const std::lock_guard lock(gMutex);
     auto* slot = Find(character);
     if (slot == nullptr) {
@@ -1356,6 +1411,17 @@ bool Publish(const std::uintptr_t character, const State& state, std::string& er
         if (slot == nullptr) { error = "Animation sync mailbox is full"; return false; }
     }
     const auto now = GetTickCount64();
+    if (!mapped) {
+        // A newer owner action without a third-person clip ends ours (as a
+        // clear would) and is consumed, so its refreshes are ignored too.
+        if (owner.transition > slot->highest) {
+            slot->highest = owner.transition;
+            ++slot->diagnostics.unmapped; slot->diagnostics.lastUnmapped = owner.animation;
+            slot->superseded = true;
+            if (Active(slot->desired)) { slot->desired = {}; slot->clearedAt = now; slot->epoch = ++gEpoch; }
+        }
+        return true;
+    }
     if (!Active(state)) {
         if (Active(slot->desired)) { slot->desired = {}; slot->clearedAt = now; slot->epoch = ++gEpoch; }
         return true;
@@ -1384,6 +1450,9 @@ bool Publish(const std::uintptr_t character, const State& state, std::string& er
     }
     slot->ownerRate = -1.0F; slot->rateSamplePhase = state.phaseSeconds;
     slot->rateSampleAt = now - state.elapsedMilliseconds; slot->readmits = 0U;
+    slot->ownerClock = ownerClock; slot->superseded = false; slot->diagnostics.source = owner.animation;
+    slot->diagnostics.sourceStart = owner.startFrame; slot->diagnostics.sourceEnd = owner.endFrame;
+    slot->diagnostics.sourceDuration = owner.durationSeconds;
     slot->desired = state; slot->highest = state.transition;
     slot->receivedAt = now; slot->clearedAt = 0U; slot->epoch = ++gEpoch;
     Record(static_cast<std::size_t>(slot - gSlots.data()), state);
@@ -2014,7 +2083,10 @@ void __fastcall LayerBlendDetour(void* controller, void*, const std::uint32_t fr
     // skeleton reference pose (0x2983D0): the T-posed arm. Fix the final pose.
     if (to != 7U || !gMaskHook.load(std::memory_order_acquire) || pose == nullptr) return;
     const auto address = reinterpret_cast<std::uintptr_t>(controller);
-    if (address == gOwnerPose.controller.load(std::memory_order_acquire)) { CaptureOwnerPose(address, pose); return; }
+    if (address == gOwnerPose.controller.load(std::memory_order_acquire)) {
+        if constexpr (kFirstPersonPosture) CaptureOwnerPose(address, pose);
+        return;
+    }
     for (auto& share : gMaskShares) {
         if (share.controller.load(std::memory_order_acquire) != address) continue;
         const std::lock_guard lock(share.mutex);
@@ -2106,6 +2178,14 @@ void Export(Diagnostics& diagnostics, const std::uintptr_t remoteCharacter) {
          {"stage", remote.stage, false},
          {"transition", Diagnostics::Unsigned(remote.transition), true},
          {"animation", Diagnostics::Unsigned(remote.animation), true},
+         {"sourceAnimation", Diagnostics::Unsigned(remote.source), true},
+         {"sourceFrames", std::to_string(remote.sourceStart) + ".." + std::to_string(remote.sourceEnd), false},
+         {"sourceDuration", Diagnostics::Unsigned(static_cast<std::uint64_t>(remote.sourceDuration * 1000.0F)), true},
+         {"ownerTravelMm", Diagnostics::Unsigned(remote.ownerTravelMm), true},
+         {"repTravelMm", Diagnostics::Unsigned(remote.repTravelMm), true},
+         {"repGapMaxMm", Diagnostics::Unsigned(remote.repGapMaxMm), true},
+         {"unmapped", Diagnostics::Unsigned(remote.unmapped), true},
+         {"lastUnmapped", Diagnostics::Unsigned(remote.lastUnmapped), true},
          {"resource", Diagnostics::Unsigned(remote.resource), true},
          {"clipPath", Diagnostics::Unsigned(remote.clipPath), true},
          {"playing", Diagnostics::Boolean(playing), true},
