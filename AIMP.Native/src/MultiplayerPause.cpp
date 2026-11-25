@@ -95,13 +95,14 @@ bool ActiveMultiplayerWorld(const std::uintptr_t pauseManager) noexcept {
         gGenerations->IsStableGeneration(generation);
 }
 
-bool NativeMenuOwnsPause() noexcept {
+bool NativeMenuOwnsPause(const std::uintptr_t base = gBase) noexcept {
     // 00810420's exact movie index, without invoking UI code from a simulation
     // worker or keeping a movie pointer beyond this query. +1CE2 belongs to the
     // HUB movie, NOT to the smaller UI manager. Pause_Game/Unpause_Game own it.
+    if (base == 0U) return false;
     std::uintptr_t manager{}, movies{};
     std::uint32_t count{};
-    if (!Read(gBase + kUiManager, manager) || manager == 0U ||
+    if (!Read(base + kUiManager, manager) || manager == 0U ||
         !Read(manager + 0x38U, movies) || movies == 0U ||
         !Read(manager + 0x3CU, count) || count == 0U || count > 256U) return false;
     bool owned = false;
@@ -109,7 +110,7 @@ bool NativeMenuOwnsPause() noexcept {
         std::uintptr_t movie{}, type{}, name{};
         std::uint8_t active{}, pauseOwned{};
         if (!Read(movies + i * sizeof(std::uintptr_t), movie) || movie == 0U || !Read(movie, type)) continue;
-        if (type == gBase + kHubType && Read(movie + 0x1CE2U, pauseOwned) && pauseOwned != 0U)
+        if (type == base + kHubType && Read(movie + 0x1CE2U, pauseOwned) && pauseOwned != 0U)
             owned = true;
         else if (Read(movie + 0x0CU, active) && active != 0U &&
             Read(movie + 0x34U, name) && name != 0U) {
@@ -123,7 +124,7 @@ bool NativeMenuOwnsPause() noexcept {
     }
     std::uintptr_t currentManager{}, currentMovies{};
     std::uint32_t currentCount{};
-    if (!Read(gBase + kUiManager, currentManager) || currentManager != manager ||
+    if (!Read(base + kUiManager, currentManager) || currentManager != manager ||
         !Read(manager + 0x38U, currentMovies) || currentMovies != movies ||
         !Read(manager + 0x3CU, currentCount) || currentCount != count) {
         gUiContextRejected.fetch_add(1U, std::memory_order_relaxed);
@@ -527,6 +528,24 @@ bool Install(const std::uintptr_t moduleBase, HookManager& hooks,
 
 bool Installed() noexcept {
     return gInstalled.load(std::memory_order_acquire);
+}
+
+std::uint32_t MenuOpen(const std::uintptr_t moduleBase) noexcept {
+    // AvS 2026-11-24: the Alien pilot's input firewall only tested 0x12000.
+    // In a multiplayer world the Escape menu can be up with ONLY the 0x401
+    // Pause_Game pair (see FilterMask), so every click/key into the pause
+    // menu was still swallowed and the Alien could not quit or disconnect.
+    if (moduleBase == 0U) return 0U;
+    std::uintptr_t pauseManager{};
+    std::uint32_t flags{};
+    if (!Read(moduleBase + kPauseManager, pauseManager) || pauseManager == 0U ||
+        !Read(pauseManager + 4U, flags)) return 0U;
+    if ((flags & kMenuReasons) != 0U) return 1U;
+    // A scripted Pause_Game without a menu must not steal the pilot's input:
+    // require the certified pause-menu/HUB owner, as FilterMask does.
+    if ((flags & kPauseGameReason) != 0U && NativeMenuOwnsPause(moduleBase))
+        return (flags & kPauseGameReason) == kPauseGameReason ? 2U : 3U;
+    return 0U;
 }
 
 bool SetLoadingHold(const bool active, const std::string& sessionId, const std::uint32_t generation) {
