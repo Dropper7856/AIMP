@@ -11,8 +11,20 @@ struct DonorMovement final {
     ap::ResponsiveStop responsiveStop{};
     bool pilotMoving{};
     float pilotYaw{};
+    // Stall watch (AvS 2026-11-25: "still stopping for no reason, getting
+    // stuck on stuff" while every held frame was driven and Admitted).
+    std::uint64_t stallAt{};float stallX{},stallZ{};float stallYaw{};
 };
 std::array<DonorMovement,4> donorMovements{};
+struct DonorStallTelemetry final {
+    std::atomic<std::uint64_t> stalls{},restarts{},requestsLost{},submits{},updates{};
+    std::atomic<unsigned> lastCycle{};
+    std::atomic<float> lastX{},lastZ{};
+} donorStallTelemetry;
+// 500 ms of driving with < 15 cm of travel. The retained kind9 request can
+// finish (arrive/fail at an obstacle) while it is still "Admitted"; Update then
+// edits a dead request and the Alien stands still. Restart it from scratch.
+constexpr std::uint64_t kDonorStallMs=500U;constexpr float kDonorStallMetres=0.15F;
 bool DonorPermission(void* opaque,const transactions::Record& r) noexcept {
     const auto& d=*static_cast<DonorMovement*>(opaque);
     const bool cleanup=r.opcode==transactions::Op::Cancel || r.opcode==transactions::Op::Release;
@@ -89,8 +101,44 @@ bool DriveDonor(const ap::Context& c,const ap::Frame* input) noexcept {
     if(d->fault)return false;
     d->responsiveStop.Cancel();
     if(!DonorGait(c,input->gait))return false;
+    if(c.localOwner && d->used && d->pilotMoving) {
+        const auto now=GetTickCount64();
+        std::array<float,3> body{};std::uintptr_t stallCycle{};std::uint8_t stallState{0xFFU};
+        if(Read(c.character+0x36CU,stallCycle) && stallCycle)static_cast<void>(Read(stallCycle+0x1AU,stallState));
+        if(Read(c.character+0x70U,body)) {
+            const float wanted=ap::WrapYaw(input->yaw+std::atan2(input->strafe,input->forward));
+            // A new heading is a fresh attempt; only a steady push can stall.
+            // Start (55) / stop (59) cycles legitimately turn in place.
+            if(!d->stallAt || stallState==55U || stallState==59U ||
+                std::hypot(body[0]-d->stallX,body[2]-d->stallZ)>=kDonorStallMetres ||
+                std::abs(ap::WrapYaw(wanted-d->stallYaw))>0.6F) {
+                d->stallAt=now;d->stallX=body[0];d->stallZ=body[2];d->stallYaw=wanted;
+            } else if(now-d->stallAt>=kDonorStallMs) {
+                donorStallTelemetry.stalls.fetch_add(1U,std::memory_order_relaxed);
+                donorStallTelemetry.lastCycle=stallState;
+                donorStallTelemetry.lastX=body[0];donorStallTelemetry.lastZ=body[2];
+                d->stallAt=0U;
+                // Retire the wedged request. Next frame DonorFor() finds no
+                // used slot and builds a brand-new kind9 request (fresh ids),
+                // exactly like the first press after a stop.
+                auto cleanup=d->command;
+                cleanup.flags=cleanup.mode=cleanup.gait=0U;
+                cleanup.goalX=cleanup.goalY=cleanup.goalZ=cleanup.distance=cleanup.stopDistance=cleanup.aux=0.0F;
+                cleanup.opcode=transactions::Op::Cancel;
+                if(d->adapter->Invoke(cleanup)==transactions::NativeOutcome::Admitted) {
+                    cleanup.opcode=transactions::Op::Release;
+                    if(d->adapter->Invoke(cleanup)==transactions::NativeOutcome::Admitted) {
+                        d->used=false;d->pilotMoving=false;
+                        donorStallTelemetry.restarts.fetch_add(1U,std::memory_order_relaxed);
+                        return true;
+                    }
+                }
+            }
+        }
+    }
     auto& r=d->command;
     r.opcode=d->used?transactions::Op::Update:transactions::Op::Submit;
+    (d->used?donorStallTelemetry.updates:donorStallTelemetry.submits).fetch_add(1U,std::memory_order_relaxed);
     if(d->used){++r.parameterRevision;++r.globalSeq;++r.ownerSeq;}
     // Donor ReadInput worldYaw; native request +20 is pi/2 (not a speed),
     // +24 is refreshed to 10 metres and +34 rebases at the current body.
@@ -101,7 +149,10 @@ bool DriveDonor(const ap::Context& c,const ap::Frame* input) noexcept {
     d->fault=outcome==transactions::NativeOutcome::Unknown;
     // A resource check can defer before the factory runs. It created no
     // retained request, so the next fresh input must retry Submit, not Update.
-    if(!d->fault && d->adapter->ActiveCount()==0U)d->used=false;
+    if(!d->fault && d->adapter->ActiveCount()==0U) {
+        if(r.opcode==transactions::Op::Update)donorStallTelemetry.requestsLost.fetch_add(1U,std::memory_order_relaxed);
+        d->used=false;
+    }
     if(c.localOwner && outcome==transactions::NativeOutcome::Admitted) {
         d->pilotMoving=true;d->pilotYaw=r.aux;
     }

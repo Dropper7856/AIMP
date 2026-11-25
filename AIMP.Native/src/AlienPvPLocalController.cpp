@@ -62,6 +62,12 @@ struct LocalState final {
     // jumps between real exits ranked by distance to the survivors.
     std::array<int,8> pickerVents{};int pickerCount{},pickerSlot{-1};
     std::uint64_t pickerBuiltAt{};bool pickPrev{},pickNext{};
+    // AvS 2026-11-25 (round 3): the eye sat ON the vent point, facing the
+    // duct wall (grey screen). FollowAfter probes the open side of the room
+    // once per selected exit and keeps the mouse look relative to that aim.
+    int pickerAimVent{-1};bool pickerAimPending{},pickerAimed{};
+    std::array<float,3> pickerExit{},pickerEye{},pickerToward{};bool pickerHasToward{};
+    float pickerYaw{},pickerPitch{},orbitYaw0{},orbitPitch0{};
     bool hudHidden{};std::uint64_t hudAt{};
     int nearbyVent{-1},selectedVent{-1};
     float cameraDistance{3.0F},cameraHeight{2.0F},cameraSide{0.5F};
@@ -87,6 +93,9 @@ std::atomic<std::uintptr_t> gOrbitBase{},gOrbitBehavior{},gOrbitTarget{};
 std::atomic<std::uint64_t> gOrbitFrames{},gOrbitCollisions{},gOrbitNoWorld{};
 struct OrbitState {std::uintptr_t target{};float yaw{},pitch{0.25F},distance{3.0F},shown{3.0F};};
 OrbitState gOrbit{}; // engine thread only
+struct AimStats final {
+    std::atomic<std::uint32_t> aims{},mode{},worlds{};std::atomic<float> open{};std::atomic<int> vent{-1};
+} gAimStats; // written by the camera hook, read by diagnostics
 
 template<typename T>
 bool Read(const std::uintptr_t at, T& out) noexcept {
@@ -527,9 +536,23 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
             if(next && !gLocal.pickNext)gLocal.pickerSlot=(gLocal.pickerSlot+1)%gLocal.pickerCount;
             if(gLocal.pickerSlot<0)gLocal.pickerSlot=0;
             alien_pvp::vents::Point exit{};
-            if(alien_pvp::vents::ReadPoint(vents,static_cast<std::uint32_t>(gLocal.pickerVents[gLocal.pickerSlot]),&VentRead,exit)) {
-                gLocal.freeEye={exit[0],exit[1]+0.6F,exit[2]};
-                gLocal.selectedVent=gLocal.pickerVents[gLocal.pickerSlot];
+            const int vent=gLocal.pickerVents[gLocal.pickerSlot];
+            if(alien_pvp::vents::ReadPoint(vents,static_cast<std::uint32_t>(vent),&VentRead,exit)) {
+                if(vent!=gLocal.pickerAimVent) {
+                    // New exit: provisional eye at head height over the vent;
+                    // the camera hook replaces it with the probed room view.
+                    gLocal.pickerAimVent=vent;gLocal.pickerAimPending=true;gLocal.pickerAimed=false;
+                    gLocal.pickerExit={exit[0],exit[1],exit[2]};
+                    gLocal.pickerHasToward=false;float best=1.0e9F;
+                    for(std::uint32_t s=0;s<context.survivorCount && s<4U;++s) {
+                        const float dx=context.survivors[s][0]-exit[0],dz=context.survivors[s][2]-exit[2];
+                        const float d=std::hypot(dx,dz);
+                        if(d>0.2F && d<best){best=d;gLocal.pickerToward={dx/d,0.0F,dz/d};gLocal.pickerHasToward=true;}
+                    }
+                    gLocal.freeEye={exit[0],exit[1]+1.0F,exit[2]};
+                }
+                if(gLocal.pickerAimed)gLocal.freeEye=gLocal.pickerEye;
+                gLocal.selectedVent=vent;
             }
         }
         gLocal.pickPrev=prev;gLocal.pickNext=next;
@@ -537,7 +560,7 @@ void TickInput(const Context& context,const std::uint64_t now) noexcept {
         input.forward=input.strafe=0.0F;
         static_cast<void>(UpdateVentInterface(context,vents));
     }
-    if(!gLocal.freeCamera){gLocal.pickerCount=0;gLocal.pickerSlot=-1;}
+    if(!gLocal.freeCamera){gLocal.pickerCount=0;gLocal.pickerSlot=-1;gLocal.pickerAimVent=-1;gLocal.pickerAimed=gLocal.pickerAimPending=false;}
     // Edges are queued independently of movement; holding a button does not
     // repeat a vent/attack command every frame. Native adapters explicitly
     // execute host-authorized native actions. No fabricated health effect.
@@ -604,13 +627,84 @@ void FollowBefore(std::uintptr_t behavior) noexcept {
         Read(child+0x148U,current) && current!=target)
         static_cast<void>(RetargetCamera(gCameraBase,child,target));
 }
+// Vent-exit picker view: find the open side of the room around the selected
+// exit with this generation's physics rays (preferring the side facing the
+// nearest survivor), put the eye just outside the opening at head height and
+// look into the room. Without a sampled world, face the survivor instead.
+void AimPickerCamera(const std::array<float,3>& orbitForward) noexcept {
+    const auto generation=gCameraGeneration.load(std::memory_order_acquire);
+    const auto now=GetTickCount64();
+    std::array<std::uintptr_t,4> worlds{};unsigned worldCount{};
+    for(auto& sample:gWorlds) {
+        if(sample.generation.load(std::memory_order_acquire)!=generation || now-sample.at.load()>1000U)continue;
+        if(const auto world=sample.world.load())worlds[worldCount++]=world;
+    }
+    const auto e=gLocal.pickerExit;
+    const auto cast=[&](const std::array<float,3>& from,const std::array<float,3>& to) noexcept {
+        float best=std::hypot(std::hypot(to[0]-from[0],to[2]-from[2]),to[1]-from[1]);
+        for(unsigned i=0;i<worldCount;++i) {
+            std::array<float,3> hit{};
+            if(Ray(worlds[i],from,to,hit))
+                best=std::min(best,std::hypot(std::hypot(hit[0]-from[0],hit[2]-from[2]),hit[1]-from[1]));
+        }
+        return best;
+    };
+    float yaw{},open{-1.0F};int mode{};
+    if(worldCount) {
+        constexpr int kDirections=16;constexpr float kReach=6.0F;float bestScore=-1.0e9F;
+        const std::array<float,3> from{e[0],e[1]+1.0F,e[2]};
+        for(int i=0;i<kDirections;++i) {
+            const float a=static_cast<float>(i)*6.28318530718F/static_cast<float>(kDirections);
+            const float dx=std::sin(a),dz=std::cos(a);
+            const float d=cast(from,{from[0]+dx*kReach,from[1],from[2]+dz*kReach});
+            const float toward=gLocal.pickerHasToward?
+                std::max(0.0F,dx*gLocal.pickerToward[0]+dz*gLocal.pickerToward[2]):0.0F;
+            const float score=d+1.5F*toward;
+            if(score>bestScore){bestScore=score;yaw=a;open=d;}
+        }
+        mode=1;
+    } else if(gLocal.pickerHasToward) {
+        yaw=std::atan2(gLocal.pickerToward[0],gLocal.pickerToward[2]);mode=2;
+    } else {
+        yaw=std::atan2(orbitForward[0],orbitForward[2]);mode=3;
+    }
+    const float dx=std::sin(yaw),dz=std::cos(yaw);
+    const float out=mode==1?std::clamp(open-0.3F,0.0F,0.7F):0.7F;
+    float height=1.0F;
+    if(worldCount) {
+        const float up=cast({e[0]+dx*out,e[1]+0.3F,e[2]+dz*out},{e[0]+dx*out,e[1]+1.6F,e[2]+dz*out});
+        height=std::clamp(0.3F+up-0.25F,0.4F,1.2F);
+    }
+    gLocal.pickerEye={e[0]+dx*out,e[1]+height,e[2]+dz*out};
+    gLocal.orbitYaw0=std::atan2(orbitForward[0],orbitForward[2]);
+    gLocal.orbitPitch0=std::asin(std::clamp(orbitForward[1],-1.0F,1.0F));
+    gLocal.pickerYaw=yaw;gLocal.pickerPitch=mode==3?gLocal.orbitPitch0:-0.12F;
+    gLocal.pickerAimed=true;gLocal.pickerAimPending=false;
+    gLocal.freeEye=gLocal.pickerEye;
+    gAimStats.mode.store(static_cast<std::uint32_t>(mode),std::memory_order_relaxed);
+    gAimStats.open.store(open,std::memory_order_relaxed);
+    gAimStats.worlds.store(worldCount,std::memory_order_relaxed);
+    gAimStats.vent.store(gLocal.pickerAimVent,std::memory_order_relaxed);
+    gAimStats.aims.fetch_add(1U,std::memory_order_release);
+}
 void FollowAfter(std::uintptr_t behavior) noexcept {
     if(!CameraHookCurrent(behavior))return;
     std::array<float,3> body{},base{},position{};
     if(!Read(gLocal.character+0x70U,body) || !Read(behavior+0x1C0U,base) || !Read(behavior+0x1CU,position))return;
     if(gLocal.freeCamera) {
         const float length=std::hypot(std::hypot(base[0]-position[0],base[2]-position[2]),base[1]-position[1]);
-        if(length>0.01F && !gLocal.exitTracking)for(unsigned i=0;i<3;++i)gLocal.freeForward[i]=(base[i]-position[i])/length;
+        std::array<float,3> orbit=gLocal.freeForward;
+        if(length>0.01F)for(unsigned i=0;i<3;++i)orbit[i]=(base[i]-position[i])/length;
+        if(!gLocal.exitTracking) {
+            if(gLocal.pickerAimPending)AimPickerCamera(orbit);
+            if(gLocal.pickerAimed) {
+                // Mouse look stays live, relative to the probed room view.
+                const float yaw=gLocal.pickerYaw+(std::atan2(orbit[0],orbit[2])-gLocal.orbitYaw0);
+                const float pitch=std::clamp(gLocal.pickerPitch+
+                    (std::asin(std::clamp(orbit[1],-1.0F,1.0F))-gLocal.orbitPitch0),-1.2F,1.2F);
+                gLocal.freeForward={std::sin(yaw)*std::cos(pitch),std::sin(pitch),std::cos(yaw)*std::cos(pitch)};
+            } else if(length>0.01F)gLocal.freeForward=orbit;
+        }
         const auto out=gLocal.freeEye;
         std::array<float,3> target{};
         for(unsigned i=0;i<3;++i)target[i]=out[i]+gLocal.freeForward[i]*5.0F;
@@ -845,6 +939,11 @@ Readiness Snapshot() noexcept {
 VentInterface VentSnapshot() noexcept {
     return {false,gLocal.wasBackstage,gLocal.nearbyVent,gLocal.selectedVent,gLocal.freeCamera,
         gLocal.pickerSlot,gLocal.pickerCount};
+}
+VentCameraStats VentCameraSnapshot() noexcept {
+    return {gAimStats.aims.load(std::memory_order_acquire),gAimStats.mode.load(std::memory_order_relaxed),
+        gAimStats.worlds.load(std::memory_order_relaxed),gAimStats.open.load(std::memory_order_relaxed),
+        gAimStats.vent.load(std::memory_order_relaxed)};
 }
 bool GoToVent(std::uint32_t index) noexcept {
     if(!gLocal.freeCamera || !gLocal.wasBackstage || alien_pvp::VentPending() || !alien_pvp::ControlActive() ||

@@ -40,6 +40,12 @@ struct VentInterface {bool open{},backstage{};int nearby{-1},selected{-1};bool f
     // near survivors, the selected position in that list and the list size.
     int pickerSlot{-1},pickerCount{};};
 [[nodiscard]] VentInterface VentSnapshot() noexcept;
+// Exit-camera aim (AvS 2026-11-25 round 3: grey view into the duct), safe to
+// read from the diagnostics thread. mode 1 physics rays, 2 toward survivor (no
+// world sampled), 3 kept mouse view; open = free distance seen from the exit
+// (m, -1 unknown); aims = exits aimed so far; vent = last aimed exit index.
+struct VentCameraStats {std::uint32_t aims{},mode{},worlds{};float open{};int vent{-1};};
+[[nodiscard]] VentCameraStats VentCameraSnapshot() noexcept;
 bool GoToVent(std::uint32_t index) noexcept;
 void Pump(const Context& context) noexcept;
 // clearCurrentWorld is false during teardown/physical generation rollover:
