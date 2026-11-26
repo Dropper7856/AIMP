@@ -76,6 +76,13 @@ struct RemoteDiagnostics final {
     std::uint64_t applied{}, failed{}, stale{}, unavailable{}, interrupted{}, completed{}, cancelled{}, deferred{};
     // Owner first-person clips with no third-person version: not played.
     std::uint64_t unmapped{};
+    // Holster-first outcome per admission (flamethrower-in-hand report, 588):
+    // requested = transition sent, alreadyUnarmed = no transition needed,
+    // busy = transition refused, timeouts = still armed after 1.5 s, drawn = drawn back.
+    std::uint64_t holsterRequested{}, holsterAlreadyUnarmed{}, holsterBusy{}, holsterTimeouts{}, holsterDrawn{};
+    // Equipment controller at the last clip start: slot (+150C), equipped (+1510),
+    // pending/fire/ready (+A0/+A3/+A4) packed, slot wrapper present.
+    std::uint32_t startSlot{0xFFFFFFFFU}, startEquipped{0xFFU}, startFlags{0xFFFFFFU}, startWrapper{};
     // lastUnmapped / source: owner first-person alias tokens (dropped / last played).
     std::uint32_t lastUnmapped{}, source{};
     // The owner's first-person take as last published (frames, seconds).
@@ -948,8 +955,9 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
         // A first-person player hidden in a locker has no weapon out: draw it
         // back only once the owner has left the locker.
         if (slot.owned.address == 0U && slot.holstered >= 0 && !player_hiding::Hidden(slot.character) &&
-            EquipmentTransition(slot.character, true, slot.holstered))
-            slot.holstered = -1;
+            EquipmentTransition(slot.character, true, slot.holstered)) {
+            slot.holstered = -1; ++d.holsterDrawn;
+        }
         return;
     }
     d.transition = slot.desired.transition; d.animation = slot.desired.animation;
@@ -982,14 +990,18 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
         std::int32_t holstered{-1};
         if (EquipmentTransition(slot.character, false, holstered)) {
             slot.holstered = holstered; slot.holsterStarted = now; slot.unarmedAt = 0U;
-            d.stage = "holstering"; return;
+            ++d.holsterRequested; d.stage = "holstering"; return;
         }
+        if (std::strcmp(d.stage, "equipment-busy") != 0) ++d.holsterBusy;
         ++d.deferred; d.stage = "equipment-busy"; return;
     }
+    if (slot.holstered < 0 && slot.holsterStarted == 0U) ++d.holsterAlreadyUnarmed;
     if (slot.holsterStarted != 0U) {
         const bool unarmed = Unarmed(slot.character);
         if (!unarmed) {
-            d.stage = now - slot.holsterStarted < kHolsterTimeoutMs ? "holstering" : "holster-not-ready";
+            const bool late = now - slot.holsterStarted >= kHolsterTimeoutMs;
+            if (late && std::strcmp(d.stage, "holster-not-ready") != 0) ++d.holsterTimeouts;
+            d.stage = late ? "holster-not-ready" : "holstering";
             return;
         }
         if (slot.unarmedAt == 0U) slot.unarmedAt = now;
@@ -1071,6 +1083,22 @@ void Advance(Slot& slot, const std::uint64_t now, MaskShare& maskShare) noexcept
         ++d.deferred; d.stage = "actor-changed"; return;
     }
     slot.handled = slot.desired.transition; // native call is attempted exactly once
+    {
+        std::uintptr_t controller{}, wrapper{};
+        std::uint32_t equipSlot{0xFFFFFFFFU};
+        std::uint8_t equipped{0xFFU}, pending{0xFFU}, fire{0xFFU}, ready{0xFFU};
+        if (Read(slot.character + 0x1100U, controller) && controller != 0U) {
+            static_cast<void>(Read(controller + 0x150CU, equipSlot));
+            static_cast<void>(Read(controller + 0x1510U, equipped));
+            static_cast<void>(Read(controller + 0xA0U, pending));
+            static_cast<void>(Read(controller + 0xA3U, fire));
+            static_cast<void>(Read(controller + 0xA4U, ready));
+            if (equipSlot <= 10U) static_cast<void>(Read(controller + equipSlot * 4U, wrapper));
+        }
+        d.startSlot = equipSlot; d.startEquipped = equipped;
+        d.startFlags = (static_cast<std::uint32_t>(pending) << 16U) | (static_cast<std::uint32_t>(fire) << 8U) | ready;
+        d.startWrapper = wrapper != 0U ? 1U : 0U;
+    }
     slot.holsterWait = waited; slot.holsterStarted = slot.unarmedAt = 0U;
     const bool invoked = Invoke(current.address, intent);
     const bool constructed = ReadCycle(slot.character, current) && current.runtime == before.runtime &&
@@ -2223,7 +2251,16 @@ void Export(Diagnostics& diagnostics, const std::uintptr_t remoteCharacter) {
          {"poseSolved", Diagnostics::Unsigned(share.solved), true},
          {"poseSkip", Diagnostics::Unsigned(share.skip), true},
          {"poseTrack", Diagnostics::Unsigned(share.track), true},
-         {"maskNoBase", Diagnostics::Unsigned(remote.maskNoBase), true}});
+         {"maskNoBase", Diagnostics::Unsigned(remote.maskNoBase), true},
+         {"holsterRequested", Diagnostics::Unsigned(remote.holsterRequested), true},
+         {"holsterAlreadyUnarmed", Diagnostics::Unsigned(remote.holsterAlreadyUnarmed), true},
+         {"holsterBusy", Diagnostics::Unsigned(remote.holsterBusy), true},
+         {"holsterTimeouts", Diagnostics::Unsigned(remote.holsterTimeouts), true},
+         {"holsterDrawn", Diagnostics::Unsigned(remote.holsterDrawn), true},
+         {"startEquipSlot", Diagnostics::Unsigned(remote.startSlot), true},
+         {"startEquipped", Diagnostics::Unsigned(remote.startEquipped), true},
+         {"startPendingFireReady", Diagnostics::Unsigned(remote.startFlags), true},
+         {"startWrapper", Diagnostics::Unsigned(remote.startWrapper), true}});
     decltype(gOwnerCycles) cycles{};
     decltype(gOwnerAliases) aliases{};
     { const std::lock_guard lock(gLocalMutex); cycles = gOwnerCycles; aliases = gOwnerAliases; }
