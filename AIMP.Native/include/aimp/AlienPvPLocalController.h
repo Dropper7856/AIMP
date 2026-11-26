@@ -59,7 +59,12 @@ struct VentCameraStats {std::uint32_t aims{},mode{},worlds{};float open{};int ve
     std::uint64_t ventFaceHits{};float hiddenGap{-1.0F},faceGap{-1.0F};
     // inReachFrames = frames any vent was inside reach; tableCount = native
     // vent table size; reachWorlds = physics worlds the reach ray used.
-    std::uint64_t inReachFrames{};std::uint32_t tableCount{},reachWorlds{};};
+    std::uint64_t inReachFrames{};std::uint32_t tableCount{},reachWorlds{};
+    // Round 8: selfHits = ray hits within 1 m of its chest start (the Alien's
+    // own body, ignored); blockedOffered = frames E was offered for a blocked
+    // vent because no visible one was in reach; hitFromStart = last hit's
+    // distance from the ray start (m).
+    std::uint64_t selfHits{},blockedOffered{};float hitFromStart{-1.0F};};
 [[nodiscard]] VentCameraStats VentCameraSnapshot() noexcept;
 bool GoToVent(std::uint32_t index) noexcept;
 void Pump(const Context& context) noexcept;

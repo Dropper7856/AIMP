@@ -918,6 +918,9 @@ std::atomic<std::uint64_t> gReservedByOutcome{},gReservedByPair{};
 std::atomic<std::uint64_t> gCycleCallsCaptured{},gCycleCallsRefused{},gCycleCallsPublished{},gCycleCallsReplayed{},gCycleCallsReplayFailed{};
 std::atomic<std::uint64_t> gDirectLocomotionConstructorsConsumed{};
 std::atomic<std::uint64_t> gDirectPoseStuckCorrections{},gDirectPoseEmergencyCorrections{},gDirectPoseAssistFrames{},gDirectPoseActionFollowFrames{};
+// AvS 2026-11-26: Client pair replay sources snapped onto the Host pose before
+// native entry (local-player victim), and the last such planar error (m).
+std::atomic<std::uint64_t> gPairSourceAligned{},gPairSourceAlignSkipped{};std::atomic<float> gPairSourceAlignError{-1.0F};
 std::atomic<std::uint32_t> gLastRefusedCycleCall{};
 std::atomic<std::uint64_t> gIntakeHeldByPair{},gIntakeHeldByHealth{},gIntakeHeldByParticipant{},gIntakeHeldByCombat{};
 std::atomic<std::uint64_t> gExecutionCaptured{}, gExecutionTransitions{}, gExecutionReplayed{}, gExecutionReplayRejected{};
@@ -5783,6 +5786,29 @@ void PumpPairTransactions() noexcept {
             }};
             const execution::ActorLifetime lifetime{pair.source.character,pair.source.runtimeId,pair.source.generation,pair.source.creationSerial};
             if(execution::InspectInteractionBoundary(memory,lifetime)!=execution::OwnershipCheck::Ready){gate(16U);continue;}
+            // AvS 2026-11-26 (long sprint then kill): the Client Alien overran
+            // the Host's stop by ~4 m, idled 1.5 m off the Host pose (paired
+            // receipts fence every pose correction), and its replay entered
+            // 78 there: the local player was never grabbed (no 16->79), the
+            // source left at once and the survivor never died. Native pair
+            // entry here assumes the Host's placement; put the source on the
+            // newest Host pose first. Local-player victims only, same floor,
+            // bounded (a larger error is a lost route, not overrun).
+            if(pair.victim.peer==gCurrent.localPeer&&pair.victim.peer!=0U) {
+                hybrid_motion::Target latest{};float local[3]{};
+                if(actor.directPoseTimeline.Latest(PreciseTickMs(),latest)&&!latest.stale&&
+                    Read(actor.character+kPositionOffset,local[0])&&Read(actor.character+kPositionOffset+4U,local[1])&&
+                    Read(actor.character+kPositionOffset+8U,local[2])) {
+                    const float planar=std::hypot(latest.position[0]-local[0],latest.position[2]-local[2]);
+                    if(std::isfinite(planar)&&planar>0.35F) {
+                        gPairSourceAlignError.store(planar,std::memory_order_relaxed);
+                        if(planar<8.0F&&std::abs(latest.position[1]-local[1])<1.5F&&
+                            character_direct_step_runtime::ApplyAIRecoveryTransform(actor.character,latest.position.data(),latest.yaw))
+                            gPairSourceAligned.fetch_add(1U,std::memory_order_relaxed);
+                        else gPairSourceAlignSkipped.fetch_add(1U,std::memory_order_relaxed);
+                    }
+                }
+            }
             // Preserve the Host's semantic flag. NativePairAdapter resolves
             // the source definition through AnimatedCharacter and the bone
             // against THIS victim; there is no second local decision here.
@@ -12675,7 +12701,10 @@ void LogDiagnostics(Diagnostics& diagnostics) {
                  {"faceFrames",Diagnostics::Unsigned(aim.ventFaceHits),true},
                  {"faceGapM",std::to_string(aim.faceGap),true},
                  {"tableCount",Diagnostics::Unsigned(aim.tableCount),true},
-                 {"worlds",Diagnostics::Unsigned(aim.reachWorlds),true}});
+                 {"worlds",Diagnostics::Unsigned(aim.reachWorlds),true},
+                 {"selfHits",Diagnostics::Unsigned(aim.selfHits),true},
+                 {"blockedOffered",Diagnostics::Unsigned(aim.blockedOffered),true},
+                 {"hitFromStartM",std::to_string(aim.hitFromStart),true}});
         }
     }
     {
@@ -13048,6 +13077,9 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"rootWarpSlotsFull", Diagnostics::Unsigned(gRootWarpSlotsFull.load()), true},
          {"locomotionFlightDropped", Diagnostics::Unsigned(gFlightDropped), true},
          {"directPoseEmergencyCorrections", Diagnostics::Unsigned(gDirectPoseEmergencyCorrections.load()), true},
+         {"pairSourceAligned", Diagnostics::Unsigned(gPairSourceAligned.load()), true},
+         {"pairSourceAlignSkipped", Diagnostics::Unsigned(gPairSourceAlignSkipped.load()), true},
+         {"pairSourceAlignErrorM", std::to_string(gPairSourceAlignError.load()), true},
          {"clientCycleCallsReplayFailed", Diagnostics::Unsigned(gCycleCallsReplayFailed.load()), true},
          {"endedSourceExitsDeferred", Diagnostics::Unsigned(gEndedSourceExitsDeferred.load()), true},
          {"localVictimEndRetained", Diagnostics::Unsigned(gLocalVictimEndRetained.load()), true},

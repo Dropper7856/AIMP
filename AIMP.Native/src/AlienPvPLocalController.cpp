@@ -104,6 +104,9 @@ std::atomic<std::uint64_t> gVentHidden{}; // frames a reachable vent was hidden 
 std::atomic<std::uint64_t> gVentFaceHits{}; // frames the ray hit the vent's own face/grille (still offered)
 std::atomic<float> gVentHiddenGap{-1.0F},gVentFaceGap{-1.0F}; // last hit -> vent point distance (m)
 constexpr float kVentFaceTolerance=1.0F;
+constexpr float kVentSelfClear=1.0F; // round 8: hits this close to the ray start are the Alien itself
+std::atomic<std::uint64_t> gVentSelfHits{},gVentBlockedOffered{};
+std::atomic<float> gVentHitFromStart{-1.0F};
 std::atomic<std::uint64_t> gVentInReach{}; // on-foot frames with any vent inside WithinReach
 std::atomic<std::uint32_t> gVentTableCount{},gVentWorlds{};
 
@@ -410,7 +413,7 @@ bool UpdateVentInterface(const Context& context,alien_pvp::vents::Table& table) 
     // see (chest -> just short of the opening, no physics hit).
     std::array<std::uintptr_t,4> worlds{};
     const unsigned worldCount=gLocal.freeCamera?0U:CurrentWorlds(worlds);
-    bool anyInReach{};
+    bool anyInReach{};float bestBlocked=100000.0F;int blockedVent=-1;
     gVentTableCount.store(table.count,std::memory_order_relaxed);
     gVentWorlds.store(worldCount,std::memory_order_relaxed);
     struct InReachMark {const bool& any;~InReachMark(){if(any)gVentInReach.fetch_add(1U,std::memory_order_relaxed);}} mark{anyInReach};
@@ -423,30 +426,43 @@ bool UpdateVentInterface(const Context& context,alien_pvp::vents::Table& table) 
             std::hypot(std::hypot(point[0]-body[0],point[2]-body[2]),point[1]-body[1])<=3.0F:
             alien_pvp::vents::WithinReach(body,point);
         if(reachable)anyInReach=true;
+        bool visible=true;
         if(reachable && distance<best && worldCount) {
             // Round 7: the round-5 ray (stopping 0.45 m short) hid every vent:
             // the opening point sits behind its own grille/frame. Only a hit
             // well clear of the vent (a real wall between) hides it now; the
             // retail path-aware entry and the 2.5 m growth abort still catch
             // a vent on the far side of a thin wall.
+            // Round 8: every frame hit ~2.1 m short of the vent with the Alien
+            // inside 2.75 m, i.e. at the ray start (the Alien's own body).
+            // Hits within kVentSelfClear of the start are ignored.
             const std::array<float,3> from{body[0],body[1]+1.0F,body[2]};
             float gap=-1.0F;
             for(unsigned w=0;w<worldCount;++w) {
                 std::array<float,3> hit{};
                 if(!Ray(worlds[w],from,point,hit))continue;
+                const float fromStart=std::sqrt((hit[0]-from[0])*(hit[0]-from[0])+(hit[1]-from[1])*(hit[1]-from[1])+
+                    (hit[2]-from[2])*(hit[2]-from[2]));
+                gVentHitFromStart.store(fromStart,std::memory_order_relaxed);
+                if(fromStart<kVentSelfClear){gVentSelfHits.fetch_add(1U,std::memory_order_relaxed);continue;}
                 gap=std::max(gap,std::sqrt((hit[0]-point[0])*(hit[0]-point[0])+(hit[1]-point[1])*(hit[1]-point[1])+
                     (hit[2]-point[2])*(hit[2]-point[2])));
             }
             if(gap>kVentFaceTolerance) {
-                reachable=false;gVentHidden.fetch_add(1U,std::memory_order_relaxed);
+                visible=false;gVentHidden.fetch_add(1U,std::memory_order_relaxed);
                 gVentHiddenGap.store(gap,std::memory_order_relaxed);
             } else if(gap>=0.0F) {
                 gVentFaceHits.fetch_add(1U,std::memory_order_relaxed);
                 gVentFaceGap.store(gap,std::memory_order_relaxed);
             }
         }
-        if(reachable && distance<best){best=distance;gLocal.nearbyVent=static_cast<int>(i);}
+        // Visibility ranks, it never removes E: a blocked vent in reach is
+        // still offered when no visible one is (path-aware entry and the
+        // 2.5 m growth abort remain the wall guards).
+        if(reachable && visible && distance<best){best=distance;gLocal.nearbyVent=static_cast<int>(i);}
+        if(reachable && distance<bestBlocked){bestBlocked=distance;blockedVent=static_cast<int>(i);}
     }
+    if(gLocal.nearbyVent<0 && blockedVent>=0){gLocal.nearbyVent=blockedVent;gVentBlockedOffered.fetch_add(1U,std::memory_order_relaxed);}
     alien_pvp::vents::Point selected{};
     if(gLocal.selectedVent<0 || !alien_pvp::vents::ReadPoint(table,static_cast<std::uint32_t>(gLocal.selectedVent),&VentRead,selected))
         gLocal.selectedVent=closest;
@@ -1050,7 +1066,8 @@ VentCameraStats VentCameraSnapshot() noexcept {
         gVentHidden.load(std::memory_order_relaxed),gVentFaceHits.load(std::memory_order_relaxed),
         gVentHiddenGap.load(std::memory_order_relaxed),gVentFaceGap.load(std::memory_order_relaxed),
         gVentInReach.load(std::memory_order_relaxed),gVentTableCount.load(std::memory_order_relaxed),
-        gVentWorlds.load(std::memory_order_relaxed)};
+        gVentWorlds.load(std::memory_order_relaxed),gVentSelfHits.load(std::memory_order_relaxed),
+        gVentBlockedOffered.load(std::memory_order_relaxed),gVentHitFromStart.load(std::memory_order_relaxed)};
 }
 bool GoToVent(std::uint32_t index) noexcept {
     if(!gLocal.freeCamera || !gLocal.wasBackstage || alien_pvp::VentPending() || !alien_pvp::ControlActive() ||
