@@ -28,6 +28,9 @@ bool Owns(std::uintptr_t character,std::uint32_t generation) noexcept;
 bool MovingNow() noexcept;
 Frame VentAuthority() noexcept;
 bool VentPending() noexcept;
+// HUD only: a vent request really in flight / a non-vent (attack) action busy.
+bool VentRequestPending() noexcept;
+bool NonVentActionBusy() noexcept;
 bool ControlActive() noexcept;
 // Worker-thread calls. Queues hold copied frames, never native resources.
 bool QueueCommand(std::span<const std::byte> bytes) noexcept;
@@ -36,4 +39,15 @@ struct Counters final {
     std::uint64_t received{},rejected{},expired{},dropped{},inputs{},commits{},poses{},corrections{},unsupportedActions{};
 };
 Counters Snapshot() noexcept;
+// Engine thread: the last owner pose (Correction) this observer received and
+// its age. False on the owner or before any correction. Debug only.
+bool LastCorrection(Frame& frame,std::uint64_t& ageMs) noexcept;
+// Debug point for "the Alien is hard to control / stops in place": frames in
+// which the local pilot held a movement key, how many drove the Alien and why
+// the others did not (session totals, any thread).
+struct MovementStats final {
+    std::uint64_t heldFrames{},drivenFrames{},blockedAction{},blockedVent{},blockedStale{},blockedStage{},driveRefused{};
+    std::uint64_t chaseDriven{}; // AvS round 5: frames the auto-chase drove the Alien
+};
+MovementStats MovementSnapshot() noexcept;
 } // namespace aimp::alien_pvp

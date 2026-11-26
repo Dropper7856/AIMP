@@ -294,19 +294,22 @@ Result NativePairAdapter::Admit(const Command& inputCommand, const Binding& inpu
             SameActor(previous.command.victim, command.source) || SameActor(previous.command.victim, command.victim) ||
             previous.binding.source.character == binding.source.character || previous.binding.source.character == binding.victim.character ||
             previous.binding.victim.character == binding.source.character || previous.binding.victim.character == binding.victim.character)
-            return Result::Waiting;
+            { RefusalSite()=502U; return Result::Waiting; }
     }
     if (count_ == kCapacity || serial_ == std::numeric_limits<std::uint64_t>::max()) return Result::Capacity;
     Busy guard(busy_);
     const auto revision = revocation_;
     const auto checked = CheckBinding(command, binding);
     if (revision != revocation_) return Result::Unknown;
+    // 50x: which check held a Waiting admission (AvS 2026-11-25: a Client
+    // waited on one Host kill forever with refusalSite 0).
+    if (checked == Check::Waiting) RefusalSite()=503U;
     if (checked != Check::Ready) return checked == Check::Waiting ? Result::Waiting :
         checked == Check::Unknown ? Result::Unknown : Result::Rejected;
     Definition definition{};
-    if (!ResolveDefinition(binding, command, definition)) return Result::Waiting;
+    if (!ResolveDefinition(binding, command, definition)) { RefusalSite()=504U; return Result::Waiting; }
     if (revision != revocation_) return Result::Unknown;
-    if (CheckBinding(command, binding) != Check::Ready || !DefinitionLive(binding, definition)) return Result::Waiting;
+    if (CheckBinding(command, binding) != Check::Ready || !DefinitionLive(binding, definition)) { RefusalSite()=505U; return Result::Waiting; }
     if (revision != revocation_) return Result::Unknown;
     // 00662670 replaces cycle+4C at 00662837 with the prepared definition.
     // Resolve ONLY the selector carried by the authoritative outcome, before
@@ -314,10 +317,10 @@ Result NativePairAdapter::Admit(const Command& inputCommand, const Binding& inpu
     Definition prepared=definition;
     if(command.outcomeRequired&&(command.outcome.flags&2U)!=0U) {
         auto preparation=command;preparation.sourceDefinition=static_cast<std::int32_t>(command.outcome.definition);
-        if(!ResolveDefinition(binding,preparation,prepared))return Result::Waiting;
+        if(!ResolveDefinition(binding,preparation,prepared)){RefusalSite()=506U;return Result::Waiting;}
         if(revision!=revocation_)return Result::Unknown;
         if(prepared.manager!=definition.manager||prepared.kind!=command.outcome.kind||
-            !DefinitionLive(binding,prepared)||CheckBinding(command,binding)!=Check::Ready)return Result::Waiting;
+            !DefinitionLive(binding,prepared)||CheckBinding(command,binding)!=Check::Ready){RefusalSite()=507U;return Result::Waiting;}
         if(revision!=revocation_)return Result::Unknown;
     }
     auto& lease = leases_[count_++]; lease = {};

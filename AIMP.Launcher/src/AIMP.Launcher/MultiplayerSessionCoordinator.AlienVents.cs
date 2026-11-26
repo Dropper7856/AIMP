@@ -51,7 +51,14 @@ internal sealed partial class MultiplayerSessionCoordinator
                 ["action"]=root.GetProperty("action").GetInt32().ToString(CultureInfo.InvariantCulture),
                 ["phase"]=root.GetProperty("phase").GetInt32().ToString(CultureInfo.InvariantCulture),
                 ["pending"]=root.GetProperty("pending").GetBoolean()?"1":"0",
-                ["freeCamera"]=root.GetProperty("freeCamera").GetBoolean()?"1":"0"
+                ["freeCamera"]=root.GetProperty("freeCamera").GetBoolean()?"1":"0",
+                // Vent-exit picker (native 2026-11-25); absent from an older DLL.
+                ["pickerSlot"]=root.TryGetProperty("pickerSlot",out var slot)?slot.GetInt32().ToString(CultureInfo.InvariantCulture):"-1",
+                ["pickerCount"]=root.TryGetProperty("pickerCount",out var total)?total.GetInt32().ToString(CultureInfo.InvariantCulture):"0",
+                // Kill prompts (native 2026-11-25 round 4); absent from an older DLL.
+                ["attackReady"]=Flag(root,"attackReady"),
+                ["attackPending"]=Flag(root,"attackPending"),
+                ["attackStarted"]=Flag(root,"attackStarted")
             },_lifetime.Token).ConfigureAwait(false);
             _alienVentHudVisible=true;
         }
@@ -64,6 +71,8 @@ internal sealed partial class MultiplayerSessionCoordinator
         }
         finally {Interlocked.Exchange(ref _alienVentPollRunning,0);}
     }
+    private static string Flag(JsonElement root,string name)=>
+        root.TryGetProperty(name,out var value) && value.ValueKind==JsonValueKind.True?"1":"0";
     private async Task HideAlienVentMapAsync()
     {
         if(!_alienVentHudVisible)return;

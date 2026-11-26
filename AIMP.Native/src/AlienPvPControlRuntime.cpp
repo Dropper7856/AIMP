@@ -18,6 +18,8 @@ namespace {
 std::mutex gQueueMutex;
 Mailbox<64> gIncoming,gOutgoing;
 std::atomic<std::uint64_t> gReceived{},gRejected{},gExpired{},gDropped{},gInputs{},gCommits{},gPoses{},gCorrections{},gUnsupported{};
+std::atomic<std::uint64_t> gHeld{},gDriven{},gBlockedAction{},gBlockedVent{},gBlockedStale{},gBlockedStage{},gDriveRefused{};
+std::atomic<std::uint64_t> gChaseDriven{};
 struct State final {
     Context context{};InputWindow window{};PredictionHistory history{};
     DeliveryInbox inbox{};DeliveryOutbox<> outbox{};bool deliveryFault{};std::uint64_t deliveryGeneration{};
@@ -102,6 +104,15 @@ bool Roar() noexcept {
 }
 bool ActionBusy() noexcept {
     return g.context.actions && g.context.actions->busy && g.context.actions->busy(g.context);
+}
+// AvS round 5 auto-chase state of the pending attack (see ActionHooks::chase).
+int ChaseState(float& yaw) noexcept {
+    return g.context.actions && g.context.actions->chase ? g.context.actions->chase(g.context,yaw) : 0;
+}
+// Busy for movement purposes: a chasing attack still lets the Alien move.
+bool MovementBusy() noexcept {
+    float yaw{};
+    return ActionBusy() && ChaseState(yaw)==0;
 }
 void ReleaseCarrier() noexcept {
     if(g.ownsSlot && character_direct_step_runtime::ReleaseAIIntentOwnership(g.context.character))g.ownsSlot=false;
@@ -324,9 +335,31 @@ void ApplyMovement(std::uint64_t now,float dt) noexcept {
     const bool fresh=g.context.localOwner ?
         active && g.context.pilotReady && Fresh(now,g.capturedAt,150U) &&
             Fresh(now,g.lastAckAt,kAuthorityTimeoutMs) : g.window.InputFresh(now);
-    if(ActionBusy() || g.hasDeferredAction) {static_cast<void>(StopDonorMovement());static_cast<void>(CancelRecovery());ReleaseCarrier();return;}
+    const bool held=g.context.localOwner && g.local.focused && (g.local.forward!=0.0F || g.local.strafe!=0.0F);
+    if(held)gHeld.fetch_add(1U,std::memory_order_relaxed);
+    if(ActionBusy() || g.hasDeferredAction) {
+        float chaseYaw{};
+        const int chase=g.hasDeferredAction?0:ChaseState(chaseYaw);
+        if(chase!=0 && g.context.localOwner && g.context.actions && g.context.actions->drive) {
+            // Round 5 auto-chase: run the Alien at the chosen survivor through
+            // the same native direction request as WASD; hold when close.
+            static_cast<void>(CancelRecovery());ReleaseCarrier();
+            if(chase==1) {
+                Frame intent{};intent.forward=1.0F;intent.strafe=0.0F;intent.yaw=chaseYaw;intent.gait=3U;
+                g.moving=g.context.actions->drive(g.context,&intent);
+                gChaseDriven.fetch_add(1U,std::memory_order_relaxed);
+            } else {static_cast<void>(StopDonorMovement());g.moving=false;}
+            return;
+        }
+        if(chase==0 || g.context.localOwner) {
+            if(held)gBlockedAction.fetch_add(1U,std::memory_order_relaxed);
+            static_cast<void>(StopDonorMovement());static_cast<void>(CancelRecovery());ReleaseCarrier();return;
+        }
+        // Host of a chasing Client pilot: keep following its measured poses.
+    }
     if(g.context.localOwner && VentAction(g.ventAuthority) &&
         (g.ventAuthority.phase==ActionPhase::Preparing || g.ventAuthority.phase==ActionPhase::Started)) {
+        if(held)gBlockedVent.fetch_add(1U,std::memory_order_relaxed);
         static_cast<void>(StopDonorMovement());static_cast<void>(CancelRecovery());ReleaseCarrier();return;
     }
     const bool remoteVent=!g.context.localOwner && VentAction(g.ventAuthority) &&
@@ -386,6 +419,7 @@ void ApplyMovement(std::uint64_t now,float dt) noexcept {
         g.expired=false;return;
     }
     if(!fresh || !stageKnown || backstage || !OrdinaryCycle(g.context.character)) {
+        if(held)(fresh?gBlockedStage:gBlockedStale).fetch_add(1U,std::memory_order_relaxed);
         static_cast<void>(StopDonorMovement());
         const bool expired=g.window.Granted() && !fresh;
         if(expired&&!g.expired)gExpired.fetch_add(1U,std::memory_order_relaxed);
@@ -441,6 +475,7 @@ void ApplyMovement(std::uint64_t now,float dt) noexcept {
         }
         g.moving=g.context.actions->drive(g.context,input.focused?&intent:nullptr) &&
             (intent.forward!=0.0F || intent.strafe!=0.0F) && input.focused;
+        if(held)(g.moving?gDriven:gDriveRefused).fetch_add(1U,std::memory_order_relaxed);
         if(g.moving){g.appliedInput=g.window.LastInput();g.appliedHost=g.window.LastHost();}
         return;
     }
@@ -548,6 +583,15 @@ bool VentPending() noexcept {
     return ActionBusy() || g.hasDeferredAction || g.ventAuthority.phase==ActionPhase::Preparing ||
         g.ventAuthority.phase==ActionPhase::Started;
 }
+// AvS round 6: VentPending() is "any action in flight" for movement/input
+// gating. The HUD showed "Entering ventilation... E / Q" for a busy KILL on
+// the Client pilot (its local attack record closed while the Host retried).
+bool VentRequestPending() noexcept {
+    return (g.hasDeferredAction && VentAction(g.deferredAction)) ||
+        (VentAction(g.ventAuthority) && (g.ventAuthority.phase==ActionPhase::Preparing ||
+            g.ventAuthority.phase==ActionPhase::Started));
+}
+bool NonVentActionBusy() noexcept {return ActionBusy() && !VentRequestPending();}
 void Reset(bool certifiedLivingCharacter) noexcept {
     if(g.context.actions && g.context.actions->cancel)g.context.actions->cancel(g.context,certifiedLivingCharacter);
     if(certifiedLivingCharacter && g.context.character && g.ownsSlot)
@@ -586,7 +630,8 @@ void Pump(const Context& context) noexcept {
         std::uint8_t state{};bool backstage{};
         const bool known=NativeStage(context.character,state,backstage);
         if(known && backstage)status.flags|=Backstage;
-        if(ActionBusy() || !known || (!OrdinaryCycle(context.character) && !spatial::ManualBackstage(state,backstage,false)))status.flags|=NativeBusy;
+        // Round 5: a chasing attack is ordinary movement for the Host replica.
+        if(MovementBusy() || !known || (!OrdinaryCycle(context.character) && !spatial::ManualBackstage(state,backstage,false)))status.flags|=NativeBusy;
         if(ReadPose(status))status.flags|=PoseValid;
         Publish(status,now);g.lastStatus=now;
     }
@@ -598,7 +643,7 @@ void Pump(const Context& context) noexcept {
         std::uint8_t state{};bool backstage{};
         const bool known=NativeStage(context.character,state,backstage);
         if(known && backstage)pose.flags|=Backstage;
-        if(ActionBusy() || !known || (!OrdinaryCycle(context.character) && !spatial::ManualBackstage(state,backstage,false)))pose.flags|=NativeBusy;
+        if(MovementBusy() || !known || (!OrdinaryCycle(context.character) && !spatial::ManualBackstage(state,backstage,false)))pose.flags|=NativeBusy;
         if(context.localOwner && known && backstage && state==18U && ActionBusy() &&
             VentAction(g.ventAuthority) && g.ventAuthority.phase==ActionPhase::Started)
             pose.flags|=VentAnimating|NativeBusy;
@@ -628,6 +673,14 @@ bool TryPopObservation(std::array<std::uint8_t,kWireBytes>& bytes) noexcept {
     std::lock_guard lock(gQueueMutex);TimedFrame value{};
     while(gOutgoing.Pop(value))if(Encode(value.frame,bytes))return true;
     return false;
+}
+bool LastCorrection(Frame& frame,std::uint64_t& ageMs) noexcept {
+    if(!g.context.owned || g.context.localOwner || !g.correctionAt)return false;
+    frame=g.correction;ageMs=GetTickCount64()-g.correctionAt;return true;
+}
+MovementStats MovementSnapshot() noexcept {
+    return {gHeld.load(),gDriven.load(),gBlockedAction.load(),gBlockedVent.load(),gBlockedStale.load(),
+        gBlockedStage.load(),gDriveRefused.load(),gChaseDriven.load()};
 }
 Counters Snapshot() noexcept {
     return {gReceived.load(),gRejected.load(),gExpired.load(),gDropped.load(),gInputs.load(),gCommits.load(),

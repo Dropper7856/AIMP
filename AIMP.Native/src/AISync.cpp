@@ -1,6 +1,7 @@
 #include <intrin.h>
 #include "aimp/AISync.h"
 #include "aimp/AlienPvPLocalController.h"
+#include "aimp/UIHeapGuard.h"
 #include "aimp/AlienPvPSpatialPolicy.h"
 #include "aimp/AlienPvPResponsiveStop.h"
 #include "aimp/AlienPvPControlRuntime.h"
@@ -569,9 +570,16 @@ struct PairTransaction final {
     std::uint32_t exitTraceMask{};
     ULONGLONG firstRefusal{}; // first pre-entry refusal of this Host interaction
     ULONGLONG hostLeftAt{}; // first pump seeing the Host source out of this pair
+    ULONGLONG firstWaiting{}; // first pre-entry Waiting admission of this Host interaction
 };
 std::array<PairTransaction,kActors> gPairTransactions{}; // Qualified engine thread only.
 constexpr ULONGLONG kPairRefusalRetryMs=1000U;
+// AvS 2026-11-25: a Client waited on a Host pair that never entered on the
+// Host (Submit Waiting, 50 s). The unentered transaction kept the Alien and
+// the local survivor reserved: the Host's real kill was never replayed and the
+// owner's PvP poses were refused (17 m replica drift). Bound that wait.
+constexpr ULONGLONG kPairWaitingAbandonMs=2500U;
+std::atomic<std::uint64_t> gPairsWaitingAbandoned{},gPairsSuperseded{};
 constexpr ULONGLONG kLocalVictimEndGraceMs=1500U;
 struct PairAdmissionFailure {
     std::uint64_t tick{},command{},serial{};
@@ -910,6 +918,9 @@ std::atomic<std::uint64_t> gReservedByOutcome{},gReservedByPair{};
 std::atomic<std::uint64_t> gCycleCallsCaptured{},gCycleCallsRefused{},gCycleCallsPublished{},gCycleCallsReplayed{},gCycleCallsReplayFailed{};
 std::atomic<std::uint64_t> gDirectLocomotionConstructorsConsumed{};
 std::atomic<std::uint64_t> gDirectPoseStuckCorrections{},gDirectPoseEmergencyCorrections{},gDirectPoseAssistFrames{},gDirectPoseActionFollowFrames{};
+// AvS 2026-11-26: Client pair replay sources snapped onto the Host pose before
+// native entry (local-player victim), and the last such planar error (m).
+std::atomic<std::uint64_t> gPairSourceAligned{},gPairSourceAlignSkipped{};std::atomic<float> gPairSourceAlignError{-1.0F};
 std::atomic<std::uint32_t> gLastRefusedCycleCall{};
 std::atomic<std::uint64_t> gIntakeHeldByPair{},gIntakeHeldByHealth{},gIntakeHeldByParticipant{},gIntakeHeldByCombat{};
 std::atomic<std::uint64_t> gExecutionCaptured{}, gExecutionTransitions{}, gExecutionReplayed{}, gExecutionReplayRejected{};
@@ -963,6 +974,9 @@ std::atomic<std::uint64_t> gPairedVictimInitializeAborted{};
 std::atomic<std::uint64_t> gPairedVictimEventsRejected{}, gPairedVictimDuplicates{}, gPairedVictimBusy{};
 std::atomic<std::uint64_t> gPairedVictimNativeDispatches{}, gPairedVictimNativeStarted{};
 std::atomic<std::uint64_t> gPairedVictimAvailabilityOverrides{};
+// AvS round 5: OR of paired-victim availability outcomes since the last
+// alien_attack_progress line (bits documented there).
+std::atomic<std::uint32_t> gPairedVictimGateSeen{};
 std::atomic<std::uint64_t> gPairedPlayerPreparationRemaps{}, gPairedPlayerCategoryRemaps{};
 std::atomic<std::uint64_t> gPairedVictimLocalDispatches{}, gPairedVictimLocalStarted{};
 std::atomic<std::uint64_t> gPairedVictimConvergenceDetached{}, gPairedVictimSnapshotsDeferred{};
@@ -4459,14 +4473,43 @@ bool LocalVictimInitializationReady(const std::uintptr_t victim, const std::uint
         Read(nativeCycle + 0x68U, source) && Read(nativeCycle + 0xB0U, sourceCycle) &&
         VictimAdmissionMatches(victim, source, sourceCycle);
 }
+// Diagnostics only: why LocalVictimInitializationReady refused (0 = ready).
+std::uint32_t LocalVictimGateBits(const std::uintptr_t victim, const std::uintptr_t nativeCycle) noexcept {
+    PairIdentity binding{};
+    std::uintptr_t source{}, sourceCycle{}, graph{}, controller{};
+    std::uint8_t enabled{}, player{}, state{};
+    if (!LocalClientVictim(victim)) return 128U;
+    if (!PublishedPairParticipant(victim, binding) || binding.animated == 0U) return 256U;
+    if (!Read(binding.animated + 0x2CF4U, enabled) || enabled == 0U ||
+        !Read(binding.animated + 0x34BCU, graph) || graph == 0U) return 512U;
+    if (!Read(victim + 0x31CU, controller) || controller == 0U ||
+        !Read(controller + 0x48U, player) || player == 0U) return 1024U;
+    if (!Read(nativeCycle + 0x1AU, state) || state != 0x4FU) return 2048U;
+    if (!Read(nativeCycle + 0x68U, source) || !Read(nativeCycle + 0xB0U, sourceCycle) ||
+        !VictimAdmissionMatches(victim, source, sourceCycle)) return 4096U;
+    return 0U;
+}
 std::uint32_t __fastcall PairedVictimAvailabilityDetour(void* logical, void*, const std::uintptr_t nativeCycle) noexcept {
     const auto retail = reinterpret_cast<TargetEligibility>(gBase + 0x0038B330U)(logical);
-    if (retail == 0U) return retail;
+    if (retail == 0U) { gPairedVictimGateSeen.fetch_or(1U, std::memory_order_relaxed); return retail; }
     std::uintptr_t victim{};
     if (!Read(reinterpret_cast<std::uintptr_t>(logical), victim) ||
-        reinterpret_cast<std::uintptr_t>(logical) != victim + 0x280U ||
-        (!RemoteVictimPresentationReady(victim) && !LocalVictimInitializationReady(victim, nativeCycle)) ||
-        !RemoteVictimPairPresent(victim, nativeCycle)) return retail;
+        reinterpret_cast<std::uintptr_t>(logical) != victim + 0x280U) {
+        gPairedVictimGateSeen.fetch_or(2U, std::memory_order_relaxed); return retail;
+    }
+    const bool local = LocalClientVictim(victim);
+    const bool remoteReady = RemoteVictimPresentationReady(victim);
+    const bool localReady = !remoteReady && LocalVictimInitializationReady(victim, nativeCycle);
+    const bool present = (remoteReady || localReady) && RemoteVictimPairPresent(victim, nativeCycle);
+    {
+        std::uint32_t bits = local ? 64U : 0U;
+        if (!remoteReady && !local) bits |= 4U;
+        if (!remoteReady && !localReady && local) bits |= 8U | LocalVictimGateBits(victim, nativeCycle);
+        if ((remoteReady || localReady) && !present) bits |= 16U;
+        if (present) bits |= 32U;
+        gPairedVictimGateSeen.fetch_or(bits, std::memory_order_relaxed);
+    }
+    if (!present) return retail;
     // Only the victim initializer and the two paired destructors call here.
     // A loaded remote presentation actor may have proxy execution phase 1/2/3;
     // permit its native victim/death graph, never its autonomous brain.
@@ -5708,6 +5751,17 @@ void PumpPairTransactions() noexcept {
         if(!PairIdentityLive(pair.source)||!PairIdentityLive(pair.victim)) {
             InvalidatePairTransactions(!PairIdentityLive(pair.source)?pair.source.character:pair.victim.character);continue;
         }
+        if(!pair.receipt.pairEntered&&!pair.receipt.transitionEntered&&actor.received.interactionCommand!=0U&&
+            actor.received.interactionPairRevision!=0U&&actor.received.interactionCommand!=pair.key.command&&
+            actor.received.interactionPairRevision!=carrier.interactionPairRevision) {
+            // The Host already started another interaction for this actor
+            // while this one never entered here: it can never be replayed.
+            interactions::Receipt lease{};
+            if(!gPairRuntime.Find(carrier,lease)||lease.resourcesReleased) {
+                gPairsSuperseded.fetch_add(1U,std::memory_order_relaxed);
+                RecordPairRefusal(pair,carrier,0U,4U);AbandonPair(actor,pair);continue;
+            }
+        }
         const auto dependency=PairRequestsReadiness(pair);
         if(dependency!=action_correlation::Readiness::Ready) {
             gate(15U);
@@ -5732,6 +5786,29 @@ void PumpPairTransactions() noexcept {
             }};
             const execution::ActorLifetime lifetime{pair.source.character,pair.source.runtimeId,pair.source.generation,pair.source.creationSerial};
             if(execution::InspectInteractionBoundary(memory,lifetime)!=execution::OwnershipCheck::Ready){gate(16U);continue;}
+            // AvS 2026-11-26 (long sprint then kill): the Client Alien overran
+            // the Host's stop by ~4 m, idled 1.5 m off the Host pose (paired
+            // receipts fence every pose correction), and its replay entered
+            // 78 there: the local player was never grabbed (no 16->79), the
+            // source left at once and the survivor never died. Native pair
+            // entry here assumes the Host's placement; put the source on the
+            // newest Host pose first. Local-player victims only, same floor,
+            // bounded (a larger error is a lost route, not overrun).
+            if(pair.victim.peer==gCurrent.localPeer&&pair.victim.peer!=0U) {
+                hybrid_motion::Target latest{};float local[3]{};
+                if(actor.directPoseTimeline.Latest(PreciseTickMs(),latest)&&!latest.stale&&
+                    Read(actor.character+kPositionOffset,local[0])&&Read(actor.character+kPositionOffset+4U,local[1])&&
+                    Read(actor.character+kPositionOffset+8U,local[2])) {
+                    const float planar=std::hypot(latest.position[0]-local[0],latest.position[2]-local[2]);
+                    if(std::isfinite(planar)&&planar>0.35F) {
+                        gPairSourceAlignError.store(planar,std::memory_order_relaxed);
+                        if(planar<8.0F&&std::abs(latest.position[1]-local[1])<1.5F&&
+                            character_direct_step_runtime::ApplyAIRecoveryTransform(actor.character,latest.position.data(),latest.yaw))
+                            gPairSourceAligned.fetch_add(1U,std::memory_order_relaxed);
+                        else gPairSourceAlignSkipped.fetch_add(1U,std::memory_order_relaxed);
+                    }
+                }
+            }
             // Preserve the Host's semantic flag. NativePairAdapter resolves
             // the source definition through AnimatedCharacter and the bone
             // against THIS victim; there is no second local decision here.
@@ -5767,6 +5844,24 @@ void PumpPairTransactions() noexcept {
             }
             RecordPairRefusal(pair,carrier,result,2U);AbandonPair(actor,pair);continue;
         }
+        if(admitted==interactions::Result::Waiting&&!pair.receipt.pairEntered&&!pair.receipt.transitionEntered) {
+            // Never let one unentered Host pair hold the actors forever. Only
+            // drop it while no native lease exists for it (nothing to retire)
+            // and either the Host already moved on to another interaction or
+            // the bounded wait expired.
+            const auto now=GetTickCount64();
+            if(!pair.firstWaiting)pair.firstWaiting=now;
+            interactions::Receipt lease{};
+            const bool owned=gPairRuntime.Find(carrier,lease)&&!lease.resourcesReleased;
+            const bool superseded=actor.received.interactionCommand!=0U&&actor.received.interactionPairRevision!=0U&&
+                actor.received.interactionCommand!=pair.key.command&&
+                actor.received.interactionPairRevision!=carrier.interactionPairRevision;
+            if(!owned&&(superseded||now-pair.firstWaiting>=kPairWaitingAbandonMs)) {
+                (superseded?gPairsSuperseded:gPairsWaitingAbandoned).fetch_add(1U,std::memory_order_relaxed);
+                RecordPairRefusal(pair,carrier,static_cast<std::uint32_t>(admitted),superseded?4U:5U);
+                AbandonPair(actor,pair);continue;
+            }
+        } else pair.firstWaiting=0U;
         if(pair.receipt.pairEntered) {
             const auto inspected=gPairRuntime.Inspect(pair.key,pair.receipt);
             if(inspected!=interactions::Result::Unknown&&inspected!=interactions::Result::Rejected)
@@ -10895,6 +10990,52 @@ static void PumpPlayerSpectate(const std::uint32_t generation, const bool camera
     player_lifecycle::PumpSpectateOnEngineThread({gBase, LocalPlayer(), generation,
         candidates.data(), count, cameraReserved});
 }
+// Debug point for "the Alien sees me where I'm not / I see the Alien elsewhere"
+// (AvS 2026-11-25). Once a second while an Alien lease is active, each PC
+// records where IT draws the Alien and every participant, plus (observer) the
+// last owner pose it received. Comparing both PCs' entries at the same
+// timestamp measures the drift of each replica independently.
+struct PvPSyncSample final {
+    std::atomic<std::uint64_t> revision{},at{};
+    std::atomic<bool> host{},localOwner{};
+    std::atomic<float> alien[3]{},correction[3]{},local[3]{};
+    std::atomic<std::uint64_t> correctionAgeMs{},correctionSequence{};
+    std::atomic<std::uint32_t> correctionFlags{},alienCycle{},peers{},participantCount{};
+    std::atomic<std::uint64_t> peer[4]{};
+    std::atomic<float> peerPos[4][3]{};
+} gPvPSync;
+void SamplePvPSync(const bool localOwner,const bool active) noexcept {
+    static std::uint64_t lastAt{};
+    const auto now=GetTickCount64();
+    if(!active || now-lastAt<1000U)return;
+    lastAt=now;
+    const auto alien=gPvPLease.ticket.character;
+    const auto store3=[](std::atomic<float>* out,std::uintptr_t character) noexcept {
+        float p[3]{};
+        if(character && Read(character+0x70U,p[0]) && Read(character+0x74U,p[1]) && Read(character+0x78U,p[2]))
+            for(int i=0;i<3;++i)out[i].store(p[i],std::memory_order_relaxed);
+    };
+    store3(gPvPSync.alien,alien);
+    store3(gPvPSync.local,LocalPlayer());
+    std::uintptr_t cycle{};std::uint8_t state{0xFFU};
+    if(Read(alien+0x36CU,cycle) && cycle)static_cast<void>(Read(cycle+0x1AU,state));
+    gPvPSync.alienCycle=state;
+    alien_pvp::Frame correction{};std::uint64_t age{};
+    if(alien_pvp::LastCorrection(correction,age)) {
+        gPvPSync.correction[0]=correction.x;gPvPSync.correction[1]=correction.y;gPvPSync.correction[2]=correction.z;
+        gPvPSync.correctionAgeMs=age;gPvPSync.correctionSequence=correction.sequence;gPvPSync.correctionFlags=correction.flags;
+    } else gPvPSync.correctionAgeMs=UINT64_MAX;
+    std::uint32_t n{};
+    for(std::uint32_t i=0;i<gCurrent.participantCount && n<4U;++i) {
+        const auto peer=gCurrent.participants[i].peer;
+        if(!peer || peer==gCurrent.localPeer)continue;
+        gPvPSync.peer[n]=peer;store3(gPvPSync.peerPos[n],ParticipantForPeer(peer));++n;
+    }
+    gPvPSync.peers=n;gPvPSync.participantCount=gCurrent.participantCount;
+    gPvPSync.host=gRole.load(std::memory_order_acquire)==Role::Host;
+    gPvPSync.localOwner=localOwner;gPvPSync.at=now;
+    gPvPSync.revision.fetch_add(1U,std::memory_order_release);
+}
 void PumpOnEngineThread() noexcept {
     const profiling::Timer timing(profiling::Section::AiPump);
     if (!Installed() || !EngineThread()) return;
@@ -10988,11 +11129,28 @@ void PumpOnEngineThread() noexcept {
         gPvPTechnicalEpoch.store(gPairBindingEpoch.load(std::memory_order_acquire),std::memory_order_release);
         gPvPTechnicalPeer.store(gPvPLease.ownerPeer,std::memory_order_release);
     }
-    alien_pvp_local::Pump({gBase,
+    alien_pvp_local::Context pilotContext{gBase,
         localLease?gPvPLease.ticket.character:0U,
         localRequested?LocalPlayer():0U,
         static_cast<std::uint32_t>(pvpPhysicalGeneration),
-        gPvPLease.ownerPeer,gCurrent.localPeer,localLease,localRequested});
+        gPvPLease.ownerPeer,gCurrent.localPeer,localLease,localRequested};
+    if(localLease) {
+        // Survivors on this PC (proxies of remote players; the local player is
+        // the parked technical body of the pilot and is never a survivor).
+        const auto addSurvivor=[&](std::uint64_t peer) noexcept {
+            if(!peer || peer==gPvPLease.ownerPeer || pilotContext.survivorCount>=4U)return;
+            const auto character=ParticipantForPeer(peer);
+            float p[3]{};
+            if(!LivingCharacter(character) || !Read(character+0x70U,p[0]) || !Read(character+0x74U,p[1]) ||
+                !Read(character+0x78U,p[2]) || !std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]))return;
+            for(std::uint32_t i=0;i<pilotContext.survivorCount;++i)
+                if(pilotContext.survivors[i][0]==p[0] && pilotContext.survivors[i][2]==p[2])return;
+            auto& out=pilotContext.survivors[pilotContext.survivorCount++];out[0]=p[0];out[1]=p[1];out[2]=p[2];
+        };
+        for(std::uint32_t i=0;i<gCurrent.participantCount;++i)addSurvivor(gCurrent.participants[i].peer);
+    }
+    alien_pvp_local::Pump(pilotContext);
+    SamplePvPSync(localLease,activeLease);
     PumpPlayerSpectate(static_cast<std::uint32_t>(pvpPhysicalGeneration),localRequested,
         (gCurrent.flags & kAlienPvP)!=0U?gPvPLease.ownerPeer:0U);
     const auto pilot=alien_pvp_local::Snapshot();
@@ -11845,16 +12003,25 @@ bool PvPShowReplica(std::uintptr_t character) noexcept {
 struct PvPReplicaTelemetry final {
     std::atomic<std::uint64_t> backstageWanted{},rejectedState{},rejectedResources{},backstageWriteFailed{},applied{};
     std::atomic<unsigned> lastRejectedState{};
+    // Every observer pose (AvS 2026-11-25: replica 17 m off with fresh poses).
+    std::atomic<std::uint64_t> poseApplied{},posePairBusy{},poseReserved{},poseCycle{},poseLease{},poseOther{};
+    std::atomic<unsigned> poseLastCycle{};
 } gPvPReplicaTelemetry;
 bool ReplicatePvPPose(const alien_pvp::Context& context,const alien_pvp::Frame& pose) noexcept {
+    auto& t=gPvPReplicaTelemetry;
     if(context.localOwner || !context.owned || !PvPLeaseScopeCurrent() || !PvPLeaseLiveIdentity() ||
-        context.character!=gPvPLease.ticket.character || PairSourceBusy(context.character) ||
-        PairReservedCharacter(context.character) || (pose.flags&alien_pvp::OwnerMeasured)==0U)return false;
+        context.character!=gPvPLease.ticket.character || (pose.flags&alien_pvp::OwnerMeasured)==0U) {
+        if(!context.localOwner)t.poseOther.fetch_add(1U,std::memory_order_relaxed);
+        return false;
+    }
+    if(PairSourceBusy(context.character)){t.posePairBusy.fetch_add(1U,std::memory_order_relaxed);return false;}
+    if(PairReservedCharacter(context.character)){t.poseReserved.fetch_add(1U,std::memory_order_relaxed);return false;}
     const bool backstage=(pose.flags&alien_pvp::Backstage)!=0U;
     std::uintptr_t cycle{};std::uint8_t state{},a{},b{};
     if(!Read(context.character+0x36CU,cycle)||!cycle||!Read(cycle+0x1AU,state)||
         !Read(context.character+0x2DAU,a)||!Read(context.character+0x2DBU,b)||
         (state!=1U&&state!=55U&&state!=56U&&state!=57U&&state!=59U&&state!=75U&&state!=77U)) {
+        t.poseCycle.fetch_add(1U,std::memory_order_relaxed);t.poseLastCycle.store(state,std::memory_order_relaxed);
         if(backstage && !(a||b)) {
             gPvPReplicaTelemetry.rejectedState.fetch_add(1U,std::memory_order_relaxed);
             gPvPReplicaTelemetry.lastRejectedState.store(state,std::memory_order_relaxed);
@@ -11864,6 +12031,7 @@ bool ReplicatePvPPose(const alien_pvp::Context& context,const alien_pvp::Frame& 
     if(backstage && !(a||b))gPvPReplicaTelemetry.backstageWanted.fetch_add(1U,std::memory_order_relaxed);
     const character_direct_step_runtime::MovementResourceLease resources(context.character);
     if(!resources) {
+        t.poseLease.fetch_add(1U,std::memory_order_relaxed);
         if(backstage && !(a||b))gPvPReplicaTelemetry.rejectedResources.fetch_add(1U,std::memory_order_relaxed);
         return false;
     }
@@ -11883,7 +12051,9 @@ bool ReplicatePvPPose(const alien_pvp::Context& context,const alien_pvp::Frame& 
         if(invisible && !PvPShowReplica(context.character))return false;
     }
     const float position[]{pose.x,pose.y,pose.z};
-    return character_direct_step_runtime::ApplyAIRecoveryTransform(context.character,position,pose.yaw);
+    const bool applied=character_direct_step_runtime::ApplyAIRecoveryTransform(context.character,position,pose.yaw);
+    (applied?t.poseApplied:t.poseOther).fetch_add(1U,std::memory_order_relaxed);
+    return applied;
 }
 #include "AISyncPvPActions.inl"
 
@@ -12142,16 +12312,28 @@ bool SnapshotAlienVents(std::uint32_t page,std::string& json,int goTo,std::uint6
     if(goTo>=0 && (incarnation!=gPvPLease.ticket.serial || !alien_pvp_local::GoToVent(static_cast<std::uint32_t>(goTo))))return false;
     const auto ui=alien_pvp_local::VentSnapshot();
     const auto authority=alien_pvp::VentAuthority();
+    // AvS 2026-11-25 round 4: a pending attack was reported as a pending vent
+    // and the HUD showed the last vent text ("Exiting ventilation... E / Q").
+    // Round 6: also while the control runtime still has a non-vent action in
+    // flight (Client pilot: Host retrying the kill after the local record closed).
+    const bool attackPending=(pvp_actions::active.used && !pvp_actions::active.cancelled &&
+        pvp_actions::active.receipt.action==alien_pvp::Action::Attack) || alien_pvp::NonVentActionBusy();
+    const bool attackStarted=attackPending && (pvp_actions::active.entered || pvp_actions::active.presented ||
+        pvp_actions::active.receipt.phase==alien_pvp::ActionPhase::Started);
     json="AVSVENTS:{\"scope\":\""+std::to_string(gPvPLease.sessionCookie)+":"+
         std::to_string(gPvPLease.ownerPeer)+":"+std::to_string(gPvPLease.nativeGeneration)+":"+
         std::to_string(gPvPLease.worldGeneration)+":"+std::to_string(gPvPLease.ticket.serial)+"\",\"page\":"+
         std::to_string(page)+",\"count\":"+std::to_string(table.count)+",\"nearby\":"+std::to_string(ui.nearby)+
         ",\"selected\":"+std::to_string(ui.selected)+",\"open\":"+(ui.open?"true":"false")+
-        ",\"backstage\":"+(ui.backstage?"true":"false")+",\"freeCamera\":"+(ui.freeCamera?"true":"false")+",\"x\":"+std::to_string(body[0])+
+        ",\"backstage\":"+(ui.backstage?"true":"false")+",\"freeCamera\":"+(ui.freeCamera?"true":"false")+
+        ",\"pickerSlot\":"+std::to_string(ui.pickerSlot)+",\"pickerCount\":"+std::to_string(ui.pickerCount)+",\"x\":"+std::to_string(body[0])+
         ",\"y\":"+std::to_string(body[1])+",\"z\":"+std::to_string(body[2])+
         ",\"action\":"+std::to_string(static_cast<unsigned>(authority.action))+
         ",\"phase\":"+std::to_string(static_cast<unsigned>(authority.phase))+
-        ",\"pending\":"+(alien_pvp::VentPending()?"true":"false")+
+        ",\"pending\":"+(alien_pvp::VentRequestPending() && !attackPending?"true":"false")+
+        ",\"attackReady\":"+(ui.attackReady && !attackPending?"true":"false")+
+        ",\"attackPending\":"+(attackPending?"true":"false")+
+        ",\"attackStarted\":"+(attackStarted?"true":"false")+
         ",\"controlReady\":"+(alien_pvp::ControlActive()?"true":"false")+",\"vents\":[";
     bool comma{};
     for(auto i=page*64U;i<std::min(table.count,(page+1U)*64U);++i) {
@@ -12414,6 +12596,118 @@ void LogDiagnostics(Diagnostics& diagnostics) {
     pvp_actions::LogAttack(diagnostics);
     pvp_actions::LogMiss(diagnostics);
     {
+        static std::uint64_t lastRevision{};
+        const auto revision=gPvPSync.revision.load(std::memory_order_acquire);
+        if(revision && revision!=lastRevision) {
+            lastRevision=revision;
+            // 2026-11-25 build wrote bare "x,y,z" as raw JSON (invalid lines).
+            const auto f=[](const std::atomic<float>* p) {
+                return "["+std::to_string(p[0].load())+","+std::to_string(p[1].load())+","+std::to_string(p[2].load())+"]";
+            };
+            std::string peers="[";
+            for(std::uint32_t i=0;i<gPvPSync.peers.load() && i<4U;++i) {
+                if(peers.size()>1U)peers+=",";
+                peers+="{\"peer\":\""+std::to_string(gPvPSync.peer[i].load())+"\",\"pos\":"+f(gPvPSync.peerPos[i])+"}";
+            }
+            peers+="]";
+            const auto age=gPvPSync.correctionAgeMs.load();
+            const auto& r=gPvPReplicaTelemetry;
+            diagnostics.Log("info","alien_pvp_sync_probe",
+                "Where THIS PC draws the Alien and each other participant [x,y,z], once a second. Compare with the other PC's entry at the same time: the difference is that replica's drift. correction = last owner pose received (observers only). replica* = observer pose applications since start: applied, refused because the Alien is pair-busy / reserved by a pending pair replay / not in a mirrorable cycle (lastRefusedCycle) / movement lease busy / other.",
+                {{"host",Diagnostics::Boolean(gPvPSync.host.load()),true},
+                 {"localOwner",Diagnostics::Boolean(gPvPSync.localOwner.load()),true},
+                 {"alien",f(gPvPSync.alien),true},
+                 {"alienCycle",Diagnostics::Unsigned(gPvPSync.alienCycle.load()),true},
+                 {"localPlayer",f(gPvPSync.local),true},
+                 {"correction",age==UINT64_MAX?std::string("null"):f(gPvPSync.correction),true},
+                 {"correctionAgeMs",age==UINT64_MAX?std::string("-1"):std::to_string(age),true},
+                 {"correctionFlags",Diagnostics::Unsigned(gPvPSync.correctionFlags.load()),true},
+                 {"participantCount",Diagnostics::Unsigned(gPvPSync.participantCount.load()),true},
+                 {"participants",peers,true},
+                 {"replicaApplied",Diagnostics::Unsigned(r.poseApplied.load()),true},
+                 {"replicaPairBusy",Diagnostics::Unsigned(r.posePairBusy.load()),true},
+                 {"replicaReserved",Diagnostics::Unsigned(r.poseReserved.load()),true},
+                 {"replicaCycle",Diagnostics::Unsigned(r.poseCycle.load()),true},
+                 {"lastRefusedCycle",Diagnostics::Unsigned(r.poseLastCycle.load()),true},
+                 {"replicaLease",Diagnostics::Unsigned(r.poseLease.load()),true},
+                 {"replicaOther",Diagnostics::Unsigned(r.poseOther.load()),true}});
+        }
+    }
+    {
+        static std::uint64_t lastBlocked{},lastStalls{},lastLost{};
+        const auto m=alien_pvp::MovementSnapshot();
+        const auto blocked=m.blockedAction+m.blockedVent+m.blockedStale+m.blockedStage;
+        const auto& s=pvp_actions::donorStallTelemetry;
+        const auto stalls=s.stalls.load(),lost=s.requestsLost.load();
+        if(blocked!=lastBlocked || stalls!=lastStalls || lost!=lastLost) {
+            lastBlocked=blocked;lastStalls=stalls;lastLost=lost;
+            diagnostics.Log("info","alien_pvp_movement_blocks",
+                "Frames in which the Alien pilot held a movement key but the Alien was not driven, by cause (session totals). action = attack/vent receipt busy or deferred, vent = vent authority pending, stale = input/authority not fresh, stage = not in an ordinary locomotion cycle. stalls = driven >= 0.5 s with < 15 cm travel (lastStallCycle/X/Z where), restarts = wedged move request replaced, requestsLost = native move request ended under an Update, submits/updates = move requests sent.",
+                {{"heldFrames",Diagnostics::Unsigned(m.heldFrames),true},
+                 {"drivenFrames",Diagnostics::Unsigned(m.drivenFrames),true},
+                 {"blockedAction",Diagnostics::Unsigned(m.blockedAction),true},
+                 {"blockedVent",Diagnostics::Unsigned(m.blockedVent),true},
+                 {"blockedStale",Diagnostics::Unsigned(m.blockedStale),true},
+                 {"blockedStage",Diagnostics::Unsigned(m.blockedStage),true},
+                 {"driveRefused",Diagnostics::Unsigned(m.driveRefused),true},
+                 {"chaseDriven",Diagnostics::Unsigned(m.chaseDriven),true},
+                 {"stalls",Diagnostics::Unsigned(stalls),true},
+                 {"restarts",Diagnostics::Unsigned(s.restarts.load()),true},
+                 {"requestsLost",Diagnostics::Unsigned(lost),true},
+                 {"submits",Diagnostics::Unsigned(s.submits.load()),true},
+                 {"updates",Diagnostics::Unsigned(s.updates.load()),true},
+                 {"lastStallCycle",Diagnostics::Unsigned(s.lastCycle.load()),true},
+                 {"lastStallX",std::to_string(s.lastX.load()),true},
+                 {"lastStallZ",std::to_string(s.lastZ.load()),true}});
+        }
+    }
+    {
+        static std::uint64_t lastGunSkips{};
+        if(const auto skips=ui_heap_guard::GunLayerFaultsSkipped();skips!=lastGunSkips) {
+            lastGunSkips=skips;
+            diagnostics.Log("warning","gun_layer_guard_skip",
+                "Retail gun-layer update hit a missing held item (the new-match crash) and skipped that frame; total this session.",
+                {{"skips",Diagnostics::Unsigned(skips),true}});
+        }
+        static std::uint32_t lastAims{};
+        const auto aim=alien_pvp_local::VentCameraSnapshot();
+        if(aim.aims!=lastAims) {
+            lastAims=aim.aims;
+            diagnostics.Log("info","alien_pvp_vent_camera",
+                "Vent-exit picker camera aimed at a new exit (debug point for the grey view into the duct). mode 1 physics rays found the open side of the room, 2 no physics world sampled (faced the nearest survivor), 3 neither (kept the mouse view), 4 elevated (ceiling) exit, probed 0.8-1.6 m above the room floor found below it, 5 no verified eye position (stayed on the probe point). Round 5: an eye must be reachable from its probe point, stand over a floor and see the exit. openM = free distance seen on the chosen side (-1 unknown); outM = metres the eye sits out from the exit (flat); liftM = eye height over the exit point (negative below a ceiling exit); floorDropM = room floor below the exit (0 = floor-level exit); ventHiddenFrames = frames a vent in reach was hidden behind geometry so E was not offered (session total); worlds = physics worlds probed.",
+                {{"vent",std::to_string(aim.vent),true},
+                 {"mode",Diagnostics::Unsigned(aim.mode),true},
+                 {"openM",std::to_string(aim.open),true},
+                 {"outM",std::to_string(aim.out),true},
+                 {"liftM",std::to_string(aim.lift),true},
+                 {"floorDropM",std::to_string(aim.floorDrop),true},
+                 {"ventHiddenFrames",Diagnostics::Unsigned(aim.ventHidden),true},
+                 {"worlds",Diagnostics::Unsigned(aim.worlds),true},
+                 {"aims",Diagnostics::Unsigned(aim.aims),true}});
+        }
+        // Round 7: "no vent prompt in front of a vent". Every 2 s while the
+        // reach counters move: was a vent in reach at all, and did the
+        // line-of-sight ray hide it (hit far from the vent) or accept it.
+        static std::uint64_t lastReach{},lastHidden{},lastFace{};static ULONGLONG lastReachLog{};
+        const auto nowTick=GetTickCount64();
+        if((aim.inReachFrames!=lastReach || aim.ventHidden!=lastHidden || aim.ventFaceHits!=lastFace) &&
+            nowTick-lastReachLog>=2000U) {
+            lastReach=aim.inReachFrames;lastHidden=aim.ventHidden;lastFace=aim.ventFaceHits;lastReachLog=nowTick;
+            diagnostics.Log("info","alien_pvp_vent_reach",
+                "Alien pilot vent prompt check (session totals). inReachFrames = frames a vent was within reach (2.75 m flat, -1.5..+4.5 m height); hiddenFrames = frames the chest->vent ray hit geometry more than 1 m from the vent (E not offered), hiddenGapM = that last distance; faceFrames = frames the ray hit within 1 m of the vent (its own grille; E still offered), faceGapM = that last distance; tableCount = native vent table size (0 = unreadable); worlds = physics worlds ray-tested.",
+                {{"inReachFrames",Diagnostics::Unsigned(aim.inReachFrames),true},
+                 {"hiddenFrames",Diagnostics::Unsigned(aim.ventHidden),true},
+                 {"hiddenGapM",std::to_string(aim.hiddenGap),true},
+                 {"faceFrames",Diagnostics::Unsigned(aim.ventFaceHits),true},
+                 {"faceGapM",std::to_string(aim.faceGap),true},
+                 {"tableCount",Diagnostics::Unsigned(aim.tableCount),true},
+                 {"worlds",Diagnostics::Unsigned(aim.reachWorlds),true},
+                 {"selfHits",Diagnostics::Unsigned(aim.selfHits),true},
+                 {"blockedOffered",Diagnostics::Unsigned(aim.blockedOffered),true},
+                 {"hitFromStartM",std::to_string(aim.hitFromStart),true}});
+        }
+    }
+    {
         static std::uint64_t lastWanted{},lastRejected{};
         const auto wanted=gPvPReplicaTelemetry.backstageWanted.load(),rejected=gPvPReplicaTelemetry.rejectedState.load();
         if(wanted!=lastWanted || rejected!=lastRejected) {
@@ -12447,12 +12741,14 @@ void LogDiagnostics(Diagnostics& diagnostics) {
         const auto count=gPairGateCount.load(std::memory_order_relaxed);
         if(count!=lastGateCount) {
             lastGateCount=count;
-            diagnostics.Log("info","aisync_pair_gate","Client pair replay: first gate holding a pending Host pair. 1 placement 2 noCommand 3 noAuthority 4 noTransition 5 notSource 6 birth 7 cookie/world 8 scope 9 otherPair 10 target 11 source 12 victim 13 serial 14 reserved 15 dependency 16 boundary 17 outcome 100 entered 2xx submit result.",
+            diagnostics.Log("info","aisync_pair_gate","Client pair replay: first gate holding a pending Host pair. 1 placement 2 noCommand 3 noAuthority 4 noTransition 5 notSource 6 birth 7 cookie/world 8 scope 9 otherPair 10 target 11 source 12 victim 13 serial 14 reserved 15 dependency 16 boundary 17 outcome 100 entered 2xx submit result (205 = Waiting; refusalSite 501 carrier capture, 502 actors held by another lease, 503 binding, 504 definition, 505 definition not live, 506/507 prepared definition). waitingAbandoned = unentered pairs dropped after 2.5 s Waiting, superseded = unentered pairs dropped because the Host started another interaction.",
                 {{"gate",Diagnostics::Unsigned(gPairGateLast.load()),true},
                  {"characterClass",Diagnostics::Unsigned(gPairGateClass.load()),true},
                  {"pairRevision",Diagnostics::Unsigned(gPairGateRevision.load()),true},
                  {"refusalSite",Diagnostics::Unsigned(gPairGateRefusalSite.load()),true},
-                 {"count",Diagnostics::Unsigned(count),true}});
+                 {"count",Diagnostics::Unsigned(count),true},
+                 {"waitingAbandoned",Diagnostics::Unsigned(gPairsWaitingAbandoned.load()),true},
+                 {"superseded",Diagnostics::Unsigned(gPairsSuperseded.load()),true}});
         }
     }
     static bool movementFailureLogged{};
@@ -12781,6 +13077,9 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"rootWarpSlotsFull", Diagnostics::Unsigned(gRootWarpSlotsFull.load()), true},
          {"locomotionFlightDropped", Diagnostics::Unsigned(gFlightDropped), true},
          {"directPoseEmergencyCorrections", Diagnostics::Unsigned(gDirectPoseEmergencyCorrections.load()), true},
+         {"pairSourceAligned", Diagnostics::Unsigned(gPairSourceAligned.load()), true},
+         {"pairSourceAlignSkipped", Diagnostics::Unsigned(gPairSourceAlignSkipped.load()), true},
+         {"pairSourceAlignErrorM", std::to_string(gPairSourceAlignError.load()), true},
          {"clientCycleCallsReplayFailed", Diagnostics::Unsigned(gCycleCallsReplayFailed.load()), true},
          {"endedSourceExitsDeferred", Diagnostics::Unsigned(gEndedSourceExitsDeferred.load()), true},
          {"localVictimEndRetained", Diagnostics::Unsigned(gLocalVictimEndRetained.load()), true},

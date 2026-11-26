@@ -193,6 +193,7 @@ Result Runtime::Submit(const State& state, const Binding& binding, Receipt& publ
     if (!MatchesCarrier(state)) return Result::WrongScope;
     Command command{};
     const auto captured = Capture(state, command);
+    if (captured == Check::Waiting) RefusalSite()=501U;
     if (captured != Check::Ready) return captured == Check::Waiting ? Result::Waiting : Result::Rejected;
     command.key={scope_,state.interactionCommand};
     const bool player=command.victim.peer!=0U;

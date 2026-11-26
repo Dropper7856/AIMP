@@ -44,6 +44,16 @@ struct Active final {
     std::uint64_t arrivedAt{};std::uint32_t cancelRefusals{};
     std::uint64_t ventProgressAt{};float ventBestDistance{std::numeric_limits<float>::infinity()};
     bool attackLatched{},retailArmed{},presented{};std::uint64_t latchedAt{},lastPairTrace{},armedAt{},presentedAt{};
+    bool directSubmitted{};
+    // AvS 2026-11-25 (round 3): settle before the direct pair, one transition
+    // retry, and the observer's fallback presentation.
+    bool settling{},transitionRetried{},observerFallback{};std::uint64_t settleAt{},observerWaitAt{};
+    // Round 4: pilot PC's first PresentPair attempt (retried for 1.5 s while
+    // an AISync replay still reserves the characters).
+    std::uint64_t presentFirstAt{};std::uint32_t presentTries{};
+    // Round 5: auto-chase until the retail query proves the kill, Started only
+    // once the victim is really in its paired cycle (79), silent re-submits.
+    bool sourceEntered{},stallTraced{};std::uint64_t sourceEnteredAt{},lastQueryAt{};std::uint32_t attackRetries{};
     std::uint32_t retargets{},flagConsumed{};
     std::uintptr_t attackAnimated{};bool shouldAttackSet{};
     ap::attack::HeldTarget brainTarget{};
@@ -69,6 +79,23 @@ bool Cycle(const std::uintptr_t character,std::uint8_t& state,bool& backstage) n
     if(!Read(character+0x36CU,cycle) || !cycle || !Read(cycle+4U,owner) || owner!=character ||
         !Read(cycle+0x1AU,state) || !Read(character+0x2DAU,hidden) || !Read(character+0x2DBU,withdrawn))return false;
     backstage=hidden!=0U || withdrawn!=0U;return true;
+}
+// Round 5: paired definition (kill variant) of the last submitted/presented
+// selector: its kind and the victim bone name it attaches to. Diagnostics only.
+std::array<std::atomic<char>,48> gDefinitionBone{};std::atomic<unsigned> gDefinitionKind{};
+void RecordDefinition(const interactions::Definition& definition) noexcept {
+    gDefinitionKind.store(definition.kind,std::memory_order_relaxed);
+    bool ended{};
+    for(std::size_t i=0;i+1<gDefinitionBone.size();++i) {
+        char ch{};
+        if(ended || !Read(definition.object+0x20U+i,ch) || ch=='\0' || ch<0x20 || ch>0x7E){ended=true;ch='\0';}
+        gDefinitionBone[i].store(ch,std::memory_order_relaxed);
+    }
+}
+std::string DefinitionBone() {
+    std::string text;
+    for(const auto& ch:gDefinitionBone){const char c=ch.load(std::memory_order_relaxed);if(!c)break;text.push_back(c);}
+    return text;
 }
 #ifndef AIMP_ALIEN_ACTION_TEST
 struct VentTelemetry final {
@@ -96,7 +123,7 @@ void LogVent(Diagnostics& diagnostics) {
     const auto revision=ventTelemetry.revision.load(std::memory_order_acquire),now=GetTickCount64();
     if(!revision || revision==lastRevision || now-lastAt<1000U)return;
     lastRevision=revision;lastAt=now;
-    diagnostics.Log("info","alien_vent_progress","Engine-thread vent observations; frameResult 0 pending, 1 arrived, 2 refused, 3 arrivedButNoPassage2.5s, 4 cancelRefusedDuringPassage.",
+    diagnostics.Log("info","alien_vent_progress","Engine-thread vent observations; frameResult 0 pending, 1 arrived, 2 refused, 3 arrivedButNoPassage2.5s, 4 cancelRefusedDuringPassage, 5 pathLedAwayFromOpening (cancelled).",
         {{"host",Diagnostics::Boolean(ventTelemetry.host.load()),true},
          {"hostSequence",Diagnostics::Unsigned(ventTelemetry.sequence.load()),true},
          {"elapsedMs",Diagnostics::Unsigned(ventTelemetry.elapsed.load()),true},
@@ -126,6 +153,19 @@ struct AttackTelemetry final {
     // 00717D90), last node type, OR of attack-manager availability bytes
     // +8..+E (bit n = +8+n; +8 ANY, +D any proven) and source/victim +2B4.
     std::atomic<unsigned> meleeStarts{},meleeRefused{},meleeType{},availability{},sourceFlag2B4{},victimFlag2B4{},brainFaults{};
+    // Direct pair (round 3): ms spent settling the Alien before submit, its
+    // cycle at submit, and whether the transition was re-issued once.
+    std::atomic<unsigned> settleMs{},settleCycle{},transitionRetried{};
+    // Round 4: HostDirectPair guard mask (stage 36), whether a Client owns the
+    // Alien, owner poses held back during settle/submit, and the pilot PC's
+    // PresentPair attempts before it took (or gave up after 1.5 s).
+    std::atomic<unsigned> directGuard{},remoteOwner{},posesHeld{},presentTries{};
+    // Round 5: silent re-submits of the current attack, frames the pilot's PC
+    // steered the Alien at its victim (session total).
+    std::atomic<unsigned> retries{},chaseFrames{};
+    // Diagnostics flush every ~5 s and kept only the last stage: a ring of
+    // the most recent stage changes (stage<<24 | elapsedMs) shows the path.
+    std::array<std::atomic<std::uint32_t>,16> history{};std::atomic<std::uint32_t> historyWrite{};
     // Session counters (never reset per attack).
     std::atomic<unsigned> ventHijacks{};
     // Last NoTarget rejection: nearest certified survivor relative to the
@@ -164,7 +204,14 @@ void LogMiss(Diagnostics& diagnostics) {
 void TraceAttack(unsigned stage,unsigned selector=0U) noexcept {
     std::uint8_t state{};bool backstage{};
     if(!Cycle(active.context.character,state,backstage))state=0xFFU;
+    const bool fresh=attackTelemetry.stage.load()!=stage || attackTelemetry.sequence.load()!=active.receipt.hostSequence ||
+        attackTelemetry.polls.load()==0U;
     attackTelemetry.sequence=active.receipt.hostSequence;attackTelemetry.elapsed=GetTickCount64()-active.began;
+    if(fresh) {
+        const auto slot=attackTelemetry.historyWrite.fetch_add(1U,std::memory_order_relaxed)%attackTelemetry.history.size();
+        const auto elapsed=static_cast<std::uint32_t>(std::min<std::uint64_t>(attackTelemetry.elapsed.load(),0xFFFFFFU));
+        attackTelemetry.history[slot].store((stage<<24U)|elapsed,std::memory_order_relaxed);
+    }
     attackTelemetry.stage=stage;attackTelemetry.selector=selector;attackTelemetry.cycle=state;
     attackTelemetry.polls.fetch_add(1U,std::memory_order_relaxed);
     attackTelemetry.revision.fetch_add(1U,std::memory_order_release);
@@ -190,7 +237,22 @@ void LogAttack(Diagnostics& diagnostics) {
     const auto sequence=attackTelemetry.sequence.load();
     if(!revision || revision==lastRevision || (sequence==lastSequence && now-lastAt<250U))return;
     lastRevision=revision;lastSequence=sequence;lastAt=now;
-    diagnostics.Log("info","alien_attack_progress","Host attack preparation; stage 1 noSelection 2 noRecord 3 targetFault 4 queryRefused 5 selectorUnproven 6 rayPending 7 submitted 8 pairRefused 9 entered 10 enteredWithRayPending 11 pairRunning 12 victimNotAcquired4s 13 retailArmed 14 retailWindowExpired 15 retailOtherVictim 16 retailRetargeted(selector=count) 17 armedQueryRefused 18 brainTargetUnavailable 19 attackBranchConsumedFlag(selector=count) 24 retailNeverStartedMelee3s 25 retailChoseVentAborted(selector=cycle) 20 clientPresented 21 clientPresentRefused 22 clientNotEntered 23 clientEntered.",
+    // [[stage,elapsedMs],...] recorded since the previous line (oldest first).
+    static std::uint32_t historyRead{};
+    std::string recent="[";
+    {
+        const auto write=attackTelemetry.historyWrite.load(std::memory_order_relaxed);
+        const auto size=static_cast<std::uint32_t>(attackTelemetry.history.size());
+        if(write-historyRead>size)historyRead=write-size;
+        for(bool comma{};historyRead!=write;++historyRead) {
+            const auto v=attackTelemetry.history[historyRead%size].load(std::memory_order_relaxed);
+            if(comma)recent+=",";
+            comma=true;
+            recent+="["+std::to_string(v>>24U)+","+std::to_string(v&0xFFFFFFU)+"]";
+        }
+    }
+    recent+="]";
+    diagnostics.Log("info","alien_attack_progress","Host attack preparation; stage 1 noSelection 2 noRecord 3 targetFault 4 queryRefused 5 selectorUnproven 6 rayPending 7 submitted 8 pairRefused 9 entered 10 enteredWithRayPending 11 pairRunning 12 victimNotAcquired4s 13 retailArmed 14 retailWindowExpired 15 retailOtherVictim 16 retailRetargeted(selector=count) 17 armedQueryRefused 18 brainTargetUnavailable 19 attackBranchConsumedFlag(selector=count) 24 retailNeverStartedMelee3s 25 retailChoseVentAborted(selector=cycle) 26 directPairNoDefinition 27 directPairInteractionRefused 28 directPairNativeFault 29 directPairDonorBusy 30 directPairNotEntered2s (7 = direct pair submitted; settleMs/settleCycle = wait for the Alien to stop before submit and its cycle then, 1 = idle; transitionRetried = transition re-issued at 600 ms) 20 clientPresented 21 clientPresentRefused 22 clientNotEntered 23 clientEntered; survivor (observer) PC: 31 waitingForPairReplay 32 fallbackPresented 33 fallbackRefused 34 killEnteredHere 35 hostEndedWithoutKillHere; 36 directPairGuard (directGuard bits: 1 lease not live, 2 scope stale, 4 not host, 8 releasing, 16 victim not live, 32 Alien pair-reserved, 64 victim pair-reserved); remoteOwner 1 = a Client pilots the Alien; posesHeld = owner poses held back on the Host during settle/submit (session total); recentStages = [stage, elapsedMs] since the previous line; presentTries = pilot-PC PresentPair attempts (stage 20 took, 21 gave up after 1.5 s). Round 5: 9 = source entered 78 (not yet a kill), 39 victim grabbed (its cycle 79) -> Started, 38 victim not grabbed within 1.5 s / pair ended without it -> re-submit, 30 not entered in 2 s -> re-submit, 37 grabbed but still paired after 9 s (stalled kill), 40 victim left the 6 m leash, 41 8 s chase window over; retries = re-submits of this attack; chaseFrames = pilot-PC frames steering at the victim (session); victimGate = OR of paired-victim availability checks on this PC since the last line (1 retail allowed, 2 not a victim view, 4 remote replica not ready, 8 local player not ready, 16 pair not present/matching, 32 AIMP allowed it, 64 local player; local-player detail 128 not the local client victim, 256 no published binding, 512 animation graph off, 1024 no player controller, 2048 cycle not 79, 4096 admission/source mismatch); bone/kind = paired definition of the selector.",
         {{"hostSequence",Diagnostics::Unsigned(sequence),true},
          {"elapsedMs",Diagnostics::Unsigned(attackTelemetry.elapsed.load()),true},
          {"stage",Diagnostics::Unsigned(attackTelemetry.stage.load()),true},
@@ -211,7 +273,20 @@ void LogAttack(Diagnostics& diagnostics) {
          {"availability",Diagnostics::Unsigned(attackTelemetry.availability.load()),true},
          {"source2B4",Diagnostics::Unsigned(attackTelemetry.sourceFlag2B4.load()),true},
          {"victim2B4",Diagnostics::Unsigned(attackTelemetry.victimFlag2B4.load()),true},
-         {"brainFaults",Diagnostics::Unsigned(attackTelemetry.brainFaults.load()),true}});
+         {"brainFaults",Diagnostics::Unsigned(attackTelemetry.brainFaults.load()),true},
+         {"settleMs",Diagnostics::Unsigned(attackTelemetry.settleMs.load()),true},
+         {"settleCycle",Diagnostics::Unsigned(attackTelemetry.settleCycle.load()),true},
+         {"transitionRetried",Diagnostics::Unsigned(attackTelemetry.transitionRetried.load()),true},
+         {"directGuard",Diagnostics::Unsigned(attackTelemetry.directGuard.load()),true},
+         {"remoteOwner",Diagnostics::Unsigned(attackTelemetry.remoteOwner.load()),true},
+         {"posesHeld",Diagnostics::Unsigned(attackTelemetry.posesHeld.load()),true},
+         {"presentTries",Diagnostics::Unsigned(attackTelemetry.presentTries.load()),true},
+         {"retries",Diagnostics::Unsigned(attackTelemetry.retries.load()),true},
+         {"chaseFrames",Diagnostics::Unsigned(attackTelemetry.chaseFrames.load()),true},
+         {"victimGate",Diagnostics::Unsigned(gPairedVictimGateSeen.exchange(0U,std::memory_order_relaxed)),true},
+         {"bone",DefinitionBone(),false},
+         {"kind",Diagnostics::Unsigned(gDefinitionKind.load(std::memory_order_relaxed)),true},
+         {"recentStages",recent,true}});
 }
 #else
 void TraceVent(unsigned=0U) noexcept {}
@@ -333,7 +408,11 @@ bool SelectPortal(const ap::Context& c,const ap::Frame& request,ap::Frame& resul
     // Donor vent.cpp::PickGo keeps the retail path-aware choice when it is
     // almost as near as the closest opening. Forcing the nearest point can
     // choose the wrong side of a wall or an inaccessible approach.
-    if(c.host && enter && found && (request.flags&ap::VentSelected)==0U) {
+    // AvS 2026-11-25 round 5: the pilot's E always carries VentSelected (the
+    // straight-line nearest opening), so this never ran and the Alien was sent
+    // ~11 m around a wall to an approach it then could not open. Apply it to
+    // every entry; the retail choice must still be within reach of the body.
+    if(c.host && enter && found) {
         const auto original=RetailEntry(manager);
         if(original>=entries && (original-entries)%0x30U==0U && (original-entries)/0x30U<count) {
             policy::Vent vent{};std::uintptr_t descriptor{};
@@ -724,18 +803,37 @@ bool VictimStillInReach(const ap::Context& c,const PairIdentity& victim,const ap
     const policy::Candidate candidate{victim.peer,target,true,true,false,true};
     return policy::SelectVictim(source,command.yaw,c.scope.ownerPeer,{&candidate,1U})==victim.peer;
 }
+// Round 5 guaranteed kill: the chosen victim stays the target while alive,
+// on (about) the same floor and within the leash; aim no longer matters.
+bool VictimInLeash(const ap::Context& c,const PairIdentity& victim) noexcept {
+    if(!PairIdentityLive(victim) || !LivingCharacter(victim.character) || ParticipantForPeer(victim.peer)!=victim.character)return false;
+    policy::Point source{},target{};
+    if(!Body(c.character,source) || !Body(victim.character,target))return false;
+    return std::abs(target.y-source.y)<=policy::kAttackHeight &&
+        std::hypot(target.x-source.x,target.z-source.z)<=policy::kAttackLeash;
+}
+// The victim is in ITS paired cycle (79) of this Alien's pair: the kill grabbed it.
+bool VictimInPair(const std::uintptr_t source,const std::uintptr_t victim) noexcept {
+    std::uintptr_t cycle{},target{},victimCycle{},owner{};std::uint8_t state{};
+    return victim && Read(source+0x36CU,cycle) && cycle && Read(cycle+0x44U,target) && target==victim &&
+        Read(victim+0x36CU,victimCycle) && victimCycle && Read(victimCycle+4U,owner) && owner==victim &&
+        Read(victimCycle+0x1AU,state) && state==0x4FU;
+}
 // Pilot-side presentation of the Host's retail kill (donor puppet.cpp model).
 // Same registration/transition the AISync Client pair replay uses; AISync's
 // replay cannot drive the locally piloted Alien (455: placement gate 1).
 // Health and death stay Host-authoritative through participant lifecycle.
+// AvS 2026-11-25 (round 3): also the survivor PC's fallback when AISync's
+// replay of a Host-owned Alien's kill never enters (victim = local player).
 bool PresentPair(const ap::Context& c,const PairIdentity& victim,const std::uint32_t selector) noexcept {
-    if(!Live(c) || !PvPLeaseScopeCurrent() || c.host || !c.localOwner || gPvPLease.releasing ||
+    if(!Live(c) || !PvPLeaseScopeCurrent() || c.host || gPvPLease.releasing ||
         !PairIdentityLive(victim) || PairReservedCharacter(c.character) || PairReservedCharacter(victim.character))return false;
 #ifndef AIMP_ALIEN_ACTION_TEST
     if(!StopDonor(c))return false;
 #endif
     interactions::Definition definition{};
     if(!animation::ResolvePairDefinition(c.character,gPvPLease.runtimeId,victim.character,victim.runtimeId,selector,definition))return false;
+    RecordDefinition(definition);
     std::uintptr_t root{},manager{},cycle{};
     if(!Read(gBase+kInteractionManagerGlobalRva,root) || !root || !Read(root,manager) || !manager ||
         !Read(c.character+0x36CU,cycle) || !cycle)return false;
@@ -749,6 +847,65 @@ bool PresentPair(const ap::Context& c,const PairIdentity& victim,const std::uint
         return true;
     } AIMP_ACTION_CATCH {return false;}
 }
+// AvS 2026-11-25 (user decision: direct kill only, no fallback). Every armed
+// retail-brain attempt since 453 ended stage 24: ATTACK_CORE never ran
+// (flagConsumed 0, meleeStarts 0), the Alien idled 3 s and the pilot's input
+// was frozen. The Host now starts the same native paired kill the observer
+// side already presents (PresentPair): interaction registration + the paired
+// transition with the selector proven by the explicit availability query.
+// Return codes (attack stage): 0 submitted, 26 definition not resolved,
+// 27 interaction refused, 28 native fault, 29 donor still retiring.
+unsigned HostDirectPair(const ap::Context& c,const PairIdentity& victim,const std::uint32_t selector) noexcept {
+    // AvS 2026-11-25 (round 4): this also required c.localOwner, so with a
+    // Client piloting the Alien every Host attempt returned 27 at once (35
+    // clicks, no kill). The Host runs the kill on its replica either way; the
+    // pilot's PC presents it on Started (PresentPair).
+    // Guard failures are stage 36 with a bit mask (directGuard) so a refusal
+    // by our own checks is never confused with a native refusal (27) again.
+    const unsigned guard=(Live(c)?0U:1U)|(PvPLeaseScopeCurrent()?0U:2U)|(c.host?0U:4U)|
+        (gPvPLease.releasing?8U:0U)|(PairIdentityLive(victim)?0U:16U)|
+        (PairReservedCharacter(c.character)?32U:0U)|(PairReservedCharacter(victim.character)?64U:0U);
+#ifndef AIMP_ALIEN_ACTION_TEST
+    attackTelemetry.directGuard=guard;
+    attackTelemetry.remoteOwner=c.localOwner?0U:1U;
+#endif
+    if(guard)return 36U;
+#ifndef AIMP_ALIEN_ACTION_TEST
+    if(!StopDonor(c))return 29U;
+    static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(c.character));
+#endif
+    interactions::Definition definition{};
+    if(!animation::ResolvePairDefinition(c.character,gPvPLease.runtimeId,victim.character,victim.runtimeId,selector,definition))return 26U;
+    RecordDefinition(definition);
+    std::uintptr_t root{},manager{},cycle{};
+    if(!Read(gBase+kInteractionManagerGlobalRva,root) || !root || !Read(root,manager) || !manager ||
+        !Read(c.character+0x36CU,cycle) || !cycle)return 28U;
+    AIMP_ACTION_TRY {
+        const auto accepted=Native<CharacterInteraction>(0x00254820U)(
+            reinterpret_cast<void*>(manager+0x90U),c.scope.entityA,c.scope.entityB,victim.entityA,victim.entityB,
+            definition.victimAttachment>0?std::uint64_t{1U}:std::uint64_t{0U},definition.victimAttachment);
+        if((accepted&0xFFU)==0U)return 27U;
+        Native<PairedTransitionA>(0x0025C4E0U)(reinterpret_cast<void*>(cycle),victim.character,
+            static_cast<std::int32_t>(selector),0U);
+        return 0U;
+    } AIMP_ACTION_CATCH {return 28U;}
+}
+// One re-issue of the paired transition on the Alien's CURRENT cycle (the
+// registration above stays). Round 2's first attack was registered but the
+// still-running locomotion replaced the cycle before it entered 78.
+bool HostRetryTransition(const ap::Context& c,const PairIdentity& victim,const std::uint32_t selector) noexcept {
+    if(!Live(c) || !c.host || !PairIdentityLive(victim))return false;
+    std::uintptr_t cycle{};
+    if(!Read(c.character+0x36CU,cycle) || !cycle)return false;
+    AIMP_ACTION_TRY {
+        Native<PairedTransitionA>(0x0025C4E0U)(reinterpret_cast<void*>(cycle),victim.character,
+            static_cast<std::int32_t>(selector),0U);
+        return true;
+    } AIMP_ACTION_CATCH {return false;}
+}
+constexpr std::uint64_t kDirectSettleMs=450U,kDirectRetryMs=600U,kDirectEntryMs=2000U,kObserverReplayWaitMs=1200U;
+// Round 5: the source in 78 must grab its victim (79) within this, else retry.
+constexpr std::uint64_t kVictimAcquireMs=1500U,kPairStallMs=9000U,kChaseQueryMs=100U;
 void Clear() noexcept {
     if(active.victim.character)player_hiding::FinishPvPSearch(active.victim.character);
     ReleaseAttackTarget();
@@ -918,6 +1075,44 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
         return false;
     }
     if(active.receipt.action==Action::Attack) {
+        if(!c.host && !c.localOwner) {
+            // Survivor/observer PC of a Host-piloted Alien. AISync's Client pair
+            // replay is the executor here: it binds the local victim and its
+            // death outcome. AvS 2026-11-25: this path called the pilot-only
+            // PresentPair (stage 21), and the replay itself was stuck on an older
+            // unentered pair, so the survivor never died and the Host showed
+            // him dead/invisible. Fallback after 1.2 s: present the Host's kill
+            // directly, only while no AISync pair holds these characters.
+            if(state==78U && !active.entered) {
+                active.entered=true;
+                std::uintptr_t cycle{},object{};interactions::Definition seen{};std::uint32_t index{};
+                if(Read(c.character+0x36CU,cycle) && cycle && Read(cycle+0x4CU,object) && object &&
+                    Read(object+8U,seen.kind)) {
+                    seen.object=object;RecordDefinition(seen);
+                    if(Read(object+4U,index) && index<25U)active.receipt.selector=index;
+                }
+                TracePair(34U);
+            }
+            if(active.receipt.phase==Phase::Started && !active.observerWaitAt) {
+                active.observerWaitAt=now;TraceAttack(31U,active.receipt.selector);
+            }
+            if(!active.entered && !active.observerFallback && active.observerWaitAt &&
+                now-active.observerWaitAt>kObserverReplayWaitMs && !active.hostEnded && !Protected(state) &&
+                !PairReservedCharacter(c.character) && !PairReservedCharacter(active.victim.character)) {
+                active.observerFallback=true;active.presentedAt=now;
+                const bool presented=PresentPair(c,active.victim,active.receipt.selector);
+                TraceAttack(presented?32U:33U,active.receipt.selector);
+                if(!presented){Clear();return false;}
+                active.presented=true;
+            }
+            if(active.entered && !Protected(state)){Clear();return false;}
+            if(active.hostEnded && !active.entered && !Protected(state) &&
+                (!active.presented || now-active.presentedAt>1500U)) {
+                TraceAttack(35U,active.receipt.selector);Clear();return false;
+            }
+            if(now-active.began>kClientAttackWaitMs && !Protected(state))Clear();
+            return false;
+        }
         if(!c.host) {
             if(!active.entered && state!=78U && active.victim.character)
                 static_cast<void>(player_hiding::PreparePvPSearch(active.victim.character,c.scope.nativeGeneration));
@@ -932,11 +1127,20 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
             // The Host's retail kill is authoritative; this Alien only plays
             // the same pair locally on its victim replica, once the Host has
             // really entered it (Started carries the retail selector).
-            if(!active.presented && !active.entered && active.receipt.phase==Phase::Started) {
-                active.presented=true;active.presentedAt=now;
-                const bool presented=PresentPair(c,active.victim,active.receipt.selector);
-                TraceAttack(presented?20U:21U,active.receipt.selector);
-                if(!presented){Clear();return false;}
+            if(!active.presented && !active.entered && active.receipt.phase==Phase::Started && state!=78U) {
+                // Round 4: one refusal used to end it (stage 21). An AISync
+                // replay of the same Host pair may hold the characters for a
+                // moment; retry each frame for up to 1.5 s.
+                if(!active.presentFirstAt)active.presentFirstAt=now;
+                ++active.presentTries;
+#ifndef AIMP_ALIEN_ACTION_TEST
+                attackTelemetry.presentTries=active.presentTries;
+#endif
+                if(PresentPair(c,active.victim,active.receipt.selector)) {
+                    active.presented=true;active.presentedAt=now;TraceAttack(20U,active.receipt.selector);
+                } else if(now-active.presentFirstAt>1500U) {
+                    TraceAttack(21U,active.receipt.selector);Clear();return false;
+                }
             }
             if(state==78U && !active.entered){active.entered=true;TracePair(23U);}
             if((active.entered && !Protected(state)) || (active.hostEnded && !Protected(state)))Clear();
@@ -949,6 +1153,57 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
             return false;
         }
         if(active.receipt.phase==Phase::Preparing) {
+            if(active.directSubmitted) {
+                // AvS 2026-11-25 round 5: the source entering 78 is not a kill.
+                // Two of three kills first ran a pair whose victim never left
+                // idle (victimState 1); the survivor PC saw the Host end it
+                // (stage 35) and the pilot had to click again (then stage 30
+                // while that pair was still ending). Started now waits for the
+                // victim's own paired cycle (79); a pair that ends or idles
+                // without it is re-submitted silently (guaranteed kill).
+                if(state==78U && !active.sourceEntered) {
+                    active.sourceEntered=true;active.sourceEnteredAt=now;TracePair(9U);
+                }
+                if(state==78U && VictimInPair(c.character,active.victim.character)) {
+                    std::uintptr_t cycle{},definition{};std::uint32_t index{};
+                    if(Read(c.character+0x36CU,cycle) && cycle && Read(cycle+0x4CU,definition) && definition &&
+                        Read(definition+4U,index) && index<25U)active.receipt.selector=index;
+                    TracePair(39U);
+                    active.entered=true;result=active.receipt;result.phase=Phase::Started;result.reason=Reason::None;
+                    ++result.resolutionRevision;active.receipt=result;return true;
+                }
+#ifndef AIMP_ALIEN_ACTION_TEST
+                PublishPairedParticipantVictim(active.victim.character,now+kPairedParticipantVictimHoldMs);
+#endif
+                const bool notEntered=!active.sourceEntered && now-active.submittedAt>kDirectEntryMs;
+                const bool notAcquired=active.sourceEntered && (state!=78U || now-active.sourceEnteredAt>kVictimAcquireMs);
+                if(notEntered || notAcquired) {
+                    // Let a running (victimless) pair end before submitting again.
+                    if(Protected(state))return false;
+                    TracePair(notEntered?30U:38U);
+                    if(active.attackRetries<policy::kAttackRetries && VictimInLeash(c,active.victim) &&
+                        now-active.began<policy::kAttackChaseMs) {
+                        ++active.attackRetries;
+#ifndef AIMP_ALIEN_ACTION_TEST
+                        attackTelemetry.retries=active.attackRetries;
+#endif
+                        active.attackLatched=active.settling=active.directSubmitted=false;
+                        active.sourceEntered=active.transitionRetried=false;active.lastQueryAt=0U;
+                        return false;
+                    }
+                    Terminal(result,Phase::Rejected,Reason::NativeRefused);active.cancelled=true;return true;
+                }
+                if(!active.sourceEntered && !active.transitionRetried && now-active.submittedAt>kDirectRetryMs && !Protected(state)) {
+                    active.transitionRetried=true;
+                    const bool retried=HostRetryTransition(c,active.victim,active.receipt.selector);
+#ifndef AIMP_ALIEN_ACTION_TEST
+                    attackTelemetry.transitionRetried=retried?1U:2U;
+#else
+                    static_cast<void>(retried);
+#endif
+                }
+                return false;
+            }
             if(active.retailArmed) {
                 // The retail brain (worker thread) runs ActionMeleeAttack on
                 // the held target, the only path that completed a kill (453).
@@ -1034,7 +1289,10 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
                 }
                 return false;
             }
-            if(!VictimStillInReach(c,active.victim,active.receipt)) {
+            // Round 5: the click proved reach and aim (SelectVictim). From here
+            // the Alien chases (Chase hook) and only the leash ends it.
+            if(!VictimInLeash(c,active.victim)) {
+                TraceAttack(40U,active.receipt.selector);
                 Terminal(result,Phase::Rejected,Reason::NoTarget);active.cancelled=true;return true;
             }
             if(!player_hiding::PreparePvPSearch(active.victim.character,c.scope.nativeGeneration)) {
@@ -1042,7 +1300,8 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
             }
             // One explicit query proves the native attack is available on THIS
             // victim; latch it instead of re-arming the cover ray every frame.
-            if(!active.attackLatched) {
+            if(!active.attackLatched && now-active.lastQueryAt>=kChaseQueryMs) {
+                active.lastQueryAt=now;
                 bool ready{};std::uint32_t selector{};
                 if(!AttackAvailability(c,active.victim,active.chooser,ready,selector)) {
                     Terminal(result,Phase::Failed,Reason::NativeUnavailable);active.cancelled=true;return true;
@@ -1050,37 +1309,61 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
                 if(ready){active.attackLatched=true;active.latchedAt=now;active.receipt.selector=selector;}
             }
             if(active.attackLatched) {
-                // Arm the retail melee: the victim becomes the AI target until
-                // the action clears. Without a held target 004128E0 refuses
-                // every melee start, so the brain never attacks unprompted.
-                if(!HoldAttackTarget(active.victim.character)) {
-                    Terminal(result,Phase::Failed,Reason::NativeUnavailable);active.cancelled=true;return true;
-                }
 #ifndef AIMP_ALIEN_ACTION_TEST
-                // The retail brain must own the Alien for the armed window: no
-                // donor kind9 request left in its tree (461 crashed with one
-                // still retiring), and no direct-step idle hold, which blocks
-                // the BT's own run to the victim (459/460 stayed in place).
-                if(!StopDonor(c)) {
-                    ReleaseAttackTarget();Terminal(result,Phase::Failed,Reason::NativeBusy);active.cancelled=true;return true;
+                // Keep the survivor proxy out of network locomotion while the
+                // grab aligns (the Client presenter does the same).
+                PublishPairedParticipantVictim(active.victim.character,now+kPairedParticipantVictimHoldMs);
+                // AvS 2026-11-25 (round 2 first attack, stage 30 at cycle 59):
+                // submitted while the Alien still ran; its locomotion replaced
+                // the cycle and the kill never entered (but stayed registered).
+                // Stop it first and submit once idle, or after 450 ms anyway.
+                if(!active.settling) {
+                    active.settling=true;active.settleAt=now;
+                    static_cast<void>(StopDonor(c));
+                    static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(c.character));
                 }
-                static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(c.character));
+                if(state!=1U && now-active.settleAt<kDirectSettleMs)return false;
+                attackTelemetry.settleMs=static_cast<unsigned>(now-active.settleAt);attackTelemetry.settleCycle=state;
+                attackTelemetry.transitionRetried=0U;
 #endif
-                active.retailArmed=true;active.armedAt=now;
-                attackTelemetry.armedPolls=0U;attackTelemetry.flagConsumed=0U;attackTelemetry.retargets=0U;
-                attackTelemetry.brainMissing=0U;
-                attackTelemetry.meleeStarts=0U;attackTelemetry.meleeRefused=0U;attackTelemetry.meleeType=0xFFU;
-                attackTelemetry.availability=0U;attackTelemetry.sourceFlag2B4=0U;attackTelemetry.victimFlag2B4=0U;
+                const auto submitted=HostDirectPair(c,active.victim,active.receipt.selector);
+                TraceAttack(submitted==0U?7U:submitted,active.receipt.selector);
+                // Round 5: a refusal while the previous attempt's pair is still
+                // retiring (27 / 36 reserved) is retried like a victimless pair.
+                if(submitted!=0U && submitted!=26U && active.attackRetries<policy::kAttackRetries &&
+                    now-active.began<policy::kAttackChaseMs) {
+                    ++active.attackRetries;
 #ifndef AIMP_ALIEN_ACTION_TEST
-                gPvPMeleeStarts.store(0U,std::memory_order_relaxed);gPvPMeleeRefused.store(0U,std::memory_order_relaxed);
-                gPvPMeleeWatch.store(active.attackAnimated,std::memory_order_relaxed);
-                ArmPvPBrain(c.character,now+kRetailAttackWindowMs+500U);
+                    attackTelemetry.retries=active.attackRetries;
 #endif
-                TraceAttack(13U,active.receipt.selector);
+                    active.attackLatched=active.settling=false;active.lastQueryAt=now;
+                    return false;
+                }
+                if(submitted!=0U) {
+                    Terminal(result,Phase::Rejected,submitted==29U?Reason::NativeBusy:Reason::NativeRefused);
+                    active.cancelled=true;return true;
+                }
+                active.directSubmitted=true;active.entrySubmitted=true;active.submittedAt=now;
                 return false;
             }
-            if(now-active.began>1500U){Terminal(result,Phase::Rejected,Reason::NativeRefused);active.cancelled=true;return true;}
+            // The retail-brain arming of 453-575 (HoldAttackTarget + SHOULD_ATTACK
+            // + ArmPvPBrain) is retired: see HostDirectPair. Its armed-branch
+            // handling above stays for a receipt armed by an older peer only.
+            if(now-active.began>policy::kAttackChaseMs) {
+                TraceAttack(41U,active.receipt.selector);
+                Terminal(result,Phase::Rejected,Reason::NativeRefused);active.cancelled=true;return true;
+            }
             return false;
+        }
+#ifndef AIMP_ALIEN_ACTION_TEST
+        if(active.directSubmitted && Protected(state))
+            PublishPairedParticipantVictim(active.victim.character,now+kPairedParticipantVictimHoldMs);
+#endif
+        if(active.entered && Protected(state) && !active.stallTraced && active.sourceEnteredAt &&
+            now-active.sourceEnteredAt>kPairStallMs) {
+            // Round 5 (kill from behind): victim grabbed, but no kill marker for
+            // 12+ s; the Alien stayed in 78. Recorded for the next log.
+            active.stallTraced=true;TracePair(37U);
         }
         if(now-active.lastPairTrace>=250U) {
             active.lastPairTrace=now;
@@ -1132,6 +1415,15 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
             policy::Point{active.receipt.resolvedX,active.receipt.resolvedY,active.receipt.resolvedZ};
         const float distance=std::sqrt(policy::DistanceSquared(body,goal));
         if(distance+0.25F<active.ventBestDistance) {active.ventBestDistance=distance;active.ventProgressAt=now;}
+        // Round 5: an entry whose path leads well away from the opening is a
+        // wrong-side approach ("the Alien started running around"). Give the
+        // pilot control back at once instead of after the 10 s window.
+        if(active.receipt.action==Action::EnterVent && !Protected(state) && std::isfinite(active.ventBestDistance) &&
+            distance>active.ventBestDistance+2.5F) {
+            TraceVent(5U);
+            Terminal(result,Phase::Failed,Reason::NoVent);
+            Cancel(c,true);return true;
+        }
     }
     // AvS 2026-11-24 (entry 7394): the node reported arrival at 5.7 s but no
     // passage (cycle 56, frontstage) followed; the Alien idled in place until
@@ -1155,6 +1447,15 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
 #ifndef AIMP_ALIEN_ACTION_TEST
 bool ReplicatePose(const ap::Context& c,const ap::Frame& pose) noexcept {
     if((pose.flags&ap::OwnerMeasured)==0U)return false;
+    // Round 4: with a Client pilot the Host's Alien is placed by owner poses.
+    // Each one rewrites its transform while the Host settles and submits the
+    // paired kill, which can replace the cycle before it enters 78 (same
+    // failure as round 2's moving submit). Hold them until entry or the end.
+    if(Same(c) && c.host && !c.localOwner && active.receipt.action==Action::Attack && !active.cancelled &&
+        !active.entered && (active.settling || active.directSubmitted)) {
+        attackTelemetry.posesHeld.fetch_add(1U,std::memory_order_relaxed);
+        return false;
+    }
     if(Same(c) && active.remoteVent) {
         const bool entering=active.receipt.action==Action::EnterVent;
         if((pose.flags&ap::NativeBusy)==0U && ((pose.flags&ap::Backstage)!=0U)==entering)
@@ -1187,11 +1488,34 @@ void RetirePending() noexcept {
     if(!active.used || !active.cancelled)return;
     ap::Frame ignored{};static_cast<void>(Poll(active.context,ignored));
 }
+// AvS 2026-11-25 round 5 auto-chase (user: "when clicking it should follow the
+// player and execute the right animation"). The pilot's own PC steers the
+// Alien at the chosen survivor while the attack is pending and not yet being
+// submitted; the Host keeps querying retail availability and submits the kill
+// that fits the angle as soon as it is proven. On the Host of a Client-piloted
+// Alien it returns nonzero so the replica keeps following the owner's poses.
+int Chase(const ap::Context& c,float& yaw) noexcept {
+    if(!Same(c) || active.cancelled || active.receipt.action!=Action::Attack || active.entered ||
+        active.presented || active.settling || active.directSubmitted || active.retailArmed)return 0;
+    if(active.receipt.phase!=Phase::Preparing)return 0;
+    if(!c.localOwner)return c.host?2:0;
+    policy::Point source{},target{};
+    if(!PairIdentityLive(active.victim) || !LivingCharacter(active.victim.character) ||
+        !Body(c.character,source) || !Body(active.victim.character,target))return 0;
+    const float dx=target.x-source.x,dz=target.z-source.z,distance=std::hypot(dx,dz);
+    if(distance>policy::kAttackLeash || std::abs(target.y-source.y)>policy::kAttackHeight)return 0;
+    if(distance<policy::kAttackChaseStop)return 2;
+    yaw=std::atan2(dx,dz);
+#ifndef AIMP_ALIEN_ACTION_TEST
+    attackTelemetry.chaseFrames.fetch_add(1U,std::memory_order_relaxed);
+#endif
+    return 1;
+}
 const ap::ActionHooks hooks{&Begin,&Poll,&Busy,&Cancel,&Recover,&CancelRecovery
 #ifndef AIMP_ALIEN_ACTION_TEST
-    ,&DriveDonor,&ReplicatePose,&InterruptVent
+    ,&DriveDonor,&ReplicatePose,&InterruptVent,&Chase
 #else
-    ,nullptr,nullptr,&InterruptVent
+    ,nullptr,nullptr,&InterruptVent,&Chase
 #endif
 };
 #undef AIMP_ACTION_TRY
