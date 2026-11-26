@@ -293,6 +293,7 @@ package frontend
       private var _mpCharacterOptions:Array = null;
       
       private var _mpLastCapturedCharacterId:String = "";
+      private var _mpAutoCharacter:Boolean = false;
       
       private var _mpLastCapturedCharacterIndex:int = -999;
       
@@ -966,15 +967,63 @@ package frontend
          this._mpCharacterOptions = characters;
          this._mpLastCapturedCharacterId = "";
          this._mpLastCapturedCharacterIndex = -999;
+         // Auto-Amanda start: the screen's default slot is not reported as the choice.
+         this._mpAutoCharacter = this._mpPendingStartGame && this._mpPendingStartMode == "survival" && this.mpFindAmanda(characters) != null;
          this.characterSelection.setCharacters(characters);
          requestState(NewFrontendMenuState.DLC_CHAR);
          this.mpCaptureCurrentCharacterSelection("gfx-character-options",false);
          if(this._mpPendingStartGame && this._mpPendingStartMode == "survival")
          {
             this._mpPendingStartGame = false;
+            // Survival maps: some characters crash the game, Amanda is the
+            // stable one. Start with her directly instead of letting each
+            // player pick (her position in the list depends on the map).
+            var amanda:Object = this.mpFindAmanda(characters);
+            var amandaId:String = amanda != null ? this.mpExtractCharacterId(amanda) : "";
+            if(amandaId != null && amandaId.length > 0)
+            {
+               if(this._mpBridge != null)
+               {
+                  this._mpBridge.selectCharacter(this._mpPendingSessionId,amandaId,"AI_UI_CHAR_NAME_1",this.mpExtractModelHint(amanda),"auto-amanda",true);
+               }
+               this.show_network_notification("Character: Amanda");
+               this._mpBridge.ackStartGame(this._mpPendingSessionId,"character_auto_amanda");
+               ExternalInterface.call("request_gameplay_start",amandaId);
+               return;
+            }
+            // No Amanda on this map: fall back to the retail selection screen.
             this.show_network_notification("Select a character");
             this._mpBridge.ackStartGame(this._mpPendingSessionId,"character_selection_opened");
          }
+      }
+
+      // Amanda = string AI_UI_CHAR_NAME_1 ("Amanda"), id Character1.
+      private function mpFindAmanda(characters:Array) : Object
+      {
+         if(characters == null)
+         {
+            return null;
+         }
+         var i:int = 0;
+         while(i < characters.length)
+         {
+            var name:String = this.mpExtractCharacterName(characters[i]);
+            if(name == "AI_UI_CHAR_NAME_1" || (name != null && name.toLowerCase() == "amanda"))
+            {
+               return characters[i];
+            }
+            i++;
+         }
+         i = 0;
+         while(i < characters.length)
+         {
+            if(this.mpExtractCharacterId(characters[i]) == "Character1")
+            {
+               return characters[i];
+            }
+            i++;
+         }
+         return null;
       }
       
       public function setSurvivorModeInfo(param1:String, param2:String) : void
@@ -2093,6 +2142,10 @@ package frontend
       
       private function mpCaptureCurrentCharacterSelection(source:String, confirmed:Boolean) : void
       {
+         if(this._mpAutoCharacter)
+         {
+            return;
+         }
          var selectedIndex:int = this.mpGetCharacterSelectedIndex();
          var data:Object = this.mpGetCharacterDataForIndex(selectedIndex);
          var characterId:String = this.mpExtractCharacterId(data);
